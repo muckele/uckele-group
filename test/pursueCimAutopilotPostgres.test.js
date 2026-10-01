@@ -29,6 +29,8 @@ const p6bMigrationPath = path.join(root,
   'supabase/migrations/20261004120000_pursue_cim_provider_boundary.sql');
 const p6cMigrationPath = path.join(root,
   'supabase/migrations/20261005120000_pursue_cim_provider_outcomes.sql');
+const p6cPolicyTupleMigrationPath = path.join(root,
+  'supabase/migrations/20261005130000_pursue_cim_policy_tuple_guard.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -159,6 +161,28 @@ test('P6C PostgreSQL outcomes are mirrored, service-role-only, and create no cad
   assert.doesNotMatch(migration, /insert into public\.deal_hunter_cim_campaign_touches/);
   assert.match(migration, /revoke all on function public\.pursue_cim_finalize_transmission_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
   assert.match(migration, /revoke all on function public\.pursue_cim_reconcile_transmission_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
+});
+
+test('P6C policy tuple correction is additive, mirrored, and enforced by the durable gate', () => {
+  assert.equal(fs.existsSync(p6cPolicyTupleMigrationPath), true,
+    'policy tuple correction must use a new additive migration');
+  const migration = fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration),
+    'canonical schema must contain the exact additive P6C policy tuple block');
+  assert.match(migration,
+    /create or replace function public\.pursue_cim_authorize_provider_pending_v1\(p_command jsonb\)/i);
+  assert.match(migration, /security definer\s+set search_path = ''/i);
+  assert.match(migration,
+    /v_conversation\.batching_policy_version\s+is distinct from\s+'batching-off-v1'/i);
+  assert.match(migration,
+    /v_member\.permission_version\s+is distinct from\s+v_activation\.prerequisite_activation_id/i);
+  assert.match(migration,
+    /\{conversation,batchingPolicyVersion\}[\s\S]*v_conversation\.batching_policy_version/i);
+  assert.match(migration,
+    /\{campaign,permission_version\}[\s\S]*v_member\.permission_version/i);
+  assert.match(migration,
+    /revoke all on function public\.pursue_cim_authorize_provider_pending_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -415,6 +439,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -696,6 +721,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -1898,6 +1924,29 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           blockedReason: permissionRace.blockedReason },
         { authorized: false, blockedReason: 'permission_changed' },
         `${database}: current campaign permission must beat snapshot permission`);
+        const unsupportedPermissionVersion = JSON.parse(psql(container, database, `begin;
+          update public.deal_hunter_cim_campaigns set permission_version = 'future-activation-v2'
+            where id='${reference.expectedCampaigns[0].campaignId}';
+          set role service_role;
+          select public.pursue_cim_authorize_provider_pending_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
+          rollback;`).split('\n').find((line) => line.startsWith('{')));
+        assert.deepEqual({ authorized: unsupportedPermissionVersion.authorized,
+          blockedReason: unsupportedPermissionVersion.blockedReason },
+        { authorized: false, blockedReason: 'unknown_policy_version' },
+        `${database}: unsupported permission version must fail closed at the durable gate`);
+        const unsupportedBatchingVersion = JSON.parse(psql(container, database, `begin;
+          update public.deal_hunter_broker_conversations
+            set batching_policy_version = 'future-batching-v2'
+            where id='${command.authoritySnapshot.conversation.id}';
+          set role service_role;
+          select public.pursue_cim_authorize_provider_pending_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
+          rollback;`).split('\n').find((line) => line.startsWith('{')));
+        assert.deepEqual({ authorized: unsupportedBatchingVersion.authorized,
+          blockedReason: unsupportedBatchingVersion.blockedReason },
+        { authorized: false, blockedReason: 'unknown_policy_version' },
+        `${database}: unsupported batching version must fail closed at the durable gate`);
         const delegatedBlockLines = psql(container, database, `begin;
           update public.deal_hunter_cim_live_provider_authorizations
             set expires_at='2026-09-25T18:59:00.000Z'::timestamptz

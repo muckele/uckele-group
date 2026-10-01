@@ -10,6 +10,7 @@ import { CIM_CAMPAIGN_POLICY_VERSION } from './cimCampaignPolicy.js';
 const READINESS_VERSION = 'cim-provider-readiness-v1';
 const SOURCE_AUTHORITY_VERSION = 'cim-source-health-authority-v1';
 const INITIAL_PAYLOAD_VERSION = 'deal-hunter-cim-manual-stage1-v1';
+const INITIAL_BATCHING_POLICY_VERSION = 'batching-off-v1';
 
 function text(value, maximum = 240) {
   const normalized = String(value ?? '').trim();
@@ -193,6 +194,7 @@ function durableSnapshot(context) {
       recipientAddressDigest: sha256(String(conversation.recipient_address ?? '').toLowerCase()),
       senderPolicyVersion: conversation.sender_policy_version,
       replyPolicyVersion: conversation.reply_policy_version,
+      batchingPolicyVersion: conversation.batching_policy_version,
     },
     authorization: context.authorization,
     activation: context.activation,
@@ -241,11 +243,13 @@ export async function authorizePreparedCimTransmission({
   }
   const unknownTransmissionPolicy = context.transmission.payload_version !== INITIAL_PAYLOAD_VERSION
     || context.conversation?.sender_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
-    || context.conversation?.reply_policy_version !== CIM_CAMPAIGN_POLICY_VERSION;
+    || context.conversation?.reply_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
+    || context.conversation?.batching_policy_version !== INITIAL_BATCHING_POLICY_VERSION;
   const unknownPolicyCampaigns = [...new Map(context.members
     .filter((member) => unknownTransmissionPolicy
       || member?.campaign?.policy_version !== CIM_CAMPAIGN_POLICY_VERSION
-      || member?.campaign?.template_version !== CIM_CAMPAIGN_POLICY_VERSION)
+      || member?.campaign?.template_version !== CIM_CAMPAIGN_POLICY_VERSION
+      || member?.campaign?.permission_version !== context.activation?.prerequisite_activation_id)
     .map((member) => [member.campaign?.id, member.campaign])).values()]
     .filter((campaign) => campaign?.id);
   if (unknownPolicyCampaigns.length > 0) {
@@ -260,6 +264,9 @@ export async function authorizePreparedCimTransmission({
         payloadVersion: String(context.transmission.payload_version ?? ''),
         senderPolicyVersion: String(context.conversation?.sender_policy_version ?? ''),
         replyPolicyVersion: String(context.conversation?.reply_policy_version ?? ''),
+        batchingPolicyVersion: String(context.conversation?.batching_policy_version ?? ''),
+        permissionVersion: String(campaign.permission_version ?? ''),
+        permissionActivationId: String(context.activation?.prerequisite_activation_id ?? ''),
         transmissionId: context.transmission.id,
       };
       let projected = false;

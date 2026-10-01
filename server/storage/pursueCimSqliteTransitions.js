@@ -938,6 +938,9 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           || conversation.terminal_revision !== expectedConversationTerminalRevision) {
           return blocked('terminal_authority_changed');
         }
+        if (conversation.batching_policy_version !== 'batching-off-v1'
+          || authoritySnapshot.conversation?.batchingPolicyVersion
+            !== conversation.batching_policy_version) return blocked('unknown_policy_version');
         if (authoritySnapshot.conversation?.id !== conversation.id
           || authoritySnapshot.conversation?.rowVersion !== conversation.row_version
           || authoritySnapshot.conversation?.recipientAuthorityId !== conversation.recipient_authority_id
@@ -989,6 +992,10 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           const campaign = database.prepare(`
             SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?
           `).get(member.campaign_id);
+          if (campaign?.permission_version !== activation.prerequisite_activation_id
+            || expectedMember?.campaign?.permission_version !== campaign?.permission_version) {
+            return blocked('unknown_policy_version');
+          }
           if (!expectedMember || !campaign || campaign.generation !== 1
             || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'
             || campaign.state !== 'initial-pending' || campaign.terminal_reason

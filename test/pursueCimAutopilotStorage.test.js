@@ -1812,7 +1812,7 @@ async function createFinalGateFixture(t, suffix) {
     .run(`source-row-${suffix}`, authority.opportunityId, `source-record-${suffix}`,
       at, at, `source-run-${suffix}`, at, at);
   database.prepare(`UPDATE deal_hunter_cim_campaigns SET
-    permission_version = 'synthetic-fl04b-initial', permission_digest = ?,
+    permission_version = 'synthetic-fl04b-enrollment', permission_digest = ?,
     permission_revision = 1, permission_scope = ? WHERE id = ?`)
     .run(digest('2'), digest('f'), authority.campaignId);
   database.prepare(`UPDATE deal_hunter_cim_capability_activations SET
@@ -2357,6 +2357,80 @@ test('P6C scenario 78 unknown policy becomes action-required and provider-inert'
   assert.notEqual(database.prepare(`SELECT withdrawn_at
     FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?`)
     .get(authorization.id).withdrawn_at, null);
+});
+
+test('P6C unsupported permission and batching versions durably fail closed before readiness', async (t) => {
+  for (const [name, mutate] of [
+    ['permission', ({ database, authority }) => database.prepare(`UPDATE
+      deal_hunter_cim_campaigns SET permission_version = ? WHERE id = ?`)
+      .run('future-activation-v2', authority.campaignId)],
+    ['batching', ({ database, authority }) => database.prepare(`UPDATE
+      deal_hunter_broker_conversations SET batching_policy_version = ? WHERE id = ?`)
+      .run('future-batching-v2', authority.conversationId)],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createFinalGateFixture(subtest, `p6c-unknown-${name}`);
+      const { database, authority, authorization, gate } = fixture;
+      mutate(fixture);
+      let readinessCalls = 0;
+      const outcome = await gate({ readProviderReadiness: async () => {
+        readinessCalls += 1;
+        throw new Error('readiness must not be consulted for an unsupported policy tuple');
+      } });
+      assert.equal(outcome.authorized, false);
+      assert.equal(outcome.blockedReason, 'unknown_policy_version');
+      assert.equal(readinessCalls, 0);
+      assert.deepEqual(database.prepare(`SELECT state, reason_code
+        FROM deal_hunter_cim_campaigns WHERE id = ?`).get(authority.campaignId), {
+        state: 'action-required', reason_code: 'unknown_policy_version',
+      });
+      assert.equal(database.prepare(`SELECT invocation_authority_count
+        FROM deal_hunter_cim_transmissions`).get().invocation_authority_count, 0);
+      assert.notEqual(database.prepare(`SELECT withdrawn_at
+        FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?`)
+        .get(authorization.id).withdrawn_at, null);
+    });
+  }
+});
+
+test('P6C SQLite CAS rejects permission and batching changes after the service snapshot', async (t) => {
+  for (const [name, mutate] of [
+    ['permission', ({ database, authority }) => database.prepare(`UPDATE
+      deal_hunter_cim_campaigns SET permission_version = ? WHERE id = ?`)
+      .run('future-activation-v2', authority.campaignId)],
+    ['batching', ({ database, authority }) => database.prepare(`UPDATE
+      deal_hunter_broker_conversations SET batching_policy_version = ? WHERE id = ?`)
+      .run('future-batching-v2', authority.conversationId)],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createFinalGateFixture(subtest, `p6c-cas-${name}`);
+      let mutationApplied = false;
+      const racingStorage = new Proxy(fixture.storage, {
+        get(target, property, receiver) {
+          if (property !== 'authorizeCimProviderPending') {
+            const value = Reflect.get(target, property, receiver);
+            return typeof value === 'function' ? value.bind(target) : value;
+          }
+          return async (command) => {
+            mutate(fixture);
+            mutationApplied = true;
+            return target.authorizeCimProviderPending(command);
+          };
+        },
+      });
+      const outcome = await fixture.gate({ storage: racingStorage });
+      assert.equal(mutationApplied, true);
+      assert.equal(outcome.authorized, false);
+      assert.equal(outcome.blockedReason, 'unknown_policy_version');
+      assert.equal(fixture.database.prepare(`SELECT invocation_authority_count
+        FROM deal_hunter_cim_transmissions`).get().invocation_authority_count, 0);
+      assert.equal(fixture.database.prepare(`SELECT state FROM deal_hunter_cim_transmissions`)
+        .get().state, 'prepared');
+      assert.equal(fixture.database.prepare(`SELECT consumed_at
+        FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?`)
+        .get(fixture.authorization.id).consumed_at, null);
+    });
+  }
 });
 
 test('P6A SQLite final gate blocks every mutable authority without consuming call authority', async (t) => {

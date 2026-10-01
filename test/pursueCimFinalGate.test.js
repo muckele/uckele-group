@@ -25,6 +25,7 @@ function finalGateContext() {
       recipient_address: 'broker@example.test',
       sender_policy_version: 'deal-hunter-cim-autopilot-v1',
       reply_policy_version: 'deal-hunter-cim-autopilot-v1',
+      batching_policy_version: 'batching-off-v1',
     },
     authorization: {
       id: 'authorization-1', activation_id: 'activation-1', capability: 'fl04b-initial',
@@ -69,7 +70,7 @@ function finalGateContext() {
         crm_ownership_revision: 1, recipient_authority_id: 'recipient-authority-1',
         recipient_fingerprint: hex('c'), freshness_authority_digest: hex('5'),
         canonical_revision: 0, discovery_revision: 0, material_revision: 0,
-        timezone_revision: 1, permission_version: 'activation-1',
+        timezone_revision: 1, permission_version: 'enrollment-activation',
         permission_digest: hex('1'), permission_revision: 1, permission_scope: hex('f'),
         policy_version: 'deal-hunter-cim-autopilot-v1',
         template_version: 'deal-hunter-cim-autopilot-v1',
@@ -216,6 +217,8 @@ test('P6C unknown transmission or policy tuple terminalizes before readiness or 
     (context) => { context.transmission.payload_version = 'future-payload-v2'; },
     (context) => { context.members[0].campaign.template_version = 'future-template-v2'; },
     (context) => { context.conversation.sender_policy_version = 'future-sender-v2'; },
+    (context) => { context.members[0].campaign.permission_version = 'future-activation-v2'; },
+    (context) => { context.conversation.batching_policy_version = 'future-batching-v2'; },
   ]) {
     const context = finalGateContext();
     mutate(context);
