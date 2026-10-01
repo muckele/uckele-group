@@ -618,19 +618,13 @@ export async function createManualCommunication({ submissionId = '', input = {},
   };
 }
 
-async function uniqueSubmissionForContact(storage, email) {
-  if (!email || !storage.listSubmissionsByContactEmail) return null;
-  const rows = await storage.listSubmissionsByContactEmail(email, { limit: 3, openOnly: true });
-  return rows.length === 1 ? rows[0] : null;
-}
-
 function requestIdFromInboundRecipient(value) {
   const address = extractEmail(value);
   return address.match(/^cim-([a-z0-9_-]{8,64})@/i)?.[1]?.toLowerCase() || '';
 }
 
 async function resolveInboundAssignment(storage, {
-  recipients = [], fromAddress = '', explicitSubmissionId = '', inReplyTo = '', references = [],
+  recipients = [], explicitSubmissionId = '', inReplyTo = '', references = [],
 } = {}) {
   for (const recipient of recipients) {
     const alias = extractEmail(recipient);
@@ -664,10 +658,7 @@ async function resolveInboundAssignment(storage, {
     if (submission) return { submissionId: submission.id, request: null, method: 'explicit-submission' };
   }
 
-  const unique = await uniqueSubmissionForContact(storage, fromAddress);
-  return unique
-    ? { submissionId: unique.id, request: null, method: 'unique-contact-email' }
-    : { submissionId: null, request: null, method: 'unassigned' };
+  return { submissionId: null, request: null, method: 'unassigned' };
 }
 
 function receivedEmailUrl(emailId, suffix = '') {
@@ -771,7 +762,13 @@ function inboundCommunicationFromWebhook(event, assignment) {
     updated_by: 'resend-webhook',
     parent_communication_id: assignment.parent?.id,
     thread_key: assignment.parent?.thread_key,
-    metadata: { assignmentMethod: assignment.method, emailEventId: event.id },
+    metadata: {
+      assignmentMethod: assignment.method,
+      emailEventId: event.id,
+      ...(metadata.pursueCimInbound
+        ? { pursueCimInbound: metadata.pursueCimInbound }
+        : {}),
+    },
   });
 }
 

@@ -9,6 +9,10 @@ import { ensureDealHunterSubmissionForCim } from './dealHunter.js';
 import { validateIanaTimezone } from './opportunityTimezone.js';
 
 const digest = (value) => sha256(stableCanonicalJson(value));
+const framedDigest = (...parts) => sha256(JSON.stringify(parts.map((part) => {
+  const value = JSON.stringify(part);
+  return [Buffer.byteLength(value), value];
+})));
 const options = (authority) => authority.recipientOptions.map(({ recipientContactRef,
   displayName, email, provenance, provenanceLabel, primary }) => ({ recipientContactRef,
   displayName, email, provenance, provenanceLabel, primary }));
@@ -185,6 +189,8 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                   const recipientFingerprint = digest({ opportunityId, emailHash: sha256(freshRecipient.email),
                     provenanceFingerprint: freshRecipient.provenanceFingerprint,
                     contactAuthorityRevision: freshRecipient.contactAuthorityRevision });
+                  const conversationId = framedDigest('cim-conversation:v1', recipientFingerprint,
+                    CIM_CAMPAIGN_POLICY_VERSION);
                   phase = 'allocation';
                   const allocation = await storage.materializePursuitCampaign({
                     opportunityId, enrollmentId: enrollment.id,
@@ -208,7 +214,7 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                     recipientFingerprint, recipientAddress: recipient.email,
                     senderPolicyVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     replyPolicyVersion: CIM_CAMPAIGN_POLICY_VERSION,
-                    replyAliasTokenDigest: digest({ opportunityId, recipientFingerprint, type: 'reply-alias-v1' }),
+                    replyAliasTokenDigest: sha256(conversationId.slice(0, 32)),
                     rfcThreadKey: digest({ opportunityId, type: 'rfc-thread-v1' }),
                     batchingPolicyVersion: 'batching-off-v1',
                     freshnessAuthorityDigest: freshnessDigest(fresh),

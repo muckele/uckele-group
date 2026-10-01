@@ -136,8 +136,8 @@ test('Resend fixtures replay idempotently and create one durable deal event per 
     direction: 'inbound',
     pageSize: 20,
   });
-  assert.equal(uniqueCommunications.total, 1);
-  assert.equal(uniqueCommunications.rows[0].provider_message_id, 'email_fixture_unique_received_001');
+  assert.equal(uniqueCommunications.total, 0,
+    'sender identity alone must not assign even a unique CRM contact');
 
   await createManualSubmission({
     company: 'Shared Contact Listing A',
@@ -164,6 +164,10 @@ test('Resend fixtures replay idempotently and create one durable deal event per 
     }),
   })).ok, true);
   const unassigned = await storage.listCrmCommunications({ unassigned: true, direction: 'inbound', pageSize: 20 });
+  const uniqueCommunication = unassigned.rows.find((row) =>
+    row.provider_message_id === 'email_fixture_unique_received_001');
+  assert.ok(uniqueCommunication);
+  assert.equal(uniqueCommunication.submission_id, null);
   const ambiguousCommunication = unassigned.rows.find((row) => row.provider_message_id === 'email_fixture_ambiguous_received_001');
   assert.ok(ambiguousCommunication);
   assert.equal(ambiguousCommunication.submission_id, null);

@@ -89,6 +89,17 @@ function canonicalInstant(value) {
   return new Date(requiredInstant(value)).toISOString();
 }
 
+function boundedInboundEvidenceList(value, name, maximum = 50, itemMaximum = 500) {
+  if (!Array.isArray(value) || value.length > maximum) {
+    throw new Error(`${name} must be a bounded array`);
+  }
+  const normalized = value.map((item) => requiredText(item, name, itemMaximum));
+  if (new Set(normalized).size !== normalized.length) {
+    throw new Error(`${name} must not contain duplicates`);
+  }
+  return normalized;
+}
+
 function cadenceContext(database, transmissionId) {
   const transmission = database.prepare(`SELECT * FROM deal_hunter_cim_transmissions
     WHERE id = ?`).get(transmissionId) ?? null;
@@ -261,7 +272,7 @@ function deterministicUuid(...parts) {
 }
 
 export function createPursueCimSqliteTransitions(database, { applyPass, readCrmMatchAuthorityFingerprint } = {}) {
-  return {
+  const transitions = {
     async readPursuitEnrollmentAuthority({ opportunityId, now }) {
       const id = requiredText(opportunityId, 'opportunityId', 200);
       const at = requiredInstant(now);
@@ -346,6 +357,120 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       return { decision, enrollment, campaign, initialTouch, transmission,
         legacySummary: { count: legacySummary.count, accepted: legacySummary.accepted ?? 0,
           ambiguous: legacySummary.ambiguous ?? 0 }, actions: [] };
+    },
+    async resolvePursueCimInboundEvidence(command = {}) {
+      const replyToAddresses = boundedInboundEvidenceList(
+        command.replyToAddresses, 'replyToAddresses', 20, 320);
+      const provider = requiredProvider(command.provider);
+      const providerMessageIds = boundedInboundEvidenceList(
+        command.providerMessageIds, 'providerMessageIds', 20, 240);
+      const rfcMessageIds = boundedInboundEvidenceList(
+        command.rfcMessageIds, 'rfcMessageIds', 50, 500);
+      const taggedTouchIds = boundedInboundEvidenceList(
+        command.taggedTouchIds, 'taggedTouchIds', 50, 240);
+      const taggedConversationId = command.taggedConversationId
+        ? requiredText(command.taggedConversationId, 'taggedConversationId') : '';
+      const taggedTransmissionId = command.taggedTransmissionId
+        ? requiredText(command.taggedTransmissionId, 'taggedTransmissionId') : '';
+      const candidates = new Map();
+      let invalidProtectedEvidence = false;
+      const addCandidate = (row, method) => {
+        if (!row?.conversation_id) return;
+        const current = candidates.get(row.conversation_id) || {
+          conversationId: row.conversation_id, transmission: null, methods: new Set(),
+        };
+        current.methods.add(method);
+        if (row.transmission_id && (!current.transmission
+          || row.transmission_id === taggedTransmissionId)) {
+          current.transmission = database.prepare(`SELECT *
+            FROM deal_hunter_cim_transmissions WHERE id = ?`).get(row.transmission_id) ?? null;
+        }
+        candidates.set(row.conversation_id, current);
+      };
+      for (const address of replyToAddresses) {
+        for (const row of database.prepare(`
+          SELECT id AS transmission_id, conversation_id
+          FROM deal_hunter_cim_transmissions WHERE lower(reply_to_address) = lower(?)
+          ORDER BY updated_at DESC, id DESC
+        `).all(address)) addCandidate(row, 'reply-alias');
+      }
+      for (const providerMessageId of providerMessageIds) {
+        for (const row of database.prepare(`
+          SELECT id AS transmission_id, conversation_id
+          FROM deal_hunter_cim_transmissions
+          WHERE provider = ? AND provider_message_id = ?
+          ORDER BY updated_at DESC, id DESC
+        `).all(provider, providerMessageId)) addCandidate(row, 'provider-message');
+      }
+      for (const messageId of rfcMessageIds) {
+        for (const row of database.prepare(`
+          SELECT tr.id AS transmission_id, tr.conversation_id
+          FROM crm_communications AS communication
+          JOIN deal_hunter_cim_transmissions AS tr
+            ON tr.communication_id = communication.id
+          WHERE communication.message_id = ?
+          ORDER BY tr.updated_at DESC, tr.id DESC
+        `).all(messageId)) addCandidate(row, 'rfc-thread');
+      }
+      if (taggedTransmissionId) {
+        const row = database.prepare(`SELECT id AS transmission_id, conversation_id
+          FROM deal_hunter_cim_transmissions WHERE id = ?`).get(taggedTransmissionId);
+        if (row) addCandidate(row, 'protected-tag');
+        else invalidProtectedEvidence = true;
+      }
+      if (taggedConversationId) {
+        const row = database.prepare(`SELECT id AS conversation_id
+          FROM deal_hunter_broker_conversations WHERE id = ?`).get(taggedConversationId);
+        if (row) addCandidate(row, 'protected-tag');
+        else invalidProtectedEvidence = true;
+      }
+      if (taggedTouchIds.length > 0) {
+        const placeholders = taggedTouchIds.map(() => '?').join(',');
+        const rows = database.prepare(`
+          SELECT t.id AS touch_id, c.conversation_id
+          FROM deal_hunter_cim_campaign_touches AS t
+          JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
+          WHERE t.id IN (${placeholders}) ORDER BY t.id
+        `).all(...taggedTouchIds);
+        if (rows.length !== taggedTouchIds.length) invalidProtectedEvidence = true;
+        for (const row of rows) addCandidate(row, 'protected-tag');
+      }
+      if (candidates.size > 50) {
+        throw new Error('Pursue CIM inbound evidence exceeds the bounded candidate set');
+      }
+      const candidateConversations = Array.from(candidates.keys()).sort()
+        .map((conversationId) => database.prepare(`SELECT *
+          FROM deal_hunter_broker_conversations WHERE id = ?`).get(conversationId) ?? null)
+        .filter(Boolean);
+      if (invalidProtectedEvidence || candidates.size > 1) {
+        return { exact: false, ambiguous: true, method: 'conflicting-exact-evidence',
+          conversation: null, transmission: null, campaignIds: [], touchIds: [],
+          candidateConversations };
+      }
+      if (candidates.size === 0) {
+        return { exact: false, ambiguous: false, method: 'none', conversation: null,
+          transmission: null, campaignIds: [], touchIds: [], candidateConversations: [] };
+      }
+      const candidate = candidates.values().next().value;
+      const conversation = database.prepare(`SELECT * FROM deal_hunter_broker_conversations
+        WHERE id = ?`).get(candidate.conversationId) ?? null;
+      if (!conversation) {
+        return { exact: false, ambiguous: true, method: 'conflicting-exact-evidence',
+          conversation: null, transmission: null, campaignIds: [], touchIds: [],
+          candidateConversations: [] };
+      }
+      const campaignIds = database.prepare(`SELECT id FROM deal_hunter_cim_campaigns
+        WHERE conversation_id = ? ORDER BY id`).all(conversation.id).map(({ id }) => id);
+      const touchIds = database.prepare(`
+        SELECT t.id FROM deal_hunter_cim_campaign_touches AS t
+        JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
+        WHERE c.conversation_id = ? ORDER BY t.id
+      `).all(conversation.id).map(({ id }) => id);
+      const methodOrder = ['reply-alias', 'provider-message', 'rfc-thread', 'protected-tag'];
+      const method = methodOrder.find((value) => candidate.methods.has(value)) || 'protected-tag';
+      return { exact: true, ambiguous: false, method, conversation,
+        transmission: candidate.transmission, campaignIds, touchIds,
+        candidateConversations: [] };
     },
     async readCimCadenceContext({ transmissionId } = {}) {
       return cadenceContext(database, requiredText(transmissionId, 'transmissionId'));
@@ -1613,7 +1738,8 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         const communicationId = digest('crm-communication:cim-autopilot:v1', transmissionId);
         const outboxId = digest('crm-outbox:cim-autopilot:v1', transmissionId);
         const providerKey = digest('cim-provider:v1', transmissionId, payloadDigest);
-        const metadata = JSON.stringify({ transmissionId, campaignIds: campaigns.map(({ id }) => id),
+        const metadata = JSON.stringify({ transmissionId, conversationId,
+          campaignIds: campaigns.map(({ id }) => id), touchIds, memberDigest,
           tags: command.tags, retryPolicy: 'reconcile-only-after-provider-pending' });
         database.prepare(`
           INSERT INTO crm_communications (
@@ -1851,7 +1977,7 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           noOp: byStatus['no-op'] ?? 0, pending: byStatus.pending ?? 0 };
       }).immediate();
     },
-    async appendCimTerminalEvent(command) {
+    appendCimTerminalEvent(command) {
       const eventId = requiredText(command.eventId, 'eventId');
       const scope = requiredText(command.scope, 'scope', 20);
       if (!['campaign', 'conversation'].includes(scope)) throw new Error('Invalid terminal scope');
@@ -1985,6 +2111,47 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           scope === 'conversation' ? expectedRevision + 1 : null, cancelledTouchIds.sort());
       }).immediate();
     },
+    appendCimAmbiguousReplyReview(commands) {
+      if (!Array.isArray(commands) || commands.length < 1 || commands.length > 50) {
+        throw new Error('Ambiguous reply containment requires a bounded command array');
+      }
+      const scopeIds = commands.map((command) => requiredText(command?.scopeId, 'scopeId'));
+      if (new Set(scopeIds).size !== scopeIds.length
+        || scopeIds.some((scopeId, index) => index > 0 && scopeIds[index - 1] >= scopeId)) {
+        throw new Error('Ambiguous reply containment commands must be unique and sorted');
+      }
+      return database.transaction(() => {
+        for (const command of commands) {
+          if (command.scope !== 'conversation'
+            || command.nextState !== 'reply-review-required'
+            || command.reasonCode !== 'ambiguous_reply_evidence') {
+            throw new Error('Invalid ambiguous reply containment command');
+          }
+          const current = database.prepare(`SELECT * FROM deal_hunter_broker_conversations
+            WHERE id = ?`).get(command.scopeId);
+          const existing = database.prepare(`SELECT id FROM deal_hunter_cim_terminal_events
+            WHERE id = ?`).get(requiredText(command.eventId, 'eventId'));
+          if (existing || !current || current.state !== 'open'
+            || current.terminal_revision !== command.expectedRevision
+            || current.row_version !== command.expectedRowVersion) {
+            return { applied: false, replay: false, conflict: true,
+              conversationIds: scopeIds, cancelledTouchIds: [] };
+          }
+        }
+        const outcomes = commands.map((command) => transitions.appendCimTerminalEvent(command));
+        if (outcomes.some((outcome) => outcome.conflict)) {
+          throw new Error('Atomic ambiguous reply containment conflicted after validation');
+        }
+        return {
+          applied: outcomes.some((outcome) => outcome.applied),
+          replay: outcomes.every((outcome) => outcome.replay),
+          conflict: false,
+          conversationIds: scopeIds,
+          cancelledTouchIds: Array.from(new Set(outcomes.flatMap(
+            (outcome) => outcome.cancelledTouchIds || []))).sort(),
+        };
+      }).immediate();
+    },
     async claimDueCimTouch(command) {
       const touchId = requiredText(command.touchId, 'touchId');
       const expectedRowVersion = requiredRevision(command.expectedRowVersion, 'expectedRowVersion');
@@ -2072,7 +2239,7 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       return database.prepare(`
         SELECT t.id AS touch_id, t.campaign_id, t.opportunity_id, t.kind,
           t.state, t.due_at, t.row_version, t.claim_expires_at,
-          c.terminal_revision AS campaign_terminal_revision,
+          c.conversation_id, c.terminal_revision AS campaign_terminal_revision,
           v.terminal_revision AS conversation_terminal_revision,
           c.crm_submission_id, c.recipient_fingerprint AS campaign_recipient_fingerprint,
           v.recipient_fingerprint AS conversation_recipient_fingerprint,
@@ -2752,4 +2919,5 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       }).immediate();
     },
   };
+  return transitions;
 }

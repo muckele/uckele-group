@@ -1329,6 +1329,38 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return { ...result, legacySummary };
     },
 
+    async resolvePursueCimInboundEvidence(command) {
+      const { data, error } = await client.rpc('pursue_cim_resolve_inbound_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      const validIds = (value) => Array.isArray(value) && value.length <= 50
+        && value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 240);
+      const validCandidateConversations = (value) => Array.isArray(value) && value.length <= 50
+        && value.every((conversation) => conversation && typeof conversation === 'object'
+          && !Array.isArray(conversation)
+          && typeof conversation.id === 'string' && conversation.id.length > 0
+          && conversation.id.length <= 240
+          && typeof conversation.state === 'string' && conversation.state.length > 0
+          && conversation.state.length <= 80
+          && Number.isSafeInteger(Number(conversation.terminal_revision))
+          && Number(conversation.terminal_revision) >= 0
+          && Number.isSafeInteger(Number(conversation.row_version))
+          && Number(conversation.row_version) >= 0);
+      if (!data || typeof data !== 'object' || Array.isArray(data)
+        || typeof data.exact !== 'boolean' || typeof data.ambiguous !== 'boolean'
+        || (data.exact && data.ambiguous) || typeof data.method !== 'string'
+        || data.method.length < 1 || data.method.length > 120
+        || !validIds(data.campaignIds) || !validIds(data.touchIds)
+        || !validCandidateConversations(data.candidateConversations)
+        || (data.exact && (!data.conversation || typeof data.conversation !== 'object'))
+        || (!data.exact && data.conversation !== null)
+        || (data.transmission !== null && typeof data.transmission !== 'object')) {
+        throw new Error('Malformed Pursue CIM inbound resolution');
+      }
+      return data;
+    },
+
     async readCimOutreachCounters() {
       const { data, error } = await client.rpc('pursue_cim_read_import_outreach_counters_v1');
       if (error) throw error;
@@ -1532,6 +1564,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           throw new Error(`Malformed Pursue CIM terminal result: ${key}`);
         }
         result[key] = number;
+      }
+      return result;
+    },
+
+    async appendCimAmbiguousReplyReview(commands) {
+      const { data, error } = await client.rpc('pursue_cim_append_ambiguous_reply_review_v1', {
+        p_commands: commands,
+      });
+      if (error) throw error;
+      const result = normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], [],
+        { extraFields: ['conversationIds', 'cancelledTouchIds'] });
+      const validIds = (value) => Array.isArray(value) && value.length <= 50
+        && value.every((item) => typeof item === 'string' && item.length > 0 && item.length <= 240);
+      if (!validIds(result.conversationIds) || !validIds(result.cancelledTouchIds)) {
+        throw new Error('Malformed Pursue CIM ambiguous reply containment result');
       }
       return result;
     },

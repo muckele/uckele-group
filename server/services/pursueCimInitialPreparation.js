@@ -3,7 +3,11 @@ import { createHash, randomBytes } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
-import { buildDealHunterCimRequestEmail, normalizeResendTags } from './delivery.js';
+import {
+  buildCimReplyToAddress,
+  buildDealHunterCimRequestEmail,
+  normalizeResendTags,
+} from './delivery.js';
 
 const leaseMilliseconds = 5 * 60 * 1000;
 
@@ -36,14 +40,21 @@ function proposal(candidate, authority, recipient) {
     submissionId: candidate.crm_submission_id,
     manualStage1: { greeting: recipient.firstName ? `Hi ${recipient.firstName},` : 'Hello,' },
   });
-  const tags = normalizeResendTags(message.tags)
+  const tags = normalizeResendTags([
+    ...message.tags,
+    { name: 'cim_conversation_id', value: candidate.conversation_id },
+    { name: 'cim_touch_id', value: candidate.touch_id },
+  ])
     .map(({ name, value }) => `${name}=${value}`);
   if (tags.some((tag) => tag.length > 120)) throw new Error('CIM tag exceeds storage bound');
   return {
     payloadVersion: message.templateVersion,
     fromAddress,
     toAddresses: [recipient.email], ccAddresses: [], bccAddresses: [],
-    replyToAddress: message.replyTo,
+    replyToAddress: buildCimReplyToAddress({
+      requestId: candidate.conversation_id,
+      replyTo: message.replyTo,
+    }),
     subject: message.subject,
     bodyText: message.text,
     bodyHtmlSanitized: message.html,
