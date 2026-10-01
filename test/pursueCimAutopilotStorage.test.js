@@ -1590,6 +1590,285 @@ test('P1B terminal event increments authority and cancels pre-provider touch ato
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'terminal-transition'").get().count, 1);
 });
 
+test('P7B SQLite domain writers converge through terminal authority with retained evidence', async (t) => {
+  const cases = [
+    ['archive', 'crm_archived', 'crm-archive', async ({ storage, authority }) => {
+      await storage.mutateWithCrmActivity({
+        operation: 'archive_submission',
+        payload: { id: `submission-${authority.campaignId}`, expectedUpdatedAt: at,
+          values: { updated_at: at, archived_at: at, archived_by: 'fixture-owner',
+            archive_reason: 'not-a-fit' } },
+        activity: { id: `activity-${authority.campaignId}`,
+          submission_id: `submission-${authority.campaignId}`, created_at: at,
+          actor: 'fixture-owner', role: 'admin', event_type: 'submission.archived',
+          summary: 'Synthetic archive.', metadata: {} },
+      });
+    }],
+    ['advanced diligence', 'advanced_beyond_broker_outreach', 'diligence',
+      async ({ storage, authority }) => {
+        await storage.mutateWithCrmActivity({
+          operation: 'update_submission',
+          payload: { id: `submission-${authority.campaignId}`, expectedUpdatedAt: at,
+            values: { updated_at: '2026-09-25T19:00:01.000Z',
+              metadata: { diligence: { stage: 'loi-candidate', decision: 'advance' } } } },
+          activity: { id: `activity-${authority.campaignId}`,
+            submission_id: `submission-${authority.campaignId}`, created_at: at,
+            actor: 'fixture-owner', role: 'admin', event_type: 'diligence.updated',
+            summary: 'Synthetic diligence.', metadata: {} },
+        });
+      }],
+    ['materials', 'materials_received', 'materials', async ({ storage, database, authority }) => {
+      database.prepare(`INSERT INTO secure_upload_requests (
+        id, submission_id, created_at, updated_at, email, status, expires_at,
+        requested_documents
+      ) VALUES (?, ?, ?, ?, 'broker@example.test', 'open', ?, '[]')`)
+        .run(`request-${authority.campaignId}`, `submission-${authority.campaignId}`,
+          at, at, '2026-09-26T19:00:00.000Z');
+      await storage.insertSecureDocument({ id: `unrelated-document-${authority.campaignId}`,
+        request_id: `request-${authority.campaignId}`,
+        submission_id: `submission-${authority.campaignId}`, created_at: at,
+        document_type: 'nda', file_name: 'nda.pdf', original_name: 'Signed NDA.pdf',
+        mime_type: 'application/pdf', size_bytes: 100, storage_path: '/synthetic/nda.pdf',
+        uploaded_by_email: null, note: null, nda_accepted_at: null });
+      assert.deepEqual(database.prepare(`SELECT state, terminal_revision AS revision
+        FROM deal_hunter_cim_campaigns WHERE id = ?`).get(authority.campaignId),
+      { state: 'initial-pending', revision: 0 },
+      'an unrelated document must not become materials authority');
+      await storage.insertSecureDocument({ id: `document-${authority.campaignId}`,
+        request_id: `request-${authority.campaignId}`,
+        submission_id: `submission-${authority.campaignId}`, created_at: at,
+        document_type: 'cim', file_name: 'cim.pdf', original_name: 'CIM.pdf',
+        mime_type: 'application/pdf', size_bytes: 100, storage_path: '/synthetic/cim.pdf',
+        uploaded_by_email: null, note: null, nda_accepted_at: null });
+    }],
+    ['suppression', 'recipient_suppressed', 'email-suppression', async ({ storage, authority }) => {
+      await storage.upsertEmailSuppression({ id: `suppression-${authority.campaignId}`,
+        normalized_email: 'broker@example.test', reason: 'explicit-opt-out',
+        source: 'synthetic-test', source_event_id: `event-${authority.campaignId}`,
+        created_at: at, created_by: 'fixture-owner', metadata: {} });
+    }],
+    ['identity ambiguity', 'identity_ambiguous', 'identity-exception', async ({ storage, authority }) => {
+      await storage.upsertDealHunterIdentityException({ id: `identity-${authority.campaignId}`,
+        created_at: at, updated_at: at, status: 'open',
+        candidate_opportunity_ids: [authority.opportunityId], reason: 'synthetic conflict',
+        evidence_version: 'test-v1', metadata: {} });
+    }],
+  ];
+
+  for (const [label, reasonCode, evidenceType, invoke] of cases) {
+    await t.test(label, async (st) => {
+      const sqlitePath = temporaryPath(st, `p7b-${label.replaceAll(' ', '-')}`);
+      const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+      st.after(() => storage.close());
+      const database = new Database(sqlitePath);
+      st.after(() => database.close());
+      const authority = insertBaseAuthority(database, `-p7b-${label.replaceAll(' ', '-')}`);
+      seedCrmOwner(database, authority.opportunityId, `submission-${authority.campaignId}`);
+
+      await invoke({ storage, database, authority });
+
+      const campaign = database.prepare('SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?')
+        .get(authority.campaignId);
+      const event = database.prepare(`SELECT * FROM deal_hunter_cim_terminal_events
+        WHERE campaign_id = ? ORDER BY revision DESC LIMIT 1`).get(authority.campaignId);
+      assert.equal(campaign.terminal_revision, 1, label);
+      assert.equal(campaign.state,
+        ['materials_received', 'advanced_beyond_broker_outreach'].includes(reasonCode) ? 'materials-received'
+          : reasonCode === 'identity_ambiguous' ? 'action-required' : 'stopped', label);
+      assert.equal(campaign.reason_code, reasonCode, label);
+      assert.equal(event?.evidence_type, evidenceType, label);
+      assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+        .get(authority.touchId).state, 'cancelled-before-provider', label);
+    });
+  }
+});
+
+test('P7B SQLite terminal writer after provider-pending records the in-flight race and stops later work', async (t) => {
+  const { storage, database, authority, pending } = await createProviderPendingFixture(t, 'p7b-in-flight');
+  await storage.upsertEmailSuppression({ id: 'p7b-in-flight-suppression',
+    normalized_email: 'broker@example.test', reason: 'hard-bounce', source: 'provider-lifecycle',
+    source_event_id: 'p7b-in-flight-event', created_at: at, created_by: 'email-webhook',
+    metadata: {} });
+
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaigns WHERE id = ?')
+    .get(authority.campaignId).state, 'stopped');
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId).state, 'provider-pending');
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+    WHERE event_type = 'terminal-in-flight-race' AND transmission_id = ?`)
+    .get(pending.id).count, 1);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches
+    WHERE campaign_id = ? AND ordinal > 0 AND state IN ('scheduled','claimed')`)
+    .get(authority.campaignId).count, 0);
+});
+
+test('P7B direct SQLite submission and upload writers use canonical terminal authority', async (t) => {
+  await t.test('atomic activity upload request category edit', async (st) => {
+    const sqlitePath = temporaryPath(st, 'p7b-activity-upload');
+    const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+    st.after(() => storage.close());
+    const database = new Database(sqlitePath);
+    st.after(() => database.close());
+    const authority = insertBaseAuthority(database, '-p7b-activity-upload');
+    const submissionId = `submission-${authority.campaignId}`;
+    seedCrmOwner(database, authority.opportunityId, submissionId);
+    await storage.mutateWithCrmActivity({
+      operation: 'insert_secure_upload_request',
+      payload: { request: { id: 'p7b-activity-upload-request', submission_id: submissionId,
+        created_at: at, updated_at: at, email: 'broker@example.test', contact_name: null,
+        requested_by: 'fixture-owner', status: 'documents-received',
+        expires_at: '2026-09-26T19:00:00.000Z', nda_required: false,
+        nda_accepted_at: null, last_uploaded_at: at, note: null, requested_documents: [],
+        revoked_at: null, closed_at: null, upload_batch_count: 1 } },
+      activity: { id: 'p7b-activity-upload-insert', submission_id: submissionId,
+        created_at: at, actor: 'fixture-owner', role: 'admin',
+        event_type: 'secure-upload.created', summary: 'Synthetic upload request.', metadata: {} },
+    });
+    assert.equal(database.prepare(`SELECT terminal_revision FROM deal_hunter_cim_campaigns
+      WHERE id = ?`).get(authority.campaignId).terminal_revision, 0);
+    await storage.mutateWithCrmActivity({
+      operation: 'update_secure_upload_request',
+      payload: { id: 'p7b-activity-upload-request', expectedStatuses: ['documents-received'],
+        values: { updated_at: '2026-09-25T19:00:01.000Z', requested_documents: ['cim'] } },
+      activity: { id: 'p7b-activity-upload-update', submission_id: submissionId,
+        created_at: '2026-09-25T19:00:01.000Z', actor: 'fixture-owner', role: 'admin',
+        event_type: 'secure-upload.updated', summary: 'Synthetic upload categories.', metadata: {} },
+    });
+    assert.deepEqual(database.prepare(`SELECT state, reason_code FROM deal_hunter_cim_campaigns
+      WHERE id = ?`).get(authority.campaignId),
+    { state: 'materials-received', reason_code: 'materials_received' });
+  });
+
+  await t.test('completed latest relevant upload', async (st) => {
+    const sqlitePath = temporaryPath(st, 'p7b-direct-upload');
+    const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+    st.after(() => storage.close());
+    const database = new Database(sqlitePath);
+    st.after(() => database.close());
+    const authority = insertBaseAuthority(database, '-p7b-direct-upload');
+    const submissionId = `submission-${authority.campaignId}`;
+    seedCrmOwner(database, authority.opportunityId, submissionId);
+    await storage.insertSecureUploadRequest({ id: 'p7b-direct-upload-request',
+      submission_id: submissionId, created_at: at, updated_at: at,
+      email: 'broker@example.test', contact_name: null, requested_by: 'fixture-owner',
+      status: 'open', expires_at: '2026-09-26T19:00:00.000Z', nda_required: false,
+      nda_accepted_at: null, last_uploaded_at: null, note: null,
+      requested_documents: ['cim'], revoked_at: null, closed_at: null,
+      upload_batch_count: 0 });
+    assert.equal(database.prepare('SELECT terminal_revision FROM deal_hunter_cim_campaigns WHERE id = ?')
+      .get(authority.campaignId).terminal_revision, 0);
+    await storage.updateSecureUploadRequest('p7b-direct-upload-request', {
+      updated_at: '2026-09-25T19:00:01.000Z', status: 'documents-received',
+      requested_documents: ['cim'] });
+    assert.deepEqual(database.prepare(`SELECT state, reason_code FROM deal_hunter_cim_campaigns
+      WHERE id = ?`).get(authority.campaignId),
+    { state: 'materials-received', reason_code: 'materials_received' });
+  });
+
+  await t.test('direct advanced-diligence update', async (st) => {
+    const sqlitePath = temporaryPath(st, 'p7b-direct-submission');
+    const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+    st.after(() => storage.close());
+    const database = new Database(sqlitePath);
+    st.after(() => database.close());
+    const authority = insertBaseAuthority(database, '-p7b-direct-submission');
+    const submissionId = `submission-${authority.campaignId}`;
+    seedCrmOwner(database, authority.opportunityId, submissionId);
+    await storage.updateSubmission(submissionId, { updated_at: '2026-09-25T19:00:01.000Z',
+      metadata: { diligence: { stage: 'loi-candidate', decision: 'advance' } } });
+    assert.deepEqual(database.prepare(`SELECT state, reason_code FROM deal_hunter_cim_campaigns
+      WHERE id = ?`).get(authority.campaignId),
+    { state: 'materials-received', reason_code: 'advanced_beyond_broker_outreach' });
+  });
+});
+
+test('P7B repeated identity evidence increments terminal authority without leaving containment', async (t) => {
+  const sqlitePath = temporaryPath(t, 'p7b-repeat-identity');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p7b-repeat-identity');
+  for (const index of [1, 2]) {
+    await storage.upsertDealHunterIdentityException({ id: `p7b-identity-${index}`,
+      created_at: at, updated_at: `2026-09-25T19:00:0${index}.000Z`, status: 'open',
+      candidate_opportunity_ids: [authority.opportunityId], reason: `conflict-${index}`,
+      evidence_version: 'test-v1', metadata: {} });
+  }
+  assert.deepEqual(database.prepare(`SELECT state, terminal_revision AS revision
+    FROM deal_hunter_cim_campaigns WHERE id = ?`).get(authority.campaignId),
+  { state: 'action-required', revision: 2 });
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_terminal_events
+    WHERE campaign_id = ? AND reason_code = 'identity_ambiguous'`)
+    .get(authority.campaignId).count, 2);
+});
+
+test('P7B common terminal primitive audits explicit-stop races exactly once', async (t) => {
+  const { storage, database, authority, pending } = await createProviderPendingFixture(t, 'p7b-explicit-stop');
+  const campaign = database.prepare('SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?')
+    .get(authority.campaignId);
+  const command = { eventId: 'p7b-explicit-stop-event', scope: 'campaign',
+    scopeId: authority.campaignId, expectedRevision: campaign.terminal_revision,
+    expectedRowVersion: campaign.row_version, nextState: 'stopped', reasonCode: 'operator-stop',
+    evidenceType: 'operator-stop', evidenceId: 'p7b-stop', metadataDigest: sha256('p7b-stop'),
+    actor: 'fixture-owner', source: 'operator-command', observedAt: at, now: at };
+  assert.equal((await storage.appendCimTerminalEvent(command)).applied, true);
+  assert.equal((await storage.appendCimTerminalEvent(command)).replay, true);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+    WHERE event_type = 'terminal-in-flight-race' AND transmission_id = ?`)
+    .get(pending.id).count, 1);
+});
+
+test('P7B unsafe delivery and post-ambiguity evidence retain terminal dominance', async (t) => {
+  await t.test('unsafe communication lifecycle is atomic', async (st) => {
+    const { storage, database, authority, pending } = await createProviderPendingFixture(st, 'p7b-unsafe-delivery');
+    await storage.updateCrmCommunication(pending.communication_id, {
+      delivery_state: 'failed', delivery_state_at: '2026-09-25T19:00:02.000Z',
+      source_event_id: 'p7b-delivery-failed', updated_at: '2026-09-25T19:00:02.000Z',
+      updated_by: 'email-webhook' });
+    assert.deepEqual(database.prepare(`SELECT state, reason_code FROM deal_hunter_cim_campaigns
+      WHERE id = ?`).get(authority.campaignId),
+    { state: 'stopped', reason_code: 'unsafe_delivery' });
+    assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_terminal_events
+      WHERE campaign_id = ? AND evidence_type = 'delivery-lifecycle'`)
+      .get(authority.campaignId).count, 1);
+  });
+
+  await t.test('accepted reconciliation cannot revive terminal provider ambiguity', async (st) => {
+    const { storage, database, authority, pending } = await createProviderPendingFixture(st, 'p7b-ambiguous-terminal');
+    const ambiguous = await storage.reconcileCimTransmission({ transmissionId: pending.id,
+      payloadDigest: pending.payload_digest, expectedRowVersion: 2, outcome: 'ambiguous',
+      provider: 'resend', providerResultCode: 'multiple-provider-identities',
+      evidenceType: 'provider-read', evidenceId: 'p7b-provider-read-ambiguous',
+      evidenceDigest: sha256('p7b-ambiguous'), observedAt: at, actor: 'fixture-owner', now: at,
+      providerIdentities: [
+        { provider: 'resend', providerMessageId: 'p7b-provider-a', evidenceId: 'candidate-a',
+          evidenceDigest: sha256('p7b-candidate-a') },
+        { provider: 'resend', providerMessageId: 'p7b-provider-b', evidenceId: 'candidate-b',
+          evidenceDigest: sha256('p7b-candidate-b') },
+      ] });
+    assert.equal(ambiguous.applied, true);
+    await storage.upsertEmailSuppression({ id: 'p7b-ambiguous-suppression',
+      normalized_email: 'broker@example.test', reason: 'hard-bounce', source: 'provider-lifecycle',
+      source_event_id: 'p7b-ambiguous-suppression-event', created_at: at,
+      created_by: 'email-webhook', metadata: {} });
+    const accepted = await storage.reconcileCimTransmission({ transmissionId: pending.id,
+      payloadDigest: pending.payload_digest, expectedRowVersion: 3, outcome: 'accepted',
+      provider: 'resend', providerMessageId: 'p7b-provider-a',
+      providerResultCode: 'signed-webhook-accepted', evidenceType: 'signed-webhook',
+      evidenceId: 'p7b-webhook-accepted', evidenceDigest: sha256('p7b-accepted'),
+      observedAt: '2026-09-25T19:00:03.000Z', actor: 'fixture-owner', now: at,
+      cadence: null });
+    assert.equal(accepted.applied, true);
+    assert.equal(accepted.nextTouch, null);
+    assert.deepEqual(database.prepare(`SELECT state, reason_code, terminal_revision AS revision
+      FROM deal_hunter_cim_campaigns WHERE id = ?`).get(authority.campaignId),
+    { state: 'stopped', reason_code: 'recipient_suppressed', revision: 1 });
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches')
+      .get().count, 1);
+  });
+});
+
 test('P1B safety emission and no-op consumption are idempotent and audited', async (t) => {
   const sqlitePath = temporaryPath(t, 'pursue-cim-safety');
   const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
@@ -2547,6 +2826,12 @@ test('P6A SQLite final gate blocks every mutable authority without consuming cal
       contact_submissions SET metadata = ? WHERE deal_hunter_opportunity_id = ?`)
       .run(JSON.stringify({ diligence: { stage: 'financial-review', checklist: { cim: true } } }),
         authority.opportunityId)],
+    ['materials-upload-request', 'materials_received', ({ database, authority }) => database.prepare(`INSERT INTO
+      secure_upload_requests (id, submission_id, created_at, updated_at, email, status,
+        expires_at, requested_documents)
+      VALUES (?, ?, ?, ?, 'broker@example.test', 'documents-received', ?, ?)`)
+      .run(`gate-upload-${authority.touchId}`, `submission-${authority.touchId.slice(6)}`,
+        at, at, '2026-09-26T19:00:00.000Z', JSON.stringify(['cim']))],
     ['prior-request', 'lifecycle_conflict', ({ database, authority }) => database.prepare(`INSERT INTO
       deal_hunter_cim_requests (id, created_at, updated_at, deal_key, recipient_email,
         status, opportunity_id, metadata)

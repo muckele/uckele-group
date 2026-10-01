@@ -1568,6 +1568,23 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return result;
     },
 
+    async convergeCimTerminalAuthority(command) {
+      const { data, error } = await client.rpc('pursue_cim_converge_terminal_authority_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || Array.isArray(data)
+        || typeof data.applied !== 'boolean' || !Array.isArray(data.outcomes)
+        || data.outcomes.length > 50
+        || data.outcomes.some((outcome) => !outcome || typeof outcome !== 'object'
+          || typeof outcome.campaignId !== 'string' || typeof outcome.eventId !== 'string'
+          || typeof outcome.reasonCode !== 'string' || typeof outcome.applied !== 'boolean'
+          || typeof outcome.replay !== 'boolean' || typeof outcome.conflict !== 'boolean')) {
+        throw new Error('Malformed Pursue CIM terminal convergence result');
+      }
+      return data;
+    },
+
     async appendCimAmbiguousReplyReview(commands) {
       const { data, error } = await client.rpc('pursue_cim_append_ambiguous_reply_review_v1', {
         p_commands: commands,
