@@ -11,6 +11,7 @@ import { orchestratePursuitEnrollment, pursuitPermissionBasisDigest,
 import { runDueCimInitialPreparations } from '../server/services/pursueCimInitialPreparation.js';
 import { resolveDealHunterOpportunity } from '../server/services/cimOpportunityIdentity.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { sha256 } from '../server/utils/security.js';
 import {
   augustLaterUrlListing,
   augustMateriallyDistinctLookalike,
@@ -129,6 +130,25 @@ test('P5 real Broker Materials authority prepares the Package 4B initial touch',
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM crm_communications').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM crm_email_outbox').get().n, 1);
   assert.equal(db.prepare('SELECT state FROM deal_hunter_cim_transmissions').get().state, 'prepared');
+  const campaign = db.prepare('SELECT * FROM deal_hunter_cim_campaigns').get();
+  const touch = db.prepare('SELECT * FROM deal_hunter_cim_campaign_touches').get();
+  const transmission = db.prepare('SELECT * FROM deal_hunter_cim_transmissions').get();
+  const communication = db.prepare('SELECT * FROM crm_communications').get();
+  const conversation = db.prepare('SELECT * FROM deal_hunter_broker_conversations').get();
+  const metadata = JSON.parse(communication.metadata);
+  const tags = new Set(metadata.tags);
+  assert.ok(communication.reply_to_address.includes(campaign.conversation_id.slice(0, 32)),
+    'the exact reply alias is conversation-bound');
+  assert.equal(conversation.reply_alias_token_digest,
+    sha256(campaign.conversation_id.slice(0, 32)),
+    'the durable alias digest binds the exact conversation token');
+  assert.ok(tags.has(`cim_conversation_id=${campaign.conversation_id}`));
+  assert.ok(tags.has(`cim_touch_id=${touch.id}`));
+  assert.equal(metadata.conversationId, campaign.conversation_id);
+  assert.equal(metadata.transmissionId, transmission.id);
+  assert.deepEqual(metadata.campaignIds, [campaign.id]);
+  assert.deepEqual(metadata.touchIds, [touch.id]);
+  assert.equal(metadata.memberDigest, transmission.member_digest);
 });
 
 test('P5 refuses preparation when the campaign leaves initial-pending after claim', async (t) => {

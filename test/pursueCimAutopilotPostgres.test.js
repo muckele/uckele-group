@@ -35,6 +35,8 @@ const p6cPolicyTupleMigrationPath = path.join(root,
   'supabase/migrations/20261005130000_pursue_cim_policy_tuple_guard.sql');
 const p6dMigrationPath = path.join(root,
   'supabase/migrations/20261006120000_pursue_cim_dormant_followup_slots.sql');
+const p7aMigrationPath = path.join(root,
+  'supabase/migrations/20261007120000_pursue_cim_conversation_first_inbound.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -55,6 +57,7 @@ const singleIdTables = expectedTables.filter((table) => ![
   'deal_hunter_opportunity_timezone_revisions',
 ].includes(table));
 const expectedP1cFunctions = [
+  'pursue_cim_append_ambiguous_reply_review_v1',
   'pursue_cim_append_crm_ownership_revision_v1',
   'pursue_cim_append_safety_events_v1',
   'pursue_cim_append_terminal_event_v1',
@@ -90,9 +93,11 @@ const expectedP1cFunctions = [
   'pursue_cim_reconcile_with_cadence_v1',
   'pursue_cim_record_capability_activation_v1',
   'pursue_cim_record_owner_decision_v1',
+  'pursue_cim_refresh_inbound_binding_v1',
   'pursue_cim_required_instant_v1',
   'pursue_cim_required_revision_v1',
   'pursue_cim_required_text_v1',
+  'pursue_cim_resolve_inbound_v1',
   'pursue_cim_resolve_local_instant_v1',
   'pursue_cim_transition_enrollment_v1',
   'pursue_cim_validate_accepted_cadence_v1',
@@ -214,6 +219,27 @@ test('P6D PostgreSQL cadence wrappers are additive, mirrored, and service-role c
   assert.match(migration, /insert into public\.deal_hunter_cim_campaign_touches/);
   assert.match(migration, /revoke all on function public\.pursue_cim_finalize_transmission_v1\(jsonb\) from service_role/);
   assert.match(migration, /grant execute on function public\.pursue_cim_finalize_with_cadence_v1\(jsonb\) to service_role/);
+});
+
+test('P7A PostgreSQL inbound resolver is additive, mirrored, read-only, and service-role constrained', () => {
+  assert.equal(fs.existsSync(p7aMigrationPath), true);
+  const migration = fs.readFileSync(p7aMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact additive P7A block');
+  assert.match(migration, /create or replace function public\.pursue_cim_resolve_inbound_v1/);
+  assert.match(migration, /language plpgsql\s+stable\s+security definer\s+set search_path = ''/i);
+  assert.match(migration, /conflicting-exact-evidence/);
+  assert.match(migration, /replyToAddresses/);
+  assert.match(migration, /providerMessageIds/);
+  assert.match(migration, /rfcMessageIds/);
+  assert.match(migration, /taggedTouchIds/);
+  assert.match(migration, /candidateConversations/);
+  assert.match(migration,
+    /pursue_cim_append_ambiguous_reply_review_v1[\s\S]*jsonb_array_length\(p_commands\) not between 1 and 50[\s\S]*pursue_cim_append_terminal_event_v1/);
+  assert.match(migration,
+    /new\.metadata - array\['conversationId','campaignIds','touchIds','memberDigest'\]\s*=\s*old\.metadata - array\['conversationId','campaignIds','touchIds','memberDigest'\]/);
+  assert.match(migration, /after insert on public\.deal_hunter_cim_transmission_touches/);
+  assert.match(migration, /grant execute on function public\.pursue_cim_resolve_inbound_v1\(jsonb\) to service_role/);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -472,6 +498,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -755,6 +782,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -1078,6 +1106,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           'pursue_cim_withdraw_capability_activation_v1',
           'pursue_cim_claim_due_touch_v1',
           'pursue_cim_list_due_initial_touches_v1',
+          'pursue_cim_resolve_inbound_v1',
+          'pursue_cim_append_ambiguous_reply_review_v1',
           'pursue_cim_read_projection_v1',
           'pursue_cim_append_safety_events_v1',
           'pursue_cim_record_owner_decision_v1',
@@ -1103,7 +1133,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
             select public.pursue_cim_list_due_initial_touches_v1(
               '${payload.p_now}'::timestamptz, ${payload.p_limit});`)), error: null };
         }
-        const argument = JSON.stringify(payload.p_command ?? payload.p_run).replaceAll("'", "''");
+        const argument = JSON.stringify(
+          payload.p_command ?? payload.p_run ?? payload.p_commands).replaceAll("'", "''");
         const data = JSON.parse(psql(container, database, `
           set role service_role;
           select public.${name}('${argument}'::jsonb);
@@ -1204,6 +1235,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         { ...reference.reconcileCommands[0], providerMessageId: 42 }],
       ['pursue_cim_append_terminal_event_v1',
         { ...reference.terminalCommands[0], preProviderResolution: 'true' }],
+      ['pursue_cim_resolve_inbound_v1', {
+        replyToAddresses: [42], provider: 'resend', providerMessageIds: [],
+        rfcMessageIds: [], taggedConversationId: '', taggedTransmissionId: '',
+        taggedTouchIds: [],
+      }],
     ];
     for (const [name, command] of malformedCommands) {
       const payload = JSON.stringify(command).replaceAll("'", "''");
@@ -1823,6 +1859,122 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       reference.expectedPreparations[index], database);
     }
     const activePreparedId = reference.expectedPreparations.at(-1).transmissionId;
+    const activeReplyTo = psql(container, database, `select reply_to_address
+      from public.deal_hunter_cim_transmissions where id='${activePreparedId}';`);
+    const activeConversationId = psql(container, database, `select conversation_id
+      from public.deal_hunter_cim_transmissions where id='${activePreparedId}';`);
+    const exactInbound = await supabase.resolvePursueCimInboundEvidence({
+      replyToAddresses: [activeReplyTo], provider: 'resend', providerMessageIds: [],
+      rfcMessageIds: [], taggedConversationId: '', taggedTransmissionId: '',
+      taggedTouchIds: [],
+    });
+    assert.deepEqual({ exact: exactInbound.exact, ambiguous: exactInbound.ambiguous,
+      method: exactInbound.method, conversationId: exactInbound.conversation?.id }, {
+      exact: true, ambiguous: false, method: 'reply-alias',
+      conversationId: activeConversationId,
+    }, `${database}: P7A exact alias resolves the durable conversation before content fetch`);
+    assert.equal(psql(container, database, `select conversation_id
+      from public.deal_hunter_cim_transmissions where id='${exactInbound.transmission?.id}';`),
+    activeConversationId, `${database}: alias-selected transmission must remain conversation-bound`);
+    const conflictingInbound = await supabase.resolvePursueCimInboundEvidence({
+      replyToAddresses: [activeReplyTo], provider: 'resend', providerMessageIds: [],
+      rfcMessageIds: [], taggedConversationId: 'missing-protected-conversation',
+      taggedTransmissionId: '', taggedTouchIds: [],
+    });
+    assert.deepEqual({ exact: conflictingInbound.exact,
+      ambiguous: conflictingInbound.ambiguous, method: conflictingInbound.method,
+      candidateConversationIds: conflictingInbound.candidateConversations.map(({ id }) => id) }, {
+      exact: false, ambiguous: true, method: 'conflicting-exact-evidence',
+      candidateConversationIds: [activeConversationId],
+    }, `${database}: conflicting protected evidence must fail closed`);
+    const atomicReviewCommands = ['conversation-atomic-a', 'conversation-atomic-b']
+      .map((scopeId, index) => ({
+        eventId: `atomic-review-${scopeId}`, scope: 'conversation', scopeId,
+        expectedRevision: 0, expectedRowVersion: 1,
+        nextState: 'reply-review-required', reasonCode: 'ambiguous_reply_evidence',
+        evidenceType: 'signed-inbound-conflicting-exact-evidence',
+        evidenceId: 'signed-atomic-review-event', observedAt: now,
+        actor: 'signed-email-webhook', source: 'pursue-cim-inbound',
+        metadataDigest: String(index + 5).repeat(64), now,
+      }));
+    const staleAtomicReviewCommands = atomicReviewCommands.map((command, index) =>
+      index === 1 ? { ...command, expectedRevision: 1 } : command);
+    const atomicReviewEvidence = psql(container, database, `begin;
+      insert into public.deal_hunter_broker_conversations
+        (id, recipient_authority_id, recipient_fingerprint, recipient_address,
+         sender_policy_version, reply_policy_version, reply_alias_token_digest,
+         rfc_thread_key, state, batching_policy_version, created_at, updated_at)
+      values
+        ('conversation-atomic-a', 'recipient-atomic-a', repeat('a',64),
+          'atomic-a@example.test', 'deal-hunter-cim-autopilot-v1',
+          'deal-hunter-cim-autopilot-v1', repeat('b',64), 'thread-atomic-a',
+          'open', 'batching-off-v1', '${now}', '${now}'),
+        ('conversation-atomic-b', 'recipient-atomic-b', repeat('c',64),
+          'atomic-b@example.test', 'deal-hunter-cim-autopilot-v1',
+          'deal-hunter-cim-autopilot-v1', repeat('d',64), 'thread-atomic-b',
+          'open', 'batching-off-v1', '${now}', '${now}');
+      select public.pursue_cim_append_ambiguous_reply_review_v1(
+        '${JSON.stringify(staleAtomicReviewCommands)}'::jsonb);
+      select jsonb_build_object('afterConflict', jsonb_agg(state order by id))
+        from public.deal_hunter_broker_conversations
+        where id in ('conversation-atomic-a','conversation-atomic-b');
+      select public.pursue_cim_append_ambiguous_reply_review_v1(
+        '${JSON.stringify(atomicReviewCommands)}'::jsonb);
+      select jsonb_build_object('afterApply', jsonb_agg(state order by id))
+        from public.deal_hunter_broker_conversations
+        where id in ('conversation-atomic-a','conversation-atomic-b');
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    assert.deepEqual(atomicReviewEvidence[0], {
+      applied: false, replay: false, conflict: true,
+      conversationIds: ['conversation-atomic-a', 'conversation-atomic-b'],
+      cancelledTouchIds: [],
+    }, `${database}: an atomic conflict must be a normal read-through result`);
+    assert.deepEqual(atomicReviewEvidence[1], { afterConflict: ['open', 'open'] },
+      `${database}: a conflict must roll back every candidate transition`);
+    assert.equal(atomicReviewEvidence[2].applied, true, database);
+    assert.deepEqual(atomicReviewEvidence[2].conversationIds,
+      ['conversation-atomic-a', 'conversation-atomic-b'], database);
+    assert.deepEqual(atomicReviewEvidence[3], {
+      afterApply: ['reply-review-required', 'reply-review-required'],
+    }, `${database}: one transaction must contain every ambiguous candidate`);
+    const bindingMetadata = JSON.parse(psql(container, database, `select jsonb_build_object(
+      'communication', communication.metadata, 'outbox', outbox.metadata)
+      from public.deal_hunter_cim_transmissions transmission
+      join public.crm_communications communication on communication.id=transmission.communication_id
+      join public.crm_email_outbox outbox on outbox.id=transmission.outbox_id
+      where transmission.id='${activePreparedId}';`));
+    for (const metadata of [bindingMetadata.communication, bindingMetadata.outbox]) {
+      assert.equal(metadata.transmissionId, activePreparedId, database);
+      assert.equal(metadata.conversationId, activeConversationId, database);
+      assert.deepEqual(metadata.touchIds, [reference.expectedCampaigns[0].touchId], database);
+      assert.match(metadata.memberDigest, /^[0-9a-f]{64}$/, database);
+    }
+    const multiMemberBinding = JSON.parse(psql(container, database, `begin;
+      insert into public.deal_hunter_cim_campaign_touches
+        (id, campaign_id, opportunity_id, logical_slot, kind, ordinal, due_at, due_local,
+         timezone_revision, state, transmission_id, created_at, updated_at)
+      select 'touch-p7a-second-member', campaign_id, opportunity_id, 'p7a-second-member',
+        'follow-up-1', 1, due_at, due_local, timezone_revision, 'scheduled',
+        '${activePreparedId}', created_at, updated_at
+      from public.deal_hunter_cim_campaign_touches
+      where id='${reference.expectedCampaigns[0].touchId}';
+      select pg_catalog.set_config('p7a.binding_revision', revision::text, true)
+        from public.deal_hunter_cim_global_authority where id='global';
+      insert into public.deal_hunter_cim_transmission_touches
+        (transmission_id, touch_id, opportunity_id, campaign_id, display_ordinal, created_at)
+      values ('${activePreparedId}', 'touch-p7a-second-member', 'opp-decision',
+        '${reference.expectedCampaigns[0].campaignId}', 2, '${now}');
+      select jsonb_build_object(
+        'revisionDelta', (select revision from public.deal_hunter_cim_global_authority
+          where id='global') - pg_catalog.current_setting('p7a.binding_revision')::bigint,
+        'touchIds', (select metadata->'touchIds' from public.crm_communications
+          where id=(select communication_id from public.deal_hunter_cim_transmissions
+            where id='${activePreparedId}')));
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).at(-1));
+    assert.equal(multiMemberBinding.revisionDelta, 0,
+      `${database}: every internal membership binding refresh must remain revision-neutral`);
+    assert.deepEqual(multiMemberBinding.touchIds.sort(),
+      [reference.expectedCampaigns[0].touchId, 'touch-p7a-second-member'].sort(), database);
     const staleRebuild = await supabase.prepareCimTransmission({
       ...reference.prepareCommands.at(-1), preparationGeneration: 3,
       claimTokenDigest: '7'.repeat(64), bodyText: 'Unapproved replacement',

@@ -403,7 +403,8 @@ test('received email uses only the fixed Resend API, persists bounded body and a
   ]);
 
   const communication = storage.state.communications[0];
-  assert.equal(communication.submission_id, 'submission-1');
+  assert.equal(communication.submission_id, null,
+    'sender identity alone must not bind an inbound communication');
   assert.equal(communication.content_state, 'complete');
   assert.equal(communication.body_text, 'Confidential inbound message body.');
   assert.equal(communication.body_html_sanitized, '');
@@ -424,7 +425,7 @@ test('received email uses only the fixed Resend API, persists bounded body and a
   });
   assert.equal(JSON.stringify(communication).includes('temporary-secret.example'), false);
   assert.equal(JSON.stringify(first).includes('Confidential inbound message body.'), false);
-  assert.equal(storage.state.recommendationsSuperseded.length > 0, true);
+  assert.equal(storage.state.recommendationsSuperseded.length, 0);
 });
 
 test('RFC In-Reply-To assigns a shared-address reply only to the unique matching CRM thread', async () => {
@@ -677,6 +678,40 @@ test('ambiguous shared broker email remains unassigned instead of selecting the 
   assert.equal(JSON.stringify(inbox).includes('provider_message_id'), false);
 });
 
+test('P7A sender-only reply stays unassigned and cannot stop a unique-contact legacy sequence', async () => {
+  const storage = createStorage({
+    submissions: [{
+      id: 'sender-only-submission', status: 'review', company: 'Unique Sender Listing',
+      broker_email: 'unique-sender@example.com',
+    }],
+    cimRequests: [{
+      id: 'sender-only-request', submission_id: 'sender-only-submission',
+      opportunity_id: 'sender-only-opportunity', status: 'sent',
+      request_state: 'provider_accepted', follow_up_state: 'scheduled',
+      next_follow_up_at: '2026-08-08T16:00:00.000Z', metadata: {},
+    }],
+  });
+
+  const result = await recordEmailEventsFromWebhook(sharedSecretRequest(receivedPayload({
+    id: 'evt-sender-only-p7a', emailId: 'received-sender-only-p7a',
+    from: 'Unique Sender <unique-sender@example.com>',
+    to: ['deals@inbound.example.com'],
+  })), {
+    storage,
+    fetcher: async () => response({
+      id: 'received-sender-only-p7a', from: 'Unique Sender <unique-sender@example.com>',
+      to: ['deals@inbound.example.com'], subject: 'Unbound reply', text: 'Hello', attachments: [],
+    }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(storage.state.emailEvents[0].submission_id, null);
+  assert.equal(storage.state.communications[0].submission_id, null);
+  assert.equal(storage.state.cimRequests[0].request_state, 'provider_accepted');
+  assert.equal(storage.state.cimRequests[0].follow_up_state, 'scheduled');
+  assert.equal(storage.state.cimRequests[0].next_follow_up_at, '2026-08-08T16:00:00.000Z');
+});
+
 test('received content failure is acknowledged as pending retry and exposed only as sanitized Operations counts', async () => {
   const storage = createStorage();
   const body = receivedPayload({ id: 'evt-retry-1', emailId: 'received-retry-1', from: 'Unknown <unknown@example.com>' });
@@ -744,6 +779,221 @@ test('received content failure is acknowledged as pending retry and exposed only
   });
   assert.equal(storage.state.communications[0].content_state, 'complete');
   assert.equal(storage.state.communications[0].body_text, 'Retry succeeded.');
+});
+
+test('P7A scenario 54 signed alias terminalizes the exact conversation before content fetch failure', async () => {
+  const storage = createStorage();
+  let terminalCommitted = false;
+  let resolutionCommand = null;
+  storage.resolvePursueCimInboundEvidence = async (command) => {
+    resolutionCommand = clone(command);
+    return {
+      exact: true,
+      ambiguous: false,
+      method: 'reply-alias',
+      conversation: {
+        id: 'conversation-p7a', state: 'open', terminal_revision: 0, row_version: 1,
+      },
+      transmission: { id: 'transmission-p7a' },
+      campaignIds: ['campaign-p7a'],
+      touchIds: ['touch-p7a'],
+    };
+  };
+  storage.appendCimTerminalEvent = async (command) => {
+    assert.equal(command.scopeId, 'conversation-p7a');
+    terminalCommitted = true;
+    return { applied: true, replay: false, conflict: false,
+      campaignRevision: null, conversationRevision: 1, cancelledTouchIds: ['touch-p7a'] };
+  };
+  const payload = receivedPayload({
+    id: 'evt-p7a-content-failure',
+    emailId: 'received-p7a-content-failure',
+    from: 'Shared Broker <shared-p7a@example.com>',
+    to: ['cim-conversation-p7a@inbound.example.com'],
+  });
+  payload.data.tags = [
+    { name: 'cim_conversation_id', value: 'conversation-p7a' },
+    { name: 'cim_touch_id', value: 'touch-p7a' },
+  ];
+
+  const result = await recordEmailEventsFromWebhook(
+    signedRequest(payload, 'svix-p7a-content-failure'),
+    {
+      storage,
+      fetcher: async () => {
+        assert.equal(terminalCommitted, true,
+          'content retrieval must start only after durable conversation terminalization');
+        return response({ unavailable: true }, 503);
+      },
+    },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ingestion[0].pendingRetry, true);
+  assert.equal(terminalCommitted, true);
+  assert.deepEqual(resolutionCommand.replyToAddresses,
+    ['cim-conversation-p7a@inbound.example.com']);
+  assert.equal(storage.state.communications[0].content_state, 'failed');
+  assert.deepEqual(storage.state.communications[0].metadata.pursueCimInbound, {
+    exact: true,
+    ambiguous: false,
+    reviewRequired: false,
+    conversationId: 'conversation-p7a',
+    transmissionId: 'transmission-p7a',
+    campaignIds: ['campaign-p7a'],
+    touchIds: ['touch-p7a'],
+    method: 'reply-alias',
+  });
+});
+
+test('P7A exact RFC parent evidence is resolved from the signed envelope before content retrieval', async () => {
+  const storage = createStorage();
+  let terminalCommitted = false;
+  storage.resolvePursueCimInboundEvidence = async (command) => command.rfcMessageIds.includes(
+    '<outbound-p7a@example.test>')
+    ? {
+        exact: true, ambiguous: false, method: 'rfc-thread',
+        conversation: { id: 'conversation-rfc-p7a', state: 'open',
+          terminal_revision: 0, row_version: 1 },
+        transmission: { id: 'transmission-rfc-p7a' },
+        campaignIds: ['campaign-rfc-p7a'], touchIds: ['touch-rfc-p7a'],
+      }
+    : { exact: false, ambiguous: false, method: 'none', conversation: null,
+        transmission: null, campaignIds: [], touchIds: [] };
+  storage.appendCimTerminalEvent = async () => {
+    terminalCommitted = true;
+    return { applied: true, replay: false, conflict: false,
+      campaignRevision: null, conversationRevision: 1, cancelledTouchIds: ['touch-rfc-p7a'] };
+  };
+  const payload = receivedPayload({ id: 'evt-p7a-rfc', emailId: 'received-p7a-rfc' });
+  payload.data.in_reply_to = '<outbound-p7a@example.test>';
+  payload.data.references = ['<earlier-p7a@example.test>', '<outbound-p7a@example.test>'];
+
+  const result = await recordEmailEventsFromWebhook(signedRequest(payload, 'svix-p7a-rfc'), {
+    storage,
+    fetcher: async () => {
+      assert.equal(terminalCommitted, true);
+      return response({ unavailable: true }, 503);
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(terminalCommitted, true);
+  assert.equal(result.ingestion[0].pendingRetry, true);
+});
+
+test('P7A oversized signed metadata retains bounded exact alias and protected tags', async () => {
+  const storage = createStorage();
+  let resolutionCommand = null;
+  storage.resolvePursueCimInboundEvidence = async (command) => {
+    resolutionCommand = clone(command);
+    return {
+      exact: true, ambiguous: false, method: 'reply-alias',
+      conversation: { id: 'conversation-oversized-p7a', state: 'open',
+        terminal_revision: 0, row_version: 1 },
+      transmission: { id: 'transmission-oversized-p7a' },
+      campaignIds: ['campaign-oversized-p7a'], touchIds: ['touch-oversized-p7a'],
+      candidateConversations: [],
+    };
+  };
+  storage.appendCimTerminalEvent = async () => ({
+    applied: true, replay: false, conflict: false, conversationRevision: 1,
+    campaignRevision: null, cancelledTouchIds: ['touch-oversized-p7a'],
+  });
+  const payload = receivedPayload({
+    id: 'evt-oversized-evidence-p7a', emailId: 'received-oversized-evidence-p7a',
+    to: ['cim-oversized-p7a@inbound.example.com'],
+  });
+  payload.data.tags = [
+    { name: 'cim_conversation_id', value: 'conversation-oversized-p7a' },
+    { name: 'cim_touch_id', value: 'touch-oversized-p7a' },
+    { name: 'untrusted', value: 'z'.repeat(40 * 1024) },
+  ];
+
+  const result = await recordEmailEventsFromWebhook(
+    signedRequest(payload, 'svix-oversized-evidence-p7a'),
+    { storage, fetcher: async () => response({ unavailable: true }, 503) },
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(resolutionCommand.replyToAddresses,
+    ['cim-oversized-p7a@inbound.example.com']);
+  assert.equal(resolutionCommand.taggedConversationId, 'conversation-oversized-p7a');
+  assert.deepEqual(resolutionCommand.taggedTouchIds, ['touch-oversized-p7a']);
+  assert.equal(storage.state.emailEvents[0].metadata.truncated, true);
+  assert.deepEqual(storage.state.emailEvents[0].metadata.to,
+    ['cim-oversized-p7a@inbound.example.com']);
+  assert.deepEqual(storage.state.emailEvents[0].metadata.tags, [
+    { name: 'cim_conversation_id', value: 'conversation-oversized-p7a' },
+    { name: 'cim_touch_id', value: 'touch-oversized-p7a' },
+  ]);
+});
+
+test('P7A terminalizes exact signed evidence before generic email-event persistence', async () => {
+  const storage = createStorage();
+  let terminalCommitted = false;
+  storage.resolvePursueCimInboundEvidence = async () => ({
+    exact: true, ambiguous: false, method: 'reply-alias',
+    conversation: { id: 'conversation-crash-p7a', state: 'open',
+      terminal_revision: 0, row_version: 1 },
+    transmission: { id: 'transmission-crash-p7a' },
+    campaignIds: ['campaign-crash-p7a'], touchIds: ['touch-crash-p7a'],
+    candidateConversations: [],
+  });
+  storage.appendCimTerminalEvent = async () => {
+    terminalCommitted = true;
+    return { applied: true, replay: false, conflict: false,
+      conversationRevision: 1, campaignRevision: null, cancelledTouchIds: ['touch-crash-p7a'] };
+  };
+  storage.insertEmailEvent = async () => {
+    assert.equal(terminalCommitted, true,
+      'generic event persistence must not precede the conversation terminal transaction');
+    throw new Error('synthetic persistence crash');
+  };
+  const payload = receivedPayload({
+    id: 'evt-crash-p7a', emailId: 'received-crash-p7a',
+    from: 'Unknown <unknown-crash@example.com>',
+    to: ['cim-crash-p7a@inbound.example.com'],
+  });
+
+  await assert.rejects(
+    recordEmailEventsFromWebhook(signedRequest(payload, 'svix-crash-p7a'), { storage }),
+    /synthetic persistence crash/,
+  );
+  assert.equal(terminalCommitted, true);
+  assert.equal(storage.state.emailEvents.length, 0);
+});
+
+test('P7A persists bounded ambiguous candidate associations on the review communication', async () => {
+  const storage = createStorage();
+  storage.resolvePursueCimInboundEvidence = async () => ({
+    exact: false, ambiguous: true, method: 'conflicting-exact-evidence',
+    conversation: null, transmission: null, campaignIds: [], touchIds: [],
+    candidateConversations: [
+      { id: 'conversation-review-a', state: 'open', terminal_revision: 0, row_version: 1 },
+      { id: 'conversation-review-b', state: 'open', terminal_revision: 0, row_version: 1 },
+    ],
+  });
+  storage.appendCimTerminalEvent = async () => {
+    throw new Error('ambiguous evidence must use the atomic batch transition');
+  };
+  storage.appendCimAmbiguousReplyReview = async (commands) => ({
+    applied: true, replay: false, conflict: false,
+    conversationIds: commands.map(({ scopeId }) => scopeId), cancelledTouchIds: [],
+  });
+  const payload = receivedPayload({
+    id: 'evt-review-association-p7a', emailId: 'received-review-association-p7a',
+    to: ['cim-conflicting-p7a@inbound.example.com'],
+  });
+
+  const result = await recordEmailEventsFromWebhook(
+    signedRequest(payload, 'svix-review-association-p7a'),
+    { storage, fetcher: async () => response({ unavailable: true }, 503) },
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(storage.state.communications[0].metadata.pursueCimInbound
+    .containedConversationIds, ['conversation-review-a', 'conversation-review-b']);
 });
 
 test('scheduled content retry re-resolves the fetched reply alias and stops the exact CIM follow-up', async () => {

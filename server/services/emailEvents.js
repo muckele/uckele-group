@@ -9,9 +9,15 @@ import {
 } from './communications.js';
 import { canonicalDailyDealHunterMailbox } from './dailyDealHunterDigest.js';
 import { reconcileDailyDealHunterWebhookEvent } from './dailyDealHunterReconciliation.js';
+import { applyVerifiedPursueCimInbound } from './pursueCimInbound.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const maxEmailEventMetadataBytes = 32 * 1024;
+const pursueCimEvidenceTagNames = new Set([
+  'cim_conversation_id', 'cimConversationId', 'conversation_id',
+  'cim_transmission_id', 'cimTransmissionId', 'transmission_id',
+  'cim_touch_id', 'cimTouchId', 'touch_id',
+]);
 
 const eventAliases = {
   'email.sent': 'sent',
@@ -62,6 +68,27 @@ function headerValue(value) {
   return Array.isArray(value) ? normalizeText(value[0], 500) : normalizeText(value, 500);
 }
 
+function boundedPursueCimEvidenceTags(tags) {
+  const entries = Array.isArray(tags)
+    ? tags
+    : tags && typeof tags === 'object'
+      ? Object.entries(tags).map(([name, value]) => ({ name, value }))
+      : [];
+  return entries.flatMap((tag) => {
+    if (typeof tag === 'string') {
+      const [name, ...rest] = tag.split('=');
+      const normalizedName = normalizeText(name, 80);
+      return pursueCimEvidenceTagNames.has(normalizedName)
+        ? [{ name: normalizedName, value: normalizeText(rest.join('='), 240) }]
+        : [];
+    }
+    const name = normalizeText(tag?.name || tag?.key, 80);
+    return pursueCimEvidenceTagNames.has(name)
+      ? [{ name, value: normalizeText(tag?.value, 240) }]
+      : [];
+  }).filter((tag) => tag.value).slice(0, 50);
+}
+
 function boundedEmailEventMetadata(value) {
   const metadata = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   let serialized = '';
@@ -83,9 +110,16 @@ function boundedEmailEventMetadata(value) {
     clickUrl: normalizeText(metadata.clickUrl, 1000),
     fromEmail: firstEmail(metadata.fromEmail || metadata.from),
     toEmail: firstEmail(metadata.toEmail || metadata.to),
+    to: inboundRecipientEmails(metadata.to).slice(0, 20),
+    tags: boundedPursueCimEvidenceTags(metadata.tags),
     replyTo: firstEmail(metadata.replyTo),
     resendEmailId: normalizeText(metadata.resendEmailId, 240),
     inboundMessageId: normalizeText(metadata.inboundMessageId, 240),
+    inReplyTo: normalizeText(metadata.inReplyTo, 500),
+    references: Array.isArray(metadata.references)
+      ? metadata.references.slice(0, 50).map((value) => normalizeText(value, 500))
+      : normalizeText(metadata.references, 5000),
+    parentProviderMessageId: normalizeText(metadata.parentProviderMessageId, 240),
     tracking: {
       communicationId: normalizeText(tracking.communicationId, 120),
       cimRequestId: normalizeText(tracking.cimRequestId, 120),
@@ -269,6 +303,7 @@ async function resolveSubmissionId(storage, {
   submissionId,
   recipientEmail,
   inboundRecipients = [],
+  allowContactEmailFallback = true,
 } = {}) {
   if (storage.getDealHunterCimRequestByReplyToAddress) {
     for (const address of inboundRecipientEmails(inboundRecipients)) {
@@ -287,7 +322,7 @@ async function resolveSubmissionId(storage, {
     }
   }
 
-  if (!recipientEmail || !storage.listSubmissionsByContactEmail) {
+  if (!allowContactEmailFallback || !recipientEmail || !storage.listSubmissionsByContactEmail) {
     return null;
   }
 
@@ -343,6 +378,14 @@ function buildEventInputFromWebhook(payload, { providerEventId = '', svixId = ''
       replyTo: normalizeText(data.reply_to || data.replyTo || payload?.reply_to || payload?.replyTo, 500),
       inboundMessageId: normalizeText(data.message_id || data.messageId, 240),
       resendEmailId: normalizeText(data.email_id || data.emailId || data.email?.id, 240),
+      inReplyTo: normalizeText(data.in_reply_to || data.inReplyTo, 500),
+      references: Array.isArray(data.references)
+        ? data.references.slice(0, 50).map((value) => normalizeText(value, 500))
+        : normalizeText(data.references, 5000),
+      parentProviderMessageId: normalizeText(
+        data.parent_email_id || data.parentEmailId || data.parent_message_id || data.parentMessageId,
+        240,
+      ),
       userAgent: normalizeText(data.user_agent || data.userAgent, 300),
     },
   };
@@ -404,6 +447,7 @@ export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
         inboundRecipients: normalizeText(input.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received'
           ? input.metadata?.to
           : [],
+        allowContactEmailFallback: eventType !== 'replied',
       });
   const provider = normalizeText(input.provider, 60) || 'unknown';
   const createdAt = normalizeEventDate(input.created_at || input.createdAt);
@@ -558,9 +602,59 @@ export async function recordEmailEventsFromWebhook(request, {
       ? payloads.length === 1 ? svixId : `${svixId}:${index + 1}`
       : '';
     const eventInput = buildEventInputFromWebhook(payload, { providerEventId, svixId });
+    const authorityProviderEventId = normalizeText(
+      eventInput.provider_event_id || eventInput.metadata?.providerEventId, 240);
+    const authorityEvent = {
+      id: authorityProviderEventId || [
+        normalizeText(eventInput.provider, 60) || 'unknown',
+        normalizeText(eventInput.message_id, 240),
+        normalizeEmailEventType(eventInput.event_type),
+        normalizeEventDate(eventInput.created_at),
+      ].join(':'),
+      provider: normalizeText(eventInput.provider, 60) || 'unknown',
+      provider_event_id: authorityProviderEventId || null,
+      event_type: normalizeEmailEventType(eventInput.event_type),
+      message_id: normalizeText(eventInput.message_id, 240) || null,
+      created_at: normalizeEventDate(eventInput.created_at),
+      metadata: boundedEmailEventMetadata(eventInput.metadata),
+    };
+    const internalDailyDigest = hasDailyDealHunterTagIdentity(authorityEvent);
+    let inbound = null;
+
+    if (!internalDailyDigest && storage.resolvePursueCimInboundEvidence) {
+      try {
+        inbound = await applyVerifiedPursueCimInbound(authorityEvent, { storage });
+      } catch {
+        return {
+          ok: false,
+          status: 503,
+          error: 'Email lifecycle processing is temporarily unavailable.',
+        };
+      }
+    }
+
     const event = await recordEmailEvent(eventInput, { storage });
     events.push(event);
-    const internalDailyDigest = hasDailyDealHunterTagIdentity(event);
+
+    if (inbound?.handled) {
+      event.metadata = {
+        ...(event.metadata || {}),
+        pursueCimInbound: {
+          exact: Boolean(inbound.exact),
+          ambiguous: Boolean(inbound.ambiguous),
+          reviewRequired: Boolean(inbound.reviewRequired),
+          conversationId: inbound.conversationId || '',
+          transmissionId: inbound.transmissionId || '',
+          campaignIds: inbound.campaignIds || [],
+          touchIds: inbound.touchIds || [],
+          ...(Array.isArray(inbound.containedConversationIds)
+            && inbound.containedConversationIds.length > 0
+            ? { containedConversationIds: inbound.containedConversationIds.slice(0, 50) }
+            : {}),
+          method: inbound.method || 'none',
+        },
+      };
+    }
 
     if (!internalDailyDigest) {
       try {
