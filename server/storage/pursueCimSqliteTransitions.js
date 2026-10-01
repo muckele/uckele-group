@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
+import { deriveAcceptedCimCadence } from '../services/pursueCimCadence.js';
 
 const cimWriterCapabilities = new Map([
   ['pursue-cim-initial', 'fl04b-initial'],
@@ -86,6 +87,36 @@ function requiredInstant(value) {
 
 function canonicalInstant(value) {
   return new Date(requiredInstant(value)).toISOString();
+}
+
+function cadenceContext(database, transmissionId) {
+  const transmission = database.prepare(`SELECT * FROM deal_hunter_cim_transmissions
+    WHERE id = ?`).get(transmissionId) ?? null;
+  if (!transmission) return null;
+  const rows = database.prepare(`
+    SELECT m.transmission_id, m.touch_id, m.opportunity_id, m.campaign_id,
+      m.display_ordinal, m.cancelled_at, m.cancellation_reason
+    FROM deal_hunter_cim_transmission_touches m
+    WHERE m.transmission_id = ? ORDER BY m.touch_id
+  `).all(transmissionId);
+  const members = rows.map((membership) => {
+    const touch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+      WHERE id = ?`).get(membership.touch_id) ?? null;
+    const campaign = database.prepare(`SELECT * FROM deal_hunter_cim_campaigns
+      WHERE id = ?`).get(membership.campaign_id) ?? null;
+    const timezone = campaign ? database.prepare(`SELECT *
+      FROM deal_hunter_opportunity_timezone_revisions
+      WHERE opportunity_id = ? AND revision = ?`).get(
+      campaign.opportunity_id, campaign.timezone_revision) ?? null : null;
+    return { membership, touch, campaign, timezone };
+  });
+  let nextTouch = null;
+  if (transmission.state === 'accepted' && members.length === 1 && members[0].touch) {
+    nextTouch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+      WHERE campaign_id = ? AND ordinal = ? ORDER BY id LIMIT 1`).get(
+      members[0].touch.campaign_id, members[0].touch.ordinal + 1) ?? null;
+  }
+  return { transmission, members, nextTouch };
 }
 
 function withinLocalSendWindow(now, timezone) {
@@ -316,6 +347,9 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         legacySummary: { count: legacySummary.count, accepted: legacySummary.accepted ?? 0,
           ambiguous: legacySummary.ambiguous ?? 0 }, actions: [] };
     },
+    async readCimCadenceContext({ transmissionId } = {}) {
+      return cadenceContext(database, requiredText(transmissionId, 'transmissionId'));
+    },
     async reconcileCimTransmission(command) {
       const transmissionId = requiredText(command.transmissionId, 'transmissionId');
       const payloadDigest = requiredText(command.payloadDigest, 'payloadDigest', 64);
@@ -367,8 +401,8 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           || new Set(normalizedIdentities.map(({ providerMessageId }) => providerMessageId)).size < 2)) {
         throw new Error('Provider identity evidence requires a multiple-ID ambiguity');
       }
-      const result = (flags, transmission = null) => ({ applied: false, unchanged: false,
-        conflict: false, ...flags, transmission });
+      const result = (flags, transmission = null, nextTouch = null) => ({ applied: false,
+        unchanged: false, conflict: false, ...flags, transmission, nextTouch });
       return database.transaction(() => {
         const transmission = database.prepare(`
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
@@ -390,7 +424,9 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
             && priorEvidence.next_state === outcomeState
             && priorEvidence.reason_code === providerResultCode
             && priorEvidence.payload_digest === evidencePayloadDigest;
-          return result({ unchanged, conflict: !unchanged }, transmission);
+          return result({ unchanged, conflict: !unchanged }, transmission,
+            unchanged && transmission.state === 'accepted'
+              ? cadenceContext(database, transmissionId)?.nextTouch ?? null : null);
         }
         const appendEvidence = (priorState, nextState) => {
           appendAudit(database, { eventType: 'transmission-reconciled',
@@ -414,7 +450,9 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           const unchanged = transmission.state === outcomeState && transmission.provider === provider
             && transmission.provider_message_id === providerMessageId;
           if (unchanged) appendEvidence(transmission.state, transmission.state);
-          return result({ unchanged, conflict: !unchanged }, transmission);
+          return result({ unchanged, conflict: !unchanged }, transmission,
+            unchanged && transmission.state === 'accepted'
+              ? cadenceContext(database, transmissionId)?.nextTouch ?? null : null);
         }
         if (transmission.state === 'ambiguous' && outcomeState === 'ambiguous'
           && transmission.provider === provider
@@ -443,6 +481,12 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         const shouldAdvance = members.length === 1
           && members[0].campaign_terminal_revision === transmission.campaign_terminal_revision
           && ['provider-ambiguous', 'initial-pending', 'active-follow-up'].includes(members[0].campaign_state);
+        const expectedCadence = outcomeState === 'accepted' && shouldAdvance
+          ? deriveAcceptedCimCadence(cadenceContext(database, transmissionId), observedAt) : null;
+        if (stableCanonicalJson(command.cadence ?? null) !== stableCanonicalJson(expectedCadence)) {
+          throw new Error('Accepted CIM reconciliation cadence does not match durable authority');
+        }
+        let nextTouch = null;
         database.prepare(`
           UPDATE deal_hunter_cim_transmissions SET state = ?, provider = ?,
             provider_message_id = ?, provider_result_code = ?, updated_at = ?,
@@ -467,12 +511,19 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
             database.prepare(`
               UPDATE deal_hunter_cim_campaigns SET state = ?, reason_code = ?,
                 initial_accepted_at = COALESCE(initial_accepted_at, ?),
+                local_expiry_at = COALESCE(local_expiry_at, ?),
+                expiry_derivation = CASE WHEN initial_accepted_at IS NULL AND ? = 'accepted'
+                  THEN ? ELSE expiry_derivation END,
                 updated_at = ?, row_version = row_version + 1
               WHERE id = ? AND row_version = ? AND terminal_revision = ?
             `).run(campaignNextState,
               outcomeState === 'definitive-failure' ? 'provider_definitive_failure'
                 : outcomeState === 'ambiguous' ? 'provider_ambiguous' : null,
               outcomeState === 'accepted' ? observedAt : null,
+              outcomeState === 'accepted' ? expectedCadence?.localExpiryAt ?? null : null,
+              outcomeState,
+              outcomeState === 'accepted'
+                ? stableCanonicalJson(expectedCadence?.expiryDerivation ?? {}) : '{}',
               now, member.campaign_id, member.campaign_row_version,
               member.campaign_terminal_revision);
             appendAudit(database, { eventType: 'campaign-transition',
@@ -480,6 +531,22 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
               opportunityId: member.opportunity_id, campaignId: member.campaign_id,
               priorState: member.campaign_state, nextState: campaignNextState,
               authorityDigest: evidenceDigest, actor, occurredAt: now });
+            if (outcomeState === 'accepted' && expectedCadence?.nextTouch) {
+              const next = expectedCadence.nextTouch;
+              database.prepare(`
+                INSERT INTO deal_hunter_cim_campaign_touches (
+                  id, campaign_id, opportunity_id, logical_slot, kind, ordinal,
+                  due_at, due_local, timezone_revision, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)
+              `).run(next.id, member.campaign_id, member.opportunity_id,
+                next.logicalSlot, next.kind, next.ordinal, next.dueAt, next.dueLocal,
+                next.timezoneRevision, now, now);
+              nextTouch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+                WHERE id = ?`).get(next.id);
+              appendAudit(database, { eventType: 'touch-created', authorityId: next.id,
+                opportunityId: member.opportunity_id, campaignId: member.campaign_id,
+                touchId: next.id, nextState: 'scheduled', actor, occurredAt: now });
+            }
           }
         }
         if (outcomeState === 'ambiguous') {
@@ -533,7 +600,7 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         appendEvidence(transmission.state, outcomeState);
         return result({ applied: true }, database.prepare(`
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
-        `).get(transmissionId));
+        `).get(transmissionId), nextTouch);
       }).immediate();
     },
     async finalizeCimTransmission(command) {
@@ -566,7 +633,9 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           const existing = transmission.state === outcomeState && transmission.provider === provider
             && transmission.provider_message_id === providerMessageId
             && transmission.provider_result_code === providerResultCode;
-          return outcome({ existing, conflict: !existing }, transmission, null);
+          return outcome({ existing, conflict: !existing }, transmission,
+            existing && transmission.state === 'accepted'
+              ? cadenceContext(database, transmissionId)?.nextTouch ?? null : null);
         }
         if (transmission.state !== 'provider-pending'
           || transmission.row_version !== expectedRowVersion
@@ -584,6 +653,15 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         if (!members.length || members.some((member) => member.state !== 'provider-pending')) {
           return outcome({ conflict: true }, transmission);
         }
+        const shouldAdvance = members.length === 1
+          && members[0].campaign_terminal_revision === transmission.campaign_terminal_revision
+          && ['initial-pending', 'active-follow-up'].includes(members[0].campaign_state);
+        const expectedCadence = outcomeState === 'accepted' && shouldAdvance
+          ? deriveAcceptedCimCadence(cadenceContext(database, transmissionId), observedAt) : null;
+        if (stableCanonicalJson(command.cadence ?? null) !== stableCanonicalJson(expectedCadence)) {
+          throw new Error('Accepted CIM finalization cadence does not match durable authority');
+        }
+        let nextTouch = null;
         const nextState = outcomeState === 'accepted' ? 'active-follow-up'
           : outcomeState === 'definitive-failure' ? 'action-required' : 'provider-ambiguous';
         database.prepare(`
@@ -610,18 +688,41 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           database.prepare(`
             UPDATE deal_hunter_cim_campaigns SET state = ?, reason_code = ?,
               initial_accepted_at = COALESCE(initial_accepted_at, ?),
+              local_expiry_at = COALESCE(local_expiry_at, ?),
+              expiry_derivation = CASE WHEN initial_accepted_at IS NULL AND ? = 'accepted'
+                THEN ? ELSE expiry_derivation END,
               row_version = row_version + 1, updated_at = ?
             WHERE id = ? AND row_version = ? AND terminal_revision = ?
           `).run(nextState,
             outcomeState === 'definitive-failure' ? 'provider_definitive_failure'
               : outcomeState === 'ambiguous' ? 'provider_ambiguous' : null,
             outcomeState === 'accepted' ? observedAt : null,
+            outcomeState === 'accepted' ? expectedCadence?.localExpiryAt ?? null : null,
+            outcomeState,
+            outcomeState === 'accepted'
+              ? stableCanonicalJson(expectedCadence?.expiryDerivation ?? {}) : '{}',
             now, member.campaign_id, member.campaign_row_version,
             member.campaign_terminal_revision);
           appendAudit(database, { eventType: 'campaign-transition',
             authorityId: `${member.campaign_id}:${member.campaign_row_version + 1}`,
             opportunityId: member.opportunity_id, campaignId: member.campaign_id,
             priorState: member.campaign_state, nextState, actor, occurredAt: now });
+          if (outcomeState === 'accepted' && expectedCadence?.nextTouch) {
+            const next = expectedCadence.nextTouch;
+            database.prepare(`
+              INSERT INTO deal_hunter_cim_campaign_touches (
+                id, campaign_id, opportunity_id, logical_slot, kind, ordinal,
+                due_at, due_local, timezone_revision, state, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)
+            `).run(next.id, member.campaign_id, member.opportunity_id,
+              next.logicalSlot, next.kind, next.ordinal, next.dueAt, next.dueLocal,
+              next.timezoneRevision, now, now);
+            nextTouch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+              WHERE id = ?`).get(next.id);
+            appendAudit(database, { eventType: 'touch-created', authorityId: next.id,
+              opportunityId: member.opportunity_id, campaignId: member.campaign_id,
+              touchId: next.id, nextState: 'scheduled', actor, occurredAt: now });
+          }
         }
         if (outcomeState === 'ambiguous') {
           const conversation = database.prepare(`
@@ -657,7 +758,7 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           payloadDigest: transmission.payload_digest, actor, occurredAt: observedAt });
         return outcome({ applied: true }, database.prepare(`
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
-        `).get(transmissionId), null);
+        `).get(transmissionId), nextTouch);
       }).immediate();
     },
     async readCimFinalGateContext(command) {

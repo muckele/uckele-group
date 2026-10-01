@@ -15,6 +15,7 @@ import {
   sendAuthorizedCimTransmission,
 } from '../server/services/pursueCimProvider.js';
 import { authorizePreparedCimTransmission } from '../server/services/pursueCimFinalGate.js';
+import { deriveAcceptedCimCadence } from '../server/services/pursueCimCadence.js';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
 import { processCrmEmailOutbox } from '../server/services/followUpEmail.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
@@ -60,6 +61,61 @@ const tableDropOrder = [
 
 const at = '2026-09-25T19:00:00.000Z';
 const digest = (character) => character.repeat(64);
+
+async function acceptedCadence(storage, transmissionId, observedAt) {
+  return deriveAcceptedCimCadence(
+    await storage.readCimCadenceContext({ transmissionId }), observedAt);
+}
+
+function insertFixtureRow(database, table, row) {
+  const columns = Object.keys(row);
+  database.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (
+    ${columns.map(() => '?').join(',')})`).run(...columns.map((column) => row[column]));
+}
+
+function primeDormantTouchForOutcome(database, sourceTransmissionId, touchId, sequence, now) {
+  const source = database.prepare('SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?')
+    .get(sourceTransmissionId);
+  const communication = database.prepare('SELECT * FROM crm_communications WHERE id = ?')
+    .get(source.communication_id);
+  const outbox = database.prepare('SELECT * FROM crm_email_outbox WHERE id = ?')
+    .get(source.outbox_id);
+  const communicationId = `p6d-chain-communication-${sequence}`;
+  const outboxId = `p6d-chain-outbox-${sequence}`;
+  const transmissionId = `p6d-chain-transmission-${sequence}`;
+  insertFixtureRow(database, 'crm_communications', { ...communication,
+    id: communicationId, provider: null, provider_message_id: null,
+    idempotency_key: `p6d-chain-communication-${sequence}`,
+    outbox_id: outboxId, delivery_state: 'provider-pending',
+    delivery_state_at: now, occurred_at: now, created_at: now, updated_at: now });
+  insertFixtureRow(database, 'crm_email_outbox', { ...outbox,
+    id: outboxId, communication_id: communicationId,
+    idempotency_key: `p6d-chain-outbox-${sequence}`,
+    client_request_key: `p6d-chain-client-${sequence}`,
+    state: 'provider-pending', provider: null, provider_message_id: null,
+    attempt_count: 0, created_at: now, updated_at: now });
+  insertFixtureRow(database, 'deal_hunter_cim_transmissions', { ...source,
+    id: transmissionId, member_digest: sha256(`p6d-chain-member-${sequence}`),
+    preparation_generation: source.preparation_generation + sequence,
+    payload_digest: sha256(`p6d-chain-payload-${sequence}`),
+    provider_idempotency_key: `p6d-chain-provider-${sequence}`,
+    communication_id: communicationId, outbox_id: outboxId,
+    state: 'provider-pending', invocation_authority_count: 1,
+    provider_invocation_authorized_at: now,
+    boundary_nonce_digest: sha256(`p6d-chain-boundary-${sequence}`),
+    provider_seam_entered_at: now, provider: null, provider_message_id: null,
+    provider_result_code: null, row_version: 3, created_at: now, updated_at: now });
+  const touch = database.prepare(`UPDATE deal_hunter_cim_campaign_touches
+    SET state='provider-pending', transmission_id=?, row_version=row_version+1, updated_at=?
+    WHERE id=? AND state='scheduled' RETURNING *`).get(transmissionId, now, touchId);
+  insertFixtureRow(database, 'deal_hunter_cim_transmission_touches', {
+    transmission_id: transmissionId, touch_id: touch.id,
+    opportunity_id: touch.opportunity_id, campaign_id: touch.campaign_id,
+    display_ordinal: 1, cancelled_at: null, cancellation_reason: null, created_at: now,
+  });
+  return database.prepare('SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?')
+    .get(transmissionId);
+}
 
 function reconciliationBinding(transmission) {
   const addresses = (value) => Array.isArray(value) ? value : JSON.parse(value);
@@ -1987,7 +2043,15 @@ test('P6C accepted provider result atomically finalizes the real P5→P6A→P6B 
     .get().state, 'accepted');
   assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
     .get(authority.touchId).state, 'accepted');
-  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 2);
+  assert.equal(first.durableResult.nextTouch.kind, 'follow-up-1');
+  const campaign = database.prepare('SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?')
+    .get(authority.campaignId);
+  assert.equal((await storage.claimDueCimTouch({ touchId: first.durableResult.nextTouch.id,
+    expectedRowVersion: 1, expectedCampaignTerminalRevision: campaign.terminal_revision,
+    expectedConversationTerminalRevision: 0, claimTokenDigest: digest('7'),
+    claimOwner: 'follow-up-worker', claimExpiresAt: '2026-09-29T13:00:00.000Z',
+    now: first.durableResult.nextTouch.due_at })).staleAuthority, true);
 
   const restart = await finalizeAuthorizedCimTransmission(common);
   assert.equal(restart.outcome.category, 'accepted');
@@ -2065,7 +2129,7 @@ test('P6C crash after accepted response reconciles the same transmission with ze
   assert.equal(reconciled.durableResult.transmission.state, 'accepted');
   assert.equal(providerCalls, 1);
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches')
-    .get().count, 1);
+    .get().count, 2);
 });
 
 test('P6C crash after definitive rejection reconciles the same transmission without retransmission', async (t) => {
@@ -2789,7 +2853,7 @@ async function createProviderPendingFixture(t, suffix) {
     boundaryNonceDigest: sha256(pending.boundaryNonce) };
 }
 
-test('P6C scenario 43 accepted finalization anchors once without creating a Package 6D slot', async (t) => {
+test('P6D scenario 43 accepted finalization anchors and creates one dormant next slot', async (t) => {
   const { storage, database, authority, authorization, pending, boundaryNonceDigest } =
     await createProviderPendingFixture(t, 'finalize');
   assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
@@ -2797,16 +2861,27 @@ test('P6C scenario 43 accepted finalization anchors once without creating a Pack
     providerProfile: 'synthetic-provider', capability: 'fl04b-initial',
     payloadDigest: pending.payload_digest, boundaryNonceDigest,
     expectedRowVersion: 2, actor: 'fixture-owner', now: at })).entered, true);
+  const observedAt = '2026-09-25T19:00:07.000Z';
   const command = { transmissionId: pending.id, payloadDigest: pending.payload_digest,
     expectedRowVersion: 3,
     outcome: 'accepted', provider: 'resend', providerMessageId: 'provider-message-1',
-    providerResultCode: 'accepted', observedAt: '2026-09-25T19:00:07.000Z',
-    actor: 'fixture-owner', now: at };
+    providerResultCode: 'accepted', observedAt,
+    actor: 'fixture-owner', now: at,
+    cadence: await acceptedCadence(storage, pending.id, observedAt) };
+  await assert.rejects(storage.finalizeCimTransmission({ ...command,
+    cadence: { ...command.cadence, nextTouch: { ...command.cadence.nextTouch,
+      dueAt: '2026-09-28T12:00:01.000Z' } } }), /cadence/i);
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_transmissions WHERE id = ?')
+    .get(pending.id).state, 'provider-pending');
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches')
+    .get().count, 1);
   const first = await storage.finalizeCimTransmission(command);
   assert.equal(first.applied, true);
   assert.equal(first.transmission.state, 'accepted');
-  assert.equal(first.nextTouch, null);
-  assert.equal((await storage.finalizeCimTransmission(command)).existing, true);
+  assert.equal(first.nextTouch.kind, 'follow-up-1');
+  const replay = await storage.finalizeCimTransmission(command);
+  assert.equal(replay.existing, true);
+  assert.equal(replay.nextTouch.id, first.nextTouch.id);
   assert.equal((await storage.finalizeCimTransmission({ ...command,
     providerMessageId: 'provider-message-2' })).conflict, true);
   assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
@@ -2815,12 +2890,64 @@ test('P6C scenario 43 accepted finalization anchors once without creating a Pack
     FROM deal_hunter_cim_campaigns WHERE id = ?`).get(authority.campaignId);
   assert.equal(campaign.state, 'active-follow-up');
   assert.equal(campaign.initial_accepted_at, '2026-09-25T19:00:07.000Z');
-  assert.equal(campaign.local_expiry_at, null);
-  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 1);
+  assert.equal(campaign.local_expiry_at, '2026-10-16T19:00:07.000Z');
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 2);
+  database.prepare('UPDATE deal_hunter_cim_campaigns SET local_expiry_at = ? WHERE id = ?')
+    .run(first.nextTouch.due_at, authority.campaignId);
+  assert.equal((await storage.claimDueCimTouch({ touchId: first.nextTouch.id,
+    expectedRowVersion: first.nextTouch.row_version,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    claimTokenDigest: digest('6'), claimOwner: 'expiry-proof',
+    claimExpiresAt: '2026-09-28T13:00:00.000Z', now: first.nextTouch.due_at })).terminal, true);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'transmission-finalized'").get().count, 1);
 });
 
-test('P6C exact reconciliation resolves ambiguity and anchors acceptance without a Package 6D slot', async (t) => {
+test('P6D SQLite persists follow-up-1/2/3 and weekday progression without activation', async (t) => {
+  const { storage, database, authority, authorization, pending, boundaryNonceDigest } =
+    await createProviderPendingFixture(t, 'durable-chain');
+  assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
+    authorizationId: authorization.id, writerPath: 'pursue-cim-initial',
+    providerProfile: 'synthetic-provider', capability: 'fl04b-initial',
+    payloadDigest: pending.payload_digest, boundaryNonceDigest,
+    expectedRowVersion: 2, actor: 'fixture-owner', now: at })).entered, true);
+  const initialObservedAt = '2026-09-25T19:00:07.000Z';
+  const initial = await storage.finalizeCimTransmission({ transmissionId: pending.id,
+    payloadDigest: pending.payload_digest, expectedRowVersion: 3, outcome: 'accepted',
+    provider: 'resend', providerMessageId: 'p6d-chain-provider-initial',
+    providerResultCode: 'accepted', observedAt: initialObservedAt,
+    actor: 'fixture-owner', now: at,
+    cadence: await acceptedCadence(storage, pending.id, initialObservedAt) });
+  const expectedKinds = ['follow-up-1', 'follow-up-2', 'follow-up-3',
+    'weekday-follow-up'];
+  const observedAt = [initial.nextTouch.due_at, '2026-10-01T15:00:07.000Z',
+    '2026-10-05T15:00:07.000Z', '2026-10-16T18:59:00.000Z'];
+  let current = initial.nextTouch;
+  for (const [index, expectedKind] of expectedKinds.entries()) {
+    assert.equal(current.kind, expectedKind);
+    assert.equal(current.state, 'scheduled', 'P6D leaves every derived slot dormant');
+    const transmission = primeDormantTouchForOutcome(database, pending.id,
+      current.id, index + 1, observedAt[index]);
+    const cadence = await acceptedCadence(storage, transmission.id, observedAt[index]);
+    const outcome = await storage.finalizeCimTransmission({ transmissionId: transmission.id,
+      payloadDigest: transmission.payload_digest, expectedRowVersion: 3,
+      outcome: 'accepted', provider: 'resend',
+      providerMessageId: `p6d-chain-provider-${index + 1}`,
+      providerResultCode: 'accepted', observedAt: observedAt[index],
+      actor: 'fixture-owner', now: observedAt[index], cadence });
+    assert.equal(outcome.applied, true);
+    current = outcome.nextTouch;
+  }
+  assert.equal(current, null, 'the next weekday slot cannot cross the local expiry');
+  assert.deepEqual(database.prepare(`SELECT kind FROM deal_hunter_cim_campaign_touches
+    WHERE campaign_id=? ORDER BY ordinal`).all(authority.campaignId).map(({ kind }) => kind),
+  ['initial', 'follow-up-1', 'follow-up-2', 'follow-up-3', 'weekday-follow-up']);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+    WHERE campaign_id=? AND event_type='touch-created'`).get(authority.campaignId).count, 4);
+  assert.equal(database.prepare(`SELECT local_expiry_at FROM deal_hunter_cim_campaigns
+    WHERE id=?`).get(authority.campaignId).local_expiry_at, '2026-10-16T19:00:07.000Z');
+});
+
+test('P6D exact reconciliation resolves ambiguity and creates one dormant next slot', async (t) => {
   const { storage, database, authority, authorization, pending, boundaryNonceDigest } =
     await createProviderPendingFixture(t, 'reconcile');
   assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
@@ -2841,7 +2968,8 @@ test('P6C exact reconciliation resolves ambiguity and anchors acceptance without
     expectedRowVersion: 4,
     outcome: 'accepted', provider: 'resend', providerMessageId: 'reconciled-provider-message',
     providerResultCode: 'signed-webhook-accepted', evidenceType: 'signed-webhook',
-    evidenceId: 'webhook-1', evidenceDigest: digest('f'), actor: 'fixture-owner', now: at };
+    evidenceId: 'webhook-1', evidenceDigest: digest('f'), actor: 'fixture-owner', now: at,
+    cadence: await acceptedCadence(storage, pending.id, at) };
   const first = await storage.reconcileCimTransmission(command);
   assert.equal(first.applied, true);
   assert.equal(first.transmission.state, 'accepted');
@@ -2852,7 +2980,8 @@ test('P6C exact reconciliation resolves ambiguity and anchors acceptance without
     'active-follow-up');
   assert.equal(database.prepare('SELECT state FROM deal_hunter_broker_conversations WHERE id = ?')
     .get(authority.conversationId).state, 'open');
-  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 1);
+  assert.equal(first.nextTouch.kind, 'follow-up-1');
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 2);
   assert.equal(database.prepare('SELECT invocation_authority_count FROM deal_hunter_cim_transmissions WHERE id = ?')
     .get(pending.id).invocation_authority_count, 1);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'transmission-reconciled'").get().count, 1);
@@ -2960,7 +3089,8 @@ test('P6C later exact evidence confirms an already accepted identity despite a d
   assert.equal((await storage.finalizeCimTransmission({ transmissionId: pending.id,
     payloadDigest: pending.payload_digest, expectedRowVersion: 3, outcome: 'accepted',
     provider: 'resend', providerMessageId: 'accepted-provider-id',
-    providerResultCode: 'accepted', observedAt: at, actor: 'fixture-owner', now: at })).applied, true);
+    providerResultCode: 'accepted', observedAt: at, actor: 'fixture-owner', now: at,
+    cadence: await acceptedCadence(storage, pending.id, at) })).applied, true);
   const confirmation = await storage.reconcileCimTransmission({ transmissionId: pending.id,
     payloadDigest: pending.payload_digest, expectedRowVersion: 4, outcome: 'accepted',
     provider: 'resend', providerMessageId: 'accepted-provider-id',
