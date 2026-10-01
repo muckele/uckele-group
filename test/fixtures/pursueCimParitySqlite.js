@@ -202,7 +202,7 @@ const expectedMaterializedClaim = { claimed: materializedClaim.claimed,
 const prepareBase = { touchIds: [expectedCampaigns[0].touchId],
   claimTokenDigest: '6'.repeat(64), expectedCampaignTerminalRevision: 0,
   expectedConversationTerminalRevision: 0, preparationGeneration: 1,
-  payloadVersion: 'payload-v1', fromAddress: 'sender@example.test',
+  payloadVersion: 'deal-hunter-cim-manual-stage1-v1', fromAddress: 'sender@example.test',
   toAddresses: ['broker2@example.test'], ccAddresses: [], bccAddresses: [],
   replyToAddress: 'reply@example.test', subject: 'Synthetic subject',
   bodyText: 'Synthetic body', bodyHtmlSanitized: '<p>Synthetic body</p>',
@@ -326,7 +326,8 @@ for (const command of seamCommands) {
   global.gc?.();
 }
 const finalizeBase = { transmissionId: preparedTransmission.id,
-  expectedRowVersion: 3, outcome: 'ambiguous', provider: 'synthetic-provider',
+  payloadDigest: preparedTransmission.payload_digest,
+  expectedRowVersion: 3, outcome: 'ambiguous', provider: 'resend',
   providerMessageId: null, providerResultCode: 'timeout', actor: 'fixture', now };
 const finalizeCommands = [finalizeBase, { ...finalizeBase },
   { ...finalizeBase, providerResultCode: 'changed-result' }];
@@ -340,8 +341,9 @@ for (const command of finalizeCommands) {
   global.gc?.();
 }
 const reconcileBase = { transmissionId: preparedTransmission.id,
+  payloadDigest: preparedTransmission.payload_digest,
   expectedRowVersion: 4, outcome: 'definitive-failure',
-  provider: 'synthetic-provider', providerMessageId: null,
+  provider: 'resend', providerMessageId: null,
   providerResultCode: 'provider-confirmed-failure', evidenceType: 'operator-check',
   evidenceId: 'reconciliation-1', evidenceDigest: 'a'.repeat(64),
   actor: 'fixture', now };
@@ -430,10 +432,14 @@ database.prepare(`insert into deal_hunter_cim_campaign_touches
   values ('touch-fence', ?, 'opp-decision', 'fence-slot', 'follow-up-1', 1,
     ?, '2026-09-25T12:00:00-07:00', 1, 'scheduled', ?, ?)`)
   .run(expectedCampaigns[0].campaignId, now, now, now);
+const terminalConversation = database.prepare(`select conversation_id from deal_hunter_cim_campaigns
+  where id = ?`).get(expectedCampaigns[0].campaignId).conversation_id;
+const terminalConversationAuthority = database.prepare(`select terminal_revision, row_version
+  from deal_hunter_broker_conversations where id = ?`).get(terminalConversation);
 const terminalBase = { eventId: 'terminal-conversation', scope: 'conversation',
-  scopeId: database.prepare(`select conversation_id from deal_hunter_cim_campaigns
-    where id = ?`).get(expectedCampaigns[0].campaignId).conversation_id,
-  expectedRevision: 0, expectedRowVersion: 1, nextState: 'responded',
+  scopeId: terminalConversation,
+  expectedRevision: terminalConversationAuthority.terminal_revision,
+  expectedRowVersion: terminalConversationAuthority.row_version, nextState: 'responded',
   reasonCode: 'broker-reply', evidenceType: 'synthetic-inbox', evidenceId: 'reply-1',
   metadataDigest: 'b'.repeat(64), actor: 'fixture', source: 'synthetic-inbox',
   observedAt: now, now };

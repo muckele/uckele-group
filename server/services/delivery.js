@@ -290,7 +290,7 @@ function providerErrorCategory(error) {
   return 'provider-outcome-unknown';
 }
 
-async function sendViaResend(message, { config, fetcher } = {}) {
+async function sendViaResend(message, { config, fetcher, onProviderAttempt } = {}) {
   const protectedIdentity = resendIdentityMessageKinds.has(message.kind);
 
   if (!config.delivery.resendApiKey || !config.delivery.resendFromEmail) {
@@ -305,6 +305,7 @@ async function sendViaResend(message, { config, fetcher } = {}) {
   }
 
   const tags = normalizeResendTags(message.tags);
+  onProviderAttempt?.();
   const response = await providerFetch('https://api.resend.com/emails', {
     method: 'POST',
     timeoutMs: config.server.outboundRequestTimeoutMs,
@@ -331,9 +332,9 @@ async function sendViaResend(message, { config, fetcher } = {}) {
   if (!response.ok) {
     const text = typeof response.text === 'function' ? await response.text().catch(() => '') : '';
     const concurrentIdempotency = /concurrent[_ -]?idempotent[_ -]?requests/i.test(text);
-    const uncertainDailyHttp = message.kind === dailyDealHunterMessageKind
-      && (response.status === 408 || response.status === 409 || response.status >= 500);
-    const ambiguous = protectedIdentity && (concurrentIdempotency || uncertainDailyHttp);
+    const uncertainProviderHttp = response.status === 408
+      || response.status === 409 || response.status >= 500;
+    const ambiguous = protectedIdentity && (concurrentIdempotency || uncertainProviderHttp);
     return {
       status: ambiguous ? 'ambiguous' : 'failed',
       error: ambiguous
@@ -533,10 +534,13 @@ async function recordTrackedEmailDelivery(message, result) {
 }
 
 async function sendMessage(message, {
-  configOverride, fetcher, cimProviderAuthorization, storage, now,
+  configOverride, fetcher, cimProviderAuthorization, storage, now, testHooks = {},
 } = {}) {
   const config = configOverride || getConfig();
   let result;
+  let providerAttempted = false;
+  let providerSeamEntered = false;
+  let providerFinalizationRowVersion = null;
   const cimClassification = await classifyCimProtectedWork(message, { storage });
 
   if (cimClassification.protected) {
@@ -595,6 +599,9 @@ async function sendMessage(message, {
         providerMessageId: '',
       };
     }
+    providerSeamEntered = true;
+    providerFinalizationRowVersion = boundary.providerFinalizationRowVersion;
+    await testHooks.afterProviderSeam?.({ boundary, message });
   }
 
   if (message.kind === dailyDealHunterMessageKind
@@ -626,7 +633,8 @@ async function sendMessage(message, {
   try {
     switch (config.delivery.provider) {
       case 'resend':
-        result = await sendViaResend(message, { config, fetcher });
+        result = await sendViaResend(message, { config, fetcher,
+          onProviderAttempt: () => { providerAttempted = true; } });
         break;
       case 'emailjs':
         result = await sendViaEmailJs(message);
@@ -653,6 +661,13 @@ async function sendMessage(message, {
       definitiveFailure: !providerOutcomeAmbiguous,
       providerOutcomeAmbiguous,
     };
+  }
+
+  if (cimClassification.protected) {
+    const observedAt = testHooks.providerOutcomeObservedAt?.() ?? new Date();
+    const providerOutcomeObservedAt = new Date(observedAt).toISOString();
+    result = { ...result, providerSeamEntered, providerAttempted,
+      providerFinalizationRowVersion, providerOutcomeObservedAt };
   }
 
   await recordTrackedEmailDelivery(message, result);

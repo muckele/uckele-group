@@ -153,16 +153,19 @@ async function attemptBoundary(fixture, {
   authorization = fixture.authorization,
   enabled = true,
   profile = 'synthetic-provider',
+  fetcher,
+  testHooks,
 } = {}) {
   return sendPreparedMessage(message, {
     storage: fixture.storage,
     cimProviderAuthorization: authorization,
     now: new Date('2026-09-25T19:00:00.000Z'),
     configOverride: resendBoundaryConfig({ enabled, profile }),
-    fetcher: async () => {
+    testHooks,
+    fetcher: fetcher || (async () => {
       fixture.counts.providerCalls += 1;
       return new Response(JSON.stringify({ id: 'synthetic-provider-message' }), { status: 200 });
-    },
+    }),
   });
 }
 
@@ -334,8 +337,42 @@ test('P6B exact same-process authorization enters the durable seam before one Re
   });
 
   assert.equal(result.status, 'sent');
+  assert.equal(result.providerSeamEntered, true);
+  assert.equal(result.providerAttempted, true);
+  assert.equal(result.providerFinalizationRowVersion, 3);
   assert.equal(seamEntries, 1);
   assert.equal(providerCalls, 1);
+});
+
+test('P6C CIM HTTP uncertainty is ambiguous while explicit provider rejection is definitive', async (t) => {
+  for (const [status, body, expectedStatus, expectedCategory] of [
+    [408, 'request timeout', 'ambiguous', 'provider-http-unknown'],
+    [409, 'conflict', 'ambiguous', 'provider-http-unknown'],
+    [503, 'temporarily unavailable', 'ambiguous', 'provider-http-unknown'],
+    [400, 'concurrent_idempotent_requests', 'ambiguous', 'concurrent-idempotency-unknown'],
+    [422, 'recipient rejected', 'failed', 'provider-nonacceptance'],
+  ]) {
+    await t.test(String(status), async () => {
+      const fixture = createBoundaryFixture({ suffix: `http-${status}` });
+      const result = await attemptBoundary(fixture, { fetcher: async () => {
+        fixture.counts.providerCalls += 1;
+        return new Response(body, { status });
+      } });
+      assert.equal(result.status, expectedStatus);
+      assert.equal(result.errorCategory, expectedCategory);
+      assert.equal(result.providerAttempted, true);
+      assert.equal(fixture.counts.providerCalls, 1);
+    });
+  }
+});
+
+test('P6C crash after durable seam entry but before the adapter makes zero provider calls', async () => {
+  const fixture = createBoundaryFixture({ suffix: 'crash-after-seam' });
+  await assert.rejects(attemptBoundary(fixture, {
+    testHooks: { async afterProviderSeam() { throw new Error('synthetic seam crash'); } },
+  }), /synthetic seam crash/);
+  assert.equal(fixture.counts.seamEntries, 1);
+  assert.equal(fixture.counts.providerCalls, 0);
 });
 
 test('P6B canonical Package 5 payload digest parity vector remains stable', () => {
