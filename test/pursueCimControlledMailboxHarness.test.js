@@ -267,6 +267,22 @@ test('P10B execute rejects durable payload drift from the reviewed artifact', as
   assert.equal(issued, 0);
 });
 
+test('P10B execute requires both cleanup transitions before issuing live authority', async () => {
+  const exactReport = report();
+  const review = buildP10bReviewArtifact(exactReport, { providerProfile: 'controlled-mailbox-v1',
+    initialActivationId: 'activation-initial-p10b' });
+  let issued = 0;
+  await assert.rejects(executeP10bControlledMailbox({
+    storage: { async issueCimLiveProviderAuthorization() { issued += 1; } },
+    config: controlledConfig(), opportunityId: 'opportunity-p10b',
+    initialActivationId: 'activation-initial-p10b', reviewDigest: review.digest,
+    confirmation: P10B_EXECUTION_CONFIRMATION, expiresAt: '2026-10-01T16:10:00.000Z',
+    actor: 'fixture-owner', now, providerReadiness: readiness(),
+    services: { async getReleaseReport() { return exactReport; } },
+  }), /cleanup storage is unavailable/i);
+  assert.equal(issued, 0);
+});
+
 test('P10B execute admits one fake call and restores hard-off and durable pause', async () => {
   const exactReport = report();
   const review = buildP10bReviewArtifact(exactReport, { providerProfile: 'controlled-mailbox-v1',
@@ -279,7 +295,7 @@ test('P10B execute admits one fake call and restores hard-off and durable pause'
     },
     async withdrawCimLiveProviderAuthorization(command) {
       calls.push(['withdraw-authorization', command]);
-      return { applied: false, conflict: true };
+      return { applied: false, conflict: true, authorization: { consumed_at: now } };
     },
     async withdrawCimCapabilityActivation(command) {
       calls.push(['withdraw-activation', command]);
@@ -404,6 +420,43 @@ test('P10B authorization response loss leaves pause on and closes all attempted 
   assert.deepEqual(calls, ['issue', 'pause:true', 'withdraw-authorization', 'withdraw-activation']);
 });
 
+test('P10B fails closed when cleanup returns still-live authority conflicts', async () => {
+  const exactReport = report();
+  const review = buildP10bReviewArtifact(exactReport, { providerProfile: 'controlled-mailbox-v1',
+    initialActivationId: 'activation-initial-p10b' });
+  const storage = {
+    async issueCimLiveProviderAuthorization(command) {
+      return { issued: true, authorization: { id: command.id, maximum_calls: 1 } };
+    },
+    async withdrawCimLiveProviderAuthorization() {
+      return { applied: false, conflict: true,
+        authorization: { consumed_at: null, withdrawn_at: null,
+          expires_at: '2026-10-01T16:10:00.000Z' } };
+    },
+    async withdrawCimCapabilityActivation() {
+      return { applied: false, conflict: true, activation: { status: 'current' } };
+    },
+  };
+  await assert.rejects(executeP10bControlledMailbox({ storage, config: controlledConfig(),
+    opportunityId: 'opportunity-p10b', initialActivationId: 'activation-initial-p10b',
+    reviewDigest: review.digest, confirmation: P10B_EXECUTION_CONFIRMATION,
+    expiresAt: '2026-10-01T16:10:00.000Z', actor: 'fixture-owner', now,
+    providerReadiness: readiness(),
+    services: {
+      async getReleaseReport() { return exactReport; },
+      async setPause() {},
+      async authorizePrepared() { return { authorized: false, blockedReason: 'authority_changed' }; },
+    },
+  }), (error) => {
+    assert.equal(error.code, 'P10B_CLEANUP_FAILED');
+    assert.deepEqual(error.p10bEvidence.cleanup.errors,
+      ['authorization_close_unproven', 'activation_close_unproven']);
+    assert.equal(error.p10bEvidence.cleanup.authorizationClosed, false);
+    assert.equal(error.p10bEvidence.cleanup.activationClosed, false);
+    return true;
+  });
+});
+
 test('P10B real SQLite authorities admit exactly one fake-provider call and replay sends zero', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p10b-execute-'));
   const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'p10b.sqlite') },
@@ -473,7 +526,9 @@ test('P10B crash, timeout, and unknown outcomes restore pause without another ca
         async issueCimLiveProviderAuthorization(command) {
           return { issued: true, authorization: { id: command.id, maximum_calls: 1 } };
         },
-        async withdrawCimLiveProviderAuthorization() { return { applied: false, conflict: true }; },
+        async withdrawCimLiveProviderAuthorization() {
+          return { applied: false, conflict: true, authorization: { consumed_at: now } };
+        },
         async withdrawCimCapabilityActivation() { return { applied: true }; },
       };
       const invoke = () => executeP10bControlledMailbox({ storage, config: controlledConfig(),

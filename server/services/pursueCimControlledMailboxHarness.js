@@ -433,7 +433,7 @@ async function cleanupExecution({ storage, services, authorizationId, initialAct
   armedConfig.dealHunter.cimProvider.enabled = false;
   const cleanup = { hardOffRestored: true, pauseRestored: false,
     authorizationClosed: false, authorizationWithdrawn: false,
-    activationWithdrawn: false, errors: [] };
+    activationClosed: false, activationWithdrawn: false, errors: [] };
   const setPause = services.setPause || setCimOutreachPaused;
   try {
     await setPause({ paused: true, actor, reason: 'P10B bounded execution complete', storage });
@@ -446,23 +446,33 @@ async function cleanupExecution({ storage, services, authorizationId, initialAct
       const result = await storage.withdrawCimLiveProviderAuthorization({ id: authorizationId,
         actor, reason: 'p10b-window-closed', now });
       cleanup.authorizationWithdrawn = result?.applied === true || result?.replay === true;
+      const absent = result?.conflict === true && result?.authorization === null;
       cleanup.authorizationClosed = cleanup.authorizationWithdrawn
-        || Boolean(result?.authorization?.consumed_at || result?.authorization?.withdrawn_at
+        || absent || Boolean(result?.authorization?.consumed_at
+          || result?.authorization?.withdrawn_at
           || (result?.authorization?.expires_at
             && Date.parse(result.authorization.expires_at) <= Date.parse(now)));
+      if (!cleanup.authorizationClosed) cleanup.errors.push('authorization_close_unproven');
     } catch {
       cleanup.errors.push('authorization_close_failed');
     }
-  }
+  } else if (authorizationId) cleanup.errors.push('authorization_close_unavailable');
   if (initialActivationId && typeof storage?.withdrawCimCapabilityActivation === 'function') {
     try {
       const result = await storage.withdrawCimCapabilityActivation({ id: initialActivationId,
         actor, reason: 'p10b-window-closed', now });
-      cleanup.activationWithdrawn = result?.applied === true || result?.replay === true;
+      cleanup.activationWithdrawn = result?.applied === true || result?.replay === true
+        || result?.activation?.status === 'withdrawn';
+      const absent = result?.conflict === true && result?.activation === null;
+      cleanup.activationClosed = cleanup.activationWithdrawn || absent
+        || (result?.activation?.status && result.activation.status !== 'current')
+        || Boolean(result?.activation?.expires_at
+          && Date.parse(result.activation.expires_at) <= Date.parse(now));
+      if (!cleanup.activationClosed) cleanup.errors.push('activation_close_unproven');
     } catch {
       cleanup.errors.push('activation_withdrawal_failed');
     }
-  }
+  } else if (initialActivationId) cleanup.errors.push('activation_close_unavailable');
   return cleanup;
 }
 
@@ -512,6 +522,12 @@ export async function executeP10bControlledMailbox({
     reviewDigest, expiresAt: expiry, actor })).slice(0, 48)}`;
   if (typeof storage?.issueCimLiveProviderAuthorization !== 'function') {
     throw new Error('P10B live authorization storage is unavailable');
+  }
+  if (typeof storage?.withdrawCimLiveProviderAuthorization !== 'function'
+    || typeof storage?.withdrawCimCapabilityActivation !== 'function'
+    || (typeof services.setPause !== 'function'
+      && typeof storage?.upsertDealHunterCimSafetySettings !== 'function')) {
+    throw new Error('P10B cleanup storage is unavailable');
   }
   const armedConfig = structuredClone(config);
   const setPause = services.setPause || setCimOutreachPaused;

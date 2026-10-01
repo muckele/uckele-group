@@ -69,41 +69,57 @@ function readJson(file, label) {
   return value;
 }
 
-function newOutputPath(file, forbiddenPaths = []) {
+function reserveOutput(file, forbiddenPaths = []) {
   const resolved = path.resolve(file);
   if (forbiddenPaths.map((item) => path.resolve(item)).includes(resolved)) {
     throw new Error('P10B output must not overwrite an input or database file');
   }
   if (fs.existsSync(resolved)) throw new Error('P10B refuses to overwrite an existing output file');
   fs.mkdirSync(path.dirname(resolved), { recursive: true, mode: 0o700 });
-  return resolved;
+  return { path: resolved, descriptor: fs.openSync(resolved, 'wx', 0o600), closed: false };
 }
 
-function writeNewJson(file, value) {
-  const resolved = path.resolve(file);
-  fs.writeFileSync(resolved, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: 'utf8', mode: 0o600, flag: 'wx',
-  });
-  return resolved;
+function writeReservedJson(reservation, value) {
+  try {
+    fs.writeFileSync(reservation.descriptor, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(reservation.descriptor);
+  } finally {
+    fs.closeSync(reservation.descriptor);
+    reservation.closed = true;
+  }
+  return reservation.path;
+}
+
+function discardReservation(reservation) {
+  if (!reservation.closed) {
+    fs.closeSync(reservation.descriptor);
+    reservation.closed = true;
+  }
+  try { fs.unlinkSync(reservation.path); }
+  catch (error) { if (error?.code !== 'ENOENT') throw error; }
 }
 
 async function prepare(args, config) {
   const sqlitePath = isolatedSqlitePath(required(args, 'sqlite-path'), { mustExist: false });
-  const output = newOutputPath(required(args, 'output'), [sqlitePath]);
-  const storage = createSqliteStorage({ storage: { sqlitePath },
-    protection: { rateLimitRetentionMs: config.protection?.rateLimitRetentionMs || 0 } });
+  const output = reserveOutput(required(args, 'output'), [sqlitePath]);
+  let storage;
+  let written = false;
   try {
+    storage = createSqliteStorage({ storage: { sqlitePath },
+      protection: { rateLimitRetentionMs: config.protection?.rateLimitRetentionMs || 0 } });
     const result = await prepareP10bControlledMailbox({ storage, config,
       actor: args.actor || 'p10b-release-owner', now: new Date().toISOString(),
       synthetic: { runId: required(args, 'run-id'), recipient: required(args, 'recipient'),
         recipientDisplayName: args['recipient-name'] || 'Controlled Mailbox Owner',
         permissionEvidenceId: required(args, 'permission-evidence-id'),
         permissionEvidenceHash: required(args, 'permission-evidence-hash') } });
-    writeNewJson(output, result);
-    process.stdout.write(`${JSON.stringify({ ok: true, mode: 'prepare', output,
+    writeReservedJson(output, result);
+    written = true;
+    process.stdout.write(`${JSON.stringify({ ok: true, mode: 'prepare', output: output.path,
       opportunityId: result.opportunityId, reviewDigest: result.review.digest })}\n`);
   } finally {
-    storage.close();
+    storage?.close();
+    if (!written) discardReservation(output);
   }
 }
 
@@ -113,11 +129,13 @@ async function execute(args, config) {
   const readiness = readJson(required(args, 'readiness'), 'P10B readiness');
   const reviewPath = path.resolve(required(args, 'review'));
   const readinessPath = path.resolve(required(args, 'readiness'));
-  const evidenceOutput = newOutputPath(required(args, 'evidence-output'),
+  const evidenceOutput = reserveOutput(required(args, 'evidence-output'),
     [sqlitePath, reviewPath, readinessPath]);
-  const storage = createSqliteStorage({ storage: { sqlitePath },
-    protection: { rateLimitRetentionMs: config.protection?.rateLimitRetentionMs || 0 } });
+  let storage;
+  let written = false;
   try {
+    storage = createSqliteStorage({ storage: { sqlitePath },
+      protection: { rateLimitRetentionMs: config.protection?.rateLimitRetentionMs || 0 } });
     let result;
     try {
       result = await executeP10bControlledMailbox({ storage, config,
@@ -128,17 +146,22 @@ async function execute(args, config) {
         actor: args.actor || 'p10b-release-owner', now: new Date().toISOString(),
         providerReadiness: readiness });
     } catch (error) {
-      if (error?.p10bEvidence) writeNewJson(evidenceOutput, error.p10bEvidence);
+      if (error?.p10bEvidence) {
+        writeReservedJson(evidenceOutput, error.p10bEvidence);
+        written = true;
+      }
       const safe = new Error(`P10B execution failed (${error?.code || 'P10B_EXECUTION_FAILED'}); inspect redacted evidence`);
       safe.code = error?.code || 'P10B_EXECUTION_FAILED';
       safe.cause = error;
       throw safe;
     }
-    const output = writeNewJson(evidenceOutput, result.evidence);
+    const output = writeReservedJson(evidenceOutput, result.evidence);
+    written = true;
     process.stdout.write(`${JSON.stringify({ ok: true, mode: 'execute', output,
       outcome: result.evidence.outcome, providerCalls: result.evidence.providerCalls })}\n`);
   } finally {
-    storage.close();
+    storage?.close();
+    if (!written) discardReservation(evidenceOutput);
   }
 }
 
