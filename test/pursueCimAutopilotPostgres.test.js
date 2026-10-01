@@ -41,6 +41,8 @@ const p7bMigrationPath = path.join(root,
   'supabase/migrations/20261008120000_pursue_cim_terminal_writer_convergence.sql');
 const p9MigrationPath = path.join(root,
   'supabase/migrations/20261009120000_pursue_cim_shadow_operations.sql');
+const p10bAuthorityMigrationPath = path.join(root,
+  'supabase/migrations/20261010120000_pursue_cim_controlled_mailbox_authority.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -72,6 +74,7 @@ const expectedP1cFunctions = [
   'pursue_cim_authorize_provider_pending_p5_v1',
   'pursue_cim_authorize_provider_pending_v1',
   'pursue_cim_bump_campaign_authority_revision_v1',
+  'pursue_cim_bump_controlled_mailbox_authority_v1',
   'pursue_cim_bump_global_authority_revision_v1',
   'pursue_cim_cancel_prepared_transmission_v1',
   'pursue_cim_canonical_json_v1',
@@ -150,6 +153,22 @@ test('P6A PostgreSQL migration is mirrored and documents deterministic final-gat
   assert.match(gate, /v_expected_member #>> '\{campaign,permission_scope\}'[\s\S]*v_member\.permission_scope/);
   assert.match(gate, /v_result := public\.pursue_cim_authorize_provider_pending_p5_v1[\s\S]*final-gate-blocked/);
   assert.match(migration, /revoke all on function public\.pursue_cim_read_final_gate_context_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
+});
+
+test('P10B synthetic identity authority correction is additive, mirrored, and service-owned', () => {
+  assert.equal(fs.existsSync(p10bAuthorityMigrationPath), true);
+  const migration = fs.readFileSync(p10bAuthorityMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration),
+    'canonical schema must contain the exact additive P10B authority block');
+  assert.match(migration, /security definer\s+set search_path = ''/i);
+  assert.match(migration, /after update of canonical_name, primary_submission_id, identity_version, metadata/i);
+  assert.match(migration, /after update of source, metadata, deal_hunter_opportunity_id/i);
+  assert.match(migration, /campaign_authority_revision = campaign_authority_revision \+ 1/i);
+  assert.match(migration,
+    /revoke all on function public\.pursue_cim_bump_controlled_mailbox_authority_v1\(\)[\s\S]*from public, anon, authenticated/i);
+  assert.match(migration,
+    /grant execute on function public\.pursue_cim_bump_controlled_mailbox_authority_v1\(\)[\s\S]*to service_role/i);
 });
 
 test('P6B PostgreSQL seam requires exact payload capability work and service-role security', () => {
@@ -613,6 +632,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p9MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p10bAuthorityMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -899,6 +919,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p9MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p10bAuthorityMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',

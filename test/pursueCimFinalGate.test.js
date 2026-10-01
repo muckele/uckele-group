@@ -5,7 +5,13 @@ import {
   authorizePreparedCimTransmission,
   normalizeCimProviderReadiness,
 } from '../server/services/pursueCimFinalGate.js';
-import { sha256 } from '../server/utils/security.js';
+import {
+  P10B_CONTROLLED_MAILBOX_HTML,
+  P10B_CONTROLLED_MAILBOX_SUBJECT,
+  P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
+  P10B_CONTROLLED_MAILBOX_TEXT,
+} from '../server/services/pursueCimControlledMailboxTemplate.js';
+import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 const now = '2026-09-25T19:00:00.000Z';
 const hex = (character) => character.repeat(64);
@@ -89,6 +95,29 @@ function finalGateContext() {
         deal_hunter_opportunity_id: 'opportunity-1' },
     }],
   };
+}
+
+function markP10bSynthetic(context, runId = 'final-gate-controlled') {
+  const opportunityId = `p10b-${sha256(stableCanonicalJson({
+    type: 'p10b-opportunity-v1', runId,
+  })).slice(0, 40)}`;
+  const submissionId = `p10b-${sha256(stableCanonicalJson({
+    type: 'p10b-submission-v1', runId,
+  })).slice(0, 40)}`;
+  const member = context.members[0];
+  member.membership.opportunity_id = opportunityId;
+  member.touch.opportunity_id = opportunityId;
+  member.campaign.opportunity_id = opportunityId;
+  member.campaign.crm_submission_id = submissionId;
+  member.opportunity = { ...member.opportunity, opportunity_id: opportunityId,
+    identity_version: 'p10b-synthetic-v1', canonical_name: 'P10B Controlled Mailbox Test',
+    primary_submission_id: submissionId,
+    metadata: { p10bSynthetic: true, runId } };
+  member.crmOwnership = { ...member.crmOwnership, submission_id: submissionId };
+  member.crmSubmission = { ...member.crmSubmission, id: submissionId,
+    deal_hunter_opportunity_id: opportunityId, source: 'p10b-controlled-mailbox',
+    metadata: { p10bSynthetic: true } };
+  return context;
 }
 
 function memberAuthority() {
@@ -260,10 +289,15 @@ test('P10A final gate rejects controlled-mailbox substitutions before readiness 
 });
 
 test('P10A exact controlled-mailbox authority can reach provider-pending', async () => {
-  const context = finalGateContext();
+  const context = markP10bSynthetic(finalGateContext());
+  const opportunityId = context.members[0].opportunity.opportunity_id;
+  context.transmission.payload_version = P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION;
   context.activation.provider_profile = 'controlled-mailbox-v1';
   context.authorization.provider_profile = 'controlled-mailbox-v1';
   context.communication.reply_to_address = 'reply@mailbox.example.test';
+  context.communication.subject = P10B_CONTROLLED_MAILBOX_SUBJECT;
+  context.communication.body_text_digest = sha256(P10B_CONTROLLED_MAILBOX_TEXT);
+  context.communication.body_html_digest = sha256(P10B_CONTROLLED_MAILBOX_HTML);
   let providerPendingCalls = 0;
   const storage = {
     async readCimFinalGateContext() { return context; },
@@ -291,12 +325,206 @@ test('P10A exact controlled-mailbox authority can reach provider-pending', async
     transmissionId: 'transmission-1', authorizationId: 'authorization-1',
     writerPath: 'pursue-cim-initial', providerProfile: 'controlled-mailbox-v1',
     actor: 'final-gate-worker', now, configOverride,
-    loadMemberAuthority: async () => memberAuthority(),
-    readCurrentAuthority: async () => currentAuthority(),
+    loadMemberAuthority: async () => ({ ...memberAuthority(), opportunityId }),
+    readCurrentAuthority: async () => {
+      const current = currentAuthority();
+      return { ...current, opportunityId, opportunity: { ...current.opportunity,
+        opportunity_id: opportunityId,
+        campaign_authority_revision:
+          context.members[0].opportunity.campaign_authority_revision } };
+    },
     readProviderReadiness: async () => ({ ...ready(), providerProfile: 'controlled-mailbox-v1' }),
   });
   assert.equal(outcome.authorized, true);
   assert.equal(providerPendingCalls, 1);
+});
+
+test('P10B final gate rejects synthetic authority revision drift after its context read', async () => {
+  const context = markP10bSynthetic(finalGateContext());
+  const opportunityId = context.members[0].opportunity.opportunity_id;
+  context.transmission.payload_version = P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION;
+  context.activation.provider_profile = 'controlled-mailbox-v1';
+  context.authorization.provider_profile = 'controlled-mailbox-v1';
+  context.communication.reply_to_address = 'reply@mailbox.example.test';
+  context.communication.subject = P10B_CONTROLLED_MAILBOX_SUBJECT;
+  context.communication.body_text_digest = sha256(P10B_CONTROLLED_MAILBOX_TEXT);
+  context.communication.body_html_digest = sha256(P10B_CONTROLLED_MAILBOX_HTML);
+  let providerPendingCalls = 0;
+  const current = currentAuthority();
+  const outcome = await authorizePreparedCimTransmission({
+    storage: {
+      async readCimFinalGateContext() { return context; },
+      async authorizeCimProviderPending() {
+        providerPendingCalls += 1;
+        return { authorized: true };
+      },
+    },
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    writerPath: 'pursue-cim-initial', providerProfile: 'controlled-mailbox-v1',
+    actor: 'final-gate-worker', now,
+    configOverride: {
+      isProduction: false,
+      delivery: { provider: 'console' },
+      dealHunter: { cimProvider: {
+        enabled: true, profile: 'controlled-mailbox-v1', mode: 'controlled-mailbox',
+        provider: 'resend', resendApiKey: 'mailbox-outbound-key',
+        resendFromEmail: 'sender@example.test', resendReplyTo: 'reply@mailbox.example.test',
+        resendInboundDomain: 'mailbox.example.test', emailWebhookSecret: 'mailbox-webhook-secret',
+        reconciliationApiKey: 'mailbox-read-key', allowedRecipients: ['broker@example.test'],
+      } },
+    },
+    loadMemberAuthority: async () => ({ ...memberAuthority(), opportunityId }),
+    readCurrentAuthority: async () => ({ ...current, opportunityId,
+      opportunity: { ...current.opportunity, opportunity_id: opportunityId,
+        campaign_authority_revision:
+          Number(context.members[0].opportunity.campaign_authority_revision) + 1 } }),
+    readProviderReadiness: async () => ({ ...ready(), providerProfile: 'controlled-mailbox-v1' }),
+  });
+  assert.equal(outcome.blockedReason, 'source_authority_unavailable');
+  assert.equal(providerPendingCalls, 0);
+});
+
+test('P10B controlled template rejects a non-synthetic durable opportunity before readiness', async () => {
+  const context = finalGateContext();
+  context.transmission.payload_version = P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION;
+  context.activation.provider_profile = 'controlled-mailbox-v1';
+  context.authorization.provider_profile = 'controlled-mailbox-v1';
+  context.communication.reply_to_address = 'reply@mailbox.example.test';
+  context.communication.subject = P10B_CONTROLLED_MAILBOX_SUBJECT;
+  context.communication.body_text_digest = sha256(P10B_CONTROLLED_MAILBOX_TEXT);
+  context.communication.body_html_digest = sha256(P10B_CONTROLLED_MAILBOX_HTML);
+  let readinessCalls = 0;
+  let providerPendingCalls = 0;
+  const outcome = await authorizePreparedCimTransmission({
+    storage: {
+      async readCimFinalGateContext() { return context; },
+      async appendCimTerminalEvent() { return { applied: true }; },
+      async authorizeCimProviderPending() {
+        providerPendingCalls += 1;
+        return { authorized: true };
+      },
+    },
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    writerPath: 'pursue-cim-initial', providerProfile: 'controlled-mailbox-v1',
+    actor: 'final-gate-worker', now,
+    configOverride: {
+      isProduction: false,
+      delivery: { provider: 'console' },
+      dealHunter: { cimProvider: {
+        enabled: true, profile: 'controlled-mailbox-v1', mode: 'controlled-mailbox',
+        provider: 'resend', resendApiKey: 'mailbox-outbound-key',
+        resendFromEmail: 'sender@example.test', resendReplyTo: 'reply@mailbox.example.test',
+        resendInboundDomain: 'mailbox.example.test', emailWebhookSecret: 'mailbox-webhook-secret',
+        reconciliationApiKey: 'mailbox-read-key', allowedRecipients: ['broker@example.test'],
+      } },
+    },
+    readProviderReadiness: async () => {
+      readinessCalls += 1;
+      return { ...ready(), providerProfile: 'controlled-mailbox-v1' };
+    },
+    loadMemberAuthority: async () => memberAuthority(),
+    readCurrentAuthority: async () => currentAuthority(),
+  });
+  assert.equal(outcome.blockedReason, 'unknown_policy_version');
+  assert.equal(readinessCalls, 0);
+  assert.equal(providerPendingCalls, 0);
+});
+
+test('P10B final gate rejects substituted controlled-template copy before readiness', async (t) => {
+  for (const [name, mutate] of [
+    ['subject', (communication) => { communication.subject = 'Substituted subject'; }],
+    ['text', (communication) => { communication.body_text_digest = sha256('Substituted text'); }],
+    ['HTML', (communication) => { communication.body_html_digest = sha256('<p>Substituted HTML</p>'); }],
+  ]) {
+    await t.test(name, async () => {
+      const context = markP10bSynthetic(finalGateContext());
+      context.transmission.payload_version = P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION;
+      context.activation.provider_profile = 'controlled-mailbox-v1';
+      context.authorization.provider_profile = 'controlled-mailbox-v1';
+      context.communication.reply_to_address = 'reply@mailbox.example.test';
+      context.communication.subject = P10B_CONTROLLED_MAILBOX_SUBJECT;
+      context.communication.body_text_digest = sha256(P10B_CONTROLLED_MAILBOX_TEXT);
+      context.communication.body_html_digest = sha256(P10B_CONTROLLED_MAILBOX_HTML);
+      mutate(context.communication);
+      let readinessCalls = 0;
+      let providerPendingCalls = 0;
+      const outcome = await authorizePreparedCimTransmission({
+        storage: {
+          async readCimFinalGateContext() { return context; },
+          async appendCimTerminalEvent() { return { applied: true }; },
+          async authorizeCimProviderPending() {
+            providerPendingCalls += 1;
+            return { authorized: true, transmission: context.transmission };
+          },
+        },
+        transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+        writerPath: 'pursue-cim-initial', providerProfile: 'controlled-mailbox-v1',
+        actor: 'final-gate-worker', now,
+        configOverride: {
+          isProduction: false,
+          delivery: { provider: 'console' },
+          dealHunter: { cimProvider: {
+            enabled: true, profile: 'controlled-mailbox-v1', mode: 'controlled-mailbox',
+            provider: 'resend', resendApiKey: 'mailbox-outbound-key',
+            resendFromEmail: 'sender@example.test', resendReplyTo: 'reply@mailbox.example.test',
+            resendInboundDomain: 'mailbox.example.test', emailWebhookSecret: 'mailbox-webhook-secret',
+            reconciliationApiKey: 'mailbox-read-key', allowedRecipients: ['broker@example.test'],
+          } },
+        },
+        loadMemberAuthority: async () => memberAuthority(),
+        readCurrentAuthority: async () => currentAuthority(),
+        readProviderReadiness: async () => {
+          readinessCalls += 1;
+          return { ...ready(), providerProfile: 'controlled-mailbox-v1' };
+        },
+      });
+      assert.equal(outcome.blockedReason, 'unknown_policy_version');
+      assert.equal(readinessCalls, 0);
+      assert.equal(providerPendingCalls, 0);
+    });
+  }
+});
+
+test('P10B controlled profile rejects the production Stage 1 payload version', async () => {
+  const context = finalGateContext();
+  context.activation.provider_profile = 'controlled-mailbox-v1';
+  context.authorization.provider_profile = 'controlled-mailbox-v1';
+  context.communication.reply_to_address = 'reply@mailbox.example.test';
+  let readinessCalls = 0;
+  let providerPendingCalls = 0;
+  const outcome = await authorizePreparedCimTransmission({
+    storage: {
+      async readCimFinalGateContext() { return context; },
+      async appendCimTerminalEvent() { return { applied: true }; },
+      async authorizeCimProviderPending() {
+        providerPendingCalls += 1;
+        return { authorized: true, transmission: context.transmission };
+      },
+    },
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    writerPath: 'pursue-cim-initial', providerProfile: 'controlled-mailbox-v1',
+    actor: 'final-gate-worker', now,
+    configOverride: {
+      isProduction: false,
+      delivery: { provider: 'console' },
+      dealHunter: { cimProvider: {
+        enabled: true, profile: 'controlled-mailbox-v1', mode: 'controlled-mailbox',
+        provider: 'resend', resendApiKey: 'mailbox-outbound-key',
+        resendFromEmail: 'sender@example.test', resendReplyTo: 'reply@mailbox.example.test',
+        resendInboundDomain: 'mailbox.example.test', emailWebhookSecret: 'mailbox-webhook-secret',
+        reconciliationApiKey: 'mailbox-read-key', allowedRecipients: ['broker@example.test'],
+      } },
+    },
+    loadMemberAuthority: async () => memberAuthority(),
+    readCurrentAuthority: async () => currentAuthority(),
+    readProviderReadiness: async () => {
+      readinessCalls += 1;
+      return { ...ready(), providerProfile: 'controlled-mailbox-v1' };
+    },
+  });
+  assert.equal(outcome.blockedReason, 'unknown_policy_version');
+  assert.equal(readinessCalls, 0);
+  assert.equal(providerPendingCalls, 0);
 });
 
 test('P6A production readiness remains closed until request-specific signed inbound routing is proven', () => {
@@ -316,6 +544,7 @@ test('P6A production readiness remains closed until request-specific signed inbo
 test('P6C unknown transmission or policy tuple terminalizes before readiness or provider work', async () => {
   for (const mutate of [
     (context) => { context.transmission.payload_version = 'future-payload-v2'; },
+    (context) => { context.transmission.payload_version = P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION; },
     (context) => { context.members[0].campaign.template_version = 'future-template-v2'; },
     (context) => { context.conversation.sender_policy_version = 'future-sender-v2'; },
     (context) => { context.members[0].campaign.permission_version = 'future-activation-v2'; },

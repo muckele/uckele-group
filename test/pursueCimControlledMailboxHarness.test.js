@@ -15,8 +15,20 @@ import {
 import { readCimCurrentAuthority } from '../server/services/cimCampaignSafety.js';
 import { loadBrokerMaterialsAuthority } from '../server/services/dealHunterBrokerMaterials.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 const now = '2026-10-01T16:00:00.000Z';
+const controlledTemplateVersion = 'p10b-controlled-mailbox-test-v1';
+const controlledSubject = 'P10B controlled mailbox lifecycle test';
+const controlledText = [
+  'Hello,',
+  '',
+  'This is a controlled, synthetic end-to-end mailbox test for Uckele Group. It is not a request concerning a real business or transaction. Please reply so the authorized test can verify inbound routing and reconciliation.',
+  '',
+  'Best,',
+  'Uckele Group',
+].join('\n');
+const controlledHtml = '<!doctype html><html><body><p>Hello,</p><p>This is a controlled, synthetic end-to-end mailbox test for Uckele Group. It is not a request concerning a real business or transaction. Please reply so the authorized test can verify inbound routing and reconciliation.</p><p>Best,</p><p>Uckele Group</p></body></html>';
 
 function readiness(overrides = {}) {
   return { version: 'cim-provider-readiness-v1', provider: 'resend',
@@ -69,14 +81,12 @@ function report(overrides = {}) {
       permissionScope: 'c'.repeat(64) },
     transmission: {
       id: 'transmission-p10b', state: 'prepared', releaseState: 'ordinary', rowVersion: 1,
-      preparationGeneration: 1, payloadVersion: 'deal-hunter-cim-manual-stage1-v1',
+      preparationGeneration: 1, payloadVersion: controlledTemplateVersion,
       payloadDigest: 'd'.repeat(64), memberDigest: 'e'.repeat(64),
       addressing: { from: 'P10B Sender <sender@mailbox.example.test>',
         to: ['owner@example.test'], cc: [], bcc: [],
         replyTo: 'cim-conversation@mailbox.example.test' },
-      copy: { subject: 'CIM / NDA request for P10B Synthetic Test',
-        text: 'Hi Owner,\nSynthetic controlled-mailbox message.',
-        html: '<p>Hi Owner,</p><p>Synthetic controlled-mailbox message.</p>' },
+      copy: { subject: controlledSubject, text: controlledText, html: controlledHtml },
       membership: [{ opportunityId: 'opportunity-p10b', campaignId: 'campaign-p10b',
         touchId: 'touch-p10b', displayOrdinal: 0, cancelledAt: '', cancellationReason: '' }],
       createdAt: now, updatedAt: now, providerOutcome: null,
@@ -110,8 +120,33 @@ test('P10B prepare is hard-off, provider-inert, and returns exact immutable revi
   assert.equal(providerCalls, 0);
   assert.equal(result.review.transmission.id, 'transmission-p10b');
   assert.equal(result.review.transmission.copy.text, exactReport.transmission.copy.text);
+  assert.equal(result.review.transmission.payloadVersion, controlledTemplateVersion);
+  assert.deepEqual(result.review.transmission.copy,
+    { subject: controlledSubject, text: controlledText, html: controlledHtml });
+  const { digest, ...canonicalReview } = result.review;
+  assert.equal(digest, sha256(stableCanonicalJson(canonicalReview)));
   assert.match(result.review.digest, /^[0-9a-f]{64}$/);
   assert.equal(result.executionAuthorized, false);
+});
+
+test('P10B review accepts only the service-owned controlled mailbox template', () => {
+  for (const [name, changedReport] of [
+    ['payload version', report({ transmission: { ...report().transmission,
+      payloadVersion: 'deal-hunter-cim-manual-stage1-v1' } })],
+    ['subject', report({ transmission: { ...report().transmission,
+      copy: { ...report().transmission.copy, subject: 'Operator supplied subject' } } })],
+    ['text', report({ transmission: { ...report().transmission,
+      copy: { ...report().transmission.copy, text: 'Operator supplied body' } } })],
+    ['html', report({ transmission: { ...report().transmission,
+      copy: { ...report().transmission.copy, html: '<p>Operator supplied body</p>' } } })],
+  ]) {
+    assert.throws(() => buildP10bReviewArtifact(changedReport, {
+      providerProfile: 'controlled-mailbox-v1', initialActivationId: 'activation-initial-p10b',
+    }), /controlled mailbox template/i, name);
+  }
+  assert.throws(() => buildP10bReviewArtifact(report(), {
+    providerProfile: 'controlled-mailbox-v2', initialActivationId: 'activation-initial-p10b',
+  }), /controlled mailbox profile/i);
 });
 
 test('P10B CLI defaults to help and exposes only explicit prepare/execute modes', () => {
@@ -157,7 +192,9 @@ test('P10B CLI prepare creates a private exact review artifact with fake credent
 test('P10B prepare rejects unsafe configuration before synthetic setup', async (t) => {
   for (const [name, config] of [
     ['already enabled', controlledConfig({ enabled: true })],
+    ['production runtime', { ...controlledConfig(), isProduction: true }],
     ['production profile', controlledConfig({ profile: 'production-resend-v1', mode: 'production' })],
+    ['substituted profile', controlledConfig({ profile: 'controlled-mailbox-v2' })],
     ['multiple recipients', controlledConfig({ allowedRecipients: ['owner@example.test', 'other@example.test'] })],
   ]) {
     await t.test(name, async () => {
@@ -170,6 +207,30 @@ test('P10B prepare rejects unsafe configuration before synthetic setup', async (
         services: { async setupSyntheticScenario() { setupCalls += 1; } },
       }), /controlled mailbox|hard-off|recipient/i);
       assert.equal(setupCalls, 0);
+    });
+  }
+});
+
+test('P10B prepare rejects substituted recipient and inbound-domain bindings', async (t) => {
+  for (const [name, config, recipient, pattern] of [
+    ['recipient', controlledConfig(), 'other@example.test', /recipient/i],
+    ['domain', controlledConfig({ resendReplyTo: 'replies@other.example.test' }),
+      'owner@example.test', /review binding|reply domain/i],
+  ]) {
+    await t.test(name, async () => {
+      await assert.rejects(prepareP10bControlledMailbox({ storage: {}, config,
+        actor: 'fixture-owner', now,
+        synthetic: { runId: `p10b-${name}-denied`, recipient,
+          permissionEvidenceId: 'permission-record-p10b',
+          permissionEvidenceHash: 'f'.repeat(64) },
+        services: {
+          async setupSyntheticScenario() {
+            return { opportunityId: 'opportunity-p10b',
+              initialActivationId: 'activation-initial-p10b' };
+          },
+          async getReleaseReport() { return report(); },
+        },
+      }), pattern);
     });
   }
 });
@@ -195,6 +256,11 @@ test('P10B default synthetic setup uses public authorities to persist one provid
   assert.equal(prepared.executionAuthorized, false);
   assert.equal(prepared.review.transmission.state, 'prepared');
   assert.equal(prepared.review.transmission.addressing.to[0], 'owner@example.test');
+  assert.equal(prepared.review.transmission.payloadVersion, controlledTemplateVersion);
+  assert.deepEqual(prepared.review.transmission.copy,
+    { subject: controlledSubject, text: controlledText, html: controlledHtml });
+  assert.doesNotMatch(prepared.review.transmission.copy.text,
+    /Golden Behavior|Tripadvisor|Better Mortgage|Wayfair|equity|SBA|proof of funds/i);
   assert.equal(after.providerSeamEntries - before.providerSeamEntries, 0);
   assert.equal(after.providerPending - before.providerPending, 0);
   assert.equal(after.transmissions - before.transmissions, 1);
@@ -249,22 +315,39 @@ test('P10B execute rejects caller-declared readiness before issuing authority', 
   assert.equal(issued, 0);
 });
 
-test('P10B execute rejects durable payload drift from the reviewed artifact', async () => {
+test('P10B execute rejects durable payload, copy, and addressing drift from the reviewed artifact', async (t) => {
   const exactReport = report();
   const review = buildP10bReviewArtifact(exactReport, { providerProfile: 'controlled-mailbox-v1',
     initialActivationId: 'activation-initial-p10b' });
-  const changedReport = report({ transmission: { ...exactReport.transmission,
-    copy: { ...exactReport.transmission.copy, text: 'Changed after review.' } } });
-  let issued = 0;
-  await assert.rejects(executeP10bControlledMailbox({
-    storage: { async issueCimLiveProviderAuthorization() { issued += 1; } },
-    config: controlledConfig(), opportunityId: 'opportunity-p10b',
-    initialActivationId: 'activation-initial-p10b', reviewDigest: review.digest,
-    confirmation: P10B_EXECUTION_CONFIRMATION, expiresAt: '2026-10-01T16:10:00.000Z',
-    actor: 'fixture-owner', now, providerReadiness: readiness(),
-    services: { async getReleaseReport() { return changedReport; } },
-  }), /review digest does not match durable state/i);
-  assert.equal(issued, 0);
+  for (const [name, transmission] of [
+    ['payload version', { ...exactReport.transmission, payloadVersion: 'changed-v1' }],
+    ['subject', { ...exactReport.transmission,
+      copy: { ...exactReport.transmission.copy, subject: 'Changed after review.' } }],
+    ['text', { ...exactReport.transmission,
+      copy: { ...exactReport.transmission.copy, text: 'Changed after review.' } }],
+    ['html', { ...exactReport.transmission,
+      copy: { ...exactReport.transmission.copy, html: '<p>Changed after review.</p>' } }],
+    ['from', { ...exactReport.transmission, addressing: {
+      ...exactReport.transmission.addressing, from: 'Other <other@mailbox.example.test>' } }],
+    ['recipient', { ...exactReport.transmission, addressing: {
+      ...exactReport.transmission.addressing, to: ['other@example.test'] } }],
+    ['reply domain', { ...exactReport.transmission, addressing: {
+      ...exactReport.transmission.addressing, replyTo: 'cim-conversation@other.example.test' } }],
+  ]) {
+    await t.test(name, async () => {
+      const changedReport = report({ transmission });
+      let issued = 0;
+      await assert.rejects(executeP10bControlledMailbox({
+        storage: { async issueCimLiveProviderAuthorization() { issued += 1; } },
+        config: controlledConfig(), opportunityId: 'opportunity-p10b',
+        initialActivationId: 'activation-initial-p10b', reviewDigest: review.digest,
+        confirmation: P10B_EXECUTION_CONFIRMATION, expiresAt: '2026-10-01T16:10:00.000Z',
+        actor: 'fixture-owner', now, providerReadiness: readiness(),
+        services: { async getReleaseReport() { return changedReport; } },
+      }), /controlled mailbox template|review binding|review digest does not match durable state/i);
+      assert.equal(issued, 0);
+    });
+  }
 });
 
 test('P10B execute requires both cleanup transitions before issuing live authority', async () => {
@@ -512,6 +595,58 @@ test('P10B real SQLite authorities admit exactly one fake-provider call and repl
     fetcher: async () => { providerCalls += 1; throw new Error('must not replay'); },
   }), /prepared|unauthorized/i);
   assert.equal(providerCalls, 1);
+});
+
+test('P10B atomic gate rejects synthetic identity drift after the service snapshot', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p10b-identity-race-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'p10b.sqlite') },
+    protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const config = controlledConfig();
+  const prepared = await prepareP10bControlledMailbox({ storage, config,
+    actor: 'fixture-owner', now,
+    synthetic: { runId: 'p10b-synthetic-identity-race', recipient: 'owner@example.test',
+      recipientDisplayName: 'Owner', permissionEvidenceId: 'permission-record-p10b',
+      permissionEvidenceHash: 'f'.repeat(64) },
+  });
+  let mutationApplied = false;
+  const racingStorage = new Proxy(storage, {
+    get(target, property, receiver) {
+      if (property !== 'authorizeCimProviderPending') {
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      }
+      return async (command) => {
+        const opportunity = await target.getCurrentDealHunterOpportunity(prepared.opportunityId);
+        await target.upsertDealHunterOpportunity({ ...opportunity, updated_at: prepared.preparedAt,
+          metadata: { ...opportunity.metadata, p10bSynthetic: false } });
+        mutationApplied = true;
+        return target.authorizeCimProviderPending(command);
+      };
+    },
+  });
+  let providerCalls = 0;
+  const expiresAt = new Date(Date.parse(prepared.preparedAt) + 10 * 60 * 1000).toISOString();
+  await assert.rejects(executeP10bControlledMailbox({ storage: racingStorage, config,
+    opportunityId: prepared.opportunityId,
+    initialActivationId: prepared.initialActivationId,
+    reviewDigest: prepared.review.digest,
+    confirmation: P10B_EXECUTION_CONFIRMATION,
+    expiresAt, actor: 'fixture-owner', now: prepared.preparedAt,
+    providerReadiness: readiness({ generatedAt: prepared.preparedAt, expiresAt }),
+    fetcher: async () => {
+      providerCalls += 1;
+      return new Response(JSON.stringify({ id: 'must-not-send' }), { status: 200 });
+    },
+  }), /final gate denied/i);
+  assert.equal(mutationApplied, true);
+  assert.equal(providerCalls, 0);
+  assert.equal((await storage.readPursueCimProjection({
+    opportunityId: prepared.opportunityId,
+  })).transmission.state, 'cancelled-before-provider');
 });
 
 test('P10B crash, timeout, and unknown outcomes restore pause without another call', async (t) => {

@@ -17,6 +17,7 @@ import {
 import { runDueCimInitialPreparations } from './pursueCimInitialPreparation.js';
 import { finalizeAuthorizedCimTransmission } from './pursueCimProvider.js';
 import { getPursueCimReleaseReport } from './pursueCimRelease.js';
+import { assertP10bControlledMailboxTemplate } from './pursueCimControlledMailboxTemplate.js';
 
 const CONTROLLED_PROFILE = 'controlled-mailbox-v1';
 const MAX_AUTHORIZATION_MS = 15 * 60 * 1000;
@@ -85,6 +86,7 @@ function exactReviewFields(report, providerProfile, initialActivationId) {
     || transmission.addressing.cc?.length || transmission.addressing.bcc?.length) {
     throw new Error('P10B exact prepared transmission is unavailable for review');
   }
+  assertP10bControlledMailboxTemplate({ providerProfile, transmission });
   return {
     version: 'p10b-controlled-mailbox-review-v1',
     providerProfile,

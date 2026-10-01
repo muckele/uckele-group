@@ -12,6 +12,7 @@ import {
   sendPreparedMessage,
 } from '../server/services/delivery.js';
 import { buildDailyDealHunterEmailEnvelope } from '../server/services/dailyDealHunterDigest.js';
+import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 function taskThreeProjection(notificationType = 'normal-digest') {
   const alert = notificationType === 'required-source-alert';
@@ -658,6 +659,14 @@ test('default and Stage 2 CIM copy remain unchanged without the trusted manual o
   assert.match(stage2.text, /reply with “unsubscribe” or “stop”/);
   assert.match(stage2.text, /Postal address:/);
   assert.equal(Object.hasOwn(stage2, 'templateVersion'), false);
+});
+
+test('production Stage 1 CIM copy remains byte-for-byte unchanged by controlled mailbox templates', () => {
+  const message = buildDealHunterCimRequestEmail({ to: 'broker@example.com', deal: sampleDeal,
+    requestedBy: 'Mathew Uckele', cimRequestId: 'direct' });
+  assert.equal(sha256(stableCanonicalJson({ subject: message.subject,
+    text: message.text, html: message.html })),
+  '8179d56aa22ae37dab80e03a13a1f8b0680c926f772ab0d12aa92c602ccfda94');
 });
 
 test('CIM request email tags are safe for Resend when deal keys contain punctuation', () => {
