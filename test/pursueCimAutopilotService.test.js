@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { getConfig } from '../server/config.js';
 import { readCimCurrentAuthority, runCimCampaignSafety } from '../server/services/cimCampaignSafety.js';
 import { loadBrokerMaterialsAuthority } from '../server/services/dealHunterBrokerMaterials.js';
 import { orchestratePursuitEnrollment, pursuitPermissionBasisDigest,
@@ -161,6 +162,41 @@ test('P5 real Broker Materials authority prepares the Package 4B initial touch',
   assert.deepEqual(metadata.campaignIds, [campaign.id]);
   assert.deepEqual(metadata.touchIds, [touch.id]);
   assert.equal(metadata.memberDigest, transmission.member_digest);
+});
+
+test('P10A preparation binds the immutable message to one controlled mailbox recipient', async (t) => {
+  const { storage, db, opportunityId, now, decision, recipient } = await seedP4bEligibleFixture(t);
+  await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  await storage.recordCimCapabilityActivation({
+    id: 'p10a-initial', capability: 'fl04b-initial', mode: 'active',
+    policyHash: 'c'.repeat(64), configHash: 'd'.repeat(64), actor: 'fixture-owner',
+    reason: 'synthetic controlled mailbox', confirmation: 'synthetic-confirmation',
+    providerProfile: 'controlled-mailbox-v1', now,
+    prerequisiteActivationId: 'p4b-enrollment',
+    prerequisiteEvidenceId: 'p10a-initial-evidence', prerequisiteEvidenceHash: 'e'.repeat(64),
+  });
+  const configOverride = structuredClone(getConfig());
+  configOverride.delivery = { ...configOverride.delivery, provider: 'console',
+    resendApiKey: '', resendFromEmail: '', resendReplyTo: '', resendInboundDomain: '',
+    emailWebhookSecret: '' };
+  configOverride.dealHunter.cimProvider = {
+    enabled: true, profile: 'controlled-mailbox-v1', mode: 'controlled-mailbox',
+    provider: 'resend', resendApiKey: 'mailbox-outbound-key',
+    resendFromEmail: 'Mailbox Sender <sender@mailbox.example.test>',
+    resendReplyTo: 'replies@mailbox-inbound.example.test',
+    resendInboundDomain: 'mailbox-inbound.example.test',
+    emailWebhookSecret: 'mailbox-webhook-secret', reconciliationApiKey: 'mailbox-read-key',
+    allowedRecipients: [recipient.email],
+  };
+  const outcomes = await runDueCimInitialPreparations({ storage, now, configOverride });
+  assert.equal(outcomes[0].prepared, true, JSON.stringify(outcomes[0]));
+  const communication = db.prepare('SELECT * FROM crm_communications').get();
+  assert.equal(communication.from_address,
+    'Mailbox Sender <sender@mailbox.example.test>');
+  assert.deepEqual(JSON.parse(communication.to_addresses), [recipient.email]);
+  assert.match(communication.reply_to_address, /@mailbox-inbound\.example\.test$/);
 });
 
 test('P5 refuses preparation when the campaign leaves initial-pending after claim', async (t) => {

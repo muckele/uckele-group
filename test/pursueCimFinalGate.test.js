@@ -198,6 +198,107 @@ test('P6A blocked and ambiguous outcomes never expose the raw boundary nonce', a
   assert.equal(Object.hasOwn(ambiguous, 'boundaryNonce'), false);
 });
 
+test('P10A final gate rejects controlled-mailbox substitutions before readiness or provider-pending', async (t) => {
+  const baseConfig = () => ({
+    isProduction: false,
+    delivery: { provider: 'console' },
+    dealHunter: { cimProvider: {
+      enabled: true, profile: 'controlled-mailbox-v1', mode: 'controlled-mailbox',
+      provider: 'resend', resendApiKey: 'mailbox-outbound-key',
+      resendFromEmail: 'sender@example.test', resendReplyTo: 'reply@mailbox.example.test',
+      resendInboundDomain: 'mailbox.example.test', emailWebhookSecret: 'mailbox-webhook-secret',
+      reconciliationApiKey: 'mailbox-read-key', allowedRecipients: ['broker@example.test'],
+    } },
+  });
+  for (const [name, mutate, expectedReason] of [
+    ['activation profile', (context) => { context.activation.provider_profile = 'production-resend-v1'; },
+      'profile_mismatch'],
+    ['authorization profile', (context) => { context.authorization.provider_profile = 'production-resend-v1'; },
+      'profile_mismatch'],
+    ['recipient', (context) => { context.communication.to_addresses = ['attacker@example.test']; },
+      'mailbox_recipient_mismatch'],
+    ['compound recipient', (context) => {
+      context.communication.to_addresses = ['Broker <broker@example.test>, attacker@example.test'];
+    }, 'mailbox_recipient_mismatch'],
+    ['malformed carbon copy', (context) => {
+      context.communication.cc_addresses = ['not-an-email'];
+    }, 'mailbox_recipient_mismatch'],
+    ['sender', (context) => { context.communication.from_address = 'production@example.test'; },
+      'mailbox_sender_mismatch'],
+    ['compound sender', (context) => {
+      context.communication.from_address = 'Sender <sender@example.test>, attacker@example.test';
+    }, 'mailbox_sender_mismatch'],
+    ['reply domain', (context) => { context.communication.reply_to_address = 'reply@production.example.test'; },
+      'mailbox_reply_domain_mismatch'],
+    ['credential namespace', (context, config) => { config.dealHunter.cimProvider.resendApiKey = ''; },
+      'outbound_credentials_missing'],
+  ]) {
+    await t.test(name, async () => {
+      const context = finalGateContext();
+      context.activation.provider_profile = 'controlled-mailbox-v1';
+      context.authorization.provider_profile = 'controlled-mailbox-v1';
+      context.communication.reply_to_address = 'reply@mailbox.example.test';
+      const configOverride = baseConfig();
+      mutate(context, configOverride);
+      let readinessCalls = 0;
+      let providerPendingCalls = 0;
+      const outcome = await authorizePreparedCimTransmission({
+        storage: {
+          async readCimFinalGateContext() { return context; },
+          async authorizeCimProviderPending() { providerPendingCalls += 1; throw new Error('must not authorize'); },
+        },
+        transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+        writerPath: 'pursue-cim-initial', providerProfile: 'controlled-mailbox-v1',
+        actor: 'final-gate-worker', now, configOverride,
+        readProviderReadiness: async () => { readinessCalls += 1; return ready(); },
+      });
+      assert.equal(outcome.blockedReason, expectedReason);
+      assert.equal(readinessCalls, 0);
+      assert.equal(providerPendingCalls, 0);
+    });
+  }
+});
+
+test('P10A exact controlled-mailbox authority can reach provider-pending', async () => {
+  const context = finalGateContext();
+  context.activation.provider_profile = 'controlled-mailbox-v1';
+  context.authorization.provider_profile = 'controlled-mailbox-v1';
+  context.communication.reply_to_address = 'reply@mailbox.example.test';
+  let providerPendingCalls = 0;
+  const storage = {
+    async readCimFinalGateContext() { return context; },
+    async authorizeCimProviderPending(command) {
+      providerPendingCalls += 1;
+      return { authorized: true, blockedReason: null,
+        transmission: { ...context.transmission, state: 'provider-pending', row_version: 2,
+          final_gate_authority_digest: command.finalGateAuthorityDigest,
+          boundary_nonce_digest: command.boundaryNonceDigest, invocation_authority_count: 1 },
+        boundaryNonceDigest: command.boundaryNonceDigest };
+    },
+  };
+  const configOverride = {
+    isProduction: false,
+    delivery: { provider: 'console' },
+    dealHunter: { cimProvider: {
+      enabled: true, profile: 'controlled-mailbox-v1', mode: 'controlled-mailbox',
+      provider: 'resend', resendApiKey: 'mailbox-outbound-key',
+      resendFromEmail: 'sender@example.test', resendReplyTo: 'reply@mailbox.example.test',
+      resendInboundDomain: 'mailbox.example.test', emailWebhookSecret: 'mailbox-webhook-secret',
+      reconciliationApiKey: 'mailbox-read-key', allowedRecipients: ['broker@example.test'],
+    } },
+  };
+  const outcome = await authorizePreparedCimTransmission({ storage,
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    writerPath: 'pursue-cim-initial', providerProfile: 'controlled-mailbox-v1',
+    actor: 'final-gate-worker', now, configOverride,
+    loadMemberAuthority: async () => memberAuthority(),
+    readCurrentAuthority: async () => currentAuthority(),
+    readProviderReadiness: async () => ({ ...ready(), providerProfile: 'controlled-mailbox-v1' }),
+  });
+  assert.equal(outcome.authorized, true);
+  assert.equal(providerPendingCalls, 1);
+});
+
 test('P6A production readiness remains closed until request-specific signed inbound routing is proven', () => {
   const readiness = normalizeCimProviderReadiness({
     provider: 'resend', outboundConfigured: true, senderConfigured: true,

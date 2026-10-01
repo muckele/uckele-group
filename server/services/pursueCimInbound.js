@@ -57,7 +57,7 @@ function canonicalDigest(value) {
   return sha256(stableCanonicalJson(value));
 }
 
-function resolutionCommand(event) {
+function resolutionCommand(event, profileBinding) {
   const metadata = event?.metadata && typeof event.metadata === 'object' ? event.metadata : {};
   const tags = metadata.tags;
   const rawType = text(metadata.rawType, 80).toLowerCase().replace(/_/g, '.');
@@ -65,20 +65,20 @@ function resolutionCommand(event) {
   return {
     replyToAddresses: unique(values(metadata.to || metadata.toEmail).map(email)),
     provider: text(event.provider, 80) || 'resend',
-    providerMessageIds: unique([
+    providerMessageIds: profileBinding?.requireExactReplyAlias ? [] : unique([
       text(metadata.parentProviderMessageId),
       text(metadata.inReplyToProviderMessageId),
       ...(rawType === 'email.received' ? [] : [text(event.message_id)]),
     ]),
-    rfcMessageIds: unique([
+    rfcMessageIds: profileBinding?.requireExactReplyAlias ? [] : unique([
       ...references(metadata.inReplyTo),
       ...references(metadata.references),
     ], 50),
-    taggedConversationId: tagValues(tags,
+    taggedConversationId: profileBinding?.requireExactReplyAlias ? '' : tagValues(tags,
       ['cim_conversation_id', 'cimConversationId', 'conversation_id'])[0] || '',
-    taggedTransmissionId: tagValues(tags,
+    taggedTransmissionId: profileBinding?.requireExactReplyAlias ? '' : tagValues(tags,
       ['cim_transmission_id', 'cimTransmissionId', 'transmission_id'])[0] || '',
-    taggedTouchIds,
+    taggedTouchIds: profileBinding?.requireExactReplyAlias ? [] : taggedTouchIds,
   };
 }
 
@@ -150,12 +150,19 @@ async function appendInboundTerminal({
   return { result: { ...result, cancelledTouchIds: [] }, conflict: true, durable };
 }
 
-export async function applyVerifiedPursueCimInbound(event, { storage, now } = {}) {
+export async function applyVerifiedPursueCimInbound(event, { storage, now, profileBinding } = {}) {
   if (event?.event_type !== 'replied') return { handled: false };
   if (!storage?.resolvePursueCimInboundEvidence || !storage?.appendCimTerminalEvent) {
     throw new Error('Pursue CIM inbound storage transitions unavailable');
   }
-  const command = resolutionCommand(event);
+  const command = resolutionCommand(event, profileBinding);
+  if (profileBinding?.requireExactReplyAlias) {
+    const expectedDomain = text(profileBinding.replyDomain, 255).toLowerCase();
+    if (!expectedDomain || command.replyToAddresses.length < 1
+      || command.replyToAddresses.some((address) => address.split('@')[1] !== expectedDomain)) {
+      throw new Error('Controlled mailbox inbound reply domain mismatch');
+    }
+  }
   const resolution = await storage.resolvePursueCimInboundEvidence(command);
   if (resolution?.ambiguous) {
     const candidates = Array.from(new Map((resolution.candidateConversations || [])
@@ -177,6 +184,8 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now } = {}
         provider: text(event.provider, 80),
         method: text(resolution.method, 120),
         conversationId: conversation.id,
+        ...(profileBinding?.providerProfile
+          ? { providerProfile: text(profileBinding.providerProfile, 120) } : {}),
       };
       containmentCommands.push(inboundTerminalCommand({
         event, conversation,
@@ -227,6 +236,12 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now } = {}
       method: text(resolution?.method, 120) || 'none',
     };
   }
+  if (profileBinding?.requireExactReplyAlias) {
+    const durableReplyAlias = email(resolution.transmission?.reply_to_address);
+    if (!durableReplyAlias || !command.replyToAddresses.includes(durableReplyAlias)) {
+      throw new Error('Controlled mailbox inbound is not bound to the durable reply alias');
+    }
+  }
   if (terminalConversationStates.has(resolution.conversation.state)) {
     return {
       handled: true,
@@ -267,6 +282,8 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now } = {}
     transmissionId: text(resolution.transmission?.id),
     campaignIds: unique(resolution.campaignIds || [], 50).sort(),
     touchIds: unique(resolution.touchIds || [], 50).sort(),
+    ...(profileBinding?.providerProfile
+      ? { providerProfile: text(profileBinding.providerProfile, 120) } : {}),
   };
   const appended = await appendInboundTerminal({
     storage, command, event, conversation: resolution.conversation,

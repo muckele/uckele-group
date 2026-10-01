@@ -287,6 +287,78 @@ test('P6C reconciliation accepts only provider evidence bound to the immutable t
   assert.equal(calls.length, 1);
 });
 
+test('P10A reconciliation rejects evidence from a substituted provider profile', async () => {
+  const transmission = reconciliationTransmission();
+  const storage = {
+    async readCimCadenceContext() { return cadenceContext(); },
+    async reconcileCimTransmission(command) {
+      return { applied: true, conflict: false,
+        transmission: { ...transmission, state: command.outcome } };
+    },
+  };
+  await assert.rejects(providerService.reconcileCimProviderTransmission({
+    storage, transmission, providerProfile: 'controlled-mailbox-v1',
+    actor: 'fixture-owner', now: '2026-09-25T19:02:00.000Z',
+    readProviderEvidence: async () => ({ ...proofFor(transmission, {
+      outcome: 'accepted', candidates: [{ provider: 'resend',
+        providerMessageId: 'provider-message-1', evidenceId: 'candidate-1' }],
+    }), providerProfile: 'production-resend-v1' }),
+  }), /provider profile/i);
+});
+
+test('P10A configured reconciliation uses only the controlled read credential and profile binding', async () => {
+  const providerProfile = 'controlled-mailbox-v1';
+  const transmission = reconciliationTransmission({
+    provider_seam_entered_at: '2026-09-25T19:00:00.000Z',
+  });
+  const binding = { ...proofFor(transmission).binding, providerProfile };
+  let reads = 0;
+  const lookup = providerService.createCimResendReconciliationLookup({
+    configOverride: {
+      delivery: { resendApiKey: 'production-read-key' },
+      dealHunter: { cimProvider: { mode: 'controlled-mailbox', profile: providerProfile,
+        provider: 'resend', reconciliationApiKey: 'mailbox-read-key' } },
+    },
+    clock: () => new Date('2026-09-25T19:05:00.000Z'),
+    fetcher: async (url, options) => {
+      reads += 1;
+      assert.equal(url, 'https://api.resend.com/emails?limit=100');
+      assert.equal(options.method, 'GET');
+      assert.equal(options.headers.Authorization, 'Bearer mailbox-read-key');
+      assert.equal(JSON.stringify(options).includes('production-read-key'), false);
+      return Response.json({ data: [{ id: 'provider-message-1',
+        from: transmission.from_address, to: transmission.to_addresses, cc: [], bcc: [],
+        reply_to: transmission.reply_to_address, subject: transmission.subject,
+        created_at: '2026-09-25T19:00:03.000Z' }] });
+    },
+  });
+  const proof = await lookup({ transmission, binding, providerProfile });
+  assert.equal(reads, 1);
+  assert.equal(proof.providerProfile, providerProfile);
+  assert.equal(proof.binding.providerProfile, providerProfile);
+  assert.equal(proof.outcome, 'accepted');
+});
+
+test('P10A configured reconciliation rejects a mismatched profile before the read', async () => {
+  const transmission = reconciliationTransmission({
+    provider_seam_entered_at: '2026-09-25T19:00:00.000Z',
+  });
+  const providerProfile = 'production-resend-v1';
+  const binding = { ...proofFor(transmission).binding, providerProfile };
+  let reads = 0;
+  const lookup = providerService.createCimResendReconciliationLookup({
+    configOverride: {
+      delivery: { resendApiKey: 'production-read-key' },
+      dealHunter: { cimProvider: { mode: 'controlled-mailbox',
+        profile: 'controlled-mailbox-v1', provider: 'resend',
+        reconciliationApiKey: 'mailbox-read-key' } },
+    },
+    fetcher: async () => { reads += 1; throw new Error('must not read'); },
+  });
+  await assert.rejects(lookup({ transmission, binding, providerProfile }), /provider profile/i);
+  assert.equal(reads, 0);
+});
+
 test('P6C bounded Resend lookup matches the immutable envelope and never sends', async () => {
   assert.equal(typeof providerService.createCimResendReconciliationLookup, 'function');
   const transmission = reconciliationTransmission({

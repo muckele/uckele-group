@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { getConfig } from '../config.js';
+import { getCimProviderDeliveryConfig, getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { commitCrmActivityMutation } from './activity.js';
@@ -987,7 +987,8 @@ async function resolveAndAssignInboundCommunication({ storage, communication, re
   return { communication: mutation.record, assignment: fullAssignment };
 }
 
-export async function ingestResendReceivedEmail({ event, storage = getStorage(), fetcher } = {}) {
+export async function ingestResendReceivedEmail({ event, storage = getStorage(), fetcher,
+  configOverride } = {}) {
   const metadata = objectValue(event?.metadata);
   const providerMessageId = compactText(metadata.resendEmailId || event?.message_id, 240);
   if (!providerMessageId) return { ok: false, accepted: false, error: 'Received email ID is missing.' };
@@ -1025,7 +1026,8 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
   }
 
   try {
-    const received = await fetchReceivedEmail(providerMessageId, { fetcher });
+    const received = await fetchReceivedEmail(providerMessageId, {
+      config: getCimProviderDeliveryConfig(configOverride || getConfig()), fetcher });
     const resolved = await resolveAndAssignInboundCommunication({
       storage,
       communication,
@@ -1046,7 +1048,8 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
   }
 }
 
-export async function retryPendingInboundIngestion({ storage = getStorage(), limit = 25, now = new Date(), fetcher } = {}) {
+export async function retryPendingInboundIngestion({ storage = getStorage(), limit = 25,
+  now = new Date(), fetcher, configOverride } = {}) {
   const dueBefore = now.toISOString();
   const pending = storage.claimCrmCommunicationsPendingIngestion
     ? await storage.claimCrmCommunicationsPendingIngestion({
@@ -1059,7 +1062,8 @@ export async function retryPendingInboundIngestion({ storage = getStorage(), lim
   const results = [];
   for (const communication of rows) {
     try {
-      const received = await fetchReceivedEmail(communication.provider_message_id, { fetcher });
+      const received = await fetchReceivedEmail(communication.provider_message_id, {
+        config: getCimProviderDeliveryConfig(configOverride || getConfig()), fetcher });
       const resolved = await resolveAndAssignInboundCommunication({ storage, communication, received });
       const updated = await updateInboundContent(storage, resolved.communication, received);
       await applyObviousInboundOptOut(storage, updated);

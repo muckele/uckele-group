@@ -38,6 +38,7 @@ function createBoundaryFixture({
   writerPath = 'pursue-cim-initial',
   capability = 'fl04b-initial',
   memberKinds = ['initial'],
+  providerProfile = 'synthetic-provider',
   seamResult = { entered: true, alreadyEntered: false, unauthorized: false },
 } = {}) {
   const transmissionId = `transmission-${suffix}`;
@@ -45,7 +46,6 @@ function createBoundaryFixture({
   const communicationId = `communication-${suffix}`;
   const outboxId = `outbox-${suffix}`;
   const rawNonce = `same-process-boundary-nonce-${suffix}`;
-  const providerProfile = 'synthetic-provider';
   const message = {
     kind,
     transmissionId,
@@ -158,6 +158,7 @@ async function attemptBoundary(fixture, {
   authorization = fixture.authorization,
   enabled = true,
   profile = 'synthetic-provider',
+  configOverride,
   fetcher,
   testHooks,
 } = {}) {
@@ -165,13 +166,35 @@ async function attemptBoundary(fixture, {
     storage: fixture.storage,
     cimProviderAuthorization: authorization,
     now: new Date('2026-09-25T19:00:00.000Z'),
-    configOverride: resendBoundaryConfig({ enabled, profile }),
+    configOverride: configOverride || resendBoundaryConfig({ enabled, profile }),
     testHooks,
     fetcher: fetcher || (async () => {
       fixture.counts.providerCalls += 1;
       return new Response(JSON.stringify({ id: 'synthetic-provider-message' }), { status: 200 });
     }),
   });
+}
+
+function controlledMailboxConfig(overrides = {}) {
+  return {
+    isProduction: false,
+    server: { outboundRequestTimeoutMs: 100 },
+    delivery: { provider: 'console', resendApiKey: '', resendFromEmail: '' },
+    dealHunter: { cimProvider: {
+      enabled: true,
+      profile: 'controlled-mailbox-v1',
+      mode: 'controlled-mailbox',
+      provider: 'resend',
+      resendApiKey: 'mailbox-outbound-key',
+      resendFromEmail: 'sender@example.test',
+      resendReplyTo: 'reply@example.test',
+      resendInboundDomain: 'example.test',
+      emailWebhookSecret: 'mailbox-webhook-secret',
+      reconciliationApiKey: 'mailbox-read-key',
+      allowedRecipients: ['broker@example.test'],
+      ...overrides,
+    } },
+  };
 }
 
 function readCimProviderEnabled(environmentValue) {
@@ -204,6 +227,47 @@ test('P6B private delivery seam default-denies CIM work without exact boundary a
   assert.equal(result.status, 'failed');
   assert.equal(result.errorCategory, 'cim-provider-authorization-required');
   assert.equal(providerCalls, 0);
+});
+
+test('P10A controlled mailbox substitutions fail before durable or provider work', async (t) => {
+  for (const [name, mutate, expectedCategory = 'cim-provider-profile-invalid'] of [
+    ['recipient', (fixture, _config) => { fixture.message.to = ['attacker@example.test']; }],
+    ['compound recipient', (fixture) => {
+      fixture.message.to = ['Broker <broker@example.test>, attacker@example.test'];
+    }, 'invalid-recipient'],
+    ['malformed carbon copy', (fixture) => { fixture.message.cc = ['not-an-email']; }],
+    ['sender', (fixture) => { fixture.message.from = 'production@production.example.test'; }],
+    ['compound sender', (fixture) => {
+      fixture.message.from = 'Sender <sender@example.test>, attacker@example.test';
+    }],
+    ['reply domain', (fixture) => { fixture.message.replyTo = 'reply@production.example.test'; }],
+    ['credential namespace', (fixture, config) => { config.dealHunter.cimProvider.resendApiKey = ''; }],
+    ['webhook namespace', (fixture, config) => { config.dealHunter.cimProvider.emailWebhookSecret = ''; }],
+    ['reconciliation namespace', (fixture, config) => { config.dealHunter.cimProvider.reconciliationApiKey = ''; }],
+  ]) {
+    await t.test(name, async () => {
+      const fixture = createBoundaryFixture({ suffix: `p10a-${name.replaceAll(' ', '-')}`,
+        providerProfile: 'controlled-mailbox-v1' });
+      const config = controlledMailboxConfig();
+      mutate(fixture, config);
+      const result = await attemptBoundary(fixture, { configOverride: config });
+      assert.equal(result.status, 'failed');
+      assert.equal(result.errorCategory, expectedCategory);
+      assert.equal(fixture.counts.reads, 0);
+      assert.equal(fixture.counts.seamEntries, 0);
+      assert.equal(fixture.counts.providerCalls, 0);
+    });
+  }
+});
+
+test('P10A exact controlled mailbox binding reaches the existing one-shot seam once', async () => {
+  const fixture = createBoundaryFixture({ suffix: 'p10a-exact',
+    providerProfile: 'controlled-mailbox-v1' });
+  const result = await attemptBoundary(fixture, { configOverride: controlledMailboxConfig() });
+  assert.equal(result.status, 'sent');
+  assert.equal(fixture.counts.reads, 1);
+  assert.equal(fixture.counts.seamEntries, 1);
+  assert.equal(fixture.counts.providerCalls, 1);
 });
 
 test('P6B unknown CIM namespace kinds fail closed at the private provider seam', async (t) => {
