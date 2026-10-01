@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 
 const reviewedTargetTriggerDigests = new Map([
   [
+    'contact_submissions:trg_cim_campaign_revision_submission_identity_update',
+    '6a07a5fa549f037ab94fdcfb7efac05de0fc41ef6b0d44ac64bad05781f4e62d',
+  ],
+  [
     'contact_submissions:trg_crm_submission_supersessions_guard_contact_delete',
     '581f73de393e598ef8c12fea6ea508a2c9efba24e66bdef2da226518275dd18b',
   ],

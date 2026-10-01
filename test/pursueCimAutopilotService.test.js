@@ -164,7 +164,7 @@ test('P5 real Broker Materials authority prepares the Package 4B initial touch',
   assert.equal(metadata.memberDigest, transmission.member_digest);
 });
 
-test('P10A preparation binds the immutable message to one controlled mailbox recipient', async (t) => {
+test('P10B controlled mailbox template rejects a non-synthetic opportunity', async (t) => {
   const { storage, db, opportunityId, now, decision, recipient } = await seedP4bEligibleFixture(t);
   await orchestratePursuitEnrollment({ storage, opportunityId,
     enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
@@ -191,12 +191,11 @@ test('P10A preparation binds the immutable message to one controlled mailbox rec
     allowedRecipients: [recipient.email],
   };
   const outcomes = await runDueCimInitialPreparations({ storage, now, configOverride });
-  assert.equal(outcomes[0].prepared, true, JSON.stringify(outcomes[0]));
-  const communication = db.prepare('SELECT * FROM crm_communications').get();
-  assert.equal(communication.from_address,
-    'Mailbox Sender <sender@mailbox.example.test>');
-  assert.deepEqual(JSON.parse(communication.to_addresses), [recipient.email]);
-  assert.match(communication.reply_to_address, /@mailbox-inbound\.example\.test$/);
+  assert.equal(outcomes[0].prepared, false, JSON.stringify(outcomes[0]));
+  assert.equal(outcomes[0].constructionFailed, true);
+  assert.match(outcomes[0].reason, /P10B synthetic opportunity/i);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM crm_communications').get().n, 0);
 });
 
 test('P5 refuses preparation when the campaign leaves initial-pending after claim', async (t) => {

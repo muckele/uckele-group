@@ -12,6 +12,10 @@ import {
   buildDealHunterCimRequestEmail,
   normalizeResendTags,
 } from './delivery.js';
+import {
+  buildP10bControlledMailboxTestEmail,
+  requiresP10bControlledMailboxTemplate,
+} from './pursueCimControlledMailboxTemplate.js';
 
 const leaseMilliseconds = 5 * 60 * 1000;
 
@@ -27,25 +31,31 @@ function proposal(candidate, authority, recipient, config) {
   const fromAddress = deliveryConfig.delivery.resendFromEmail
     || deliveryConfig.delivery.fallbackRecipient;
   if (!fromAddress || !recipient.email) throw new Error('CIM sender or recipient unavailable');
-  const field = (name) => authority.sourceRows.find((row) => row.field === name)?.value || '';
-  const message = buildDealHunterCimRequestEmail({
-    to: recipient.email,
-    deal: {
-      opportunityId: candidate.opportunity_id,
-      dealKey: authority.score?.deal_key || '',
-      name: authority.opportunity?.canonical_name || authority.score?.name || '',
-      industry: field('industry'),
-      location: authority.opportunity?.canonical_location || '',
-      listingUrl: field('listing_url') || authority.score?.listing_url || '',
-      brokerName: recipient.displayName,
-      score: authority.score?.fit_score,
-    },
-    requestedBy: 'pursue-cim-autopilot',
-    cimRequestId: candidate.touch_id,
-    submissionId: candidate.crm_submission_id,
-    manualStage1: { greeting: recipient.firstName ? `Hi ${recipient.firstName},` : 'Hello,' },
-    configOverride: deliveryConfig,
-  });
+  let message;
+  if (requiresP10bControlledMailboxTemplate({ candidate, authority, config })) {
+    message = buildP10bControlledMailboxTestEmail({ candidate, authority, recipient,
+      config, deliveryConfig });
+  } else {
+    const field = (name) => authority.sourceRows.find((row) => row.field === name)?.value || '';
+    message = buildDealHunterCimRequestEmail({
+      to: recipient.email,
+      deal: {
+        opportunityId: candidate.opportunity_id,
+        dealKey: authority.score?.deal_key || '',
+        name: authority.opportunity?.canonical_name || authority.score?.name || '',
+        industry: field('industry'),
+        location: authority.opportunity?.canonical_location || '',
+        listingUrl: field('listing_url') || authority.score?.listing_url || '',
+        brokerName: recipient.displayName,
+        score: authority.score?.fit_score,
+      },
+      requestedBy: 'pursue-cim-autopilot',
+      cimRequestId: candidate.touch_id,
+      submissionId: candidate.crm_submission_id,
+      manualStage1: { greeting: recipient.firstName ? `Hi ${recipient.firstName},` : 'Hello,' },
+      configOverride: deliveryConfig,
+    });
+  }
   const tags = normalizeResendTags([
     ...message.tags,
     { name: 'cim_conversation_id', value: candidate.conversation_id },

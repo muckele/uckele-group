@@ -5601,6 +5601,38 @@ export function createSqliteStorage(config, options = {}) {
       SELECT NEW.opportunity_id, MAX(revision) + 1, NEW.primary_submission_id
       FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = NEW.opportunity_id;
     END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_opportunity_identity_update
+    AFTER UPDATE OF canonical_name, primary_submission_id, identity_version, metadata
+    ON deal_hunter_opportunities
+    WHEN (OLD.opportunity_id GLOB 'p10b-*'
+      OR OLD.identity_version = 'p10b-synthetic-v1'
+      OR NEW.identity_version = 'p10b-synthetic-v1'
+      OR (json_valid(OLD.metadata) AND json_extract(OLD.metadata, '$.p10bSynthetic') = 1)
+      OR (json_valid(NEW.metadata) AND json_extract(NEW.metadata, '$.p10bSynthetic') = 1))
+      AND (OLD.canonical_name IS NOT NEW.canonical_name
+        OR OLD.primary_submission_id IS NOT NEW.primary_submission_id
+        OR OLD.identity_version IS NOT NEW.identity_version
+        OR OLD.metadata IS NOT NEW.metadata)
+    BEGIN
+      UPDATE deal_hunter_opportunities
+      SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id = NEW.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_submission_identity_update
+    AFTER UPDATE OF source, metadata, deal_hunter_opportunity_id ON contact_submissions
+    WHEN (OLD.source = 'p10b-controlled-mailbox' OR NEW.source = 'p10b-controlled-mailbox'
+      OR OLD.deal_hunter_opportunity_id GLOB 'p10b-*'
+      OR NEW.deal_hunter_opportunity_id GLOB 'p10b-*'
+      OR (json_valid(OLD.metadata) AND json_extract(OLD.metadata, '$.p10bSynthetic') = 1)
+      OR (json_valid(NEW.metadata) AND json_extract(NEW.metadata, '$.p10bSynthetic') = 1))
+      AND (OLD.source IS NOT NEW.source OR OLD.metadata IS NOT NEW.metadata
+        OR OLD.deal_hunter_opportunity_id IS NOT NEW.deal_hunter_opportunity_id)
+    BEGIN
+      UPDATE deal_hunter_opportunities
+      SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id IN (OLD.deal_hunter_opportunity_id, NEW.deal_hunter_opportunity_id)
+        OR primary_submission_id IN (OLD.id, NEW.id);
+    END;
     CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_source_insert
     AFTER INSERT ON deal_hunter_opportunity_source_observations
     BEGIN

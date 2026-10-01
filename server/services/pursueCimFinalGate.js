@@ -1,12 +1,23 @@
 import { randomBytes } from 'node:crypto';
 
-import { getConfig, validateCimProviderProfileBinding } from '../config.js';
+import {
+  CONTROLLED_CIM_MAILBOX_PROFILE,
+  getConfig,
+  validateCimProviderProfileBinding,
+} from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
 import { readCimCurrentAuthority as readCurrentCimAuthority } from './cimCampaignSafety.js';
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { CIM_CAMPAIGN_POLICY_VERSION } from './cimCampaignPolicy.js';
+import {
+  P10B_CONTROLLED_MAILBOX_HTML,
+  P10B_CONTROLLED_MAILBOX_SUBJECT,
+  P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
+  P10B_CONTROLLED_MAILBOX_TEXT,
+  isP10bControlledMailboxSyntheticMember,
+} from './pursueCimControlledMailboxTemplate.js';
 
 const READINESS_VERSION = 'cim-provider-readiness-v1';
 const SOURCE_AUTHORITY_VERSION = 'cim-source-health-authority-v1';
@@ -257,7 +268,15 @@ export async function authorizePreparedCimTransmission({
     replyToAddress: context.communication?.reply_to_address,
   });
   if (!profileBinding.ok) return failure(profileBinding.blockers[0] || 'profile_mismatch');
-  const unknownTransmissionPolicy = context.transmission.payload_version !== INITIAL_PAYLOAD_VERSION
+  const controlledMailboxProfile = providerProfile === CONTROLLED_CIM_MAILBOX_PROFILE;
+  const supportedInitialPayload = controlledMailboxProfile
+    ? context.transmission.payload_version === P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION
+      && context.communication?.subject === P10B_CONTROLLED_MAILBOX_SUBJECT
+      && context.communication?.body_text_digest === sha256(P10B_CONTROLLED_MAILBOX_TEXT)
+      && context.communication?.body_html_digest === sha256(P10B_CONTROLLED_MAILBOX_HTML)
+      && context.members.every(isP10bControlledMailboxSyntheticMember)
+    : context.transmission.payload_version === INITIAL_PAYLOAD_VERSION;
+  const unknownTransmissionPolicy = !supportedInitialPayload
     || context.conversation?.sender_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
     || context.conversation?.reply_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
     || context.conversation?.batching_policy_version !== INITIAL_BATCHING_POLICY_VERSION;
@@ -336,6 +355,16 @@ export async function authorizePreparedCimTransmission({
       currentAuthority = { opportunityId, blocked: true,
         blockers: ['source-authority-unavailable'], sourceRows: [], sourceStates: [],
         identityExceptions: [], sourceHealth: { healthy: false, issues: ['unavailable'] } };
+    }
+    if (controlledMailboxProfile) {
+      const contextRevision = Number(member.opportunity?.campaign_authority_revision);
+      const currentRevision = Number(currentAuthority?.opportunity?.campaign_authority_revision);
+      if (currentAuthority?.opportunityId !== opportunityId
+        || currentAuthority?.opportunity?.opportunity_id !== opportunityId
+        || !Number.isSafeInteger(contextRevision) || contextRevision < 1
+        || currentRevision !== contextRevision) {
+        return failure('source_authority_unavailable');
+      }
     }
     members.push({
       membership: member.membership,
