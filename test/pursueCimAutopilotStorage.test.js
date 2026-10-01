@@ -2258,7 +2258,7 @@ test('P6A SQLite final gate consumes one authority, keeps the raw nonce ephemera
 });
 
 test('P6B SQLite same-process final gate enters the common provider seam exactly once', async (t) => {
-  const { storage, authorization, gate } =
+  const { storage, database, authorization, gate } =
     await createFinalGateFixture(t, 'p6b-same-process');
   const finalGate = await gate();
   assert.equal(finalGate.authorized, true, JSON.stringify(finalGate));
@@ -2291,6 +2291,13 @@ test('P6B SQLite same-process final gate enters the common provider seam exactly
   assert.equal(replay.reconciliationOnly, true);
   assert.equal(providerCalls, 1);
   assert.equal((await storage.readCimOutreachCounters()).providerSeamEntries, 1);
+  const operations = await storage.readPursueCimOperationsSnapshot({ now: at, limit: 100 });
+  assert.deepEqual(operations.boundary, { accepts: 1, rejects: 1,
+    byWriterPath: { 'accepted:pursue-cim-initial': 1,
+      'rejected:pursue-cim-initial': 1 } });
+  assert.equal(database.prepare(`SELECT reason_code FROM deal_hunter_cim_audit_events
+    WHERE event_type='provider-boundary-rejected'`).get().reason_code,
+  'cim-provider-seam-already-entered');
 });
 
 test('P6C accepted provider result atomically finalizes the real P5→P6A→P6B pipeline once', async (t) => {
@@ -3821,6 +3828,146 @@ test('P1B safety stop atomically cancels prepared work and issued authorization'
     .get(authority.touchId).state, 'cancelled-before-provider');
   assert.equal(database.prepare('SELECT withdrawn_at FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?')
     .get('safety-held-auth').withdrawn_at, at);
+});
+
+test('P9 SQLite operations snapshot is bounded, read-only, and classifies shadow candidates', async (t) => {
+  const { storage, database, authority, prepared } = await createPreparedFixture(t, 'p9-operations');
+  seedLegacyEvidence(database);
+  database.prepare(`UPDATE deal_hunter_cim_requests SET last_attempt_at = ?
+    WHERE id = 'legacy-request'`).run('2026-09-24T19:00:00.000Z');
+  database.prepare(`INSERT INTO deal_hunter_cim_audit_events
+    (id,event_type,reason_code,actor,source,occurred_at,metadata)
+    VALUES ('p9-capability-block','final-gate-blocked','capability_inactive',
+      'fixture','test',?,'{}'),
+      ('p9-readiness-block','final-gate-blocked','provider_readiness_unavailable',
+      'fixture','test',?,'{}')`).run(at, at);
+  const before = Object.fromEntries([
+    'deal_hunter_pursuit_enrollments', 'deal_hunter_cim_campaigns',
+    'deal_hunter_cim_campaign_touches', 'deal_hunter_cim_transmissions',
+    'deal_hunter_cim_live_provider_authorizations', 'deal_hunter_cim_audit_events',
+  ].map((table) => [table, fingerprintRows(database, table, 'rowid')]));
+
+  const snapshot = await storage.readPursueCimOperationsSnapshot({ now: at, limit: 100 });
+  const after = Object.fromEntries(Object.keys(before)
+    .map((table) => [table, fingerprintRows(database, table, 'rowid')]));
+
+  assert.deepEqual(after, before);
+  assert.equal(snapshot.counts.campaigns, 1);
+  assert.equal(snapshot.counts.transmissions, 1);
+  assert.equal(snapshot.stateCounts.campaigns['initial-pending'], 1);
+  assert.equal(snapshot.stateCounts.transmissions.prepared, 1);
+  assert.equal(snapshot.pause.paused, true);
+  assert.ok(snapshot.shadowCandidates.some((candidate) =>
+    candidate.kind === 'would-enroll' && candidate.subjectId === authority.enrollmentId));
+  assert.ok(snapshot.shadowCandidates.some((candidate) =>
+    candidate.kind === 'would-send' && candidate.subjectId === prepared.id));
+  assert.equal(snapshot.invariants.shadowProviderCalls, 0);
+  assert.equal(snapshot.invariants.expiredActivationAttempts, 1);
+  assert.equal(snapshot.invariants.readinessLoss, 1);
+  assert.equal(snapshot.legacy.writerInvocations, 1);
+  assert.equal(snapshot.invariants.unexpectedLegacyInvocations, 0,
+    'historical legacy attempts are inventory, not unexpected invocation findings');
+  database.prepare(`UPDATE deal_hunter_cim_requests SET last_attempt_at = ?
+    WHERE id = 'legacy-request'`).run(at);
+  const afterLegacyInvocation = await storage.readPursueCimOperationsSnapshot({ now: at, limit: 100 });
+  assert.equal(afterLegacyInvocation.invariants.unexpectedLegacyInvocations, 1);
+  database.prepare(`UPDATE deal_hunter_cim_safety_settings SET outreach_paused = 0
+    WHERE id = 'global'`).run();
+  const unpaused = await storage.readPursueCimOperationsSnapshot({ now: at, limit: 100 });
+  assert.ok(unpaused.shadowCandidates.some((candidate) => candidate.kind === 'would-send'
+    && candidate.subjectId === prepared.id && candidate.eligible === false
+    && candidate.reason === 'exact_live_authorization_missing'));
+  assert.ok(snapshot.shadowCandidates.length <= 100);
+});
+
+test('P9 SQLite shadow send remains blocked when live final-gate readiness is not proven', async (t) => {
+  const { storage, prepared } = await createFinalGateFixture(t, 'p9-shadow-readiness');
+
+  const snapshot = await storage.readPursueCimOperationsSnapshot({ now: at, limit: 100 });
+
+  assert.ok(snapshot.shadowCandidates.some((candidate) => candidate.kind === 'would-send'
+    && candidate.subjectId === prepared.id && candidate.eligible === false
+    && candidate.reason === 'final_gate_readiness_unproven'));
+});
+
+test('P9 terminal-before-provider alert excludes the allowed post-gate pre-seam race', async (t) => {
+  const { storage, database, authority, prepared, gate } =
+    await createFinalGateFixture(t, 'p9-terminal-cutoff');
+  assert.equal((await gate()).authorized, true);
+  database.prepare(`UPDATE deal_hunter_cim_transmissions
+    SET provider_seam_entered_at=? WHERE id=?`)
+    .run('2026-09-25T19:02:00.000Z', prepared.id);
+  database.prepare(`INSERT INTO deal_hunter_cim_terminal_events
+    (id,scope,scope_id,campaign_id,revision,reason_code,evidence_type,evidence_id,
+      observed_at,actor,source,metadata_digest,created_at)
+    VALUES ('p9-terminal-race','campaign',?,?,1,'reply_received','signed-event',?,
+      ?,'fixture-owner','synthetic-test',?,?)`).run(authority.campaignId,
+    authority.campaignId, 'p9-terminal-race-evidence', '2026-09-25T19:01:00.000Z',
+    digest('a'), '2026-09-25T19:01:00.000Z');
+
+  const afterGate = await storage.readPursueCimOperationsSnapshot({ now: at, limit: 100 });
+  assert.equal(afterGate.invariants.replyOrMaterialsBeforeGateProviderCalls, 0);
+
+  database.prepare(`INSERT INTO deal_hunter_cim_terminal_events
+    (id,scope,scope_id,conversation_id,revision,reason_code,evidence_type,evidence_id,
+      observed_at,actor,source,metadata_digest,created_at)
+    VALUES ('p9-terminal-before-gate','conversation',?,?,1,'materials_received',
+      'signed-event',?,?,'fixture-owner','synthetic-test',?,?)`).run(
+    authority.conversationId, authority.conversationId, 'p9-terminal-before-evidence',
+    '2026-09-25T18:59:00.000Z', digest('b'), '2026-09-25T18:59:00.000Z');
+  const beforeGate = await storage.readPursueCimOperationsSnapshot({ now: at, limit: 100 });
+  assert.equal(beforeGate.invariants.replyOrMaterialsBeforeGateProviderCalls, 1);
+});
+
+test('P9 SQLite automatic containment atomically pauses and withdraws live authority with replay safety', async (t) => {
+  const { storage, database, authorization } = await createFinalGateFixture(t, 'p9-containment');
+  await assert.rejects(storage.applyPursueCimAutomaticContainment({
+    findingId: '6'.repeat(64), evidenceDigest: '5'.repeat(64),
+    findingCodes: ['operator_supplied_boolean'], actor: 'p9-shadow-containment',
+    now: '2026-09-25T19:00:00.000Z',
+  }), /Invalid Pursue CIM containment findings/);
+  const command = { findingId: '7'.repeat(64), evidenceDigest: '8'.repeat(64),
+    findingCodes: ['duplicate_provider_identity', 'missing_live_envelope'],
+    actor: 'p9-shadow-containment', now: '2026-09-25T19:01:00.000Z' };
+  const first = await storage.applyPursueCimAutomaticContainment(command);
+  const replay = await storage.applyPursueCimAutomaticContainment(command);
+  database.prepare(`UPDATE deal_hunter_cim_safety_settings SET outreach_paused=0
+    WHERE id='global'`).run();
+  const reasserted = await storage.applyPursueCimAutomaticContainment(command);
+
+  assert.deepEqual(first, { applied: true, replay: false, paused: true,
+    withdrawnActivations: 3, withdrawnAuthorizations: 1 });
+  assert.deepEqual(replay, { applied: false, replay: true, paused: true,
+    withdrawnActivations: 0, withdrawnAuthorizations: 0 });
+  assert.deepEqual(reasserted, { applied: false, replay: true, paused: true,
+    withdrawnActivations: 0, withdrawnAuthorizations: 0 });
+  assert.equal(database.prepare(`SELECT outreach_paused FROM deal_hunter_cim_safety_settings
+    WHERE id='global'`).get().outreach_paused, 1);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_capability_activations
+    WHERE status='current'`).get().count, 0);
+  assert.equal(database.prepare(`SELECT withdrawn_at FROM deal_hunter_cim_live_provider_authorizations
+    WHERE id=?`).get(authorization.id).withdrawn_at, command.now);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+    WHERE event_type='automatic-containment'`).get().count, 1);
+});
+
+test('P9 SQLite containment rolls back pause and withdrawals when immutable audit persistence fails', async (t) => {
+  const { storage, database, authorization } = await createFinalGateFixture(t, 'p9-containment-rollback');
+  database.exec(`CREATE TRIGGER reject_p9_containment_audit
+    BEFORE INSERT ON deal_hunter_cim_audit_events
+    WHEN NEW.event_type = 'automatic-containment'
+    BEGIN SELECT RAISE(ABORT, 'synthetic P9 audit failure'); END;`);
+  await assert.rejects(storage.applyPursueCimAutomaticContainment({
+    findingId: '9'.repeat(64), evidenceDigest: 'a'.repeat(64),
+    findingCodes: ['shadow_provider_call'], actor: 'p9-shadow-containment',
+    now: '2026-09-25T19:01:00.000Z',
+  }), /synthetic P9 audit failure/);
+  assert.equal(database.prepare(`SELECT outreach_paused FROM deal_hunter_cim_safety_settings
+    WHERE id='global'`).get().outreach_paused, 0);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_capability_activations
+    WHERE status='current'`).get().count, 3);
+  assert.equal(database.prepare(`SELECT withdrawn_at FROM deal_hunter_cim_live_provider_authorizations
+    WHERE id=?`).get(authorization.id).withdrawn_at, null);
 });
 
 test('P1B prepared and provider-pending outbox rows cannot reach the legacy sender', async (t) => {

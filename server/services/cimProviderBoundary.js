@@ -70,6 +70,26 @@ function denied(errorCategory, reconciliationOnly = false) {
   return { allowed: false, errorCategory, reconciliationOnly };
 }
 
+async function deniedWithObservation({ storage, authorization, errorCategory,
+  reconciliationOnly = false, now }) {
+  const outcome = denied(errorCategory, reconciliationOnly);
+  if (typeof storage?.recordCimProviderBoundaryRejection !== 'function') return outcome;
+  try {
+    await storage.recordCimProviderBoundaryRejection({
+      transmissionId: authorization.transmissionId,
+      authorizationId: authorization.authorizationId,
+      reasonCode: errorCategory,
+      reconciliationOnly,
+      expectedRowVersion: authorization.expectedRowVersion,
+      actor: authorization.actor,
+      now,
+    });
+  } catch {
+    return outcome;
+  }
+  return outcome;
+}
+
 export async function enterCimProviderBoundary({
   message, storage, authorization, now = new Date(),
 } = {}) {
@@ -81,6 +101,9 @@ export async function enterCimProviderBoundary({
     return denied('cim-provider-seam-unauthorized');
   }
   const nowIso = now instanceof Date ? now.toISOString() : new Date(now).toISOString();
+  const reject = (errorCategory, reconciliationOnly = false) => deniedWithObservation({
+    storage, authorization, errorCategory, reconciliationOnly, now: nowIso,
+  });
   let durable;
   try {
     durable = await storage.readCimFinalGateContext({
@@ -91,7 +114,7 @@ export async function enterCimProviderBoundary({
       now: nowIso,
     });
   } catch {
-    return denied('cim-provider-seam-unauthorized');
+    return reject('cim-provider-seam-unauthorized');
   }
   const transmission = durable?.transmission;
   const liveAuthorization = durable?.authorization;
@@ -113,7 +136,7 @@ export async function enterCimProviderBoundary({
     || communication.delivery_state !== 'provider-pending'
     || outbox.state !== 'provider-pending'
     || Number(transmission.invocation_authority_count) !== 1) {
-    return denied('cim-provider-work-mismatch');
+    return reject('cim-provider-work-mismatch');
   }
   if (message.kind !== expectedWork.kind
     || communication.kind !== expectedWork.kind
@@ -123,10 +146,10 @@ export async function enterCimProviderBoundary({
       && members.some((member) => member?.touch?.kind !== expectedWork.touchKind))
     || (expectedWork.excludeTouchKind
       && members.some((member) => member?.touch?.kind === expectedWork.excludeTouchKind))) {
-    return denied('cim-provider-work-mismatch');
+    return reject('cim-provider-work-mismatch');
   }
   if (transmission.provider_seam_entered_at) {
-    return denied('cim-provider-seam-already-entered', true);
+    return reject('cim-provider-seam-already-entered', true);
   }
   if (liveAuthorization.id !== authorization.authorizationId
     || liveAuthorization.transmission_id !== transmission.id
@@ -138,17 +161,17 @@ export async function enterCimProviderBoundary({
     || !liveAuthorization.consumed_at
     || liveAuthorization.withdrawn_at
     || Date.parse(liveAuthorization.expires_at) <= Date.parse(nowIso)) {
-    return denied('cim-provider-seam-unauthorized');
+    return reject('cim-provider-seam-unauthorized');
   }
   if (liveAuthorization.writer_path !== authorization.writerPath) {
-    return denied('cim-provider-writer-path-mismatch');
+    return reject('cim-provider-writer-path-mismatch');
   }
   if (liveAuthorization.provider_profile !== authorization.providerProfile
     || activation.provider_profile !== authorization.providerProfile) {
-    return denied('cim-provider-profile-mismatch');
+    return reject('cim-provider-profile-mismatch');
   }
   if (sha256(authorization.boundaryNonce) !== transmission.boundary_nonce_digest) {
-    return denied('cim-provider-nonce-invalid');
+    return reject('cim-provider-nonce-invalid');
   }
   const touchIds = members.map((member) => member?.touch?.id).filter(Boolean).sort();
   const templateVersions = members.map((member) => member?.campaign?.template_version || '');
@@ -168,7 +191,7 @@ export async function enterCimProviderBoundary({
   if (!messageMatchesCommunication
     || payloadDigest !== transmission.payload_digest
     || liveAuthorization.payload_digest !== transmission.payload_digest) {
-    return denied('cim-provider-payload-mismatch');
+    return reject('cim-provider-payload-mismatch');
   }
   let seam;
   try {
@@ -185,10 +208,10 @@ export async function enterCimProviderBoundary({
       now: nowIso,
     });
   } catch {
-    return denied('cim-provider-seam-unauthorized', true);
+    return reject('cim-provider-seam-unauthorized', true);
   }
-  if (seam?.alreadyEntered) return denied('cim-provider-seam-already-entered', true);
-  if (!seam?.entered) return denied('cim-provider-seam-unauthorized');
+  if (seam?.alreadyEntered) return reject('cim-provider-seam-already-entered', true);
+  if (!seam?.entered) return reject('cim-provider-seam-unauthorized');
   return { allowed: true, payloadDigest,
     providerFinalizationRowVersion: authorization.expectedRowVersion + 1 };
 }

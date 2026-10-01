@@ -1400,6 +1400,75 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return counts;
     },
 
+    async readPursueCimOperationsSnapshot({ now, limit = 100 } = {}) {
+      if (typeof now !== 'string' || !Number.isFinite(Date.parse(now))
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid Pursue CIM operations snapshot request');
+      }
+      const { data, error } = await client.rpc('pursue_cim_read_operations_snapshot_v1', {
+        p_now: new Date(now).toISOString(), p_limit: limit,
+      });
+      if (error) throw error;
+      const countObject = (value, field) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)
+          || Object.keys(value).length > 100
+          || Object.values(value).some((item) => {
+            const normalized = typeof item === 'string' ? Number(item) : item;
+            return !Number.isSafeInteger(normalized) || normalized < 0;
+          })) throw new Error(`Malformed Pursue CIM operations snapshot: ${field}`);
+      };
+      if (!data || typeof data !== 'object' || Array.isArray(data)
+        || !data.counts || !data.stateCounts || !data.reasonCounts
+        || !data.providerPending || !data.activations || !data.legacy
+        || !data.boundary || !data.invariants || !data.pause
+        || !Array.isArray(data.shadowCandidates) || data.shadowCandidates.length > limit
+        || typeof data.pause.paused !== 'boolean'
+        || typeof data.pause.source !== 'string') {
+        throw new Error('Malformed Pursue CIM operations snapshot');
+      }
+      countObject(data.counts, 'counts');
+      for (const [key, value] of Object.entries(data.stateCounts)) countObject(value, `stateCounts.${key}`);
+      for (const [key, value] of Object.entries(data.reasonCounts)) countObject(value, `reasonCounts.${key}`);
+      for (const [key, value] of Object.entries(data.invariants)) {
+        const normalized = typeof value === 'string' ? Number(value) : value;
+        if (!Number.isSafeInteger(normalized) || normalized < 0) {
+          throw new Error(`Malformed Pursue CIM operations snapshot: invariants.${key}`);
+        }
+      }
+      return data;
+    },
+
+    async applyPursueCimAutomaticContainment(command) {
+      const { data, error } = await client.rpc('pursue_cim_apply_automatic_containment_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      const result = normalizePursueCimRpcResult(data, ['applied', 'replay'], [], {
+        extraFields: ['paused', 'withdrawnActivations', 'withdrawnAuthorizations'],
+        requireOutcome: true,
+      });
+      if (result.paused !== true
+        || !Number.isSafeInteger(Number(result.withdrawnActivations))
+        || Number(result.withdrawnActivations) < 0
+        || !Number.isSafeInteger(Number(result.withdrawnAuthorizations))
+        || Number(result.withdrawnAuthorizations) < 0) {
+        throw new Error('Malformed Pursue CIM containment result');
+      }
+      return { ...result,
+        withdrawnActivations: Number(result.withdrawnActivations),
+        withdrawnAuthorizations: Number(result.withdrawnAuthorizations) };
+    },
+
+    async recordCimProviderBoundaryRejection(command) {
+      const { data, error } = await client.rpc('pursue_cim_record_boundary_rejection_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data, ['applied', 'replay'], [], {
+        requireOutcome: true,
+      });
+    },
+
     async listCimSafetyEvents({ safetyRunId }) {
       const runId = String(safetyRunId || '').trim();
       if (!runId || runId.length > 240 || runId !== safetyRunId) {

@@ -13,6 +13,19 @@ const cimWriterCapabilities = new Map([
   ['pursue-cim-batch', 'fl04c-batch'],
   ['pursue-cim-autopilot-batch', 'fl04c-batch'],
 ]);
+const pursueCimContainmentFindingCodes = new Set([
+  'duplicate_provider_identity', 'missing_durable_authority', 'multiple_active_campaigns',
+  'duplicate_accepted_touch', 'active_identity_ambiguity', 'unexpected_legacy_invocation',
+  'terminal_evidence_before_provider_call', 'invalid_claimed_timezone',
+  'expired_activation_attempt', 'missing_live_envelope',
+  'inbound_or_reconciliation_readiness_loss', 'shadow_provider_call',
+]);
+const pursueCimBoundaryRejectionCodes = new Set([
+  'cim-provider-seam-unauthorized', 'cim-provider-work-mismatch',
+  'cim-provider-seam-already-entered', 'cim-provider-writer-path-mismatch',
+  'cim-provider-profile-mismatch', 'cim-provider-nonce-invalid',
+  'cim-provider-payload-mismatch',
+]);
 
 function digest(...parts) {
   const framed = parts.map((part) => {
@@ -154,7 +167,7 @@ function appendAudit(database, event) {
     ) VALUES (
       @id, @eventType, @opportunityId, @campaignId, @conversationId, @touchId,
       @transmissionId, @activationId, @authorizationId, @priorState, @nextState,
-      @reasonCode, @authorityDigest, @payloadDigest, @actor, @source, @occurredAt, '{}'
+      @reasonCode, @authorityDigest, @payloadDigest, @actor, @source, @occurredAt, @metadata
     )
   `).run({
     id: event.id ?? digest('cim-audit:v1', event.eventType, event.authorityId),
@@ -174,6 +187,7 @@ function appendAudit(database, event) {
     actor: event.actor,
     source: event.source ?? 'sqlite-transition',
     occurredAt: event.occurredAt,
+    metadata: JSON.stringify(event.metadata ?? {}),
   });
 }
 
@@ -1058,6 +1072,37 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         return { entered: true, alreadyEntered: false, unauthorized: false };
       }).immediate();
     },
+    async recordCimProviderBoundaryRejection(command) {
+      const transmissionId = requiredText(command.transmissionId, 'transmissionId');
+      const authorizationId = requiredText(command.authorizationId, 'authorizationId');
+      const reasonCode = requiredText(command.reasonCode, 'reasonCode', 160);
+      const actor = requiredText(command.actor, 'actor', 200);
+      const expectedRowVersion = requiredRevision(command.expectedRowVersion,
+        'expectedRowVersion');
+      const now = requiredInstant(command.now);
+      if (!pursueCimBoundaryRejectionCodes.has(reasonCode)
+        || typeof command.reconciliationOnly !== 'boolean') {
+        throw new Error('Invalid CIM provider boundary rejection');
+      }
+      return database.transaction(() => {
+        const authorization = database.prepare(`SELECT transmission_id
+          FROM deal_hunter_cim_live_provider_authorizations WHERE id=?`).get(authorizationId);
+        if (authorization?.transmission_id !== transmissionId) {
+          throw new Error('Invalid CIM provider boundary rejection authority');
+        }
+        const id = digest('cim-boundary-rejected:v1', transmissionId, authorizationId,
+          reasonCode, expectedRowVersion);
+        if (database.prepare(`SELECT 1 FROM deal_hunter_cim_audit_events WHERE id=?`).get(id)) {
+          return { applied: false, replay: true };
+        }
+        appendAudit(database, { id, eventType: 'provider-boundary-rejected',
+          authorityId: id, transmissionId, authorizationId, reasonCode,
+          actor, source: 'provider-boundary-observer', occurredAt: now,
+          metadata: { reconciliationOnly: command.reconciliationOnly,
+            expectedRowVersion } });
+        return { applied: true, replay: false };
+      }).immediate();
+    },
     async authorizeCimProviderPending(command) {
       const transmissionId = requiredText(command.transmissionId, 'transmissionId');
       const authorizationId = requiredText(command.authorizationId, 'authorizationId');
@@ -1858,6 +1903,279 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         counts[key] = database.prepare(`SELECT COUNT(*) AS n FROM ${table} ${where}`).get().n;
       }
       return counts;
+    },
+    async readPursueCimOperationsSnapshot({ now, limit = 100 } = {}) {
+      const at = canonicalInstant(now);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid Pursue CIM operations limit');
+      }
+      const counts = await transitions.readCimOutreachCounters();
+      const grouped = (table, column, where = '') => Object.fromEntries(database.prepare(`
+        SELECT COALESCE(${column}, 'unspecified') AS key, COUNT(*) AS count
+        FROM ${table} ${where} GROUP BY COALESCE(${column}, 'unspecified')
+        ORDER BY key LIMIT 101
+      `).all().slice(0, 100).map((row) => [row.key, row.count]));
+      const reasonGrouped = (table, where = '') => grouped(table, 'reason_code', where);
+      const safety = database.prepare(`SELECT * FROM deal_hunter_cim_safety_settings
+        WHERE id = 'global'`).get() ?? null;
+      const paused = safety ? Number(safety.outreach_paused) === 1 : true;
+      const providerPending = database.prepare(`SELECT COUNT(*) AS count,
+        MIN(updated_at) AS oldest_at FROM deal_hunter_cim_transmissions
+        WHERE state IN ('provider-pending', 'ambiguous')`).get();
+      const activation = database.prepare(`SELECT COUNT(*) AS current,
+        SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= ? THEN 1 ELSE 0 END) AS expired,
+        MIN(CASE WHEN expires_at > ? THEN expires_at END) AS nearest_expiry_at
+        FROM deal_hunter_cim_capability_activations WHERE status = 'current'`).get(at, at);
+      const legacy = database.prepare(`SELECT COUNT(*) AS total,
+        SUM(CASE WHEN request_state IN ('pending', 'ready') THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN delivery_state IN ('ambiguous', 'unknown') THEN 1 ELSE 0 END) AS ambiguous,
+        SUM(CASE WHEN last_attempt_at IS NOT NULL THEN 1 ELSE 0 END) AS writer_invocations
+        FROM deal_hunter_cim_requests`).get();
+      const oldestAt = providerPending.oldest_at ?? '';
+      const scalar = (sql, ...parameters) => Number(database.prepare(sql).get(...parameters)?.count || 0);
+      const writerPathCounts = Object.fromEntries(database.prepare(`
+        SELECT 'accepted:' || a.writer_path AS key, COUNT(DISTINCT e.id) AS count
+        FROM deal_hunter_cim_audit_events e
+        JOIN deal_hunter_cim_live_provider_authorizations a
+          ON a.id=e.authorization_id
+        WHERE e.event_type='provider-seam-entered' GROUP BY a.writer_path
+        UNION ALL
+        SELECT 'rejected:' || a.writer_path, COUNT(DISTINCT e.id)
+        FROM deal_hunter_cim_audit_events e
+        JOIN deal_hunter_cim_live_provider_authorizations a
+          ON a.id=e.authorization_id
+        WHERE e.event_type='provider-boundary-rejected' GROUP BY a.writer_path
+        ORDER BY key LIMIT 100`).all().map((row) => [row.key, row.count]));
+      const missingAuthority = scalar(`SELECT COUNT(*) AS count
+        FROM deal_hunter_cim_transmissions tr
+        LEFT JOIN crm_communications c ON c.id = tr.communication_id
+        LEFT JOIN crm_email_outbox o ON o.id = tr.outbox_id
+        WHERE tr.provider_seam_entered_at IS NOT NULL AND (
+          c.id IS NULL OR o.id IS NULL OR tr.final_gate_authority_digest IS NULL
+          OR NOT EXISTS (SELECT 1 FROM deal_hunter_cim_live_provider_authorizations a
+            WHERE a.transmission_id = tr.id AND a.consumed_at IS NOT NULL))`);
+      const duplicateAcceptedTouches = scalar(`SELECT COUNT(*) AS count FROM (
+        SELECT m.touch_id FROM deal_hunter_cim_transmission_touches m
+        JOIN deal_hunter_cim_transmissions tr ON tr.id = m.transmission_id
+        WHERE tr.state = 'accepted' AND m.cancelled_at IS NULL
+        GROUP BY m.touch_id HAVING COUNT(*) > 1)`);
+      const multipleActiveCampaigns = scalar(`SELECT COUNT(*) AS count FROM (
+        SELECT opportunity_id FROM deal_hunter_cim_campaigns WHERE state IN (
+          'queued','waiting-on-eligibility','initial-pending','active-follow-up',
+          'action-required','provider-ambiguous') GROUP BY opportunity_id HAVING COUNT(*) > 1)`);
+      const activeIdentityAmbiguities = scalar(`SELECT COUNT(DISTINCT c.id) AS count
+        FROM deal_hunter_cim_campaigns c JOIN deal_hunter_identity_exceptions e
+          ON e.status = 'open' AND EXISTS (
+            SELECT 1 FROM json_each(e.candidate_opportunity_ids)
+            WHERE json_each.value = c.opportunity_id)
+        WHERE c.state IN ('queued','waiting-on-eligibility','initial-pending',
+          'active-follow-up','action-required','provider-ambiguous')`);
+      const invalidClaimedTimezones = scalar(`SELECT COUNT(*) AS count
+        FROM deal_hunter_cim_campaign_touches t
+        LEFT JOIN deal_hunter_opportunity_timezone_revisions z
+          ON z.opportunity_id = t.opportunity_id AND z.revision = t.timezone_revision
+        WHERE t.state = 'claimed' AND (z.opportunity_id IS NULL
+          OR z.state NOT IN ('verified','derived') OR z.iana_timezone IS NULL)`);
+      const terminalBeforeProvider = scalar(`SELECT COUNT(DISTINCT tr.id) AS count
+        FROM deal_hunter_cim_transmissions tr
+        JOIN deal_hunter_cim_transmission_touches m ON m.transmission_id = tr.id
+        JOIN deal_hunter_cim_audit_events provider_pending
+          ON provider_pending.transmission_id = tr.id
+          AND provider_pending.event_type = 'provider-pending'
+        JOIN deal_hunter_cim_terminal_events e ON
+          (e.campaign_id = m.campaign_id OR e.conversation_id = tr.conversation_id)
+        WHERE tr.provider_seam_entered_at IS NOT NULL
+          AND e.created_at <= provider_pending.occurred_at
+          AND e.reason_code IN ('reply_received','materials_received',
+            'advanced_beyond_broker_outreach')`);
+      const shadowRows = database.prepare(`SELECT * FROM (
+        SELECT id AS subject_id, 'would-enroll' AS kind, state, reason_code,
+          NULL AS payload_digest, created_at AS sort_at
+        FROM deal_hunter_pursuit_enrollments
+        WHERE state IN ('queued','waiting-on-eligibility')
+        UNION ALL
+        SELECT id, 'would-claim', state, terminal_reason, NULL, due_at
+        FROM deal_hunter_cim_campaign_touches
+        WHERE kind='initial' AND state IN ('scheduled','claimed') AND due_at <= ?
+        UNION ALL
+        SELECT id, 'would-send', state, NULL, payload_digest, created_at
+        FROM deal_hunter_cim_transmissions
+        WHERE state='prepared' AND provider_seam_entered_at IS NULL
+      ) candidates ORDER BY sort_at, kind, subject_id LIMIT ?`).all(at, limit);
+      const shadowCandidates = shadowRows.map((candidate) => {
+        if (paused) return { kind: candidate.kind, subjectId: candidate.subject_id,
+          eligible: false, reason: 'central_outreach_pause' };
+        const capability = candidate.kind === 'would-enroll'
+          ? 'fl04b-enrollment' : 'fl04b-initial';
+        const currentActivation = currentActivationChain(database, capability, at);
+        if (!currentActivation) return { kind: candidate.kind, subjectId: candidate.subject_id,
+          eligible: false, reason: 'capability_inactive' };
+        if (candidate.kind === 'would-enroll' && candidate.state !== 'queued') {
+          return { kind: candidate.kind, subjectId: candidate.subject_id,
+            eligible: false, reason: candidate.reason_code || 'enrollment_waiting' };
+        }
+        if (candidate.kind === 'would-claim' && candidate.state !== 'scheduled') {
+          return { kind: candidate.kind, subjectId: candidate.subject_id,
+            eligible: false, reason: 'already_claimed' };
+        }
+        if (candidate.kind === 'would-send') {
+          const authorization = database.prepare(`SELECT 1
+            FROM deal_hunter_cim_live_provider_authorizations
+            WHERE transmission_id=? AND activation_id=? AND capability='fl04b-initial'
+              AND payload_digest=? AND maximum_calls=1 AND consumed_at IS NULL
+              AND withdrawn_at IS NULL AND expires_at > ? LIMIT 1`).get(
+            candidate.subject_id, currentActivation.id, candidate.payload_digest, at);
+          if (!authorization) return { kind: candidate.kind, subjectId: candidate.subject_id,
+            eligible: false, reason: 'exact_live_authorization_missing' };
+          return { kind: candidate.kind, subjectId: candidate.subject_id,
+            eligible: false, reason: 'final_gate_readiness_unproven' };
+        }
+        return { kind: candidate.kind, subjectId: candidate.subject_id,
+          eligible: true, reason: 'ready' };
+      });
+      return {
+        counts,
+        stateCounts: {
+          enrollments: grouped('deal_hunter_pursuit_enrollments', 'state'),
+          campaigns: grouped('deal_hunter_cim_campaigns', 'state'),
+          touches: grouped('deal_hunter_cim_campaign_touches', 'state'),
+          transmissions: grouped('deal_hunter_cim_transmissions', 'state'),
+          conversations: grouped('deal_hunter_broker_conversations', 'state'),
+        },
+        reasonCounts: {
+          enrollments: reasonGrouped('deal_hunter_pursuit_enrollments'),
+          campaigns: reasonGrouped('deal_hunter_cim_campaigns'),
+          touches: grouped('deal_hunter_cim_campaign_touches', 'terminal_reason'),
+          gateBlocks: reasonGrouped('deal_hunter_cim_audit_events',
+            "WHERE event_type = 'final-gate-blocked'"),
+        },
+        providerPending: { count: providerPending.count, oldestAt,
+          oldestAgeSeconds: oldestAt ? Math.max(0, Math.floor((Date.parse(at) - Date.parse(oldestAt)) / 1000)) : 0 },
+        activations: { current: activation.current, expired: activation.expired ?? 0,
+          nearestExpiryAt: activation.nearest_expiry_at ?? '',
+          modes: grouped('deal_hunter_cim_capability_activations', 'mode', "WHERE status = 'current'") },
+        legacy: { total: legacy.total, active: legacy.active ?? 0,
+          ambiguous: legacy.ambiguous ?? 0, writerInvocations: legacy.writer_invocations ?? 0,
+          classifications: grouped('deal_hunter_cim_requests', 'delivery_state') },
+        boundary: {
+          accepts: scalar(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+            WHERE event_type = 'provider-seam-entered'`),
+          rejects: scalar(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+            WHERE event_type = 'provider-boundary-rejected'`),
+          byWriterPath: writerPathCounts,
+        },
+        invariants: {
+          duplicateProviderIdentities: scalar(`SELECT COUNT(*) AS count
+            FROM deal_hunter_cim_audit_events WHERE event_type = 'provider-identity-conflict'`),
+          missingDurableAuthority: missingAuthority,
+          multipleActiveCampaigns,
+          duplicateAcceptedTouches,
+          activeIdentityAmbiguities,
+          unexpectedLegacyInvocations: scalar(`SELECT COUNT(*) AS count
+            FROM deal_hunter_cim_requests
+            WHERE last_attempt_at IS NOT NULL AND last_attempt_at >= (
+              SELECT MIN(created_at) FROM deal_hunter_cim_capability_activations
+              WHERE status='current' AND mode NOT IN ('off','shadow'))`),
+          replyOrMaterialsBeforeGateProviderCalls: terminalBeforeProvider,
+          invalidClaimedTimezones,
+          expiredActivationAttempts: scalar(`SELECT COUNT(*) AS count
+            FROM deal_hunter_cim_audit_events WHERE event_type='final-gate-blocked'
+              AND reason_code='capability_inactive'`),
+          missingEnvelopeAttempts: scalar(`SELECT COUNT(*) AS count
+            FROM deal_hunter_cim_audit_events WHERE event_type='final-gate-blocked'
+              AND reason_code IN ('live_authorization_missing','live_authorization_invalid',
+                'authorization_missing','authorization_expired')`),
+          readinessLoss: scalar(`SELECT COUNT(*) AS count
+            FROM deal_hunter_cim_audit_events WHERE event_type='final-gate-blocked'
+              AND reason_code='provider_readiness_unavailable'`),
+          shadowProviderCalls: scalar(`SELECT COUNT(*) AS count
+            FROM deal_hunter_cim_audit_events WHERE event_type='shadow-provider-call'`),
+        },
+        pause: { paused, source: safety ? 'operations-control' : 'fail-closed-default' },
+        shadowCandidates,
+      };
+    },
+    async applyPursueCimAutomaticContainment(command = {}) {
+      const findingId = requiredText(command.findingId, 'findingId', 64);
+      const evidenceDigest = requiredText(command.evidenceDigest, 'evidenceDigest', 64);
+      const actor = requiredText(command.actor, 'actor', 200);
+      const now = canonicalInstant(command.now);
+      if (!/^[0-9a-f]{64}$/.test(findingId) || !/^[0-9a-f]{64}$/.test(evidenceDigest)
+        || !Array.isArray(command.findingCodes) || command.findingCodes.length < 1
+        || command.findingCodes.length > 20) {
+        throw new Error('Invalid Pursue CIM containment command');
+      }
+      const findingCodes = command.findingCodes.map((code) => requiredText(code,
+        'findingCode', 160)).sort();
+      if (new Set(findingCodes).size !== findingCodes.length
+        || stableCanonicalJson(findingCodes) !== stableCanonicalJson(command.findingCodes)
+        || findingCodes.some((code) => !pursueCimContainmentFindingCodes.has(code))) {
+        throw new Error('Invalid Pursue CIM containment findings');
+      }
+      const auditId = `cim-containment:${findingId}`;
+      return database.transaction(() => {
+        const replay = Boolean(database.prepare(`SELECT 1 FROM deal_hunter_cim_audit_events
+          WHERE id = ?`).get(auditId));
+        const alreadySafe = database.prepare(`SELECT outreach_paused = 1 AS paused,
+          NOT EXISTS (SELECT 1 FROM deal_hunter_cim_capability_activations
+            WHERE status='current') AS activations_withdrawn,
+          NOT EXISTS (SELECT 1 FROM deal_hunter_cim_live_provider_authorizations
+            WHERE consumed_at IS NULL AND withdrawn_at IS NULL) AS authorizations_withdrawn
+          FROM deal_hunter_cim_safety_settings WHERE id='global'`).get();
+        if (replay && alreadySafe?.paused && alreadySafe.activations_withdrawn
+          && alreadySafe.authorizations_withdrawn) {
+          return { applied: false, replay: true, paused: true,
+            withdrawnActivations: 0, withdrawnAuthorizations: 0 };
+        }
+        const currentSafety = database.prepare(`SELECT * FROM deal_hunter_cim_safety_settings
+          WHERE id='global'`).get() ?? null;
+        let metadata = {};
+        try { metadata = JSON.parse(currentSafety?.metadata || '{}'); } catch { metadata = {}; }
+        database.prepare(`INSERT INTO deal_hunter_cim_safety_settings
+          (id, updated_at, outreach_paused, updated_by, metadata)
+          VALUES ('global', ?, 1, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,
+            outreach_paused=1, updated_by=excluded.updated_by, metadata=excluded.metadata`)
+          .run(now, actor, JSON.stringify({ ...metadata, p9Containment: {
+            findingId, evidenceDigest, findingCodes, occurredAt: now } }));
+        const activations = database.prepare(`SELECT id FROM deal_hunter_cim_capability_activations
+          WHERE status='current' ORDER BY id`).all();
+        for (const activation of activations) {
+          database.prepare(`UPDATE deal_hunter_cim_capability_activations
+            SET status='withdrawn', withdrawn_at=?, updated_at=?
+            WHERE id=? AND status='current'`).run(now, now, activation.id);
+          appendAudit(database, { eventType: 'capability-withdrawn',
+            authorityId: `p9:${findingId}:${activation.id}`, activationId: activation.id,
+            priorState: 'current', nextState: 'withdrawn',
+            reasonCode: 'automatic_containment', actor, source: 'p9-auto-containment',
+            occurredAt: now, authorityDigest: evidenceDigest });
+        }
+        const authorizations = database.prepare(`SELECT id, transmission_id
+          FROM deal_hunter_cim_live_provider_authorizations
+          WHERE consumed_at IS NULL AND withdrawn_at IS NULL ORDER BY id`).all();
+        for (const authorization of authorizations) {
+          database.prepare(`UPDATE deal_hunter_cim_live_provider_authorizations
+            SET withdrawn_at=? WHERE id=? AND consumed_at IS NULL AND withdrawn_at IS NULL`)
+            .run(now, authorization.id);
+          appendAudit(database, { eventType: 'authorization-withdrawn',
+            authorityId: `p9:${findingId}:${authorization.id}`,
+            transmissionId: authorization.transmission_id,
+            authorizationId: authorization.id, priorState: 'issued', nextState: 'withdrawn',
+            reasonCode: 'automatic_containment', actor, source: 'p9-auto-containment',
+            occurredAt: now, authorityDigest: evidenceDigest });
+        }
+        appendAudit(database, { id: replay
+          ? digest('cim-containment-reasserted:v1', findingId, now) : auditId,
+        eventType: replay ? 'automatic-containment-reasserted' : 'automatic-containment',
+          authorityId: findingId, reasonCode: 'high_severity_invariant',
+          authorityDigest: evidenceDigest, actor, source: 'p9-auto-containment',
+          occurredAt: now, metadata: { findingCodes,
+            withdrawnActivations: activations.length,
+            withdrawnAuthorizations: authorizations.length } });
+        return { applied: !replay, replay, paused: true,
+          withdrawnActivations: activations.length,
+          withdrawnAuthorizations: authorizations.length };
+      }).immediate();
     },
     async listCimSafetyEvents({ safetyRunId }) {
       const runId = requiredText(safetyRunId, 'safetyRunId');

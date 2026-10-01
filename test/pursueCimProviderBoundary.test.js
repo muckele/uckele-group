@@ -126,7 +126,7 @@ function createBoundaryFixture({
     },
     members,
   };
-  const counts = { reads: 0, seamEntries: 0, providerCalls: 0 };
+  const counts = { reads: 0, seamEntries: 0, providerCalls: 0, boundaryRejections: 0 };
   const storage = {
     async readCimFinalGateContext() {
       counts.reads += 1;
@@ -136,6 +136,11 @@ function createBoundaryFixture({
       counts.seamEntries += 1;
       counts.lastSeamCommand = command;
       return typeof seamResult === 'function' ? seamResult(command, durable) : seamResult;
+    },
+    async recordCimProviderBoundaryRejection(command) {
+      counts.boundaryRejections += 1;
+      counts.lastBoundaryRejection = command;
+      return { applied: true, replay: false };
     },
   };
   const authorization = createCimProviderBoundaryAuthorization({
@@ -454,6 +459,9 @@ test('P6B payload mutation matrix stops before seam entry and provider invocatio
       assert.equal(result.errorCategory, 'cim-provider-payload-mismatch');
       assert.equal(fixture.counts.seamEntries, 0);
       assert.equal(fixture.counts.providerCalls, 0);
+      assert.equal(fixture.counts.boundaryRejections, 1);
+      assert.equal(fixture.counts.lastBoundaryRejection.reasonCode,
+        'cim-provider-payload-mismatch');
     });
   }
 });
@@ -478,6 +486,9 @@ test('P6B nonce mismatch matrix never enters the durable seam', async (t) => {
       assert.equal(result.errorCategory, 'cim-provider-nonce-invalid');
       assert.equal(fixture.counts.seamEntries, 0);
       assert.equal(fixture.counts.providerCalls, 0);
+      assert.equal(fixture.counts.boundaryRejections, 1);
+      assert.equal(fixture.counts.lastBoundaryRejection.reasonCode,
+        'cim-provider-nonce-invalid');
     });
   }
 
