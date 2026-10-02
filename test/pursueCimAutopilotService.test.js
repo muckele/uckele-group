@@ -23,7 +23,7 @@ import {
 } from '../server/services/pursueCimOperations.js';
 import { resolveDealHunterOpportunity } from '../server/services/cimOpportunityIdentity.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
-import { sha256 } from '../server/utils/security.js';
+import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { createPursueCimReleaseEvidenceReport } from '../scripts/audit-pursue-cim-autopilot.js';
 import {
   augustLaterUrlListing,
@@ -979,6 +979,9 @@ test('P9 release evidence is bound to commit/tree and excludes addresses and cop
     candidate: { commit: '1'.repeat(40), tree: '2'.repeat(40), clean: true },
     policy: { version: 'deal-hunter-cim-autopilot-v1', hash: '3'.repeat(64) },
     config: { hash: '4'.repeat(64), providerEnabled: false, centralPaused: true },
+    schema: { sqliteStorageSourceHash: '7'.repeat(64), postgresSchemaHash: '8'.repeat(64),
+      migrationChainHash: '9'.repeat(64) },
+    commands: [{ id: 'pursue-cim-focused-tests', digest: 'a'.repeat(64), exitCode: 0 }],
     scenarios: { attempted: 65, passed: 65, failed: 0, digest: '5'.repeat(64) },
     operations: { alerts: [], counts: { transmissions: 1 } },
     shadow: { providerCalls: 0, counts: { wouldEnroll: 1, wouldClaim: 0, wouldSend: 0, blocked: 2 },
@@ -988,11 +991,42 @@ test('P9 release evidence is bound to commit/tree and excludes addresses and cop
   assert.equal(report.candidate.commit, '1'.repeat(40));
   assert.equal(report.candidate.tree, '2'.repeat(40));
   assert.equal(report.providerCalls, 0);
+  assert.equal(report.version, 'pursue-cim-release-evidence-v2');
+  assert.equal(report.schema.sqliteStorageSourceHash, '7'.repeat(64));
+  assert.deepEqual(report.commands[0], {
+    id: 'pursue-cim-focused-tests', digest: 'a'.repeat(64), exitCode: 0,
+  });
   assert.ok(/^[0-9a-f]{64}$/.test(report.evidenceDigest));
   const serialized = JSON.stringify(report);
   assert.equal(serialized.includes('@'), false);
   assert.equal(serialized.includes('subject'), false);
   assert.equal(serialized.includes('body'), false);
+});
+
+test('P10C release evidence fails closed without schema and safe command evidence', () => {
+  const complete = {
+    candidate: { commit: '1'.repeat(40), tree: '2'.repeat(40), clean: true },
+    policy: { version: 'deal-hunter-cim-autopilot-v1', hash: '3'.repeat(64) },
+    config: { hash: '4'.repeat(64), providerEnabled: false, centralPaused: true },
+    schema: { sqliteStorageSourceHash: '7'.repeat(64), postgresSchemaHash: '8'.repeat(64),
+      migrationChainHash: '9'.repeat(64) },
+    commands: [{ id: 'pursue-cim-focused-tests', digest: 'a'.repeat(64), exitCode: 0 }],
+    scenarios: { attempted: 1, passed: 1, failed: 0, digest: '5'.repeat(64) },
+  };
+  assert.throws(() => buildPursueCimReleaseEvidence({ ...complete, schema: {} }),
+    /schema evidence/i);
+  assert.throws(() => buildPursueCimReleaseEvidence({ ...complete, commands: [] }),
+    /command evidence/i);
+  for (const commands of [
+    [{ command: 'node --test test/pursueCimAutopilotService.test.js', exitCode: 0 }],
+    [{ id: 'DATABASE_URL=postgres://alice:secret@db/app', digest: 'a'.repeat(64), exitCode: 0 }],
+    [{ id: 'authorization-bearer-secret', digest: 'a'.repeat(64), exitCode: 0 }],
+    [{ id: '--api-key=secret', digest: 'a'.repeat(64), exitCode: 0 }],
+    [{ id: 'broker@example.test/private/path', digest: 'a'.repeat(64), exitCode: 0 }],
+  ]) {
+    assert.throws(() => buildPursueCimReleaseEvidence({ ...complete, commands }),
+      /command evidence/i);
+  }
 });
 
 test('P9 release-evidence command composes only read-only operations and shadow projections', async () => {
@@ -1008,12 +1042,25 @@ test('P9 release-evidence command composes only read-only operations and shadow 
     config: { delivery: { provider: 'console', resendApiKey: 'private-secret' },
       dealHunter: { cimOutreach: { paused: true }, cimAutomation: { paused: true } } },
     candidate: { commit: '1'.repeat(40), tree: '2'.repeat(40), clean: true },
+    commands: [{ id: 'pursue-cim-focused-tests', digest: 'a'.repeat(64), exitCode: 0 }],
     scenarios: { attempted: 65, passed: 65, failed: 0, digest: '5'.repeat(64) },
-    now: '2026-10-01T17:10:00.000Z' });
+    now: '2026-10-01T17:10:00.000Z', repoRoot: process.cwd() });
   assert.equal(reads, 2);
   assert.equal(report.providerCalls, 0);
   assert.equal(report.config.providerEnabled, false);
   assert.equal(report.config.centralPaused, true);
   assert.equal(report.operations.activations.current, 2);
+  const migrations = fs.readdirSync(path.join(process.cwd(), 'supabase/migrations'))
+    .filter((name) => name.endsWith('.sql')).sort()
+    .map((name) => ({ name, hash: sha256(fs.readFileSync(
+      path.join(process.cwd(), 'supabase/migrations', name))) }));
+  assert.equal(report.schema.sqliteStorageSourceHash,
+    sha256(fs.readFileSync(path.join(process.cwd(), 'server/storage/sqlite.js'))));
+  assert.equal(report.schema.postgresSchemaHash,
+    sha256(fs.readFileSync(path.join(process.cwd(), 'supabase/schema.sql'))));
+  assert.equal(report.schema.migrationChainHash, sha256(stableCanonicalJson({
+    version: 'pursue-cim-migration-chain-v1', migrations,
+  })));
+  assert.equal(report.commands.length, 1);
   assert.equal(JSON.stringify(report).includes('private-secret'), false);
 });

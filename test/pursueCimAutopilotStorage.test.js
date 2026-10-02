@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { fork } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -18,6 +18,8 @@ import { authorizePreparedCimTransmission } from '../server/services/pursueCimFi
 import { deriveAcceptedCimCadence } from '../server/services/pursueCimCadence.js';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
 import { processCrmEmailOutbox } from '../server/services/followUpEmail.js';
+import { recordEmailEventsFromWebhook } from '../server/services/emailEvents.js';
+import { buildPursueCimReleaseEvidence } from '../server/services/pursueCimOperations.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { createPursueCimProviderFake } from './fixtures/pursueCimHarness.js';
@@ -61,6 +63,15 @@ const tableDropOrder = [
 
 const at = '2026-09-25T19:00:00.000Z';
 const digest = (character) => character.repeat(64);
+
+function signedPursueCimWebhookRequest(body, id, signingKey) {
+  const rawBody = JSON.stringify(body);
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const signature = createHmac('sha256', signingKey)
+    .update(`${id}.${timestamp}.${rawBody}`).digest('base64');
+  return { body, rawBody, headers: { 'svix-id': id, 'svix-timestamp': timestamp,
+    'svix-signature': `v1,${signature}` } };
+}
 
 async function acceptedCadence(storage, transmissionId, observedAt) {
   return deriveAcceptedCimCadence(
@@ -3968,6 +3979,112 @@ test('P9 SQLite containment rolls back pause and withdrawals when immutable audi
     WHERE status='current'`).get().count, 3);
   assert.equal(database.prepare(`SELECT withdrawn_at FROM deal_hunter_cim_live_provider_authorizations
     WHERE id=?`).get(authorization.id).withdrawn_at, null);
+});
+
+test('P10C scenario 76 pause preserves inbound and reconciliation while provider-pending cannot retry', async (t) => {
+  const withdrawal = await createFinalGateFixture(t, 'p10c-scenario-76-withdrawal');
+  const withdrawalContainment = await withdrawal.storage.applyPursueCimAutomaticContainment({
+    findingId: digest('5'), evidenceDigest: digest('6'),
+    findingCodes: ['inbound_or_reconciliation_readiness_loss'],
+    actor: 'p10c-rollback-rehearsal', now: '2026-09-25T19:01:00.000Z',
+  });
+  assert.equal(withdrawalContainment.withdrawnAuthorizations, 1);
+  assert.equal(withdrawal.database.prepare(`SELECT consumed_at FROM
+    deal_hunter_cim_live_provider_authorizations WHERE id=?`)
+    .get(withdrawal.authorization.id).consumed_at, null);
+  assert.equal(withdrawal.database.prepare(`SELECT withdrawn_at FROM
+    deal_hunter_cim_live_provider_authorizations WHERE id=?`)
+    .get(withdrawal.authorization.id).withdrawn_at, '2026-09-25T19:01:00.000Z');
+
+  const { storage, database, authority, authorization, pending, boundaryNonceDigest } =
+    await createProviderPendingFixture(t, 'p10c-scenario-76');
+  assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
+    authorizationId: authorization.id, writerPath: 'pursue-cim-initial',
+    providerProfile: 'synthetic-provider', capability: 'fl04b-initial',
+    payloadDigest: pending.payload_digest, boundaryNonceDigest,
+    expectedRowVersion: 2, actor: 'fixture-owner', now: at })).entered, true);
+  const containment = await storage.applyPursueCimAutomaticContainment({
+    findingId: digest('7'), evidenceDigest: digest('8'),
+    findingCodes: ['inbound_or_reconciliation_readiness_loss'],
+    actor: 'p10c-rollback-rehearsal', now: '2026-09-25T19:01:00.000Z',
+  });
+  assert.equal(containment.paused, true);
+  assert.equal(containment.withdrawnActivations, 3);
+
+  const provider = createPursueCimProviderFake();
+  const retry = await processCrmEmailOutbox({ outboxId: pending.outbox_id,
+    storage, sender: (request) => provider.execute(request), config: {}, now: new Date(at) });
+  assert.equal(retry.ok, false);
+  assert.equal(provider.providerCalls.length, 0);
+  assert.equal(database.prepare(`SELECT state FROM deal_hunter_cim_transmissions
+    WHERE id=?`).get(pending.id).state, 'provider-pending');
+
+  const durable = database.prepare(`SELECT * FROM deal_hunter_cim_transmissions WHERE id=?`)
+    .get(pending.id);
+  const reconciled = await reconcileCimProviderTransmission({ storage, transmission: durable,
+    actor: 'p10c-rollback-rehearsal', now: new Date('2026-09-25T19:02:00.000Z'),
+    readProviderEvidence: async ({ binding }) => ({ type: 'signed-provider-event',
+      id: 'p10c-reconciliation-event', provider: 'resend', outcome: 'accepted',
+      observedAt: '2026-09-25T19:01:30.000Z', binding,
+      candidates: [{ provider: 'resend', providerMessageId: 'provider-p10c',
+        evidenceId: 'p10c-provider-identity' }] }),
+  });
+  assert.equal(reconciled.resolved, true);
+  assert.equal(reconciled.providerCalls, 0);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+    WHERE transmission_id=? AND event_type='transmission-reconciled'`)
+    .get(pending.id).count, 1);
+
+  const signingKey = Buffer.from('p10c-scenario-76-signing-key');
+  const webhook = await recordEmailEventsFromWebhook(signedPursueCimWebhookRequest({
+    id: 'p10c-scenario-76-reply', type: 'email.replied',
+    created_at: '2026-09-25T19:03:00.000Z',
+    data: { email_id: 'provider-p10c', from: 'Broker <broker@example.test>',
+      to: ['reply@example.test'], subject: 'Re: synthetic request' },
+  }, 'svix-p10c-scenario-76', signingKey), { storage, configOverride: {
+    isProduction: false, delivery: {}, dealHunter: { cimProvider: {
+      mode: 'controlled-mailbox', profile: 'synthetic-provider',
+      emailWebhookSecret: `whsec_${signingKey.toString('base64')}`,
+      resendInboundDomain: 'example.test',
+    } },
+  } });
+  assert.equal(webhook.ok, true);
+  assert.equal(webhook.events[0].metadata.pursueCimInbound.exact, true);
+  assert.equal(webhook.events[0].metadata.pursueCimInbound.transmissionId, pending.id);
+  assert.equal(database.prepare(`SELECT state FROM deal_hunter_broker_conversations
+    WHERE id=?`).get(authority.conversationId).state, 'responded');
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_terminal_events
+    WHERE conversation_id=? AND reason_code='reply_received'`)
+    .get(authority.conversationId).count, 1);
+  const inbound = database.prepare(`SELECT * FROM email_events
+    WHERE provider_event_id='svix-p10c-scenario-76'`).get();
+  assert.equal(inbound.event_type, 'replied');
+  assert.equal(JSON.parse(inbound.metadata).svixId, 'svix-p10c-scenario-76');
+  const terminalEvidence = database.prepare(`SELECT evidence_type, evidence_id, source
+    FROM deal_hunter_cim_terminal_events
+    WHERE conversation_id=? AND reason_code='reply_received'`)
+    .get(authority.conversationId);
+  assert.deepEqual(terminalEvidence, { evidence_type: 'signed-inbound-reply-alias',
+    evidence_id: 'svix-p10c-scenario-76', source: 'pursue-cim-inbound' });
+
+  const evidence = buildPursueCimReleaseEvidence({
+    candidate: { commit: digest('1').slice(0, 40), tree: digest('2').slice(0, 40), clean: true },
+    policy: { version: 'deal-hunter-cim-autopilot-v1', hash: digest('3') },
+    config: { hash: digest('4'), providerEnabled: false, centralPaused: true },
+    schema: { sqliteStorageSourceHash: digest('4'), postgresSchemaHash: digest('5'),
+      migrationChainHash: digest('6') },
+    commands: [{ id: 'pursue-cim-focused-tests', digest: digest('7'), exitCode: 0 }],
+    scenarios: { attempted: 1, passed: 1, failed: 0,
+      digest: sha256(stableCanonicalJson({ scenario: 76, status: 'passed' })) },
+    operations: { alerts: [], counts: { providerPending: 0 },
+      activations: { current: 0, expired: 0, modes: {} },
+      pause: { paused: true, source: 'operations-control' } },
+    shadow: { providerCalls: provider.providerCalls.length, counts: {}, decisions: [] },
+    generatedAt: '2026-09-25T19:04:00.000Z',
+  });
+  assert.equal(evidence.version, 'pursue-cim-release-evidence-v2');
+  assert.equal(evidence.providerCalls, 0);
+  assert.equal(evidence.schema.sqliteStorageSourceHash, digest('4'));
 });
 
 test('P1B prepared and provider-pending outbox rows cannot reach the legacy sender', async (t) => {
