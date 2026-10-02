@@ -1681,7 +1681,9 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       if (preparationGeneration < 1) throw new Error('Preparation generation must be positive');
       const payloadVersion = requiredText(command.payloadVersion, 'payloadVersion', 120);
       const fromAddress = requiredText(command.fromAddress, 'fromAddress', 320);
-      const replyToAddress = requiredText(command.replyToAddress, 'replyToAddress', 320);
+      const replyToAddress = command.replyToAddress === ''
+        && payloadVersion === 'p10b-limited-free-smoke-test-v1'
+        ? '' : requiredText(command.replyToAddress, 'replyToAddress', 320);
       const subject = requiredText(command.subject, 'subject', 998);
       const bodyText = requiredText(command.bodyText, 'bodyText', 100000);
       const bodyHtmlSanitized = requiredText(command.bodyHtmlSanitized, 'bodyHtmlSanitized', 100000);

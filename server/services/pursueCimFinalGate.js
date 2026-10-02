@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
 import {
+  CONTROLLED_CIM_LIMITED_SMOKE_PROFILE,
   CONTROLLED_CIM_MAILBOX_PROFILE,
   getConfig,
   validateCimProviderProfileBinding,
@@ -16,6 +17,10 @@ import {
   P10B_CONTROLLED_MAILBOX_SUBJECT,
   P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
   P10B_CONTROLLED_MAILBOX_TEXT,
+  P10B_LIMITED_SMOKE_HTML,
+  P10B_LIMITED_SMOKE_SUBJECT,
+  P10B_LIMITED_SMOKE_TEMPLATE_VERSION,
+  P10B_LIMITED_SMOKE_TEXT,
   isP10bControlledMailboxSyntheticMember,
 } from './pursueCimControlledMailboxTemplate.js';
 
@@ -268,12 +273,21 @@ export async function authorizePreparedCimTransmission({
     replyToAddress: context.communication?.reply_to_address,
   });
   if (!profileBinding.ok) return failure(profileBinding.blockers[0] || 'profile_mismatch');
-  const controlledMailboxProfile = providerProfile === CONTROLLED_CIM_MAILBOX_PROFILE;
+  const controlledMailboxProfile = [CONTROLLED_CIM_MAILBOX_PROFILE,
+    CONTROLLED_CIM_LIMITED_SMOKE_PROFILE].includes(providerProfile);
+  const controlledTemplate = providerProfile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE
+    ? { version: P10B_LIMITED_SMOKE_TEMPLATE_VERSION, subject: P10B_LIMITED_SMOKE_SUBJECT,
+      text: P10B_LIMITED_SMOKE_TEXT, html: P10B_LIMITED_SMOKE_HTML, replyTo: '' }
+    : { version: P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
+      subject: P10B_CONTROLLED_MAILBOX_SUBJECT, text: P10B_CONTROLLED_MAILBOX_TEXT,
+      html: P10B_CONTROLLED_MAILBOX_HTML, replyTo: null };
   const supportedInitialPayload = controlledMailboxProfile
-    ? context.transmission.payload_version === P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION
-      && context.communication?.subject === P10B_CONTROLLED_MAILBOX_SUBJECT
-      && context.communication?.body_text_digest === sha256(P10B_CONTROLLED_MAILBOX_TEXT)
-      && context.communication?.body_html_digest === sha256(P10B_CONTROLLED_MAILBOX_HTML)
+    ? context.transmission.payload_version === controlledTemplate.version
+      && context.communication?.subject === controlledTemplate.subject
+      && context.communication?.body_text_digest === sha256(controlledTemplate.text)
+      && context.communication?.body_html_digest === sha256(controlledTemplate.html)
+      && (controlledTemplate.replyTo === null
+        || (context.communication?.reply_to_address || '') === controlledTemplate.replyTo)
       && context.members.every(isP10bControlledMailboxSyntheticMember)
     : context.transmission.payload_version === INITIAL_PAYLOAD_VERSION;
   const unknownTransmissionPolicy = !supportedInitialPayload
