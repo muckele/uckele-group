@@ -15,8 +15,13 @@ import {
   executeP10bLimitedFreeSmoke,
   prepareP10bControlledMailbox,
   prepareP10bLimitedFreeSmoke,
+  resolveP10bSyntheticPreparationInstant,
 } from '../server/services/pursueCimControlledMailboxHarness.js';
 import { readCleanImplementationHead } from '../scripts/run-pursue-cim-controlled-mailbox.js';
+import {
+  CIM_CAMPAIGN_POLICY_VERSION,
+  calculateNextCimSlot,
+} from '../server/services/cimCampaignPolicy.js';
 import { readCimCurrentAuthority } from '../server/services/cimCampaignSafety.js';
 import { loadBrokerMaterialsAuthority } from '../server/services/dealHunterBrokerMaterials.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
@@ -48,6 +53,30 @@ const limitedText = [
 const limitedHtml = '<!doctype html><html><body><p>Hello,</p><p>This is a controlled, synthetic outbound-only smoke test for Uckele Group. It is not a request concerning a real business or transaction. No reply is requested or monitored.</p><p>Best,</p><p>Uckele Group</p></body></html>';
 const databaseIdentityHash = '9'.repeat(64);
 const implementationHead = '1'.repeat(40);
+
+test('P10B synthetic preparation advances its explicit clock to the policy-owned initial slot', async (t) => {
+  for (const [name, readyAt, expectedDueAt] of [
+    ['before Pacific window after spring DST', '2026-03-09T14:30:00.000Z',
+      '2026-03-09T15:00:00.000Z'],
+    ['during Pacific window', '2026-03-09T16:00:00.000Z',
+      '2026-03-09T16:00:00.000Z'],
+    ['after Pacific window', '2026-03-10T00:30:00.000Z',
+      '2026-03-10T15:00:00.000Z'],
+    ['spring-forward Sunday', '2026-03-08T09:30:00.000Z',
+      '2026-03-09T15:00:00.000Z'],
+    ['fall-back Sunday', '2026-11-01T08:30:00.000Z',
+      '2026-11-02T16:00:00.000Z'],
+  ]) {
+    await t.test(name, () => {
+      const slot = calculateNextCimSlot({ policyVersion: CIM_CAMPAIGN_POLICY_VERSION,
+        timezone: 'America/Los_Angeles', kind: 'initial', readyAt });
+      assert.equal(slot.dueAt, expectedDueAt);
+      assert.equal(resolveP10bSyntheticPreparationInstant({ authorityAt: readyAt,
+        initialTouch: { due_at: slot.dueAt, kind: 'initial', state: 'scheduled' } }),
+      expectedDueAt);
+    });
+  }
+});
 
 function readiness(overrides = {}) {
   return { version: 'cim-provider-readiness-v1', provider: 'resend',
@@ -796,6 +825,24 @@ test('P10B default synthetic setup uses public authorities to persist one provid
   assert.equal(projection.transmission.state, 'prepared');
   assert.equal(await storage.getPursueCimLiveProviderAuthorization(
     projection.transmission.id), null);
+});
+
+test('P10B real synthetic setup prepares at the persisted next slot after Pacific hours', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p10b-after-hours-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'p10b.sqlite') },
+    protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const prepared = await prepareP10bControlledMailbox({ storage, config: controlledConfig(),
+    actor: 'fixture-owner', now: '2036-03-11T00:30:00.000Z',
+    synthetic: { runId: 'p10b-after-hours-setup', recipient: 'owner@example.test',
+      recipientDisplayName: 'Owner', permissionEvidenceId: 'permission-record-p10b',
+      permissionEvidenceHash: 'f'.repeat(64) } });
+  assert.equal(prepared.preparedAt, '2036-03-11T15:00:00.000Z');
+  assert.equal(prepared.review.transmission.state, 'prepared');
+  assert.equal(prepared.executionAuthorized, false);
 });
 
 test('P10B execute requires exact review digest and confirmation before authority or provider work', async (t) => {

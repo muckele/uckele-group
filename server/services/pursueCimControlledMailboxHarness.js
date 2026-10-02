@@ -263,6 +263,17 @@ function setupDigest(label, runId) {
   return sha256(stableCanonicalJson({ type: `p10b-${label}-v1`, runId }));
 }
 
+export function resolveP10bSyntheticPreparationInstant({ authorityAt, initialTouch } = {}) {
+  const authorityMs = Date.parse(authorityAt || '');
+  const dueMs = Date.parse(initialTouch?.due_at || '');
+  if (!Number.isFinite(authorityMs) || !Number.isFinite(dueMs)
+    || initialTouch?.kind !== 'initial' || initialTouch?.state !== 'scheduled'
+    || dueMs < authorityMs) {
+    throw new Error('P10B synthetic initial preparation clock is invalid');
+  }
+  return new Date(dueMs).toISOString();
+}
+
 async function readP10bSyntheticSourceHealth(storage) {
   const states = await storage.listDealHunterSourceFreshnessStates();
   const accepted = Array.isArray(states) && states.length > 0
@@ -290,7 +301,7 @@ export async function setupP10bSyntheticScenario({
     'allocateDealHunterSourceGeneration', 'writeDealHunterOpportunityScore',
     'reconcileDealHunterCurrentScoreEligibility', 'setDealHunterOpportunityOperatorDecision',
     'recordOwnerDecision', 'appendOpportunityTimezoneRevision',
-    'recordCimCapabilityActivation',
+    'recordCimCapabilityActivation', 'readPursueCimProjection',
   ];
   if (requiredMethods.some((name) => typeof storage?.[name] !== 'function')) {
     throw new Error('P10B public synthetic storage authorities are unavailable');
@@ -415,6 +426,11 @@ export async function setupP10bSyntheticScenario({
   if (!enrollment?.campaign || enrollment.enrollment?.state !== 'campaign-created') {
     throw new Error(`P10B synthetic campaign allocation failed: ${enrollment?.enrollment?.reason_code || 'unknown'}`);
   }
+  const projection = await storage.readPursueCimProjection({ opportunityId });
+  const preparationAt = resolveP10bSyntheticPreparationInstant({
+    authorityAt: at,
+    initialTouch: projection?.initialTouch,
+  });
   const initialActivation = await storage.recordCimCapabilityActivation({ ...commonActivation,
     id: initialActivationId, capability: 'fl04b-initial',
     prerequisiteActivationId: enrollmentActivationId,
@@ -428,13 +444,13 @@ export async function setupP10bSyntheticScenario({
   }
   await setCimOutreachPaused({ paused: true, actor,
     reason: `P10B prepare-only hold ${sha256(runId)}`, storage });
-  const prepared = await runDueCimInitialPreparations({ storage, now: at,
+  const prepared = await runDueCimInitialPreparations({ storage, now: preparationAt,
     actor: 'p10b-controlled-mailbox-preparer', configOverride: config });
   if (prepared.length !== 1 || prepared[0].prepared !== true) {
     throw new Error(`P10B synthetic transmission preparation failed: ${JSON.stringify(prepared)}`);
   }
   return { opportunityId, initialActivationId, transmissionId: prepared[0].transmissionId,
-    campaignId: enrollment.campaign.id, effectiveNow: at };
+    campaignId: enrollment.campaign.id, effectiveNow: preparationAt };
 }
 
 export async function prepareP10bControlledMailbox({
