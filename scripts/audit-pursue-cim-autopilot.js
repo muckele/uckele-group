@@ -40,8 +40,23 @@ function scenarioEvidence(document) {
     digest: sha256(stableCanonicalJson({ version: 'p9-scenario-results-v1', results })) };
 }
 
+async function schemaEvidence(repoRoot) {
+  const sqliteSource = await fs.readFile(path.join(repoRoot, 'server/storage/sqlite.js'));
+  const postgresSchema = await fs.readFile(path.join(repoRoot, 'supabase/schema.sql'));
+  const migrationDirectory = path.join(repoRoot, 'supabase/migrations');
+  const migrationNames = (await fs.readdir(migrationDirectory))
+    .filter((name) => name.endsWith('.sql')).sort();
+  const migrations = await Promise.all(migrationNames.map(async (name) => ({ name,
+    hash: sha256(await fs.readFile(path.join(migrationDirectory, name))) })));
+  return { sqliteStorageSourceHash: sha256(sqliteSource),
+    postgresSchemaHash: sha256(postgresSchema),
+    migrationChainHash: sha256(stableCanonicalJson({
+      version: 'pursue-cim-migration-chain-v1', migrations,
+    })) };
+}
+
 export async function createPursueCimReleaseEvidenceReport({ storage, config,
-  candidate, scenarios, now = new Date().toISOString(), repoRoot = root } = {}) {
+  candidate, schema, commands, scenarios, now = new Date().toISOString(), repoRoot = root } = {}) {
   if (!storage || !config) throw new Error('Pursue CIM release-evidence dependencies are required');
   const [operations, shadow] = await Promise.all([
     getPursueCimOperations({ storage, now }),
@@ -62,6 +77,7 @@ export async function createPursueCimReleaseEvidenceReport({ storage, config,
     policy: { version: policy.version, hash: sha256(stableCanonicalJson(policy)) },
     config: { hash: sha256(stableCanonicalJson(configProjection)), providerEnabled,
       centralPaused: operations.pause.paused !== false },
+    schema: schema || await schemaEvidence(repoRoot), commands,
     scenarios, operations, shadow, generatedAt: now });
 }
 
@@ -74,7 +90,7 @@ async function main() {
   const storage = getStorage();
   try {
     const report = await createPursueCimReleaseEvidenceReport({ storage, config: getConfig(),
-      scenarios: scenarioEvidence(document) });
+      commands: document.commands, scenarios: scenarioEvidence(document) });
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } finally {
     storage.close?.();

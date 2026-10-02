@@ -53,6 +53,44 @@ function normalizeCounts(value) {
   ].map((key) => [key, count(source[key])]));
 }
 
+function normalizeSchemaEvidence(schema = {}) {
+  const fields = ['sqliteStorageSourceHash', 'postgresSchemaHash', 'migrationChainHash'];
+  const normalized = Object.fromEntries(fields.map((field) => [field,
+    /^[0-9a-f]{64}$/.test(schema?.[field] || '') ? schema[field] : '']));
+  if (fields.some((field) => !normalized[field])) {
+    throw new Error('Complete Pursue CIM schema evidence is required');
+  }
+  return normalized;
+}
+
+const releaseEvidenceCommandIds = new Set([
+  'pursue-cim-focused-tests',
+  'pursue-cim-full-check',
+  'pursue-cim-postgres-parity',
+  'pursue-cim-ui-tests',
+  'pursue-cim-production-build',
+  'pursue-cim-p1d-schema-attestation',
+]);
+
+function normalizeCommandEvidence(commands = []) {
+  if (!Array.isArray(commands) || commands.length < 1 || commands.length > 50) {
+    throw new Error('Bounded Pursue CIM command evidence is required');
+  }
+  return commands.map((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)
+      || Object.keys(item).sort().join(',') !== 'digest,exitCode,id') {
+      throw new Error('Malformed Pursue CIM command evidence');
+    }
+    if (!releaseEvidenceCommandIds.has(item.id) || !/^[0-9a-f]{64}$/.test(item.digest || '')) {
+      throw new Error('Malformed Pursue CIM command evidence');
+    }
+    if (!Number.isSafeInteger(item.exitCode) || item.exitCode < 0 || item.exitCode > 255) {
+      throw new Error('Malformed Pursue CIM command evidence');
+    }
+    return { id: item.id, digest: item.digest, exitCode: item.exitCode };
+  });
+}
+
 function findingList(invariants = {}) {
   return Object.entries(findingCodes).flatMap(([key, code]) => {
     const total = count(invariants[key]);
@@ -210,9 +248,10 @@ export async function runPursueCimAutomaticContainment({ storage, actor,
 }
 
 export function buildPursueCimReleaseEvidence({ candidate = {}, policy = {}, config = {},
-  scenarios = {}, operations = {}, shadow = {}, generatedAt = new Date().toISOString() } = {}) {
+  schema = {}, commands = [], scenarios = {}, operations = {}, shadow = {},
+  generatedAt = new Date().toISOString() } = {}) {
   const report = {
-    version: 'pursue-cim-release-evidence-v1',
+    version: 'pursue-cim-release-evidence-v2',
     generatedAt: new Date(generatedAt).toISOString(),
     candidate: {
       commit: /^[0-9a-f]{40}$/.test(candidate.commit || '') ? candidate.commit : '',
@@ -223,6 +262,8 @@ export function buildPursueCimReleaseEvidence({ candidate = {}, policy = {}, con
       hash: /^[0-9a-f]{64}$/.test(policy.hash || '') ? policy.hash : '' },
     config: { hash: /^[0-9a-f]{64}$/.test(config.hash || '') ? config.hash : '',
       providerEnabled: config.providerEnabled === true, centralPaused: config.centralPaused !== false },
+    schema: normalizeSchemaEvidence(schema),
+    commands: normalizeCommandEvidence(commands),
     scenarios: { attempted: count(scenarios.attempted), passed: count(scenarios.passed),
       failed: count(scenarios.failed),
       digest: /^[0-9a-f]{64}$/.test(scenarios.digest || '') ? scenarios.digest : '' },
