@@ -9,6 +9,7 @@
   "nodeRuntime": {
     "repository": "node",
     "tag": "22-alpine",
-    "digest": null
+    "digest": null,
+    "requiredFeatures": ["node:sqlite"]
   }
 }

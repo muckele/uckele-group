@@ -78,4 +78,5 @@ test('scanner package keeps the official source tag but requires unresolved immu
     repository: 'clamav/clamav', tag: '1.4.6_base', digest: null,
   });
   assert.equal(sourceLock.nodeRuntime.digest, null);
+  assert.deepEqual(sourceLock.nodeRuntime.requiredFeatures, ['node:sqlite']);
 });

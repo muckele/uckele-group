@@ -6,7 +6,8 @@ FROM clamav/clamav:1.4.6_base@${CLAMAV_BASE_DIGEST}
 
 # Both immutable digests are intentionally required build arguments. Until official
 # read-only metadata resolves them and a later review records them, an actual build
-# must fail rather than silently resolving either mutable source tag.
+# must fail rather than silently resolving either mutable source tag. The selected
+# Node 22 digest must also be verified to expose the built-in node:sqlite module.
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY package.json /opt/uckele/package.json
 COPY server/services/cimScanProtocol.js /opt/uckele/server/services/cimScanProtocol.js
