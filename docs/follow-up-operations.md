@@ -66,7 +66,7 @@ AI enrichment is independent and optional. Enabling it requires:
 - an explicit `FOLLOW_UP_AI_REASONING_EFFORT` (`low` is the evaluation baseline);
 - reviewed bounds in `FOLLOW_UP_AI_TIMEOUT_MS`, `FOLLOW_UP_AI_MAX_CONTEXT_CHARS`, `FOLLOW_UP_AI_MAX_OUTPUT_TOKENS`, `FOLLOW_UP_AI_MAX_RETRIES`, and `FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE`;
 - `FOLLOW_UP_AI_DATA_HANDLING_APPROVAL_ID`, a non-secret reference to the completed privacy/data-handling approval;
-- `FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION=follow-up-eval-v1` after the matching live synthetic and human evaluation is accepted;
+- `FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION=follow-up-eval-v2` after the matching live synthetic and human evaluation is accepted;
 - `FOLLOW_UP_AI_COST_RATE_APPROVAL_ID`, a non-secret reference to the approved cost, latency, and rate envelope; and
 - `FOLLOW_UP_AI_SYNTHETIC_SMOKE_ID`, a non-secret reference to a reviewed smoke from the approved project.
 
@@ -100,7 +100,7 @@ Recommendation metadata retains only bounded provenance/contract versions; confi
 
 ### Evaluation and model decision
 
-Run `npm run eval:follow-ups` for the credential-free frozen corpus before release. The baseline is 51/51 deterministic cases passing across 40 regression and 11 holdout cases plus 24/24 fake-client adapter response/fault cases. The checked baseline includes a SHA-256 over both fixture files, and the runner refuses unreviewed corpus/version/count/split drift. Read [the evaluation protocol](../evals/follow-up-recommendations/README.md) before any live call.
+Run `npm run eval:follow-ups` for the credential-free frozen corpus before release. The baseline is 75/75 deterministic cases passing across 60 regression and 15 holdout cases plus 24/24 fake-client adapter response/fault cases. The checked baseline includes a SHA-256 over both fixture files, and the runner refuses unreviewed corpus/version/count/split drift. Read [the evaluation protocol](../evals/follow-up-recommendations/README.md) before any live call.
 
 No paid live evaluation has been authorized or run as of 2026-08-10, and no production model is selected. The initial bounded comparison is `gpt-5.6-terra:low` versus `gpt-5.6-sol:low`; `medium` is considered only if low effort misses a material quality target. A candidate needs 100% automatic safety/schema gates, at least 90% blinded human usable-with-minor-edits results, an allowed exact returned model, and approved measured latency/token/cost/rate evidence. Documentation positioning alone is not a model selection.
 

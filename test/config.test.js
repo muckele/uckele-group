@@ -261,7 +261,7 @@ test('AI enablement requires explicit bounded controls and documented rollout ga
     aiMaxRetries: 0,
     aiRateLimitPerMinute: 10,
     aiDataHandlingApprovalId: 'privacy-review-2026-08',
-    aiAcceptedEvalVersion: 'follow-up-eval-v1',
+    aiAcceptedEvalVersion: 'follow-up-eval-v2',
     aiCostRateApprovalId: 'operations-envelope-2026-08',
     aiSyntheticSmokeId: 'synthetic-smoke-2026-08',
   });
@@ -291,7 +291,7 @@ test('environment parsing does not normalize invalid AI enablement controls into
       FOLLOW_UP_AI_MAX_RETRIES: '3',
       FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE: '121',
       FOLLOW_UP_AI_DATA_HANDLING_APPROVAL_ID: 'privacy-review',
-      FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION: 'follow-up-eval-v1',
+      FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION: 'follow-up-eval-v2',
       FOLLOW_UP_AI_COST_RATE_APPROVAL_ID: 'cost-review',
       FOLLOW_UP_AI_SYNTHETIC_SMOKE_ID: 'synthetic-smoke',
     },
