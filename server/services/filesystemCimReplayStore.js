@@ -182,14 +182,21 @@ async function immediateTransaction(database, input, operation) {
   }
 }
 
-function verifyInitializedDatabase(database) {
-  try {
-    database.prepare('SELECT key_id FROM replay_entries LIMIT 1').get();
-  } catch (error) {
-    database.close();
-    throw new Error('Replay store database schema is invalid.', { cause: error });
+async function verifyInitializedDatabase(database, input) {
+  for (;;) {
+    assertActive(input);
+    try {
+      database.prepare('SELECT key_id FROM replay_entries LIMIT 1').get();
+      return database;
+    } catch (error) {
+      if (isBusy(error)) {
+        await waitForRetry(input);
+        continue;
+      }
+      database.close();
+      throw new Error('Replay store database schema is invalid.', { cause: error });
+    }
   }
-  return database;
 }
 
 function validateStoredEntry(entry) {
@@ -242,7 +249,9 @@ export function createFilesystemCimReplayStore({
         await ensureRoot(replayRoot);
         const file = path.join(replayRoot, databaseName);
         await ensurePrivateDatabaseFile(file, input);
-        const database = verifyInitializedDatabase(await initializeDatabase(file, input));
+        const database = await verifyInitializedDatabase(
+          await initializeDatabase(file, input), input,
+        );
         const stat = await fsp.lstat(file);
         if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
           database.close();
