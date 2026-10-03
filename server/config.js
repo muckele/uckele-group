@@ -478,6 +478,10 @@ export function getConfig() {
       maxTotalUploadBytes: numberFromEnv(process.env.SECURE_DOCUMENTS_MAX_TOTAL_UPLOAD_BYTES, 24 * 1024 * 1024),
       maxConcurrentUploads: Math.max(1, numberFromEnv(process.env.SECURE_DOCUMENTS_MAX_CONCURRENT_UPLOADS, 2)),
       storageDir: process.env.SECURE_DOCUMENTS_STORAGE_DIR || path.join(rootDir, 'data', 'secure-documents'),
+      quarantineDir: path.join(
+        process.env.SECURE_DOCUMENTS_STORAGE_DIR || path.join(rootDir, 'data', 'secure-documents'),
+        '.cim-attachment-quarantine',
+      ),
     },
     protection: {
       contactJsonLimit: process.env.CONTACT_JSON_LIMIT || '64kb',
