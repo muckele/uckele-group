@@ -684,6 +684,104 @@ describe('Acquisition Inbox queue', () => {
     expect(container.scrollWidth).toBeLessThanOrEqual(container.clientWidth || container.scrollWidth);
   });
 
+  test('morning briefing surfaces an evidence-aware actionable current-score shortlist', async () => {
+    const lead = queueRow({
+      missingEvidenceCount: 3,
+      contradictionCount: 2,
+      freshness: { discoveryRevision: 4, materialRevision: 7 },
+    });
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/action')) {
+        writes.push(JSON.parse(options.body));
+        return jsonResponse({ success: true, action: 'watch' });
+      }
+      if (url.endsWith('/triage/opp-1')) return jsonResponse({ success: true, ...detailResponse(lead) });
+      return jsonResponse(queueResponse({
+        rows: [lead], total: 1,
+        dailyDigest: digestProjection({ topOpportunities: [lead] }),
+      }));
+    }));
+
+    renderInbox();
+    const briefing = await screen.findByRole('region', { name: 'Morning briefing' });
+    expect(within(briefing).getByRole('heading', { name: 'Current priority shortlist' })).toBeVisible();
+    expect(within(briefing).getByText('Priority #1')).toBeVisible();
+    expect(within(briefing).getByText((_, element) => element?.tagName === 'P'
+      && element.textContent.includes('Why it fits: Recurring inspections'))).toBeVisible();
+    expect(within(briefing).getByText((_, element) => element?.tagName === 'P'
+      && element.textContent.includes('Check before pursuit: Customer concentration'))).toBeVisible();
+    expect(within(briefing).getByText('3 missing evidence items')).toBeVisible();
+    expect(within(briefing).getByText('2 source conflicts')).toBeVisible();
+    expect(within(briefing).getByRole('button', { name: 'Open shortlist lead Evergreen Fire Protection' })).toBeEnabled();
+    for (const action of ['Pursue', 'Watch', 'Pass']) {
+      expect(within(briefing).getByRole('button', { name: `${action} shortlist lead Evergreen Fire Protection` })).toBeEnabled();
+    }
+
+    fireEvent.click(within(briefing).getByRole('button', { name: 'Open shortlist lead Evergreen Fire Protection' }));
+    expect(await screen.findByRole('dialog', { name: /Evergreen Fire Protection/ })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    fireEvent.click(within(briefing).getByRole('button', { name: 'Pass shortlist lead Evergreen Fire Protection' }));
+    expect(await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
+    expect(writes).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    fireEvent.click(within(briefing).getByRole('button', { name: 'Watch shortlist lead Evergreen Fire Protection' }));
+    const currentDetail = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    expect(writes).toHaveLength(0);
+    fireEvent.click(within(currentDetail).getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
+    await waitFor(() => expect(writes).toEqual([expectOwnerCommand('watch', {
+      expectedDiscoveryRevision: 4,
+      expectedMaterialRevision: 7,
+    })]));
+  });
+
+  test('shortlist Pass requires visible current detail before submitting its revisions', async () => {
+    let queueReads = 0;
+    const writes = [];
+    const shortlistLead = () => {
+      const row = queueRow();
+      delete row.freshness;
+      return row;
+    };
+    const visibleQueueRow = (discoveryRevision, materialRevision) => queueRow({
+      freshness: { discoveryRevision, materialRevision },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/action')) {
+        writes.push(JSON.parse(options.body));
+        return jsonResponse({ success: true, action: 'pass' });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        return jsonResponse({ success: true, ...detailResponse(queueRow({
+          freshness: { discoveryRevision: 4, materialRevision: 7 },
+        })) });
+      }
+      queueReads += 1;
+      const lead = shortlistLead();
+      const queueItem = queueReads === 1 ? visibleQueueRow(1, 0) : visibleQueueRow(2, 1);
+      return jsonResponse(queueResponse({
+        rows: [queueItem], total: 1,
+        dailyDigest: digestProjection({ topOpportunities: [lead] }),
+      }));
+    }));
+
+    renderInbox();
+    const briefing = await screen.findByRole('region', { name: 'Morning briefing' });
+    fireEvent.click(within(briefing).getByRole('button', { name: 'Pass shortlist lead Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    expect(writes).toHaveLength(0);
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const form = within(drawer).getByRole('form', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(form).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.click(within(form).getByRole('button', { name: 'Confirm Pass' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toEqual(expectOwnerCommand('pass', {
+      reason: 'valuation', note: '', expectedDiscoveryRevision: 4, expectedMaterialRevision: 7,
+    }));
+  });
+
   test('Acquisition Inbox renders one bounded optional Deal OS warning and usable primary summary', async () => {
     const row = queueRow();
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({

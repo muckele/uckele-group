@@ -1154,7 +1154,8 @@ test('triage response includes the bounded server-owned morning briefing project
   });
   assert.deepEqual(response.dailyDigest?.topOpportunities.map((row) => row.name), ['Server first', 'Server second']);
   assert.deepEqual(Object.keys(response.dailyDigest?.topOpportunities[0] || {}).sort(), [
-    'changedSinceReview', 'confidence', 'fitScore', 'name', 'observationFreshness', 'operatorPriority',
+    'changedSinceReview', 'confidence', 'contradictionCount', 'fitScore',
+    'missingEvidenceCount', 'name', 'observationFreshness', 'operatorPriority',
     'opportunityId', 'reviewed', 'scoreStatus', 'state', 'topConcern', 'topStrength', 'workflow',
   ]);
   assert.equal(response.dailyDigest?.actionsAllowed, true);

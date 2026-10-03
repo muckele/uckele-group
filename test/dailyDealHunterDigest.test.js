@@ -205,7 +205,9 @@ test('daily digest projection returns at most five allowlisted current opportuni
   assert.deepEqual(Object.keys(projection.topOpportunities[0]).sort(), [
     'changedSinceReview',
     'confidence',
+    'contradictionCount',
     'fitScore',
+    'missingEvidenceCount',
     'name',
     'observationFreshness',
     'operatorPriority',
