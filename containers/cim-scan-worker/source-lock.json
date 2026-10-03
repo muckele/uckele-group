@@ -9,7 +9,7 @@
   "nodeRuntime": {
     "repository": "node",
     "tag": "22-alpine",
-    "digest": null,
-    "requiredFeatures": ["node:sqlite"]
-  }
+    "digest": null
+  },
+  "dependencyLock": "package-lock.json"
 }

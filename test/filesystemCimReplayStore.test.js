@@ -3,12 +3,31 @@ import assert from 'node:assert/strict';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createFilesystemCimReplayStore } from '../server/services/filesystemCimReplayStore.js';
 
 const keyId = 'test-key-1';
 const requestId = 'a1111111-1111-4111-8111-111111111111';
 const requestDigest = 'a'.repeat(64);
+const replayStoreModule = new URL('../server/services/filesystemCimReplayStore.js', import.meta.url).href;
+
+function childExit(child) {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+}
+
+function childOutput(child, expected) {
+  return new Promise((resolve, reject) => {
+    let output = '';
+    child.once('error', reject);
+    child.stdout.on('data', (chunk) => {
+      output += chunk;
+      if (output.includes(expected)) resolve(output);
+    });
+  });
+}
 
 function claim(store, overrides = {}) {
   const controller = new AbortController();
@@ -92,6 +111,15 @@ test('filesystem replay identity conflicts, enforces its cap, and expires exact 
 test('filesystem replay store serializes concurrent claims and rolls back a crashed transaction', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-crash-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const databasePath = path.join(root, 'cim-replay.sqlite3');
+  await fsp.writeFile(databasePath, '', { mode: 0o600 });
+  const initializationCrash = spawnSync(process.execPath, ['-e', `
+    const Database = require('better-sqlite3');
+    const database = new Database(process.argv[1]);
+    database.exec('BEGIN EXCLUSIVE; CREATE TABLE interrupted (value TEXT)');
+    process.kill(process.pid, 'SIGKILL');
+  `, databasePath], { cwd: process.cwd(), encoding: 'utf8' });
+  assert.equal(initializationCrash.signal, 'SIGKILL', initializationCrash.stderr);
   const store = createFilesystemCimReplayStore({
     root, now: () => new Date('2026-10-03T12:00:00.000Z'),
   });
@@ -99,17 +127,80 @@ test('filesystem replay store serializes concurrent claims and rolls back a cras
   const statuses = (await Promise.all([claim(store), claim(store)])).map((entry) => entry.status).sort();
   assert.deepEqual(statuses, ['accepted', 'inflight']);
   const crashScript = `
-    const { DatabaseSync } = require('node:sqlite');
-    const database = new DatabaseSync(process.argv[1]);
+    const Database = require('better-sqlite3');
+    const database = new Database(process.argv[1]);
     database.exec('BEGIN IMMEDIATE');
     database.prepare('INSERT INTO replay_entries (key_id, request_id, request_digest, expires_at) VALUES (?, ?, ?, ?)')
       .run('test-key-1', 'b1111111-1111-4111-8111-111111111111', '${'b'.repeat(64)}', ${Date.parse('2026-10-03T12:03:00.000Z')});
     process.kill(process.pid, 'SIGKILL');
   `;
-  const crashed = spawnSync(process.execPath, ['-e', crashScript, path.join(root, 'cim-replay.sqlite3')], {
+  const crashed = spawnSync(process.execPath, ['-e', crashScript, databasePath], {
     cwd: process.cwd(), encoding: 'utf8',
   });
   assert.equal(crashed.signal, 'SIGKILL', crashed.stderr);
+  assert.equal((await claim(store, {
+    requestId: 'b1111111-1111-4111-8111-111111111111', requestDigest: 'b'.repeat(64),
+  })).status, 'accepted');
+});
+
+test('filesystem replay initializes atomically across real worker processes', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-process-init-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const childScript = `
+    const { createFilesystemCimReplayStore } = await import(process.argv[1]);
+    const index = Number(process.argv[3]);
+    const store = createFilesystemCimReplayStore({
+      root: process.argv[2], maxEntries: 20,
+      now: () => new Date('2026-10-03T12:00:00.000Z'),
+    });
+    const requestId = String(index).padStart(8, '0') + '-1111-4111-8111-111111111111';
+    const result = await store.claim({
+      keyId: 'test-key-1', requestId, requestDigest: index.toString(16).padStart(64, '0'),
+      expiresAt: '2026-10-03T12:03:00.000Z', deadlineAt: performance.now() + 5_000,
+      signal: new AbortController().signal,
+    });
+    process.stdout.write(JSON.stringify(result));
+  `;
+  const children = Array.from({ length: 20 }, (_, index) => spawn(process.execPath, [
+    '--input-type=module', '-e', childScript, replayStoreModule, root, String(index + 1),
+  ], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] }));
+  const results = await Promise.all(children.map(async (child) => {
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const exited = await childExit(child);
+    assert.equal(exited.code, 0, stderr);
+    return JSON.parse(stdout);
+  }));
+  assert.equal(results.every(({ status }) => status === 'accepted'), true);
+});
+
+test('filesystem replay refuses lock contention past the shared deadline without committing', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-lock-deadline-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const store = createFilesystemCimReplayStore({
+    root, now: () => new Date('2026-10-03T12:00:00.000Z'),
+  });
+  assert.equal((await claim(store)).status, 'accepted');
+  const lockScript = `
+    const Database = require('better-sqlite3');
+    const database = new Database(process.argv[1]);
+    database.exec('BEGIN');
+    database.prepare('SELECT COUNT(*) FROM replay_entries').get();
+    process.stdout.write('ready');
+    setTimeout(() => { database.exec('COMMIT'); database.close(); }, 300);
+  `;
+  const lockHolder = spawn(process.execPath, ['-e', lockScript, path.join(root, 'cim-replay.sqlite3')], {
+    cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  await childOutput(lockHolder, 'ready');
+  await assert.rejects(claim(store, {
+    requestId: 'b1111111-1111-4111-8111-111111111111', requestDigest: 'b'.repeat(64),
+    deadlineAt: performance.now() + 25,
+  }), /deadline/i);
+  const exited = await childExit(lockHolder);
+  assert.equal(exited.code, 0);
   assert.equal((await claim(store, {
     requestId: 'b1111111-1111-4111-8111-111111111111', requestDigest: 'b'.repeat(64),
   })).status, 'accepted');

@@ -17,7 +17,7 @@ This branch closes routine operability gaps without changing the approved archit
 
 ## Immutable source pin remains deliberately unresolved
 
-The package names the requested official source tag `clamav/clamav:1.4.6_base`, but `CLAMAV_BASE_DIGEST` has no default. The auxiliary `node:22-alpine` runtime stage likewise requires `NODE_BASE_DIGEST` with no default and records `node:sqlite` as a required built-in runtime feature. `source-lock.json` records both digests as `null` and marks the package blocked.
+The package names the requested official source tag `clamav/clamav:1.4.6_base`, but `CLAMAV_BASE_DIGEST` has no default. The auxiliary `node:22-alpine` runtime stage likewise requires `NODE_BASE_DIGEST` with no default. The future build installs production dependencies from the checked-in `package-lock.json`; this source-only work did not run that install. `source-lock.json` records both digests as `null` and marks the package blocked.
 
 On 2026-10-03, a read-only check of the official Docker Hub tag listing showed current `1.4.6_base-debian*` variants and abbreviated per-platform digests, but did not expose an authoritative full digest for the exact requested `1.4.6_base` tag. No digest was inferred from a related tag or abbreviated display. No registry API, pull, inspect, build, or package installation was used. A later separately reviewed update must obtain the exact full index/platform digest from authoritative metadata, record the selected architecture, set both source locks, and re-review the package before any build.
 

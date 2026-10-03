@@ -1,14 +1,17 @@
 ARG NODE_BASE_DIGEST
 ARG CLAMAV_BASE_DIGEST
 FROM node:22-alpine@${NODE_BASE_DIGEST} AS node-runtime
+WORKDIR /build
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 FROM clamav/clamav:1.4.6_base@${CLAMAV_BASE_DIGEST}
 
 # Both immutable digests are intentionally required build arguments. Until official
 # read-only metadata resolves them and a later review records them, an actual build
-# must fail rather than silently resolving either mutable source tag. The selected
-# Node 22 digest must also be verified to expose the built-in node:sqlite module.
+# must fail rather than silently resolving either mutable source tag.
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /build/node_modules /opt/uckele/node_modules
 COPY package.json /opt/uckele/package.json
 COPY server/services/cimScanProtocol.js /opt/uckele/server/services/cimScanProtocol.js
 COPY server/services/cimScanWorker.js /opt/uckele/server/services/cimScanWorker.js

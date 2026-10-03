@@ -71,6 +71,8 @@ test('scanner package keeps the official source tag but requires unresolved immu
   assert.match(dockerfile, /^ARG NODE_BASE_DIGEST\nARG CLAMAV_BASE_DIGEST\nFROM node:22-alpine@\$\{NODE_BASE_DIGEST\}/);
   assert.match(dockerfile, /FROM clamav\/clamav:1\.4\.6_base@\$\{CLAMAV_BASE_DIGEST\}/);
   assert.doesNotMatch(dockerfile, /ARG (?:CLAMAV|NODE)_BASE_DIGEST=/);
+  assert.match(dockerfile, /COPY package\.json package-lock\.json/);
+  assert.match(dockerfile, /RUN npm ci --omit=dev/);
   assert.match(clamConfig, /^LocalSocket \/run\/clamav\/clamd\.sock$/m);
   assert.doesNotMatch(clamConfig, /^\s*(?:TCPAddr|TCPSocket)\b/m);
   assert.equal(sourceLock.status, 'blocked-pending-authoritative-digests');
@@ -78,5 +80,5 @@ test('scanner package keeps the official source tag but requires unresolved immu
     repository: 'clamav/clamav', tag: '1.4.6_base', digest: null,
   });
   assert.equal(sourceLock.nodeRuntime.digest, null);
-  assert.deepEqual(sourceLock.nodeRuntime.requiredFeatures, ['node:sqlite']);
+  assert.equal(sourceLock.dependencyLock, 'package-lock.json');
 });

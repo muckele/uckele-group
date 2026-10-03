@@ -1,6 +1,6 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import Database from 'better-sqlite3';
 
 const defaultMaximumEntries = 10_000;
 const identityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
@@ -65,70 +65,131 @@ async function ensureRoot(root) {
   }
 }
 
-async function validateDatabasePath(file) {
+async function ensurePrivateDatabaseFile(file, input) {
+  assertActive(input);
+  let handle;
   try {
-    const stat = await fsp.lstat(file);
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
-      throw new Error('Existing replay store database must be a private real file.');
-    }
-    return true;
+    handle = await fsp.open(file, 'wx', 0o600);
+    await handle.sync();
   } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    throw error;
+    if (error.code !== 'EEXIST') throw error;
+  } finally {
+    await handle?.close();
+  }
+  const stat = await fsp.lstat(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
+    throw new Error('Existing replay store database must be a private real file.');
   }
 }
 
-function initializeDatabase(file) {
-  const database = new DatabaseSync(file, { timeout: 500 });
+function validateDatabaseIdentity(database) {
+  const existingApplicationId = database.pragma('application_id', { simple: true });
+  const existingVersion = database.pragma('user_version', { simple: true });
+  if (existingApplicationId !== 0 && existingApplicationId !== applicationId) {
+    throw new Error('Replay store database belongs to another application.');
+  }
+  if (existingVersion !== 0 && existingVersion !== schemaVersion) {
+    throw new Error('Replay store database schema version is unsupported.');
+  }
+  return { existingApplicationId, existingVersion };
+}
+
+function isBusy(error) {
+  return error?.code === 'SQLITE_BUSY' || error?.code === 'SQLITE_LOCKED';
+}
+
+function waitForRetry(input) {
+  assertActive(input);
+  return new Promise((resolve) => setTimeout(resolve, 5));
+}
+
+async function initializeDatabase(file, input) {
+  for (;;) {
+    assertActive(input);
+    const database = new Database(file, { timeout: 0 });
+    let transactionOpen = false;
+    try {
+      database.pragma('busy_timeout = 0');
+      database.pragma('synchronous = FULL');
+      const quickCheck = database.pragma('quick_check', { simple: true });
+      if (quickCheck !== 'ok') throw new Error('Replay store database failed its integrity check.');
+      let identity = validateDatabaseIdentity(database);
+      if (identity.existingApplicationId === applicationId
+        && identity.existingVersion === schemaVersion) return database;
+      database.exec('BEGIN EXCLUSIVE');
+      transactionOpen = true;
+      identity = validateDatabaseIdentity(database);
+      if (identity.existingApplicationId === 0 && identity.existingVersion === 0) {
+        const tables = database.prepare(`
+          SELECT name FROM sqlite_master
+          WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        `).all();
+        if (tables.length > 0) throw new Error('Replay store database contains unknown state.');
+        database.exec(`
+          CREATE TABLE replay_entries (
+            key_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            result_expires_at INTEGER,
+            result_wire TEXT,
+            PRIMARY KEY (key_id, request_id),
+            CHECK ((result_expires_at IS NULL) = (result_wire IS NULL))
+          ) WITHOUT ROWID;
+          PRAGMA application_id = ${applicationId};
+          PRAGMA user_version = ${schemaVersion};
+        `);
+      } else if (identity.existingApplicationId !== applicationId
+        || identity.existingVersion !== schemaVersion) {
+        throw new Error('Replay store database initialization is inconsistent.');
+      }
+      assertActive(input);
+      database.exec('COMMIT');
+      transactionOpen = false;
+      assertActive(input);
+      return database;
+    } catch (error) {
+      if (transactionOpen) {
+        try { database.exec('ROLLBACK'); } catch { /* preserve the authoritative failure */ }
+      }
+      database.close();
+      if (!isBusy(error)) throw error;
+      await waitForRetry(input);
+    }
+  }
+}
+
+async function immediateTransaction(database, input, operation) {
+  for (;;) {
+    assertActive(input);
+    let transactionOpen = false;
+    try {
+      database.exec('BEGIN IMMEDIATE');
+      transactionOpen = true;
+      const result = operation();
+      assertActive(input);
+      database.exec('COMMIT');
+      transactionOpen = false;
+      assertActive(input);
+      return result;
+    } catch (error) {
+      if (transactionOpen) {
+        try { database.exec('ROLLBACK'); } catch { /* preserve the authoritative failure */ }
+      }
+      if (!isBusy(error)) throw error;
+      await waitForRetry(input);
+    }
+  }
+}
+
+function verifyInitializedDatabase(database) {
   try {
-    database.exec('PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;');
-    const quickCheck = database.prepare('PRAGMA quick_check').get().quick_check;
-    if (quickCheck !== 'ok') throw new Error('Replay store database failed its integrity check.');
-    const existingApplicationId = database.prepare('PRAGMA application_id').get().application_id;
-    const existingVersion = database.prepare('PRAGMA user_version').get().user_version;
-    if (existingApplicationId !== 0 && existingApplicationId !== applicationId) {
-      throw new Error('Replay store database belongs to another application.');
-    }
-    if (existingVersion !== 0 && existingVersion !== schemaVersion) {
-      throw new Error('Replay store database schema version is unsupported.');
-    }
-    if (existingApplicationId === 0) {
-      const tables = database.prepare(`
-        SELECT name FROM sqlite_master
-        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-      `).all();
-      if (tables.length > 0) throw new Error('Replay store database contains unknown state.');
-    }
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS replay_entries (
-        key_id TEXT NOT NULL,
-        request_id TEXT NOT NULL,
-        request_digest TEXT NOT NULL,
-        expires_at INTEGER NOT NULL,
-        result_expires_at INTEGER,
-        result_wire TEXT,
-        PRIMARY KEY (key_id, request_id),
-        CHECK ((result_expires_at IS NULL) = (result_wire IS NULL))
-      ) WITHOUT ROWID;
-    `);
-    database.exec(`PRAGMA application_id = ${applicationId}; PRAGMA user_version = ${schemaVersion};`);
-    return database;
+    database.prepare('SELECT key_id FROM replay_entries LIMIT 1').get();
   } catch (error) {
     database.close();
-    throw error;
+    throw new Error('Replay store database schema is invalid.', { cause: error });
   }
-}
-
-function immediateTransaction(database, operation) {
-  database.exec('BEGIN IMMEDIATE');
-  try {
-    const result = operation();
-    database.exec('COMMIT');
-    return result;
-  } catch (error) {
-    try { database.exec('ROLLBACK'); } catch { /* preserve the authoritative failure */ }
-    throw error;
-  }
+  return database;
 }
 
 function validateStoredEntry(entry) {
@@ -180,9 +241,8 @@ export function createFilesystemCimReplayStore({
       databasePromise = (async () => {
         await ensureRoot(replayRoot);
         const file = path.join(replayRoot, databaseName);
-        await validateDatabasePath(file);
-        const database = initializeDatabase(file);
-        await fsp.chmod(file, 0o600);
+        await ensurePrivateDatabaseFile(file, input);
+        const database = verifyInitializedDatabase(await initializeDatabase(file, input));
         const stat = await fsp.lstat(file);
         if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) {
           database.close();
@@ -205,7 +265,7 @@ export function createFilesystemCimReplayStore({
         const requestExpiry = validateIdentity(input);
         const database = await openDatabase(input);
         const at = currentTime(now);
-        return immediateTransaction(database, () => {
+        return immediateTransaction(database, input, () => {
           assertActive(input);
           database.prepare('DELETE FROM replay_entries WHERE expires_at <= ?').run(at);
           assertActive(input);
@@ -244,7 +304,7 @@ export function createFilesystemCimReplayStore({
         validateIdentity({ ...input, expiresAt: new Date(currentTime(now) + 1).toISOString() });
         const database = await openDatabase(input);
         const at = currentTime(now);
-        return immediateTransaction(database, () => {
+        return immediateTransaction(database, input, () => {
           assertActive(input);
           database.prepare('DELETE FROM replay_entries WHERE expires_at <= ?').run(at);
           const claim = database.prepare(`
