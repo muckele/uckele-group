@@ -10,11 +10,14 @@ const requestId = 'a1111111-1111-4111-8111-111111111111';
 const requestDigest = 'a'.repeat(64);
 
 function claim(store, overrides = {}) {
+  const controller = new AbortController();
   return store.claim({
     keyId,
     requestId,
     requestDigest,
     expiresAt: '2026-10-03T12:03:00.000Z',
+    deadlineAt: performance.now() + 1_000,
+    signal: controller.signal,
     ...overrides,
   });
 }
@@ -41,6 +44,7 @@ test('filesystem replay claim and completion survive process restart atomically'
   assert.equal((await claim(afterClaimCrash)).status, 'inflight');
   assert.equal(await afterClaimCrash.complete({
     keyId, requestId, requestDigest, resultWire: resultWire(),
+    deadlineAt: performance.now() + 1_000, signal: new AbortController().signal,
   }), true);
 
   const afterCompletionCrash = createFilesystemCimReplayStore({ root, now: clock });
@@ -74,6 +78,12 @@ test('filesystem replay store serializes concurrent claims and ignores only its 
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-crash-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   await fsp.writeFile(path.join(root, '.cim-replay-tmp-interrupted'), '{partial', { mode: 0o600 });
+  await fsp.writeFile(path.join(root, 'slot-00000.json'), JSON.stringify({
+    identityHash: 'f'.repeat(64),
+    ownerPid: 2_147_483_647,
+    reservationId: 'crashed-reservation',
+    expiresAt: '2026-10-03T12:03:00.000Z',
+  }), { mode: 0o600 });
   const store = createFilesystemCimReplayStore({
     root, now: () => new Date('2026-10-03T12:00:00.000Z'),
   });
@@ -81,6 +91,8 @@ test('filesystem replay store serializes concurrent claims and ignores only its 
   const statuses = (await Promise.all([claim(store), claim(store)])).map((entry) => entry.status).sort();
   assert.deepEqual(statuses, ['accepted', 'inflight']);
   assert.equal((await fsp.readdir(root)).some((name) => name.startsWith('.cim-replay-tmp-')), false);
+  const slotWire = await fsp.readFile(path.join(root, 'slot-00000.json'), 'utf8');
+  assert.equal(JSON.parse(slotWire).identityHash === 'f'.repeat(64), false);
 });
 
 test('filesystem replay claim stays atomic across independently constructed store instances', async (t) => {
@@ -96,6 +108,63 @@ test('filesystem replay claim stays atomic across independently constructed stor
   assert.deepEqual(statuses, ['accepted', 'inflight']);
 });
 
+test('filesystem replay cap stays atomic across different identities and store instances', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-global-cap-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const options = {
+    root, maxEntries: 1, now: () => new Date('2026-10-03T12:00:00.000Z'),
+  };
+  const first = createFilesystemCimReplayStore(options);
+  const second = createFilesystemCimReplayStore(options);
+  const statuses = (await Promise.all([
+    claim(first),
+    claim(second, {
+      requestId: 'b1111111-1111-4111-8111-111111111111',
+      requestDigest: 'b'.repeat(64),
+    }),
+  ])).map(({ status }) => status).sort();
+  assert.deepEqual(statuses, ['accepted', 'capacity']);
+  assert.equal((await fsp.readdir(root)).filter((name) => name.startsWith('claim-')).length, 1);
+});
+
+test('filesystem replay cleanup leaves a live publisher temporary file alone', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-live-temp-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const liveTemp = `.cim-replay-tmp-${process.pid}-00000000-0000-4000-8000-000000000000`;
+  await fsp.writeFile(path.join(root, liveTemp), '{partial', { mode: 0o600 });
+  const store = createFilesystemCimReplayStore({
+    root, now: () => new Date('2026-10-03T12:00:00.000Z'),
+  });
+
+  assert.equal((await claim(store)).status, 'accepted');
+  assert.equal((await fsp.readdir(root)).includes(liveTemp), true);
+});
+
+test('filesystem replay refuses expired or aborted mutations before publishing state', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-deadline-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const store = createFilesystemCimReplayStore({
+    root, now: () => new Date('2026-10-03T12:00:00.000Z'),
+  });
+  const aborted = new AbortController();
+  aborted.abort(new Error('cancelled'));
+
+  await assert.rejects(claim(store, { signal: aborted.signal }), /abort|cancel/i);
+  await assert.rejects(claim(store, { deadlineAt: performance.now() - 1 }), /deadline/i);
+  const names = await fsp.readdir(root).catch((error) => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  assert.equal(names.some((name) => name.startsWith('claim-') || name.startsWith('result-')), false);
+
+  assert.equal((await claim(store)).status, 'accepted');
+  await assert.rejects(store.complete({
+    keyId, requestId, requestDigest, resultWire: resultWire(),
+    deadlineAt: performance.now() + 1_000, signal: aborted.signal,
+  }), /abort|cancel/i);
+  assert.equal((await fsp.readdir(root)).some((name) => name.startsWith('result-')), false);
+});
+
 test('filesystem replay completion refuses mismatched or expired result authority', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-replay-result-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
@@ -105,10 +174,12 @@ test('filesystem replay completion refuses mismatched or expired result authorit
   assert.equal((await claim(store)).status, 'accepted');
   assert.equal(await store.complete({
     keyId, requestId, requestDigest, resultWire: resultWire({ requestDigest: 'f'.repeat(64) }),
+    deadlineAt: performance.now() + 1_000, signal: new AbortController().signal,
   }), false);
   assert.equal(await store.complete({
     keyId, requestId, requestDigest,
     resultWire: resultWire({ expiresAt: '2026-10-03T11:59:59.000Z' }),
+    deadlineAt: performance.now() + 1_000, signal: new AbortController().signal,
   }), false);
   assert.equal((await claim(store)).status, 'inflight');
 });

@@ -8,6 +8,8 @@ const identityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
 const recordNamePattern = /^(claim|result)-([a-f0-9]{64})\.json$/;
 const temporaryPrefix = '.cim-replay-tmp-';
+const temporaryNamePattern = /^\.cim-replay-tmp-(\d+)-[0-9a-f-]+$/;
+const slotNamePattern = /^slot-(\d{5})\.json$/;
 
 function currentTime(now) {
   const value = now();
@@ -77,8 +79,36 @@ async function readOptionalRecord(file, expectedFields) {
   }
 }
 
-async function atomicCreate(root, file, value) {
-  const candidate = path.join(root, `${temporaryPrefix}${randomUUID()}`);
+function assertActive({ deadlineAt, signal } = {}) {
+  if (!Number.isFinite(deadlineAt) || deadlineAt <= performance.now()) {
+    const error = new Error('Replay store deadline is invalid or expired.');
+    error.code = 'CIM_SCAN_DEADLINE';
+    throw error;
+  }
+  if (!signal || typeof signal.aborted !== 'boolean') {
+    throw new Error('Replay store abort signal is required.');
+  }
+  if (signal.aborted) {
+    if (signal.reason instanceof Error) throw signal.reason;
+    const error = new Error('Replay store operation was aborted.');
+    error.name = 'AbortError';
+    throw error;
+  }
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+async function atomicCreate(root, file, value, guard) {
+  guard();
+  const candidate = path.join(root, `${temporaryPrefix}${process.pid}-${randomUUID()}`);
   let handle;
   try {
     handle = await fsp.open(candidate, 'wx', 0o600);
@@ -86,6 +116,7 @@ async function atomicCreate(root, file, value) {
     await handle.sync();
     await handle.close();
     handle = null;
+    guard();
     try {
       await fsp.link(candidate, file);
     } catch (error) {
@@ -122,6 +153,10 @@ function resultFile(root, hash) {
   return path.join(root, `result-${hash}.json`);
 }
 
+function slotFile(root, index) {
+  return path.join(root, `slot-${String(index).padStart(5, '0')}.json`);
+}
+
 async function existingStatus(root, hash, input, at) {
   const existing = await readOptionalRecord(claimFile(root, hash), [
     'keyId', 'requestId', 'requestDigest', 'expiresAt',
@@ -146,10 +181,22 @@ async function existingStatus(root, hash, input, at) {
   return { status: 'inflight' };
 }
 
-async function inspectAndPrune(root, at) {
+async function removeExactReservation(file, reservationId, guard) {
+  const record = await readOptionalRecord(file, [
+    'identityHash', 'ownerPid', 'reservationId', 'expiresAt',
+  ]);
+  if (!record || record.reservationId !== reservationId) return;
+  guard();
+  await fsp.unlink(file).catch((error) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+}
+
+async function inspectAndPrune(root, at, guard) {
   const names = (await fsp.readdir(root)).sort();
   const claims = new Map();
   const results = new Set();
+  const slots = new Map();
   for (const name of names) {
     const file = path.join(root, name);
     if (name.startsWith(temporaryPrefix)) {
@@ -157,7 +204,15 @@ async function inspectAndPrune(root, at) {
       if (!stat.isFile() || stat.isSymbolicLink()) {
         throw new Error('Replay store contains invalid interrupted state.');
       }
+      const match = temporaryNamePattern.exec(name);
+      if (match && processIsAlive(Number(match[1]))) continue;
+      guard();
       await fsp.unlink(file);
+      continue;
+    }
+    const slotMatch = slotNamePattern.exec(name);
+    if (slotMatch) {
+      slots.set(Number(slotMatch[1]), file);
       continue;
     }
     const match = recordNamePattern.exec(name);
@@ -177,15 +232,58 @@ async function inspectAndPrune(root, at) {
       throw new Error('Replay store claim identity is inconsistent.');
     }
     if (Date.parse(claim.expiresAt) <= at) {
+      guard();
       await fsp.unlink(resultFile(root, hash)).catch((error) => {
         if (error.code !== 'ENOENT') throw error;
       });
+      guard();
       await fsp.unlink(file);
       claims.delete(hash);
     }
   }
+  const claimedSlots = new Map();
+  for (const [index, file] of slots) {
+    const slot = await readCanonicalRecord(file, [
+      'identityHash', 'ownerPid', 'reservationId', 'expiresAt',
+    ]);
+    if (!digestPattern.test(slot.identityHash)
+      || !Number.isSafeInteger(slot.ownerPid) || slot.ownerPid < 1
+      || typeof slot.reservationId !== 'string' || slot.reservationId.length > 64
+      || !Number.isFinite(Date.parse(slot.expiresAt))) {
+      throw new Error('Replay store slot is invalid.');
+    }
+    const claimExists = claims.has(slot.identityHash);
+    const duplicate = claimExists && claimedSlots.has(slot.identityHash);
+    const activeReservation = processIsAlive(slot.ownerPid) && Date.parse(slot.expiresAt) > at;
+    const abandoned = !claimExists && !activeReservation;
+    if ((duplicate && !activeReservation) || abandoned) {
+      guard();
+      await fsp.unlink(file);
+      slots.delete(index);
+      continue;
+    }
+    if (claimExists) claimedSlots.set(slot.identityHash, index);
+  }
+  for (const hash of claims.keys()) {
+    if (!claimedSlots.has(hash)) throw new Error('Replay store claim has no capacity reservation.');
+  }
   await syncDirectory(root);
-  return claims.size;
+}
+
+async function reserveSlot({ root, maxEntries, hash, requestExpiry, guard }) {
+  for (let index = 0; index < maxEntries; index += 1) {
+    const reservationId = randomUUID();
+    const record = JSON.stringify({
+      identityHash: hash,
+      ownerPid: process.pid,
+      reservationId,
+      expiresAt: new Date(requestExpiry).toISOString(),
+    });
+    if (await atomicCreate(root, slotFile(root, index), record, guard)) {
+      return { file: slotFile(root, index), reservationId };
+    }
+  }
+  return null;
 }
 
 export function createFilesystemCimReplayStore({
@@ -208,35 +306,65 @@ export function createFilesystemCimReplayStore({
   return Object.freeze({
     async claim(input = {}) {
       return serialized(async () => {
+        const guard = () => assertActive(input);
+        guard();
         const requestExpiry = validateIdentity(input);
         const at = currentTime(now);
+        guard();
         await ensureRoot(replayRoot);
-        const entryCount = await inspectAndPrune(replayRoot, at);
+        await inspectAndPrune(replayRoot, at, guard);
         const hash = identityHash(input.keyId, input.requestId);
         const existing = await existingStatus(replayRoot, hash, input, at);
         if (existing) return existing;
-        if (requestExpiry <= at || entryCount >= maxEntries) return { status: 'capacity' };
+        if (requestExpiry <= at) return { status: 'capacity' };
+        const reservation = await reserveSlot({
+          root: replayRoot, maxEntries, hash, requestExpiry, guard,
+        });
+        if (!reservation) {
+          const raced = await existingStatus(replayRoot, hash, input, currentTime(now));
+          return raced || { status: 'capacity' };
+        }
         const record = JSON.stringify({
           keyId: input.keyId,
           requestId: input.requestId,
           requestDigest: input.requestDigest,
           expiresAt: new Date(requestExpiry).toISOString(),
         });
-        if (!await atomicCreate(replayRoot, claimFile(replayRoot, hash), record)) {
-          const raced = await existingStatus(replayRoot, hash, input, at);
-          if (!raced) throw new Error('Replay claim race lost without durable authority.');
-          return raced;
+        try {
+          const publishGuard = () => {
+            guard();
+            if (requestExpiry <= currentTime(now)) {
+              throw new Error('Replay request expired before its claim was published.');
+            }
+          };
+          if (!await atomicCreate(replayRoot, claimFile(replayRoot, hash), record, publishGuard)) {
+            await removeExactReservation(reservation.file, reservation.reservationId, () => {});
+            const raced = await existingStatus(replayRoot, hash, input, currentTime(now));
+            if (!raced) throw new Error('Replay claim race lost without durable authority.');
+            return raced;
+          }
+          return { status: 'accepted' };
+        } catch (error) {
+          const published = await readOptionalRecord(claimFile(replayRoot, hash), [
+            'keyId', 'requestId', 'requestDigest', 'expiresAt',
+          ]).catch(() => null);
+          if (!published || published.requestDigest !== input.requestDigest) {
+            await removeExactReservation(reservation.file, reservation.reservationId, () => {});
+          }
+          throw error;
         }
-        return { status: 'accepted' };
       });
     },
 
     async complete(input = {}) {
       return serialized(async () => {
+        const guard = () => assertActive(input);
+        guard();
         validateIdentity({ ...input, expiresAt: new Date(currentTime(now) + 1).toISOString() });
         const at = currentTime(now);
+        guard();
         await ensureRoot(replayRoot);
-        await inspectAndPrune(replayRoot, at);
+        await inspectAndPrune(replayRoot, at, guard);
         const hash = identityHash(input.keyId, input.requestId);
         const claim = await readOptionalRecord(claimFile(replayRoot, hash), [
           'keyId', 'requestId', 'requestDigest', 'expiresAt',
@@ -260,7 +388,7 @@ export function createFilesystemCimReplayStore({
           resultExpiresAt: new Date(resultExpiresAt).toISOString(),
           resultWire: input.resultWire,
         });
-        return atomicCreate(replayRoot, resultFile(replayRoot, hash), record);
+        return atomicCreate(replayRoot, resultFile(replayRoot, hash), record, guard);
       });
     },
   });

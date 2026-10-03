@@ -136,3 +136,27 @@ test('pinned HTTP request client requires HTTPS pinning, redirect refusal, and e
     openByteStream: () => Readable.from([Buffer.from('x')]), maxResponseBytes: 64,
   }), /length|size/i);
 });
+
+test('pinned HTTP request client aborts an admitted exchange when body setup fails', async () => {
+  const original = new Error('source-open-failed');
+  let aborts = 0;
+  const client = createPinnedHttpScanRequestClient({
+    endpoint: 'https://scanner.internal/v1/cim-scan', certificatePinSha256: 'a'.repeat(64),
+    async openExchange() {
+      return {
+        async awaitAdmission() { return { status: 100 }; },
+        async write() {},
+        async finish() { return { status: 200, body: [] }; },
+        abort() { aborts += 1; throw new Error('abort-failed'); },
+      };
+    },
+  });
+  const upload = await client.authorize({
+    requestWire: JSON.stringify({ sizeBytes: 1 }), redirects: 'error', maxResponseBytes: 64,
+  });
+
+  await assert.rejects(upload.sendBody({
+    openByteStream() { throw original; }, maxResponseBytes: 64,
+  }), (error) => error === original);
+  assert.equal(aborts, 1);
+});

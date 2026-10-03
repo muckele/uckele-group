@@ -127,6 +127,10 @@ async function readResponseBody(body, maximum) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+function abortExchange(exchange, reason) {
+  try { exchange?.abort?.(reason); } catch { /* preserve the authoritative failure */ }
+}
+
 export function createPinnedHttpScanRequestClient({
   endpoint,
   certificatePinSha256,
@@ -169,35 +173,35 @@ export function createPinnedHttpScanRequestClient({
       if (!exchange || typeof exchange.awaitAdmission !== 'function'
         || typeof exchange.write !== 'function' || typeof exchange.finish !== 'function'
         || typeof exchange.abort !== 'function') {
-        exchange?.abort?.();
+        abortExchange(exchange);
         throw new Error('Scanner HTTP exchange seam is invalid.');
       }
       let admission;
       try {
         admission = await exchange.awaitAdmission({ signal, deadlineAt });
       } catch (error) {
-        exchange.abort(error);
+        abortExchange(exchange, error);
         throw error;
       }
       if (admission?.status !== 100) {
-        exchange.abort();
+        abortExchange(exchange);
         throw new Error('Scanner worker did not admit the request before its body.');
       }
       let bodyOpened = false;
       return Object.freeze({
-        abort(reason) { exchange.abort(reason); },
+        abort(reason) { abortExchange(exchange, reason); },
         async sendBody({ openByteStream, maxResponseBytes: bodyCap, signal: bodySignal, deadlineAt: bodyDeadline } = {}) {
           if (bodyOpened) throw new Error('Scanner upload handle is single-use.');
           bodyOpened = true;
-          if (typeof openByteStream !== 'function') throw new Error('Scanner body factory is required.');
-          if (bodyCap !== maxResponseBytes) throw new Error('Scanner response cap changed after admission.');
-          const stream = openByteStream();
-          if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
-            exchange.abort();
-            throw new Error('Scanner attachment stream is invalid.');
-          }
+          let stream;
           let sent = 0;
           try {
+            if (typeof openByteStream !== 'function') throw new Error('Scanner body factory is required.');
+            if (bodyCap !== maxResponseBytes) throw new Error('Scanner response cap changed after admission.');
+            stream = openByteStream();
+            if (!stream || typeof stream[Symbol.asyncIterator] !== 'function') {
+              throw new Error('Scanner attachment stream is invalid.');
+            }
             for await (const value of stream) {
               const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
               if (chunk.length > sizeBytes - sent) throw new Error('Scanner attachment exceeds its authenticated size.');
@@ -212,8 +216,8 @@ export function createPinnedHttpScanRequestClient({
             if (response?.status !== 200) throw new Error('Scanner HTTP response was not successful.');
             return await readResponseBody(response.body, maxResponseBytes);
           } catch (error) {
-            exchange.abort(error);
-            stream.destroy?.(error);
+            abortExchange(exchange, error);
+            try { stream?.destroy?.(error); } catch { /* preserve the authoritative failure */ }
             throw error;
           }
         },
