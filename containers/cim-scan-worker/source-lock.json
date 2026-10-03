@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "status": "locked",
+  "platform": "linux/amd64",
+  "clamav": {
+    "repository": "clamav/clamav",
+    "tag": "1.4.6_base",
+    "digest": "sha256:90effb795234e6a93b070310a4bab5a58d93d94b9a077a09ce2229947679782b",
+    "platformDigest": "sha256:58d9b21b5694a1f5b3a136e4f2e4fc6b463fce88635737e16f8cb9ee9455a199"
+  },
+  "nodeRuntime": {
+    "repository": "node",
+    "tag": "22-alpine",
+    "digest": "sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402",
+    "platformDigest": "sha256:2c752226d477b4a886378baa95b9af252be59301b725fdb0b7e15208131505a8"
+  },
+  "dependencyLock": "package-lock.json"
+}

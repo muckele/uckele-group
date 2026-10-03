@@ -1,6 +1,6 @@
 # P8-03 On-Demand Scanner: Offline Handoff
 
-**State:** design and synthetic integration only; not configured, deployed, or active
+**State:** design, synthetic integration, and dependent offline operability bundle only; not configured, deployed, or active
 
 **Dependency:** PR55 reviewed head `55d6d8e20ce2c9267ec7d9a22e6ca6f3c66e1810`
 
@@ -8,7 +8,7 @@
 
 The application can model one globally leased scan job on the existing P8 attachment lifecycle. Protocol helpers sign a short-lived exact attachment identity; an unwired adapter can perform a generation-fenced start/admit/upload/stop lifecycle through injected interfaces; a single-task worker can validate the request, require fresh scanner evidence, create and safely remove one ephemeral copy, and return a signed result; and a ClamAV adapter implements bounded `INSTREAM` framing over an injected Unix-socket connector only.
 
-All exercised controllers, request clients, authentication keys, replay stores, scanner connections, signature evidence, and attachment bytes are synthetic. There is no default instance, network client, socket connector, credential lookup, Machine ID, hostname, or runtime registration. `secureDocuments.cimAttachmentIntake.enabled` and `.scannerReady` remain literal `false` values with no environment activation path.
+All exercised control/HTTP seams, authentication keys, scanner responses, signature evidence, and attachment bytes are synthetic. The dependent P8-04 bundle adds a filesystem replay implementation, a one-shot worker/file-descriptor entrypoint, a real local Unix-socket connector, and concrete policy adapters over injected Fly-control and HTTP-exchange seams. There is still no default provider implementation, credential lookup, Machine ID, hostname, certificate pin, or runtime registration. `secureDocuments.cimAttachmentIntake.enabled` and `.scannerReady` remain literal `false` values with no environment activation path.
 
 The Supabase SQL under `docs/operations/sql/` is a rollback-only review proposal. It is not in `supabase/migrations`, is not reflected in the deployed schema, and must not be applied from this branch. Fresh disposable SQLite test databases contain the offline fields; existing deployed databases are not upgraded.
 
@@ -49,11 +49,11 @@ The owner must separately approve all of the following, in this order:
 10. A limited non-user canary using approved synthetic fixtures, followed by a separately approved real-attachment canary and data-handling review.
 11. Deliberate runtime wiring and only then separate activation of scanner readiness and intake. No environment variable alone may activate either gate.
 
-## Synthetic benchmark proposal
+## Later eight-job live-smoke proposal
 
-Run only after approvals 1–9. Use randomly generated non-user files and an approved harmless antivirus test fixture; do not use broker email, provider downloads, or real attachments.
+Run only after fresh action-time approval of approvals 1–9, the exact reviewed head, resource target, cost ceiling, fixtures, cleanup targets, and stop conditions. Use generated non-user files and an approved harmless antivirus test fixture; do not use broker email, provider downloads, or real attachments. This phase grants no smoke permission.
 
-Record at least 30 cold and 30 warm samples for each allowed size band (1 KiB, 1 MiB, 4 MiB, and 8 MiB):
+The smoke is exactly eight jobs, not 284 cases: cold/warm clean 1 KiB, cold/warm clean 8 MiB, one approved harmless unsafe fixture, one stale-signature refusal, one replay/conflict job, and one timeout/owned-cleanup/owned-stop job. Record for each applicable job:
 
 - provider start request to generation-owned running state;
 - worker admission latency and rejection behavior;
@@ -66,7 +66,9 @@ Record at least 30 cold and 30 warm samples for each allowed size band (1 KiB, 1
 - forced timeout/abort, crash-after-copy, crash-after-scan, cleanup refusal, and restart-orphan behavior; and
 - provider-billed runtime granularity plus volume/rootfs/signature-transfer charges.
 
-Project monthly cost from measured provider billing for 0, 1, 10, and 25 running hours, including persistent storage and signature refresh overhead. The prior $1–$3/month figure is not a guarantee; it was a provisional estimate assuming about 10 running hours and remains unaccepted until this benchmark supplies actual startup, root filesystem, signature, compute, and storage costs.
+Project monthly cost from measured provider billing for 0, 1, 10, and 25 running hours, including persistent storage and signature refresh overhead. The prior $1–$3/month figure is not a guarantee; it was a provisional estimate assuming about 10 running hours and remains unaccepted until this smoke supplies actual startup, root filesystem, signature, compute, and storage costs.
+
+Permanent volume deletion or any other unrecoverable data deletion is never preapproved by this runbook. It requires action-time approval naming the exact target.
 
 ## Current prohibitions
 

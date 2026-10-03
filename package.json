@@ -25,6 +25,7 @@
     "cim:autopilot:evidence": "node scripts/audit-pursue-cim-autopilot.js",
     "cim:autopilot:contain": "node scripts/contain-pursue-cim-autopilot.js",
     "cim:p10b": "node scripts/run-pursue-cim-controlled-mailbox.js",
+    "cim:scan:synthetic": "node scripts/run-cim-scan-synthetic-harness.js",
     "eval:follow-ups": "node scripts/run-follow-up-eval.js",
     "eval:follow-ups:live": "node scripts/run-follow-up-eval.js --live",
     "check": "npm run eval:follow-ups && npm run lint && npm test && npm run test:ui && npm run build",
