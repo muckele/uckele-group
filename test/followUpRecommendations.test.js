@@ -204,6 +204,312 @@ test('deterministic recommendation fixtures cover hard stops, triage, waiting, a
   }
 });
 
+test('buyer qualification and financial prerequisites require owner review without a draft', async (t) => {
+  const fixtures = [
+    {
+      name: 'buyer profile',
+      body: 'Please complete our buyer profile before receiving access.',
+      signal: 'buyer-qualification-request',
+    },
+    {
+      name: 'proof of funds before CIM',
+      body: 'Please provide proof of funds before we share the CIM.',
+      signal: 'financial-qualification-request',
+    },
+    {
+      name: 'fee agreement',
+      body: 'Our process requires a signed fee agreement before proceeding.',
+      signal: 'financial-commitment-request',
+    },
+    {
+      name: 'lender commitment letter',
+      body: 'Please submit a lender commitment letter for the seller to review.',
+      signal: 'financial-commitment-request',
+    },
+    {
+      name: 'imperative buyer profile',
+      body: 'Complete our buyer profile before proceeding.',
+      signal: 'buyer-qualification-request',
+    },
+    {
+      name: 'you must provide proof of funds',
+      body: 'You must provide proof of funds before access.',
+      signal: 'financial-qualification-request',
+    },
+    {
+      name: 'passive proof of funds requirement',
+      body: 'Proof of funds must be provided before access.',
+      signal: 'financial-qualification-request',
+    },
+    {
+      name: 'passive buyer profile requirement',
+      body: 'Buyer profile must be completed before access.',
+      signal: 'buyer-qualification-request',
+    },
+    {
+      name: 'omitted copula fee requirement',
+      body: 'Signed fee agreement required before proceeding.',
+      signal: 'financial-commitment-request',
+    },
+    {
+      name: 'financing commitment without letter',
+      body: 'A financing commitment is required before access.',
+      signal: 'financial-commitment-request',
+    },
+    {
+      name: 'you need to pay retainer',
+      body: 'You need to pay the retainer before proceeding.',
+      signal: 'financial-commitment-request',
+    },
+    {
+      name: 'modal buyer profile request',
+      body: 'Can you send us your buyer profile?',
+      signal: 'buyer-qualification-request',
+    },
+    {
+      name: 'modal proof of funds request',
+      body: 'Could you please provide proof of funds before access?',
+      signal: 'financial-qualification-request',
+    },
+    {
+      name: 'contextual fee agreement request',
+      body: 'Before we proceed, please sign and return the fee agreement.',
+      signal: 'financial-commitment-request',
+    },
+    {
+      name: 'plural upfront processing fees',
+      body: 'You need to pay the upfront processing fees before proceeding.',
+      signal: 'financial-commitment-request',
+    },
+    {
+      name: 'upload proof of funds',
+      body: 'Please upload proof of funds before access.',
+      signal: 'financial-qualification-request',
+    },
+    {
+      name: 'fill out buyer qualification form',
+      body: 'Please fill out our buyer qualification form before proceeding.',
+      signal: 'buyer-qualification-request',
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, () => {
+      const recommendation = buildDeterministicFollowUpRecommendation({
+        context: context({ communications: [communication({ body_text: fixture.body })] }),
+        now,
+        config: config(),
+      });
+
+      assert.equal(recommendation.intent, 'nda_request');
+      assert.equal(recommendation.actionType, 'complete_nda_or_buyer_profile');
+      assert.equal(recommendation.conversationState, 'nda_or_buyer_profile_requested');
+      assert.equal(recommendation.draftSubject, '');
+      assert.equal(recommendation.draftBodyText, '');
+      assert.equal(recommendation.sendAllowed, false);
+      assert.ok(recommendation.signals.includes(fixture.signal));
+      assert.ok(recommendation.blockers.includes('owner-qualification-review-required'));
+      assert.ok(recommendation.safetyFlags.includes('outreach-blocked'));
+    });
+  }
+});
+
+test('satisfied, negated, quoted, and unrelated prerequisite terms are not new requests', async (t) => {
+  const fixtures = [
+    {
+      name: 'already provided proof of funds',
+      body: 'We already provided proof of funds. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'negated proof of funds requirement',
+      body: 'No proof of funds is required. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'counterparty negates proof of funds requirement',
+      body: 'We do not require proof of funds. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'contracted proof of funds negation',
+      body: "Proof of funds isn't required. Could you send the CIM?",
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'confirmation of negated proof of funds requirement',
+      body: 'Please send confirmation that no proof of funds is required.',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+    {
+      name: 'counterparty needs no proof of funds',
+      body: 'We need no proof of funds. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'proof of funds already provided after requirement',
+      body: 'The seller requires proof of funds, which we already provided. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'proof of funds provided in following clause',
+      body: 'Proof of funds is required; we have already provided it. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'proof of funds provided in following sentence',
+      body: 'Proof of funds is required. We have already provided the proof of funds. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'proof of funds has been provided',
+      body: 'Proof of funds has been provided. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'proof of funds is provided',
+      body: 'Proof of funds is provided. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'fee agreement signed status',
+      body: 'Fee agreement signed. Thank you.',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+    {
+      name: 'fee agreement is signed status',
+      body: 'The fee agreement is signed. Could you send the CIM?',
+      action: 'send_approved_materials',
+      state: 'documents_requested',
+    },
+    {
+      name: 'signed fee agreement requested for records',
+      body: 'Please send the fee agreement we already signed for our records.',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+    {
+      name: 'already attached proof of funds without attachment metadata',
+      body: 'Attached is our proof of funds.',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+    {
+      name: 'unrelated use of commitment',
+      body: 'What is the expected time commitment?',
+      action: 'answer_question',
+      state: 'reply_received',
+    },
+    {
+      name: 'quoted proof of funds request',
+      body: 'Thanks for the update.\n\nOn Friday someone wrote:\n> Please provide proof of funds before we share the CIM.',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+    {
+      name: 'Outlook quoted proof of funds request',
+      body: 'Thanks for the update.\n\nFrom: Broker <broker@example.test>\nSent: Friday, October 2, 2026\nTo: Buyer <buyer@example.test>\nSubject: Re: Opportunity\n\nPlease provide proof of funds before we share the CIM.',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+    {
+      name: 'inline attributed proof of funds request',
+      body: 'For reference, the prior email said: “Please provide proof of funds before we share the CIM.”',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+    {
+      name: 'curly single-quoted stated proof of funds request',
+      body: 'The prior email stated: ‘Please upload proof of funds before access.’',
+      action: 'manual_review',
+      state: 'reply_received',
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, () => {
+      const recommendation = buildDeterministicFollowUpRecommendation({
+        context: context({ communications: [communication({ body_text: fixture.body })] }),
+        now,
+        config: config(),
+      });
+
+      assert.equal(recommendation.actionType, fixture.action);
+      assert.equal(recommendation.conversationState, fixture.state);
+      assert.notEqual(recommendation.signals[0], 'buyer-qualification-request');
+      assert.notEqual(recommendation.signals[0], 'financial-qualification-request');
+      assert.notEqual(recommendation.signals[0], 'financial-commitment-request');
+    });
+  }
+});
+
+test('a new prerequisite request is retained after an older prerequisite was satisfied', () => {
+  const recommendation = buildDeterministicFollowUpRecommendation({
+    context: context({
+      communications: [communication({
+        body_text: 'We already provided the old proof of funds. Updated proof of funds is required before access.',
+      })],
+    }),
+    now,
+    config: config(),
+  });
+
+  assert.equal(recommendation.actionType, 'complete_nda_or_buyer_profile');
+  assert.equal(recommendation.conversationState, 'nda_or_buyer_profile_requested');
+  assert.equal(recommendation.draftBodyText, '');
+  assert.ok(recommendation.blockers.includes('owner-qualification-review-required'));
+});
+
+test('hard stops and inbound attachments retain precedence over qualification requests', async (t) => {
+  const fixtures = [
+    {
+      name: 'explicit opt out',
+      communication: communication({ body_text: 'Please unsubscribe. We also require proof of funds.' }),
+      action: 'stop_all_outreach',
+      state: 'opted_out',
+    },
+    {
+      name: 'attachment review',
+      communication: communication({
+        body_text: 'Please provide proof of funds.',
+        attachment_metadata: [{ id: 'attachment-1', name: 'requirements.pdf', content_type: 'application/pdf' }],
+      }),
+      action: 'review_documents',
+      state: 'documents_received_review_needed',
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, () => {
+      const recommendation = buildDeterministicFollowUpRecommendation({
+        context: context({ communications: [fixture.communication] }),
+        now,
+        config: config(),
+      });
+
+      assert.equal(recommendation.actionType, fixture.action);
+      assert.equal(recommendation.conversationState, fixture.state);
+      assert.equal(recommendation.sendAllowed, false);
+      if (fixture.name === 'attachment review') {
+        assert.ok(recommendation.blockers.includes('owner-qualification-review-required'));
+        assert.ok(recommendation.safetyFlags.includes('outreach-blocked'));
+      }
+    });
+  }
+});
+
 test('priority scoring is explainable, capped, and does not count opens', () => {
   const recommendation = buildDeterministicFollowUpRecommendation({
     context: context({
@@ -576,6 +882,50 @@ test('generation persists once, reuses its fingerprint cache, and never calls AI
   });
   assert.equal(archived.recommendation.action_type, 'no_action');
   assert.equal(aiCalls, 0, 'archived/no-action recommendations never disclose context to AI');
+});
+
+test('qualification requests with attachments retain review precedence and never call AI', async () => {
+  const storage = recommendationStorage({
+    communications: [communication({
+      body_text: 'Please provide proof of funds.',
+      attachment_metadata: [{ id: 'attachment-1', name: 'requirements.pdf', content_type: 'application/pdf' }],
+    })],
+  });
+  let aiCalls = 0;
+  const result = await generateCrmFollowUpRecommendation({
+    submissionId: 'submission-1',
+    storage,
+    config: config({ aiEnabled: true, aiModel: 'gpt-test' }),
+    now,
+    aiClient: { responses: { async create() { aiCalls += 1; throw new Error('must not be called'); } } },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.recommendation.action_type, 'review_documents');
+  assert.ok(result.recommendation.blockers_json.includes('owner-qualification-review-required'));
+  assert.ok(result.recommendation.safety_flags_json.includes('outreach-blocked'));
+  assert.equal(aiCalls, 0);
+});
+
+test('owner-only qualification requests never call AI without attachments', async () => {
+  const storage = recommendationStorage({
+    communications: [communication({ body_text: 'Please upload proof of funds before access.' })],
+  });
+  let aiCalls = 0;
+  const result = await generateCrmFollowUpRecommendation({
+    submissionId: 'submission-1',
+    storage,
+    config: config({ aiEnabled: true, aiModel: 'gpt-test' }),
+    now,
+    aiClient: { responses: { async create() { aiCalls += 1; throw new Error('must not be called'); } } },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.recommendation.action_type, 'complete_nda_or_buyer_profile');
+  assert.equal(result.recommendation.draft_body_text, '');
+  assert.ok(result.recommendation.blockers_json.includes('owner-qualification-review-required'));
+  assert.ok(result.recommendation.safety_flags_json.includes('outreach-blocked'));
+  assert.equal(aiCalls, 0);
 });
 
 test('a complete input fingerprint reuses cache and changed communication content creates new advice', async () => {

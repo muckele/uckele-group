@@ -32,7 +32,7 @@ function config(overrides = {}) {
       aiMaxRetries: 0,
       aiRateLimitPerMinute: 10,
       aiDataHandlingApprovalId: 'privacy-review-test',
-      aiAcceptedEvalVersion: 'follow-up-eval-v1',
+      aiAcceptedEvalVersion: 'follow-up-eval-v2',
       aiCostRateApprovalId: 'cost-rate-review-test',
       aiSyntheticSmokeId: 'synthetic-smoke-test',
       senderEmail: 'Uckele Group <mathew@uckelegroup.com>',

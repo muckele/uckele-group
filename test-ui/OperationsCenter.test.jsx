@@ -143,7 +143,7 @@ describe('Operations Center partial failures', () => {
         costRateApproved: false,
         evalAccepted: false,
         acceptedEvalVersion: '',
-        expectedEvalVersion: 'follow-up-eval-v1',
+        expectedEvalVersion: 'follow-up-eval-v2',
         syntheticSmokeObserved: false,
         promptVersion: 'follow-up-ai-prompt-v2',
         schemaVersion: 'follow-up-ai-schema-v2',

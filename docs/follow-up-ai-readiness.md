@@ -1,6 +1,6 @@
 # Optional AI hardening and rollout evidence
 
-Prepared and re-checked: 2026-08-10
+Prepared: 2026-08-10; deterministic corpus re-checked: 2026-10-03
 
 This document is the implementation evidence and blocker ledger for optional OpenAI enrichment in the CRM Follow-ups Workspace. It does not authorize enabling AI, processing real CRM data with a model, running a paid model evaluation, enabling generic CRM email, applying a production migration, or releasing code.
 
@@ -23,11 +23,11 @@ This document is the implementation evidence and blocker ledger for optional Ope
 
 ## Implementation resolution
 
-Repository hardening was implemented and locally rechecked on 2026-08-10 without a live model call or production configuration change:
+Repository hardening was implemented and locally rechecked on 2026-08-10. The deterministic owner-prerequisite corpus extension was rechecked on 2026-10-03 without a live model call or production configuration change:
 
 | Area | Resolution and evidence | Status |
 | --- | --- | --- |
-| Deterministic baseline | The versioned synthetic gate passes 51/51 cases across 40 regression and 11 holdout fixtures. Storage-backed tests cover time boundaries, legacy/malformed data, duplicate IDs, cache expiry, concurrent refresh, and context races. | Code gate passed |
+| Deterministic baseline | The versioned synthetic gate passes 75/75 cases across 60 regression and 15 holdout fixtures. Storage-backed tests cover time boundaries, legacy/malformed data, duplicate IDs, cache expiry, concurrent refresh, and context races. | Code gate passed |
 | AI authority | The strict model schema contains enrichment fields only. Deterministic action, intent, priority/timing, hard stops, blockers/safety, confidence, recipients, and `sendAllowed: false` are not model-controlled. Hard stops skip the provider request. | Code gate passed |
 | Minimized input | A dedicated serialized projection uses opaque evidence labels and excludes addresses, raw RFC IDs/headers, URLs, filenames, document names/IDs, attachment IDs/MIME types/contents, suppression details, and internal CRM/CIM IDs. Recognizable leak canaries are asserted absent. | Code gate passed |
 | Responses controls | The adapter explicitly sets model, `store: false`, `tools: []`, reasoning effort, strict JSON Schema, output cap, timeout, and per-request retries. Startup validates bounded settings and fingerprints include result-changing controls and contract versions. | Code gate passed |
@@ -36,7 +36,7 @@ Repository hardening was implemented and locally rechecked on 2026-08-10 without
 | Readiness gates | Model/key presence, reasoning/bounds, data-handling approval, exact accepted eval version, cost/rate approval, and synthetic-smoke evidence are independent fail-closed gates. API-key value is never returned. | Code gate passed; external gates open |
 | Telemetry | Persisted metadata is bounded to versions/provenance/model IDs/state/reason/latency/characters/tokens/cache/single-flight outcomes. SQLite and Supabase expose count-only aggregates; missing observations remain null/`Not observed`. | Code gate passed |
 | UX | Recommendation provenance now distinguishes deterministic, enriched/human-review-required, and degraded deterministic fallback. The prior probability-like percentage presentation is removed. Operations separates deterministic availability from each optional-AI readiness gate. | Code gate passed |
-| Evaluation | `follow-up-eval-v1` contains 51 synthetic decision cases plus 24 fake-client adapter cases. The guarded live runner requires explicit synthetic/paid acknowledgements, explicit candidates, a key, and both production flags false. | Offline gate passed; paid comparison not authorized/not run |
+| Evaluation | `follow-up-eval-v2` contains 75 synthetic decision cases plus 24 fake-client adapter cases. The guarded live runner requires explicit synthetic/paid acknowledgements, explicit candidates, a key, and both production flags false. | Offline gate passed; paid comparison not authorized/not run |
 
 The code path is prepared for a disabled rollout review, but optional AI is not approved for production use. No exact production model can be selected until the live synthetic comparison, blind human quality review, exact-returned-model check, measured latency/token evidence, dated cost calculation, privacy/data-handling approval, cost/rate approval, and controlled smoke all exist. Deterministic Recommendations remain the releaseable credential-free capability.
 
@@ -56,7 +56,7 @@ Installed contract inspected locally: `openai@7.4.0`. Its Responses types suppor
 
 ## Initial model/eval decision
 
-No paid live model run or real-CRM evaluation is authorized in this task. The bounded starting comparison is therefore `gpt-5.6-terra` at `low` reasoning versus `gpt-5.6-sol` at `low` reasoning, using the same frozen synthetic corpus, request shape, schema, and graders. `medium` effort is a follow-up candidate only if low effort misses a material quality target. No model is accepted for production until the live synthetic comparison and blinded human rubric are completed. The runtime model remains unset and optional AI remains disabled. The accepted offline artifact currently records 51/51 deterministic cases and 24/24 adapter response/fault cases passing; it contains no live quality, latency, token, or cost measurement.
+No paid live model run or real-CRM evaluation is authorized in this task. The bounded starting comparison is therefore `gpt-5.6-terra` at `low` reasoning versus `gpt-5.6-sol` at `low` reasoning, using the same frozen synthetic corpus, request shape, schema, and graders. `medium` effort is a follow-up candidate only if low effort misses a material quality target. No model is accepted for production until the live synthetic comparison and blinded human rubric are completed. The runtime model remains unset and optional AI remains disabled. The accepted offline artifact currently records 75/75 deterministic cases and 24/24 adapter response/fault cases passing; it contains no live quality, latency, token, or cost measurement.
 
 ## Blocker ledger
 
@@ -73,11 +73,11 @@ Airtable is retired from Deal Hunter source collection and health. The separate,
 
 ## Local verification record
 
-Verification was run on 2026-08-10 with the bundled Node.js 24 runtime. It is evidence for the repository changes only; it is not evidence that a production migration, production configuration, provider account, real CRM data path, or deployment has been exercised.
+The original hardening verification was run on 2026-08-10 with the bundled Node.js 24 runtime. The deterministic owner-prerequisite extension was verified on 2026-10-03 with Node.js 22.23.2. This is repository evidence only; it is not evidence that a production migration, production configuration, provider account, real CRM data path, or deployment has been exercised.
 
 | Gate | Result | Scope and limitations |
 | --- | --- | --- |
-| `npm run check` | Passed | Frozen offline eval 51/51 deterministic and 24/24 adapter-fault cases; ESLint with zero warnings; backend 358/358; UI 85/85 across 18 files; Vite production build; metadata pre-render for 9 public routes |
+| Current `npm run check` stages | Passed except one unrelated exact-head self-check | Frozen offline eval 75/75 deterministic and 24/24 adapter-fault cases; ESLint with zero warnings; backend suite has one P10B limited-smoke test intentionally refusing a dirty/non-exact checkout head; UI and the Vite/pre-render build pass when run separately. |
 | `npm run test:browser` | Passed 6/6 | Chromium coverage includes public navigation/focus, unauthenticated fail-closed entry points, keyboard-accessible overview links, CRM URL state, Operations, and the authenticated Follow-ups queue at 390×844 with modal focus restoration and safe display of untrusted email text. API routes are synthetic browser fixtures, not a real CRM or provider. |
 | Focused privacy/config/live-guard/recommendation suite | Passed 73/73 | Deterministic policy, serialized AI projection and credential canaries, Responses contract, returned-model enforcement, failure mapping, evidence validation, cache/single-flight/race behavior, application rate cap, strict environment parsing, and pre-network live-eval guards |
 | Live-eval negative guard | Refused before a provider call | Running the live entry point without `--synthetic-only`, `--ack-paid-api`, an API key, and an explicit candidate stops locally; no OpenAI request was made |

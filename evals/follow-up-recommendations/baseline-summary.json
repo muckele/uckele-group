@@ -1,16 +1,16 @@
 {
-  "evalVersion": "follow-up-eval-v1",
-  "recordedAt": "2026-08-10",
+  "evalVersion": "follow-up-eval-v2",
+  "recordedAt": "2026-10-03",
   "privacy": "synthetic-only",
-  "corpusSha256": "c95846669f98e49a07eaf7d90c2e22c4bc21ed6694c58f88d10b7135544ee4f7",
-  "fixtureCount": 51,
+  "corpusSha256": "ae10a3b0dcd972084ce4a6dfa1bef4932e88c67f9682703ba3b8ba68d02ef94c",
+  "fixtureCount": 75,
   "faultFixtureCount": 24,
   "splits": {
-    "regression": 40,
-    "holdout": 11
+    "regression": 60,
+    "holdout": 15
   },
   "deterministic": {
-    "passedCases": 51,
+    "passedCases": 75,
     "failedCases": 0,
     "expectedActionAndState": true,
     "sendAllowedFalse": true,
