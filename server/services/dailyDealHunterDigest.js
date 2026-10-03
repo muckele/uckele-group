@@ -353,6 +353,8 @@ function projectedOpportunity(row = {}) {
     fitScore: row.fitScore,
     scoreStatus: safeDisplayText(row.scoreStatus, 40),
     confidence: safeDisplayText(row.confidence, 20),
+    missingEvidenceCount: boundedCount(row.missingEvidenceCount),
+    contradictionCount: boundedCount(row.contradictionCount),
     operatorPriority: safeDisplayText(row.operatorPriority, 40),
     reviewed: row.reviewed,
     changedSinceReview: row.changedSinceReview,
