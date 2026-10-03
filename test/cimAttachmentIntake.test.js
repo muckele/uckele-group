@@ -26,6 +26,17 @@ function scanCimAttachment(options) {
   return scanCimAttachmentWithGate({ readiness: readyIntake, ...options });
 }
 
+async function seedSyntheticPublicationVerdict(storage, intakeId) {
+  const updated = await storage.updateCimAttachmentIntake(intakeId, {
+    scan_completed_at: '2026-10-03T12:00:00.000Z',
+    scan_request_digest: 'f'.repeat(64),
+    scan_signature_version: 'synthetic-db-1',
+    scan_signature_updated_at: '2026-10-03T11:55:00.000Z',
+    scan_verdict_expires_at: '2099-10-04T12:00:00.000Z',
+  }, { expectedStatus: 'awaiting-owner-approval' });
+  assert.ok(updated, 'test fixture must seed explicit synthetic publication authority');
+}
+
 const roots = [];
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
@@ -94,6 +105,27 @@ function memoryStorage({ communicationSubmissionId = 'submission-1' } = {}) {
       if (!current || (options.expectedStatus && current.lifecycle_status !== options.expectedStatus)) return null;
       const next = { ...current, ...structuredClone(values) };
       rows.set(id, next);
+      return structuredClone(next);
+    },
+    async claimCimAttachmentPublication(command) {
+      const current = rows.get(command.intakeId);
+      if (!current || current.lifecycle_status !== 'awaiting-owner-approval'
+        || current.scan_status !== 'clean' || !current.scan_verdict_expires_at
+        || current.scan_verdict_expires_at <= command.approvedAt) return null;
+      const next = {
+        ...current,
+        lifecycle_status: 'publishing',
+        owner_approved_at: command.approvedAt,
+        owner_approved_by: command.ownerApprovedBy,
+        approved_submission_id: command.approvedSubmissionId,
+        approved_document_type: command.approvedDocumentType,
+        vault_request_id: command.vaultRequestId,
+        vault_document_id: command.vaultDocumentId,
+        vault_relative_path: command.vaultRelativePath,
+        hold_reason: null,
+        updated_at: command.approvedAt,
+      };
+      rows.set(command.intakeId, next);
       return structuredClone(next);
     },
     async getCrmCommunication(id) { return communication?.id === id ? structuredClone(communication) : null; },
@@ -605,6 +637,7 @@ test('owner publication rejects absent or wrong assignment and resumes an existi
   const storage = memoryStorage({ communicationSubmissionId: null });
   const captured = await captureCimAttachment({ metadata: metadata(), byteStream: streamBytes(pdfBytes()), storage, quarantineRoot, maxBytes: 1024 });
   await scanCimAttachment({ intakeId: captured.id, storage, quarantineRoot, scanner: createDeterministicFakeScanner({ defaultOutcome: 'clean' }) });
+  await seedSyntheticPublicationVerdict(storage, captured.id);
 
   for (const documentType of [undefined, 'invented-type']) {
     await assert.rejects(
@@ -645,6 +678,7 @@ test('disk-full publication remains retryable and leaves no vault partial', asyn
   const storage = memoryStorage();
   const captured = await captureCimAttachment({ metadata: metadata(), byteStream: streamBytes(pdfBytes()), storage, quarantineRoot, maxBytes: 1024 });
   await scanCimAttachment({ intakeId: captured.id, storage, quarantineRoot, scanner: createDeterministicFakeScanner({ defaultOutcome: 'clean' }) });
+  await seedSyntheticPublicationVerdict(storage, captured.id);
   const diskFull = Object.assign(new Error('simulated disk full'), { code: 'ENOSPC' });
   await assert.rejects(
     publishApprovedCimAttachment({
@@ -657,6 +691,18 @@ test('disk-full publication remains retryable and leaves no vault partial', asyn
   assert.equal((await storage.getCimAttachmentIntake(captured.id)).lifecycle_status, 'publishing');
   const vaultEntries = await fs.readdir(vaultRoot, { recursive: true }).catch(() => []);
   assert.equal(vaultEntries.some((entry) => String(entry).includes('.partial-')), false);
+  await assert.rejects(
+    publishApprovedCimAttachment({
+      intakeId: captured.id, submissionId: 'submission-1', documentType: 'cim',
+      actor: 'owner@example.test', storage, quarantineRoot, vaultRoot,
+      copyFile: async (_sourceHandle, destinationHandle) => {
+        await destinationHandle.write(Buffer.from('tampered copy'));
+      },
+    }),
+    /copy failed integrity/i,
+  );
+  const tamperEntries = await fs.readdir(vaultRoot, { recursive: true }).catch(() => []);
+  assert.equal(tamperEntries.some((entry) => String(entry).includes('.partial-')), false);
   const published = await publishApprovedCimAttachment({
     intakeId: captured.id, submissionId: 'submission-1', documentType: 'cim',
     actor: 'owner@example.test', storage, quarantineRoot, vaultRoot,
@@ -699,6 +745,7 @@ test('SQLite publication is atomic and only the resulting vault document changes
     await storage.insertCrmCommunication(communication());
     const captured = await captureCimAttachment({ metadata: metadata(), byteStream: streamBytes(pdfBytes()), storage, quarantineRoot, maxBytes: 1024 });
     await scanCimAttachment({ intakeId: captured.id, storage, quarantineRoot, scanner: createDeterministicFakeScanner({ defaultOutcome: 'clean' }) });
+    await seedSyntheticPublicationVerdict(storage, captured.id);
     assert.equal(evaluateAcquisitionMaterialsState({ submission: submission(), secureDocuments: [] }).materialsReceived, false);
 
     let failBeforeCommit = true;
@@ -728,6 +775,7 @@ test('SQLite publication is atomic and only the resulting vault document changes
       byteStream: streamBytes(pdfBytes('commit-response-lost')), storage, quarantineRoot, maxBytes: 1024,
     });
     await scanCimAttachment({ intakeId: second.id, storage, quarantineRoot, scanner: createDeterministicFakeScanner({ defaultOutcome: 'clean' }) });
+    await seedSyntheticPublicationVerdict(storage, second.id);
     const responseLostStorage = {
       ...storage,
       async publishCimAttachmentToVault(input) {

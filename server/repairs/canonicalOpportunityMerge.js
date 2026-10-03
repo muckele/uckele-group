@@ -774,7 +774,7 @@ const relationshipInventoryEntries = [
   }),
   ...relationshipEntries({
     table: 'secure_attachment_ingestions',
-    columns: ['duplicate_of_id', 'provider_message_id', 'provider_attachment_id'],
+    columns: ['duplicate_of_id', 'provider_message_id', 'provider_attachment_id', 'scan_request_id'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
     scannerPath: 'dependentState.records.linkedCrmState',
     reason: redundantRelationshipReason,

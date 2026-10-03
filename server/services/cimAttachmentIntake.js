@@ -452,10 +452,163 @@ export async function scanCimAttachment({
     next_scan_at: outcome === 'unavailable' && attemptCount < maximumScanAttempts
       ? new Date(Date.parse(updatedAt) + retryDelaysMs[attemptCount - 1]).toISOString()
       : null,
+    scan_completed_at: updatedAt,
   };
   const updated = await storage.updateCimAttachmentIntake(intake.id, values, { expectedStatus: intake.lifecycle_status });
   if (!updated) return storage.getCimAttachmentIntake(intake.id);
   return updated;
+}
+
+async function openVerifiedQuarantineHandle(quarantineRoot, intake) {
+  const { candidate, stat: pathStat } = await assertOwnedRegularFile(quarantineRoot, intake.quarantine_path);
+  const noFollow = fs.constants?.O_NOFOLLOW || 0;
+  const handle = await fs.open(candidate, fs.constants.O_RDONLY | noFollow);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.dev !== pathStat.dev || stat.ino !== pathStat.ino) {
+      throw new Error('Quarantined attachment identity changed before scan claim consumption.');
+    }
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(64 * 1024);
+    let size = 0;
+    while (true) {
+      const read = await handle.read(buffer, 0, buffer.length, size);
+      if (read.bytesRead === 0) break;
+      size += read.bytesRead;
+      hash.update(buffer.subarray(0, read.bytesRead));
+      if (size > Number(intake.size_bytes)) {
+        throw new Error('Quarantined attachment exceeds its claimed size.');
+      }
+    }
+    if (size !== Number(intake.size_bytes) || hash.digest('hex') !== intake.sha256) {
+      throw new Error('Quarantined attachment failed integrity validation.');
+    }
+    return handle;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+function canonicalTimestamp(value) {
+  if (typeof value !== 'string') return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value ? date : null;
+}
+
+function hasBoundOnDemandVerdictEvidence(result, claim, receivedAt) {
+  if (!['clean', 'unsafe'].includes(result?.outcome)) return true;
+  const scannedAt = canonicalTimestamp(result.scannedAt);
+  const signatureUpdatedAt = canonicalTimestamp(result.signatureUpdatedAt);
+  const protocolResultExpiresAt = canonicalTimestamp(result.protocolResultExpiresAt);
+  const requestedAt = canonicalTimestamp(claim.scan_requested_at);
+  const leaseExpiresAt = canonicalTimestamp(claim.scan_lease_expires_at);
+  const boundedEvidenceText = (value) => typeof value === 'string' && value.length > 0
+    && value.length <= 120 && ![...value].some((character) => {
+      const code = character.codePointAt(0);
+      return code <= 31 || code === 127;
+    });
+  return boundedEvidenceText(result.engineVersion)
+    && boundedEvidenceText(result.signatureVersion)
+    && /^[0-9a-f]{64}$/.test(String(result.requestDigest || ''))
+    && scannedAt && signatureUpdatedAt && protocolResultExpiresAt && requestedAt && leaseExpiresAt
+    && signatureUpdatedAt <= scannedAt
+    && scannedAt.getTime() - signatureUpdatedAt.getTime() <= 24 * 60 * 60 * 1000
+    && scannedAt >= requestedAt
+    && scannedAt.getTime() <= receivedAt.getTime() + 30_000
+    && scannedAt <= leaseExpiresAt
+    && protocolResultExpiresAt > receivedAt
+    && protocolResultExpiresAt > scannedAt
+    && protocolResultExpiresAt <= leaseExpiresAt;
+}
+
+export async function scanCimAttachmentOnDemand({
+  intakeId,
+  storage,
+  quarantineRoot,
+  scanner,
+  readiness,
+  jobOwner,
+  now = () => new Date(),
+} = {}) {
+  if (readiness?.scannerReady !== true) {
+    throw new Error('CIM attachment scanner is not ready.');
+  }
+  if (!storage || typeof storage.claimCimAttachmentScan !== 'function'
+    || typeof storage.completeCimAttachmentScan !== 'function') {
+    throw new Error('Atomic CIM attachment scan lifecycle storage is required.');
+  }
+  if (!scanner || typeof scanner.scan !== 'function') {
+    throw new Error('An explicit on-demand scanner adapter is required.');
+  }
+  const owner = boundedIdentifier(jobOwner, 'Scan job owner');
+  const id = boundedIdentifier(intakeId, 'Attachment intake id');
+  const claimedAt = isoNow(typeof now === 'function' ? now() : now);
+  const requestId = randomUUID();
+  const leaseExpiresAt = new Date(Date.parse(claimedAt) + 4 * 60 * 1000).toISOString();
+  const claim = await storage.claimCimAttachmentScan({
+    intakeId: id, requestId, jobOwner: owner, claimedAt, leaseExpiresAt,
+  });
+  if (!claim) throw new Error('Attachment scan claim is not eligible or is owned by another job.');
+
+  let handle;
+  let result;
+  try {
+    handle = await openVerifiedQuarantineHandle(quarantineRoot, claim);
+    let opened = false;
+    result = await scanner.scan({
+      claim: {
+        intakeId: claim.id,
+        requestId: claim.scan_request_id,
+        attempt: Number(claim.scan_attempt_count),
+        jobOwner: claim.scan_job_owner,
+        leaseExpiresAt: claim.scan_lease_expires_at,
+      },
+      sha256: claim.sha256,
+      sizeBytes: Number(claim.size_bytes),
+      mimeType: claim.detected_mime_type,
+      openByteStream() {
+        if (opened) throw new Error('Quarantine descriptor stream may be opened only once.');
+        opened = true;
+        return handle.createReadStream({ autoClose: false, start: 0 });
+      },
+    });
+  } catch {
+    result = { outcome: 'unavailable', reasonCode: 'scanner_unavailable' };
+  } finally {
+    if (handle) await handle.close();
+  }
+
+  const receivedAt = new Date(isoNow(typeof now === 'function' ? now() : now));
+  let outcome = ['clean', 'unsafe', 'unavailable', 'ambiguous'].includes(result?.outcome)
+    ? result.outcome : 'ambiguous';
+  if (!hasBoundOnDemandVerdictEvidence(result, claim, receivedAt)) outcome = 'ambiguous';
+  const completedAt = receivedAt.toISOString();
+  const normalized = {
+    outcome,
+    reasonCode: String(
+      outcome === 'ambiguous' && result?.outcome !== 'ambiguous'
+        ? 'result_binding_invalid'
+        : result?.reasonCode || (outcome === 'ambiguous' ? 'scan_ambiguous' : 'scanner_unavailable'),
+    ).slice(0, 120),
+    engineVersion: result?.engineVersion ? String(result.engineVersion).slice(0, 120) : null,
+    signatureVersion: result?.signatureVersion ? String(result.signatureVersion).slice(0, 120) : null,
+    signatureUpdatedAt: result?.signatureUpdatedAt || null,
+    requestDigest: result?.requestDigest ? String(result.requestDigest).slice(0, 64) : null,
+  };
+  const completed = await storage.completeCimAttachmentScan({
+    intakeId: claim.id,
+    requestId: claim.scan_request_id,
+    jobOwner: claim.scan_job_owner,
+    attempt: Number(claim.scan_attempt_count),
+    completedAt,
+    verdictExpiresAt: outcome === 'clean'
+      ? new Date(Date.parse(completedAt) + 24 * 60 * 60 * 1000).toISOString()
+      : null,
+    result: normalized,
+  });
+  if (!completed) throw new Error('Attachment scan result lost its lifecycle lease.');
+  return completed;
 }
 
 function assertFrozenApproval(intake, { submissionId, documentType, actor }) {
@@ -470,35 +623,54 @@ function assertFrozenApproval(intake, { submissionId, documentType, actor }) {
   }
 }
 
-async function ensureVaultFile({ intake, quarantineRoot, vaultRoot, relativePath, copyFile = fs.copyFile }) {
-  const { candidate: sourcePath } = await assertOwnedRegularFile(quarantineRoot, intake.quarantine_path);
+async function copyOpenFile(sourceHandle, destinationHandle, { maxBytes }) {
+  const buffer = Buffer.alloc(64 * 1024);
+  let position = 0;
+  while (true) {
+    const read = await sourceHandle.read(buffer, 0, buffer.length, position);
+    if (read.bytesRead === 0) break;
+    if (read.bytesRead > maxBytes - position) throw new Error('Vault publication source exceeds its exact size.');
+    await destinationHandle.write(buffer, 0, read.bytesRead, position);
+    position += read.bytesRead;
+  }
+}
+
+async function ensureVaultFile({ intake, quarantineRoot, vaultRoot, relativePath, copyFile = copyOpenFile }) {
   const destinationPath = ownedPath(vaultRoot, relativePath);
   await ensureOwnedDirectory(vaultRoot, path.dirname(relativePath));
-  const sourceIdentity = await hashOwnedFile(quarantineRoot, intake.quarantine_path);
-  if (sourceIdentity.sha256 !== intake.sha256 || sourceIdentity.size !== Number(intake.size_bytes)) {
-    throw new Error('Quarantined attachment failed integrity validation.');
-  }
+  const sourceHandle = await openVerifiedQuarantineHandle(quarantineRoot, intake);
   try {
-    const destinationIdentity = await hashOwnedFile(vaultRoot, relativePath);
-    if (destinationIdentity.sha256 !== intake.sha256 || destinationIdentity.size !== Number(intake.size_bytes)) {
-      throw new Error('Existing vault publication file failed integrity validation.');
+    try {
+      const destinationIdentity = await hashOwnedFile(vaultRoot, relativePath);
+      if (destinationIdentity.sha256 !== intake.sha256 || destinationIdentity.size !== Number(intake.size_bytes)) {
+        throw new Error('Existing vault publication file failed integrity validation.');
+      }
+      return destinationPath;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
     }
-    return destinationPath;
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-  const temporaryPath = `${destinationPath}.partial-${randomUUID()}`;
-  try {
-    await copyFile(sourcePath, temporaryPath, fs.constants.COPYFILE_EXCL);
-    await fs.chmod(temporaryPath, 0o600);
-    const handle = await fs.open(temporaryPath, 'r');
-    try { await handle.sync(); } finally { await handle.close(); }
-    await fs.rename(temporaryPath, destinationPath);
-    await fs.chmod(destinationPath, 0o600);
-    return destinationPath;
-  } catch (error) {
-    await safeUnlink(temporaryPath).catch(() => {});
-    throw error;
+    const temporaryPath = `${destinationPath}.partial-${randomUUID()}`;
+    try {
+      const destinationHandle = await fs.open(temporaryPath, 'wx', 0o600);
+      try {
+        await copyFile(sourceHandle, destinationHandle, { maxBytes: Number(intake.size_bytes) });
+        await destinationHandle.sync();
+      } finally {
+        await destinationHandle.close();
+      }
+      const copiedIdentity = await hashOwnedFile(vaultRoot, path.relative(vaultRoot, temporaryPath));
+      if (copiedIdentity.sha256 !== intake.sha256 || copiedIdentity.size !== Number(intake.size_bytes)) {
+        throw new Error('Vault publication copy failed integrity validation.');
+      }
+      await fs.rename(temporaryPath, destinationPath);
+      await fs.chmod(destinationPath, 0o600);
+      return destinationPath;
+    } catch (error) {
+      await safeUnlink(temporaryPath).catch(() => {});
+      throw error;
+    }
+  } finally {
+    await sourceHandle.close();
   }
 }
 
@@ -553,18 +725,23 @@ export async function publishApprovedCimAttachment({
     const requestId = randomUUID();
     const documentId = randomUUID();
     const relativePath = path.join(requestId, `${documentId}-${sanitizeSecureDocumentFileName(intake.original_file_name)}`);
-    const claimed = await storage.updateCimAttachmentIntake(intake.id, {
-      lifecycle_status: 'publishing',
-      owner_approved_at: approvedAt,
-      owner_approved_by: normalizedActor,
-      approved_submission_id: normalizedSubmissionId,
-      approved_document_type: normalizedType,
-      vault_request_id: requestId,
-      vault_document_id: documentId,
-      vault_relative_path: relativePath,
-      hold_reason: null,
-      updated_at: approvedAt,
-    }, { expectedStatus: 'awaiting-owner-approval' });
+    if (intake.scan_verdict_expires_at && Date.parse(intake.scan_verdict_expires_at) <= Date.parse(approvedAt)) {
+      throw new Error('Attachment clean scan verdict expired before owner approval.');
+    }
+    if (typeof storage.claimCimAttachmentPublication !== 'function') {
+      throw new Error('Atomic attachment publication claim storage is required.');
+    }
+    const claimed = await storage.claimCimAttachmentPublication({
+      intakeId: intake.id,
+      approvedAt,
+      ownerApprovedBy: normalizedActor,
+      approvedSubmissionId: normalizedSubmissionId,
+      approvedDocumentType: normalizedType,
+      vaultRequestId: requestId,
+      vaultDocumentId: documentId,
+      vaultRelativePath: relativePath,
+    });
+    if (!claimed) throw new Error('Attachment publication claim was rejected or its clean verdict expired.');
     intake = claimed || await storage.getCimAttachmentIntake(intake.id);
     assertFrozenApproval(intake, { submissionId: normalizedSubmissionId, documentType: normalizedType, actor: normalizedActor });
     if (intake.lifecycle_status === 'published') return intake;
