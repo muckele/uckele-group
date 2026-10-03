@@ -17,8 +17,10 @@ COPY server/services/clamavUnixSocketScanner.js /opt/uckele/server/services/clam
 COPY server/services/filesystemCimReplayStore.js /opt/uckele/server/services/filesystemCimReplayStore.js
 COPY server/services/cimScanWorkerEntrypoint.js /opt/uckele/server/services/cimScanWorkerEntrypoint.js
 COPY scripts/run-cim-scan-worker.js /opt/uckele/scripts/run-cim-scan-worker.js
+COPY scripts/check-cim-scan-worker-health.js /opt/uckele/scripts/check-cim-scan-worker-health.js
 COPY containers/cim-scan-worker/clamd.conf /etc/clamav/clamd.conf
 COPY containers/cim-scan-worker/entrypoint.sh /usr/local/bin/uckele-cim-scan-entrypoint
 
 WORKDIR /opt/uckele
+HEALTHCHECK --interval=5s --timeout=3s --start-period=60s --start-interval=1s --retries=3 CMD ["node", "scripts/check-cim-scan-worker-health.js"]
 ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-entrypoint"]

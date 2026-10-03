@@ -16,4 +16,8 @@ while [ ! -S "$socket_path" ]; do
   sleep 0.1
 done
 
+# Confirm ClamD answers on the configured Unix socket, then keep the process
+# alive long enough for Docker's 1s start-period probe and 3s timeout to finish.
+node scripts/check-cim-scan-worker-health.js
+sleep 4
 node scripts/run-cim-scan-worker.js
