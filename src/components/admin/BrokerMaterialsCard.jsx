@@ -42,6 +42,48 @@ function blockerPresentation(brokerMaterials) {
   return { badge: 'Blocked', sentence: blocker.message || 'Broker materials cannot be prepared yet.', action: recipientBlocker ? 'Add / Verify Broker Email' : 'View Requirements', recipientBlocker };
 }
 
+export function BrokerMaterialsAttachmentStatus({ value }) {
+  const inbound = value?.inbound || {};
+  const vault = value?.vault || {};
+  const inboundPresentation = {
+    metadata_observed: {
+      label: 'Metadata observed',
+      sentence: inbound.count === 1
+        ? '1 inbound attachment metadata record is observed. Metadata alone does not establish retrieval, scanning, secure vault availability, or review.'
+        : `${inbound.count} inbound attachment metadata records are observed. Metadata alone does not establish retrieval, scanning, secure vault availability, or review.`,
+    },
+    pending: {
+      label: 'Retrieval pending',
+      sentence: `Inbound content or attachment retrieval is still pending.${inbound.count > 0
+        ? ` ${inbound.count} attachment metadata record${inbound.count === 1 ? ' is' : 's are'} observed.`
+        : ''}`,
+    },
+    error: {
+      label: 'Retrieval error',
+      sentence: `Inbound content or attachment retrieval failed and remains unresolved.${inbound.count > 0
+        ? ` ${inbound.count} attachment metadata record${inbound.count === 1 ? ' is' : 's are'} observed.`
+        : ''}`,
+    },
+  }[inbound.status];
+  const vaultAvailable = vault.status === 'available' && Number(vault.count) > 0;
+  if (!inboundPresentation && !vaultAvailable) return null;
+  return (
+    <section aria-label="Attachment intake status" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+      {inboundPresentation ? <>
+        <h5 className="font-semibold">Attachment status: {inboundPresentation.label}</h5>
+        <p className="mt-1 leading-5">{inboundPresentation.sentence}</p>
+        <p className="mt-1 text-xs text-amber-900/75">Provenance: inbound communication</p>
+      </> : null}
+      {vaultAvailable ? <div className={inboundPresentation ? 'mt-2 border-t border-amber-200 pt-2' : ''}>
+        <p className="leading-5">{vault.count === 1
+          ? '1 separate secure vault document is available. Scan and owner-review status are not inferred here.'
+          : `${vault.count} separate secure vault documents are available. Scan and owner-review status are not inferred here.`}</p>
+        <p className="mt-1 text-xs text-amber-900/75">Provenance: secure document</p>
+      </div> : null}
+    </section>
+  );
+}
+
 function MessageList({ empty = 'None', items }) {
   if (!items?.length) return <p className="mt-2 text-sm text-ink/58">{empty}</p>;
   return <ul className="mt-2 space-y-2">{items.map((item, index) => <li className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900" key={`${item.code || item.message}-${index}`}>{item.message || item.code}</li>)}</ul>;
@@ -225,6 +267,7 @@ export default function BrokerMaterialsCard({
       </div>
 
       {!preparation || checking ? <p className="mt-3 text-sm leading-6 text-ink/68">{collapsed.sentence}</p> : null}
+      <BrokerMaterialsAttachmentStatus value={brokerMaterials?.attachmentStatus} />
       {!followUps ? <p aria-atomic="true" aria-live="polite" className="sr-only" role="status">{liveMessage}</p> : null}
       {error ? <p className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" ref={alertRef} role="alert" tabIndex={-1}>{error}</p> : null}
 

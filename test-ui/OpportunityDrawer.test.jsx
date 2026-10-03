@@ -402,6 +402,34 @@ describe('Opportunity drawer', () => {
     expect(within(crmCim).getByText('CIM communications')).toBeVisible();
   });
 
+  test('surfaces bounded attachment status beside the existing CRM action', () => {
+    const detail = detailFixture();
+    detail.brokerMaterials.attachmentStatus = {
+      inbound: { status: 'metadata_observed', count: 1, provenance: 'inbound_communication' },
+      vault: { status: 'none', count: 0, provenance: 'secure_document' },
+    };
+    render(<OpportunityDrawer detail={detail} onClose={vi.fn()} />);
+
+    const card = screen.getByRole('region', { name: 'Broker Materials' });
+    expect(within(card).getByText('Attachment status: Metadata observed')).toBeVisible();
+    expect(screen.getByRole('link', { name: 'Open linked CRM record' })).toHaveAttribute('href', '/admin/crm/crm-1');
+  });
+
+  test('keeps attachment status visible when a durable Pursue release owns the record', () => {
+    const detail = detailFixture();
+    detail.pursueCimReleaseAvailable = true;
+    detail.brokerMaterials.attachmentStatus = {
+      inbound: { status: 'pending', count: 2, provenance: 'inbound_communication' },
+      vault: { status: 'none', count: 0, provenance: 'secure_document' },
+    };
+    render(<OpportunityDrawer detail={detail} onClose={vi.fn()} />);
+
+    expect(screen.getByRole('region', { name: 'Attachment intake status' })).toBeVisible();
+    expect(screen.getByText('Attachment status: Retrieval pending')).toBeVisible();
+    expect(screen.queryByRole('region', { name: 'Broker Materials' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open linked CRM record' })).toHaveAttribute('href', '/admin/crm/crm-1');
+  });
+
   test('does not steal focus when authoritative detail refreshes in the background', () => {
     const { rerender } = render(<OpportunityDrawer detail={detailFixture()} loading={false} onClose={vi.fn()} />);
     const disclosure = screen.getByRole('button', { name: 'Broker Materials review' });

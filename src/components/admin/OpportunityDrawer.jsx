@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
-import BrokerMaterialsCard from './BrokerMaterialsCard.jsx';
+import BrokerMaterialsCard, { BrokerMaterialsAttachmentStatus } from './BrokerMaterialsCard.jsx';
 
 const factFields = [
   ['seller_name', 'Seller name'], ['seller_email', 'Seller email'], ['seller_phone', 'Seller phone'],
@@ -298,6 +298,9 @@ export default function OpportunityDrawer({
               {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} submitDisabled={actionsBlocked} /></div> : null}
               {linkedCrmId ? <a className={`${secondaryButton} mt-4 gap-2`} href={`/admin/crm/${encodeURIComponent(linkedCrmId)}`}><ExternalLink aria-hidden="true" className="h-4 w-4" />Open linked CRM record</a> : null}
               <div className="mt-4"><CimReleaseCard error={cimReleaseError} loading={cimReleaseLoading} onStop={onCimReleaseStop} pending={cimReleaseStopping} readOnly={cimReleaseReadOnly} release={cimRelease} /></div>
+              {detail.pursueCimReleaseAvailable || cimRelease?.campaign
+                ? <div className="mt-4"><BrokerMaterialsAttachmentStatus value={detail.brokerMaterials?.attachmentStatus} /></div>
+                : null}
               {!detail.pursueCimReleaseAvailable && !cimRelease?.campaign ? <div className="mt-4"><BrokerMaterialsCard
                 brokerMaterials={detail.brokerMaterials}
                 businessName={name}
