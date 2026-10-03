@@ -156,15 +156,116 @@ function sha256(value) {
 export function stripQuotedEmailText(value = '') {
   const lines = plainText(value).split('\n');
   const kept = [];
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     if (/^\s*>/.test(line)) continue;
     if (/^\s*on .{0,240}wrote:\s*$/i.test(line)) break;
     if (/^\s*-{2,}\s*(original|forwarded) message\s*-{2,}\s*$/i.test(line)) break;
     if (/^\s*begin forwarded message\s*:?\s*$/i.test(line)) break;
+    if (/^\s*from\s*:/i.test(line)) {
+      const headerWindow = lines.slice(index, index + 7);
+      if (headerWindow.some((item) => /^\s*sent\s*:/i.test(item))
+        && headerWindow.some((item) => /^\s*subject\s*:/i.test(item))) break;
+    }
     if (/^\s*--\s*$/.test(line)) break;
     kept.push(line);
   }
-  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim().slice(0, maxCommunicationCharacters);
+  return kept.join('\n')
+    .replace(/\b(?:for reference,\s*)?(?:(?:the\s+)?(?:prior|previous|earlier)\s+(?:email|message)|they|he|she|the broker|the seller)\s+(?:said|stated|wrote|asked|requested)\s*:?\s*["“'‘][^"”'’\n]{1,2000}["”'’]/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxCommunicationCharacters);
+}
+
+function prerequisiteIsSatisfiedOrNegated(value, termSource) {
+  const term = `(?:${termSource})`;
+  const completedAction = '(?:provided|submitted|sent|shared|returned|completed|signed|executed|paid|received)';
+  const patterns = [
+    new RegExp(`\\bno\\s+(?:(?:current|updated|additional|new)\\s+)?${term}\\b`, 'i'),
+    new RegExp(`\\b(?:need|needs|require|requires)\\s+no\\s+${term}\\b`, 'i'),
+    new RegExp(`\\b${term}\\b[^.!?]{0,30}\\b(?:is|are|was|were|will be)?\\s*not\\s+(?:required|needed|due)\\b`, 'i'),
+    new RegExp(`\\b${term}\\b[^.!?]{0,30}\\b(?:is|are|was|were)n['’]t\\s+(?:required|needed|due)\\b`, 'i'),
+    new RegExp(`\\b(?:(?:do|does|will|would)\\s+not|(?:do|does|will|would)n['’]t|won['’]t|never|no longer)\\s+(?:need|require|requires)\\b[^.!?]{0,40}\\b${term}\\b`, 'i'),
+    new RegExp(`\\b(?:already|previously)\\s+(?:(?:have|has|had|was|were)\\s+)?${completedAction}\\b[^.!?]{0,60}\\b${term}\\b`, 'i'),
+    new RegExp(`\\b(?:attached|enclosed)\\s+is\\b[^.!?]{0,60}\\b${term}\\b`, 'i'),
+    new RegExp(`\\b${term}\\b[^.!?]{0,80}\\b(?:already|previously)\\s+${completedAction}\\b`, 'i'),
+    new RegExp(`\\b${term}\\b[^.!?]{0,80}\\b(?:is|are|has|have|had|was|were)\\s+(?:already\\s+|previously\\s+)?${completedAction}\\b`, 'i'),
+    new RegExp(`\\b${term}\\b[^.!?]{0,80}\\b(?:has|have|had)\\s+(?:already\\s+|previously\\s+)?been\\s+${completedAction}\\b`, 'i'),
+  ];
+  return patterns.some((pattern) => pattern.test(value));
+}
+
+function matchesExplicitPrerequisiteRequest(value, termSource, directActions) {
+  const clauses = value.split(/(?<=[.!?;])\s+/).filter(Boolean);
+  return clauses.some((clause, index) => {
+    const term = `(?:${termSource})`;
+    if (!new RegExp(`\\b${term}\\b`, 'i').test(clause)
+      || prerequisiteIsSatisfiedOrNegated(clause, termSource)) return false;
+    const directRequest = new RegExp(
+      `(?:^|[.!?;]\\s+)(?:please\\s+|kindly\\s+)?(?:${directActions})\\b[^.!?]{0,60}\\b${term}\\b`,
+      'i',
+    );
+    const modalRequest = new RegExp(
+      `\\b(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?(?:${directActions})\\b`
+        + `[^.!?]{0,60}\\b${term}\\b`,
+      'i',
+    );
+    const contextualRequest = new RegExp(
+      `(?:^|[.!?;]\\s+)[^.!?;]{0,40}\\b(?:please|kindly)\\s+(?:${directActions})\\b`
+        + `[^.!?]{0,60}\\b${term}\\b`,
+      'i',
+    );
+    const directedRequirement = new RegExp(
+      `\\byou\\s+(?:must|need to|have to|are required to)\\s+(?:${directActions})\\b`
+        + `[^.!?]{0,60}\\b${term}\\b`,
+      'i',
+    );
+    const counterpartyRequirement = new RegExp(
+      `\\b(?:we|the seller|seller|the broker|broker|our process|the process|access|release)\\b`
+        + `[^.!?]{0,40}\\b(?:need|needs|require|requires|will require|must have)\\b`
+        + `[^.!?]{0,40}\\b${term}\\b`,
+      'i',
+    );
+    const termFirstRequirement = new RegExp(
+      `(?:^|[.!?;]\\s+)(?!(?:no|not)\\b)[^.!?]{0,24}\\b${term}\\b[^.!?]{0,30}`
+        + '\\b(?:(?:is|are|will be|must be)\\s+(?:required|needed|due|provided|submitted|completed|signed|executed|paid)|required|needed|due)\\b',
+      'i',
+    );
+    if (directRequest.test(clause)
+      || modalRequest.test(clause)
+      || contextualRequest.test(clause)
+      || directedRequirement.test(clause)
+      || counterpartyRequirement.test(clause)) return true;
+    if (!termFirstRequirement.test(clause)) return false;
+    if (/\b(?:current|updated|additional|new)\b/i.test(clause)) return true;
+    const adjacentContext = clauses.slice(Math.max(0, index - 1), index + 2).join(' ');
+    return !prerequisiteIsSatisfiedOrNegated(adjacentContext, termSource);
+  });
+}
+
+function classifyOwnerPrerequisiteRequest(value) {
+  if (matchesExplicitPrerequisiteRequest(
+    value,
+    'buyer profile|buyer qualifications?(?: (?:form|profile|questionnaire))?',
+    'complete|fill out|provide|submit|send|share|return|upload',
+  )) {
+    return { intent: 'nda_request', signals: ['buyer-qualification-request'], ownerReviewOnly: true };
+  }
+  if (matchesExplicitPrerequisiteRequest(
+    value,
+    'proof[ -]?of[ -]?funds|pof|bank (?:verification )?letters?',
+    'provide|submit|send|share|return|upload',
+  )) {
+    return { intent: 'nda_request', signals: ['financial-qualification-request'], ownerReviewOnly: true };
+  }
+  if (matchesExplicitPrerequisiteRequest(
+    value,
+    'fee agreements?|retainer(?: agreements?)?|upfront (?:processing )?fees?|processing fees?|(?:lender|financing|loan) commitments?(?: letters?)?',
+    'complete|fill out|provide|submit|send|share|return|upload|sign|execute|pay',
+  )) {
+    return { intent: 'nda_request', signals: ['financial-commitment-request'], ownerReviewOnly: true };
+  }
+  return null;
 }
 
 function communicationForAnalysis(communication = {}) {
@@ -288,6 +389,8 @@ function classifyInboundIntent(body = '') {
   if (/(?:later this (?:year|quarter)|next (?:month|quarter|year)|circle back|reach (?:back )?out|not (?:right )?now|after the holidays)/i.test(normalized)) {
     return { intent: 'future_timing', signals: ['future-timing-request'] };
   }
+  const ownerPrerequisite = classifyOwnerPrerequisiteRequest(normalized);
+  if (ownerPrerequisite) return ownerPrerequisite;
   if (/(?:nda|non[ -]?disclosure|confidentiality agreement)/i.test(normalized)) {
     return { intent: 'nda_request', signals: ['nda-request'] };
   }
@@ -505,7 +608,10 @@ export function buildDeterministicFollowUpRecommendation({ context, now = new Da
         confidence: 0.97,
         rationale: 'The latest inbound message includes attachment metadata. A human must review the files before responding; no attachment contents were analyzed.',
         signals: unique([...base.signals, 'inbound-attachments']),
-        blockers: ['attachment-review-required'],
+        blockers: classification.ownerReviewOnly
+          ? ['attachment-review-required', 'owner-qualification-review-required']
+          : ['attachment-review-required'],
+        safetyFlags: classification.ownerReviewOnly ? ['outreach-blocked'] : [],
         draftSubject: '',
         draftBodyText: '',
       };
@@ -534,7 +640,9 @@ export function buildDeterministicFollowUpRecommendation({ context, now = new Da
       ambiguous: 'manual_review',
     };
     const actionType = actionByIntent[classification.intent] || 'reply_to_inbound';
-    const draft = deliverableActions.has(actionType) ? replyDraft(context, latest, classification.intent) : { subject: '', body: '' };
+    const draft = deliverableActions.has(actionType) && !classification.ownerReviewOnly
+      ? replyDraft(context, latest, classification.intent)
+      : { subject: '', body: '' };
     const stateByIntent = {
       document_request: 'documents_requested',
       nda_request: 'nda_or_buyer_profile_requested',
@@ -545,12 +653,19 @@ export function buildDeterministicFollowUpRecommendation({ context, now = new Da
       ...base,
       conversationState: stateByIntent[classification.intent] || base.conversationState,
       actionType,
-      rationale: classification.intent === 'ambiguous'
-        ? 'The latest inbound message needs a human interpretation before a reply is drafted.'
-        : `The latest inbound message was classified as ${classification.intent.replaceAll('_', ' ')} and needs a reviewed response.`,
+      rationale: classification.ownerReviewOnly
+        ? 'The latest inbound requests a buyer-qualification, fee, or financing prerequisite that only the owner may review; do not disclose qualifications or make a commitment.'
+        : classification.intent === 'ambiguous'
+          ? 'The latest inbound message needs a human interpretation before a reply is drafted.'
+          : `The latest inbound message was classified as ${classification.intent.replaceAll('_', ' ')} and needs a reviewed response.`,
       draftSubject: draft.subject,
       draftBodyText: draft.body,
-      blockers: classification.intent === 'document_request' && context.documents.length === 0 ? ['requested-documents-not-available'] : [],
+      blockers: classification.ownerReviewOnly
+        ? ['owner-qualification-review-required']
+        : classification.intent === 'document_request' && context.documents.length === 0
+          ? ['requested-documents-not-available']
+          : [],
+      safetyFlags: classification.ownerReviewOnly ? ['outreach-blocked'] : [],
     };
   }
 

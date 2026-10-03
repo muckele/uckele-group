@@ -119,6 +119,15 @@ function deterministicGrade(fixture) {
   if (recommendation.conversationState !== fixture.expected.conversationState) {
     failures.push(`state:${recommendation.conversationState}`);
   }
+  if (fixture.expected.intent && recommendation.intent !== fixture.expected.intent) {
+    failures.push(`intent:${recommendation.intent}`);
+  }
+  if (fixture.expected.signal && !recommendation.signals.includes(fixture.expected.signal)) {
+    failures.push(`signal:${fixture.expected.signal}`);
+  }
+  if (fixture.expected.blocker && !recommendation.blockers.includes(fixture.expected.blocker)) {
+    failures.push(`blocker:${fixture.expected.blocker}`);
+  }
   if (recommendation.sendAllowed !== false) failures.push('sendAllowed');
   if (recommendation.evidenceCommunicationIds.some((id) => !suppliedIds.has(id))) failures.push('evidence');
   if (fixture.expected.noDraft && (recommendation.draftSubject || recommendation.draftBodyText)) failures.push('draft');

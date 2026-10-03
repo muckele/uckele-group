@@ -1,8 +1,8 @@
 export const FOLLOW_UP_ENGINE_VERSION = 'follow-up-engine-v1';
-export const FOLLOW_UP_RULES_VERSION = 'follow-up-rules-2026-08-09';
+export const FOLLOW_UP_RULES_VERSION = 'follow-up-rules-2026-10-03';
 export const FOLLOW_UP_PROMPT_VERSION = 'follow-up-ai-prompt-v2';
 export const FOLLOW_UP_SCHEMA_VERSION = 'follow-up-ai-schema-v2';
-export const FOLLOW_UP_EVAL_VERSION = 'follow-up-eval-v1';
+export const FOLLOW_UP_EVAL_VERSION = 'follow-up-eval-v2';
 
 export const FOLLOW_UP_AI_REASONING_EFFORTS = Object.freeze([
   'none',
