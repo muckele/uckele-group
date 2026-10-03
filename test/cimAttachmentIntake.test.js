@@ -9,12 +9,22 @@ import { evaluateAcquisitionMaterialsState } from '../server/services/acquisitio
 import { createBackupBundle, restoreBackupBundle, verifyBackupBundle } from '../server/services/backups.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
-  captureCimAttachment,
+  captureCimAttachment as captureCimAttachmentWithGate,
   cleanupStaleCimAttachmentPartials,
-  createDeterministicFakeScanner,
   publishApprovedCimAttachment,
-  scanCimAttachment,
+  scanCimAttachment as scanCimAttachmentWithGate,
 } from '../server/services/cimAttachmentIntake.js';
+import { createDeterministicFakeScanner } from './support/cimAttachmentScanner.js';
+
+const readyIntake = Object.freeze({ enabled: true, scannerReady: true });
+
+function captureCimAttachment(options) {
+  return captureCimAttachmentWithGate({ readiness: readyIntake, ...options });
+}
+
+function scanCimAttachment(options) {
+  return scanCimAttachmentWithGate({ readiness: readyIntake, ...options });
+}
 
 const roots = [];
 afterEach(async () => {
@@ -213,6 +223,65 @@ test('capture hard-caps the stream, validates magic, and stores a private conten
     /non-binary chunk/i,
   );
   assert.equal((await fs.readdir(root)).some((name) => name.startsWith('.partial-')), false);
+});
+
+test('capture rejects before storage or provider bytes unless intake and scanner readiness are explicit', async () => {
+  let storageTouched = false;
+  let streamConsumed = false;
+  const storage = {
+    async getCimAttachmentIntakeByProviderAttachment() {
+      storageTouched = true;
+      throw new Error('storage must not be touched while intake is disabled');
+    },
+  };
+  async function* providerBytes() {
+    streamConsumed = true;
+    yield pdfBytes('must-not-be-consumed');
+  }
+
+  for (const readiness of [
+    undefined,
+    {},
+    { enabled: false, scannerReady: true },
+    { enabled: 'true', scannerReady: true },
+    { enabled: true, scannerReady: false },
+    { enabled: true, scannerReady: 'true' },
+  ]) {
+    await assert.rejects(
+      captureCimAttachmentWithGate({
+        metadata: metadata(), byteStream: providerBytes(), storage, quarantineRoot: '/not-used',
+        maxBytes: 1024, readiness,
+      }),
+      /intake is disabled|scanner is not ready/i,
+    );
+  }
+  assert.equal(storageTouched, false);
+  assert.equal(streamConsumed, false);
+});
+
+test('scan rejects before storage access unless scanner readiness is explicit', async () => {
+  let storageTouched = false;
+  const storage = {
+    async getCimAttachmentIntake() {
+      storageTouched = true;
+      throw new Error('storage must not be touched while scanner is disabled');
+    },
+  };
+
+  for (const readiness of [undefined, { scannerReady: false }, { scannerReady: 'true' }]) {
+    await assert.rejects(
+      scanCimAttachmentWithGate({
+        intakeId: 'held-attachment', storage, quarantineRoot: '/not-used', readiness,
+      }),
+      /scanner is not ready/i,
+    );
+  }
+  assert.equal(storageTouched, false);
+});
+
+test('deterministic test scanner fails closed unless a test chooses an outcome', async () => {
+  const result = await createDeterministicFakeScanner().scan({ sha256: 'fixture-sha' });
+  assert.deepEqual(result, { outcome: 'unavailable' });
 });
 
 test('capture enforces one hard elapsed-time bound and removes the partial', async () => {

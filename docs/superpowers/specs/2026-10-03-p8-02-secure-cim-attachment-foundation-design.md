@@ -22,12 +22,13 @@ Attachment metadata and bytes are hostile input. They are data, never instructio
 6. treats the unique `(provider, provider_message_id, provider_attachment_id)` tuple as the replay identity;
 7. creates a separate provenance row for a distinct provider tuple with duplicate bytes, but points it at the same content-addressed quarantine object;
 8. never logs, parses, renders, or sends attachment contents;
-9. requires a deterministic scanner adapter result of `clean`, `unsafe`, or `unavailable`; only a deterministic fake is included;
-10. requires `clean` plus a fresh owner approval naming `submissionId`, `documentType`, and actor before vault publication;
-11. rejects approval when the inbound communication is unassigned, assigned to another submission, or ambiguous, and records a bounded hold reason;
-12. leaves quarantine in `HOLD`; there is no automatic or permanent-purge operation;
-13. validates that every read, write, copy, and cleanup path is owned by the expected quarantine or vault root; and
-14. never lets observed metadata, quarantine state, or scan state satisfy the existing materials predicate. Only a published `secure_documents` row can do so.
+9. rejects capture before storage access or byte consumption unless explicit intake-enabled and scanner-ready gates are both true, with both gates hard-disabled in runtime configuration;
+10. requires an injected scanner adapter result of `clean`, `unsafe`, or `unavailable`; the deterministic fake exists only in test support and defaults to `unavailable`;
+11. requires `clean` plus a fresh owner approval naming `submissionId`, `documentType`, and actor before vault publication;
+12. rejects approval when the inbound communication is unassigned, assigned to another submission, or ambiguous, and records a bounded hold reason;
+13. leaves quarantine in `HOLD`; there is no automatic or permanent-purge operation;
+14. validates that every read, write, copy, and cleanup path is owned by the expected quarantine or vault root; and
+15. never lets observed metadata, quarantine state, or scan state satisfy the existing materials predicate. Only a published `secure_documents` row can do so.
 
 ## Lifecycle
 
@@ -44,13 +45,13 @@ The lifecycle row owns provider provenance, observed communication/assignment, d
 
 ## Capture and duplicate contract
 
-`captureCimAttachment({ metadata, byteStream, storage, quarantineRoot, maxBytes, maxDurationMs })` is the offline ingress seam. It first verifies that the referenced communication exists, is inbound, and has the same provider/message provenance. A second call for the same provider tuple returns or recovers the existing row without reading the new stream. Capture writes `.partial-<intake-id>`, incrementally hashes and hard-caps it by bytes and elapsed time, validates its signature against the declared allowed vault MIME family, fsyncs it, then persists a `quarantining` lifecycle row before atomically linking the bytes to `<sha256>.<safe-extension>`. It removes the partial only after the canonical object is verified and advances the row to `scan-pending`. A distinct tuple with the same SHA-256 records `duplicate_of_id` and reuses the canonical quarantine path, including when both captures race.
+`captureCimAttachment({ metadata, byteStream, storage, quarantineRoot, maxBytes, maxDurationMs, readiness })` is the offline ingress seam. It first requires `readiness.enabled === true` and `readiness.scannerReady === true`; otherwise it rejects before normalizing metadata, touching storage, or consuming provider bytes. Runtime configuration hard-defaults both values to `false` and provides no environment-variable activation path in this foundation. After the gates, capture verifies that the referenced communication exists, is inbound, and has the same provider/message provenance. A second call for the same provider tuple returns or recovers the existing row without reading the new stream. Capture writes `.partial-<intake-id>`, incrementally hashes and hard-caps it by bytes and elapsed time, validates its signature against the declared allowed vault MIME family, fsyncs it, then persists a `quarantining` lifecycle row before atomically linking the bytes to `<sha256>.<safe-extension>`. It removes the partial only after the canonical object is verified and advances the row to `scan-pending`. A distinct tuple with the same SHA-256 records `duplicate_of_id` and reuses the canonical quarantine path, including when both captures race.
 
 Stream overflow, invalid magic, unexpected stream failure, link failure, and disk-full before the database boundary leave no owned temporary file and no publishable state. Because a lost database response is indistinguishable from a rejected insert, an insert error conservatively retains only the root-owned `.partial-<intake-id>` until replay/reconciliation or the bounded stale-partial sweep; it never creates an untracked canonical object. Failures never delete an existing canonical object. A crash after row persistence leaves either `.partial-<intake-id>` or the verified canonical object attached to a `quarantining` row. Replay or restart reconciliation completes that row without rereading provider bytes; cleanup removes only stale, unclaimed, regular, root-owned partial files and never follows symbolic links.
 
 ## Scanner and retry contract
 
-`scanCimAttachment` receives an injected adapter. The repository ships `createDeterministicFakeScanner`, which produces only configured deterministic outcomes and makes no external calls. No production scanner is selected by default.
+`scanCimAttachment` rejects before storage access unless `readiness.scannerReady === true`, then receives an injected adapter. Production source ships no scanner implementation. `test/support/cimAttachmentScanner.js` supplies the deterministic fake used by offline tests; it makes no external calls and defaults to `unavailable` unless a test explicitly chooses another outcome.
 
 An unavailable scanner records a bounded attempt, retry time, and visible hold reason. The three-attempt default permits retry after 15 minutes and then 2 hours; a third unavailable result records `retry_exhausted` in HOLD with no further automatic retry. Calls before `next_scan_at` are rejected without invoking the scanner. The service does not schedule retries; a caller must invoke it. Unsafe rows record an `unsafe` hold reason for owner review and can never be approved or published.
 

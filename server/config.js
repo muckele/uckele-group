@@ -482,6 +482,10 @@ export function getConfig() {
         process.env.SECURE_DOCUMENTS_STORAGE_DIR || path.join(rootDir, 'data', 'secure-documents'),
         '.cim-attachment-quarantine',
       ),
+      cimAttachmentIntake: {
+        enabled: false,
+        scannerReady: false,
+      },
     },
     protection: {
       contactJsonLimit: process.env.CONTACT_JSON_LIMIT || '64kb',

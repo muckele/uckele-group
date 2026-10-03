@@ -279,8 +279,15 @@ export async function captureCimAttachment({
   quarantineRoot,
   maxBytes,
   maxDurationMs = defaultCaptureDurationMs,
+  readiness,
   now = new Date(),
 } = {}) {
+  if (readiness?.enabled !== true) {
+    throw new Error('CIM attachment intake is disabled.');
+  }
+  if (readiness?.scannerReady !== true) {
+    throw new Error('CIM attachment scanner is not ready.');
+  }
   const input = normalizeCaptureMetadata(metadata);
   const communication = await storage.getCrmCommunication(input.communicationId);
   if (!communication || communication.direction !== 'inbound') {
@@ -391,21 +398,17 @@ export async function captureCimAttachment({
   }
 }
 
-export function createDeterministicFakeScanner({ defaultOutcome = 'clean', outcomesBySha256 = {} } = {}) {
-  const allowed = new Set(['clean', 'unsafe', 'unavailable']);
-  if (!allowed.has(defaultOutcome)) throw new Error('Fake scanner default outcome is invalid.');
-  return {
-    name: 'deterministic-fake',
-    version: '1',
-    async scan({ sha256 }) {
-      const outcome = outcomesBySha256[sha256] || defaultOutcome;
-      if (!allowed.has(outcome)) throw new Error('Fake scanner configured an invalid outcome.');
-      return { outcome };
-    },
-  };
-}
-
-export async function scanCimAttachment({ intakeId, storage, quarantineRoot, scanner, now = new Date() } = {}) {
+export async function scanCimAttachment({
+  intakeId,
+  storage,
+  quarantineRoot,
+  scanner,
+  readiness,
+  now = new Date(),
+} = {}) {
+  if (readiness?.scannerReady !== true) {
+    throw new Error('CIM attachment scanner is not ready.');
+  }
   const intake = await storage.getCimAttachmentIntake(boundedIdentifier(intakeId, 'Attachment intake id'));
   if (!intake) throw new Error('Attachment intake was not found.');
   if (intake.lifecycle_status === 'published' || intake.scan_status === 'clean' || intake.scan_status === 'unsafe') return intake;

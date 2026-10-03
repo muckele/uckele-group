@@ -41,7 +41,7 @@
 
 **Files:** `server/services/cimAttachmentIntake.js`, `server/services/documentVault.js`, `test/cimAttachmentIntake.test.js`
 
-**Interfaces:** Produces `captureCimAttachment({ metadata, byteStream, storage, quarantineRoot, maxBytes, maxDurationMs })` and restart recovery/partial cleanup.
+**Interfaces:** Produces `captureCimAttachment({ metadata, byteStream, storage, quarantineRoot, maxBytes, maxDurationMs, readiness })` and restart recovery/partial cleanup. Capture rejects before storage or byte-stream access unless the hard-disabled intake and scanner-readiness gates are both explicitly true.
 
 - [x] Write and run failing tests for hard byte/time bounds, MIME magic, hashing, replay, duplicate races, disk-full, symlink/path escape, and restart recovery.
 - [x] Implement private `0700`/`0600` content-addressed quarantine using only an injected stream.
@@ -49,12 +49,12 @@
 
 ### Task 3: Injected scan and visible holds
 
-**Files:** `server/services/cimAttachmentIntake.js`, `test/cimAttachmentIntake.test.js`
+**Files:** `server/config.js`, `server/services/cimAttachmentIntake.js`, `test/support/cimAttachmentScanner.js`, `test/cimAttachmentIntake.test.js`, `test/config.test.js`
 
-**Interfaces:** Produces `createDeterministicFakeScanner` and `scanCimAttachment`; consumes lifecycle storage and root-owned quarantine files.
+**Interfaces:** Produces gated `scanCimAttachment`; consumes lifecycle storage, an explicitly ready injected adapter, and root-owned quarantine files. The deterministic fake is test-only and defaults to unavailable.
 
 - [x] Write and run failing tests for clean, unsafe, unavailable, retry timing, and retry exhaustion.
-- [x] Implement the fake-only adapter and bounded hold reasons without a scheduler or default production scanner.
+- [x] Implement bounded hold reasons without a scheduler or production scanner, and keep the default-unavailable deterministic fake in test support only.
 - [x] Run the focused scan tests under Node 22.
 
 ### Task 4: Owner-approved vault publication

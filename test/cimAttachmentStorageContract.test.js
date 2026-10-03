@@ -59,7 +59,9 @@ test('Supabase migration is additive, service-role-only, and publishes through o
 test('quarantine has no HTTP route or default live scanner implementation', () => {
   const app = fs.readFileSync(path.resolve('server/app.js'), 'utf8');
   const intakeService = fs.readFileSync(path.resolve('server/services/cimAttachmentIntake.js'), 'utf8');
+  const testScanner = fs.readFileSync(path.resolve('test/support/cimAttachmentScanner.js'), 'utf8');
   assert.equal(/cim[-_/]attachment.*download/i.test(app), false);
   assert.equal(/fetch\s*\(|resend|clamav|clamd|scanner.*url/i.test(intakeService), false);
-  assert.match(intakeService, /createDeterministicFakeScanner/);
+  assert.doesNotMatch(intakeService, /createDeterministicFakeScanner|deterministic-fake/);
+  assert.match(testScanner, /createDeterministicFakeScanner/);
 });
