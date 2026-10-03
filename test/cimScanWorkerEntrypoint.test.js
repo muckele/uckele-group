@@ -64,21 +64,27 @@ test('worker entrypoint loads private inputs and leaves attachment opening lazy'
   assert.deepEqual(output, ['signed-result-wire']);
 });
 
-test('scanner package keeps the official source tag but requires unresolved immutable digests', async () => {
+test('scanner package locks official sources for linux/amd64', async () => {
   const dockerfile = await fsp.readFile('containers/cim-scan-worker/Containerfile', 'utf8');
   const clamConfig = await fsp.readFile('containers/cim-scan-worker/clamd.conf', 'utf8');
   const sourceLock = JSON.parse(await fsp.readFile('containers/cim-scan-worker/source-lock.json', 'utf8'));
-  assert.match(dockerfile, /^ARG NODE_BASE_DIGEST\nARG CLAMAV_BASE_DIGEST\nFROM node:22-alpine@\$\{NODE_BASE_DIGEST\}/);
+  assert.match(dockerfile, /^ARG NODE_BASE_DIGEST=sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402\nARG CLAMAV_BASE_DIGEST=sha256:90effb795234e6a93b070310a4bab5a58d93d94b9a077a09ce2229947679782b\nFROM node:22-alpine@\$\{NODE_BASE_DIGEST\}/);
   assert.match(dockerfile, /FROM clamav\/clamav:1\.4\.6_base@\$\{CLAMAV_BASE_DIGEST\}/);
-  assert.doesNotMatch(dockerfile, /ARG (?:CLAMAV|NODE)_BASE_DIGEST=/);
   assert.match(dockerfile, /COPY package\.json package-lock\.json/);
   assert.match(dockerfile, /RUN npm ci --omit=dev/);
   assert.match(clamConfig, /^LocalSocket \/run\/clamav\/clamd\.sock$/m);
   assert.doesNotMatch(clamConfig, /^\s*(?:TCPAddr|TCPSocket)\b/m);
-  assert.equal(sourceLock.status, 'blocked-pending-authoritative-digests');
+  assert.equal(sourceLock.status, 'locked');
+  assert.equal(sourceLock.platform, 'linux/amd64');
   assert.deepEqual(sourceLock.clamav, {
-    repository: 'clamav/clamav', tag: '1.4.6_base', digest: null,
+    repository: 'clamav/clamav', tag: '1.4.6_base',
+    digest: 'sha256:90effb795234e6a93b070310a4bab5a58d93d94b9a077a09ce2229947679782b',
+    platformDigest: 'sha256:58d9b21b5694a1f5b3a136e4f2e4fc6b463fce88635737e16f8cb9ee9455a199',
   });
-  assert.equal(sourceLock.nodeRuntime.digest, null);
+  assert.deepEqual(sourceLock.nodeRuntime, {
+    repository: 'node', tag: '22-alpine',
+    digest: 'sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402',
+    platformDigest: 'sha256:2c752226d477b4a886378baa95b9af252be59301b725fdb0b7e15208131505a8',
+  });
   assert.equal(sourceLock.dependencyLock, 'package-lock.json');
 });
