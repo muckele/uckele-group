@@ -311,6 +311,34 @@ test('environment parsing does not normalize invalid AI enablement controls into
   }
 });
 
+test('secure attachment quarantine defaults beneath the existing private vault root', () => {
+  const configModuleUrl = new URL('../server/config.js', import.meta.url).href;
+  const vaultRoot = path.join(os.tmpdir(), 'p8-secure-vault-root');
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', [
+    `import { getConfig } from ${JSON.stringify(configModuleUrl)};`,
+    'const config = getConfig();',
+    'console.log(JSON.stringify(config.secureDocuments));',
+  ].join('\n')], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      NODE_ENV: 'development',
+      SECURE_DOCUMENTS_STORAGE_DIR: vaultRoot,
+      CIM_ATTACHMENT_QUARANTINE_DIR: path.join(os.tmpdir(), 'must-not-escape-vault'),
+      CIM_ATTACHMENT_INTAKE_ENABLED: 'true',
+      CIM_ATTACHMENT_SCANNER_READY: 'true',
+    },
+  });
+  assert.equal(child.status, 0, child.stderr);
+  const secureDocuments = JSON.parse(child.stdout.trim());
+  assert.equal(secureDocuments.storageDir, vaultRoot);
+  assert.equal(secureDocuments.quarantineDir, path.join(vaultRoot, '.cim-attachment-quarantine'));
+  assert.deepEqual(secureDocuments.cimAttachmentIntake, {
+    enabled: false,
+    scannerReady: false,
+  });
+});
+
 test('Deal Hunter parses explicit Airtable retirement and validates Deal OS import bounds', () => {
   const configModuleUrl = new URL('../server/config.js', import.meta.url).href;
   const child = spawnSync(process.execPath, ['--input-type=module', '--eval', [

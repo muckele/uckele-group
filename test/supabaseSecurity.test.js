@@ -3,6 +3,10 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 const schemaUrl = new URL('../supabase/schema.sql', import.meta.url);
+const secureCimAttachmentMigrationUrl = new URL(
+  '../supabase/migrations/20261011120000_secure_cim_attachment_foundation.sql',
+  import.meta.url,
+);
 const migrationUrl = new URL(
   '../supabase/migrations/20260713104500_supabase_service_role_isolation.sql',
   import.meta.url,
@@ -462,7 +466,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const pursueCimAutopilotMigration = fs.readFileSync(pursueCimAutopilotMigrationUrl, 'utf8');
   const crmAuthorityMigration = fs.readFileSync(crmAuthorityMigrationUrl, 'utf8');
   const pursueCimP4bMigration = fs.readFileSync(pursueCimP4bMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}`;
+  const secureCimAttachmentMigration = fs.readFileSync(secureCimAttachmentMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${secureCimAttachmentMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');

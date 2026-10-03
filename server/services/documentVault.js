@@ -16,7 +16,7 @@ import {
   updateSecureDocumentCleanupJobState,
 } from './secureDocumentCleanupState.js';
 
-const allowedMimeTypes = new Set([
+export const secureDocumentAllowedMimeTypes = new Set([
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/vnd.ms-excel',
@@ -95,7 +95,7 @@ const mimeTypesByExtension = new Map([
   ['.zip', 'application/zip'],
 ]);
 
-function sanitizeFileName(fileName) {
+export function sanitizeSecureDocumentFileName(fileName) {
   const cleaned = String(fileName || 'document')
     .replace(/[^a-zA-Z0-9._-]+/g, '-')
     .replace(/-+/g, '-')
@@ -141,7 +141,7 @@ function verifyAccessToken(token) {
   return verifySignedPayload(token, config.secureDocuments.tokenSecret);
 }
 
-function normalizeDocumentType(value) {
+export function normalizeSecureDocumentType(value) {
   const normalized = String(value || 'other').trim().toLowerCase();
   const aliases = {
     'tax-returns': 'tax_returns',
@@ -158,14 +158,14 @@ function normalizeDocumentType(value) {
 }
 
 function documentTypeLabel(value) {
-  return normalizeDocumentType(value).split('_').map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(' ');
+  return normalizeSecureDocumentType(value).split('_').map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(' ');
 }
 
 function normalizeRequestedDocuments(values = []) {
   const seen = new Set();
   return (Array.isArray(values) ? values : [])
     .map((item) => {
-      const category = normalizeDocumentType(typeof item === 'string' ? item : item?.category || item?.id);
+      const category = normalizeSecureDocumentType(typeof item === 'string' ? item : item?.category || item?.id);
       return { category, label: String(item?.label || documentTypeLabel(category)).trim().slice(0, 120), required: item?.required !== false };
     })
     .filter((item) => item.category !== 'other' && !seen.has(item.category) && seen.add(item.category))
@@ -174,7 +174,7 @@ function normalizeRequestedDocuments(values = []) {
 
 function buildRequestedDocumentChecklist(requestRecord, documents = []) {
   const counts = documents.reduce((result, document) => {
-    const category = normalizeDocumentType(document.document_type);
+    const category = normalizeSecureDocumentType(document.document_type);
     result[category] = (result[category] || 0) + 1;
     return result;
   }, {});
@@ -185,7 +185,7 @@ function buildRequestedDocumentChecklist(requestRecord, documents = []) {
   }));
 }
 
-function inferMimeType(document = {}) {
+export function inferSecureDocumentMimeType(document = {}) {
   const supplied = String(document.mimeType || '').trim().toLowerCase();
 
   if (supplied && supplied !== 'application/octet-stream') {
@@ -242,7 +242,7 @@ function hasTextSignature(buffer) {
   return buffer.length > 0 && !buffer.subarray(0, Math.min(buffer.length, 4096)).includes(0);
 }
 
-function bufferMatchesMimeType(buffer, mimeType) {
+export function secureDocumentBufferMatchesMimeType(buffer, mimeType) {
   if (mimeType === 'application/pdf') {
     return buffer.subarray(0, 5).toString('ascii') === '%PDF-';
   }
@@ -285,7 +285,7 @@ function prepareDocumentPayload(document = {}, config) {
   document = document || {};
   const errors = [];
   const decodedBytes = estimateBase64DecodedBytes(document.contentBase64);
-  const mimeType = inferMimeType(document);
+  const mimeType = inferSecureDocumentMimeType(document);
   let buffer = null;
 
   if (!document.name || !document.contentBase64) {
@@ -304,14 +304,14 @@ function prepareDocumentPayload(document = {}, config) {
 
   if (!mimeType) {
     errors.push(`${document.name || 'A file'} must include a file type.`);
-  } else if (!allowedMimeTypes.has(mimeType)) {
+  } else if (!secureDocumentAllowedMimeTypes.has(mimeType)) {
     errors.push(`${document.name || 'A file'} uses a file type that is not allowed.`);
   }
 
   if (errors.length === 0) {
     buffer = Buffer.from(normalizeBase64(document.contentBase64), 'base64');
 
-    if (!bufferMatchesMimeType(buffer, mimeType)) {
+    if (!secureDocumentBufferMatchesMimeType(buffer, mimeType)) {
       errors.push(`${document.name || 'A file'} does not match the selected file type.`);
     }
   }
@@ -854,7 +854,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     for (const preparedDocument of preparedDocuments) {
       const { document, buffer, mimeType } = preparedDocument;
       const documentId = randomUUID();
-      const safeOriginalName = sanitizeFileName(document.name);
+      const safeOriginalName = sanitizeSecureDocumentFileName(document.name);
       const safeStoredName = `${documentId}-${safeOriginalName}`;
       const storagePath = path.join(requestDirectory, safeStoredName);
 
@@ -863,7 +863,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
         request_id: context.request.id,
         submission_id: context.submission.id,
         created_at: new Date().toISOString(),
-        document_type: normalizeDocumentType(document.documentType),
+        document_type: normalizeSecureDocumentType(document.documentType),
         file_name: safeStoredName,
         original_name: safeOriginalName,
         mime_type: mimeType,
