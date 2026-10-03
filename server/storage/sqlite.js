@@ -569,6 +569,56 @@ function normalizeCanonicalUtcIso(value, fieldName) {
   return value;
 }
 
+const cimScanDigestPattern = /^[0-9a-f]{64}$/;
+const cimScanReasonPattern = /^[a-z][a-z0-9_]{0,63}$/;
+const maxCimSignatureAgeMs = 24 * 60 * 60 * 1000;
+
+function normalizeBoundedCimScanText(value, fieldName) {
+  const hasControl = typeof value === 'string' && [...value].some((character) => {
+    const code = character.codePointAt(0);
+    return code <= 31 || code === 127;
+  });
+  if (typeof value !== 'string' || value.length < 1 || value.length > 120 || hasControl) {
+    throw new Error(`${fieldName} must be bounded text.`);
+  }
+  return value;
+}
+
+function validateCimScanCompletionEvidence({ completedAt, verdictExpiresAt, result }) {
+  const completed = normalizeCanonicalUtcIso(completedAt, 'Attachment scan completion time');
+  const completedMs = Date.parse(completed);
+  const outcome = result?.outcome;
+  if (!['clean', 'unsafe', 'unavailable', 'ambiguous'].includes(outcome)) {
+    throw new Error('Attachment scan outcome is invalid.');
+  }
+  const reasonCode = String(result?.reasonCode || '');
+  if (!cimScanReasonPattern.test(reasonCode)) {
+    throw new Error('Attachment scan reason code is invalid.');
+  }
+  if (outcome === 'clean' || outcome === 'unsafe') {
+    normalizeBoundedCimScanText(result?.engineVersion, 'Scanner engine version');
+    normalizeBoundedCimScanText(result?.signatureVersion, 'Scanner signature version');
+    if (!cimScanDigestPattern.test(String(result?.requestDigest || ''))) {
+      throw new Error('Attachment scan request digest is invalid.');
+    }
+    const signatureUpdatedAt = normalizeCanonicalUtcIso(
+      result?.signatureUpdatedAt,
+      'Scanner signature update time',
+    );
+    const signatureMs = Date.parse(signatureUpdatedAt);
+    if (signatureMs > completedMs || completedMs - signatureMs > maxCimSignatureAgeMs) {
+      throw new Error('Attachment scan signature evidence is outside the freshness window.');
+    }
+  }
+  if (outcome === 'clean') {
+    const expiry = normalizeCanonicalUtcIso(verdictExpiresAt, 'Attachment scan verdict expiry');
+    const expiryMs = Date.parse(expiry);
+    if (expiryMs <= completedMs || expiryMs - completedMs > 24 * 60 * 60 * 1000) {
+      throw new Error('Attachment scan verdict expiry is outside the bounded window.');
+    }
+  }
+}
+
 function normalizeSecureDocumentCleanupLease({ claimedAt, leaseExpiresAt, leaseToken } = {}) {
   const normalizedClaimedAt = normalizeCanonicalUtcIso(claimedAt, 'Cleanup-job lease claim time');
   const normalizedLeaseExpiresAt = normalizeCanonicalUtcIso(leaseExpiresAt, 'Cleanup-job lease expiry');
@@ -3746,7 +3796,7 @@ export function createSqliteStorage(config, options = {}) {
       quarantine_path TEXT NOT NULL,
       duplicate_of_id TEXT REFERENCES secure_attachment_ingestions(id) ON DELETE RESTRICT,
       lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN (
-        'quarantining', 'scan-pending', 'scan-unavailable', 'unsafe',
+        'quarantining', 'scan-pending', 'scanning', 'scan-unavailable', 'unsafe',
         'awaiting-owner-approval', 'publishing', 'published'
       )),
       scan_status TEXT NOT NULL CHECK (scan_status IN ('pending', 'clean', 'unsafe', 'unavailable')),
@@ -3755,6 +3805,15 @@ export function createSqliteStorage(config, options = {}) {
       scanner_version TEXT,
       scan_last_error TEXT,
       next_scan_at TEXT,
+      scan_request_id TEXT,
+      scan_job_owner TEXT,
+      scan_requested_at TEXT,
+      scan_lease_expires_at TEXT,
+      scan_completed_at TEXT,
+      scan_request_digest TEXT,
+      scan_signature_version TEXT,
+      scan_signature_updated_at TEXT,
+      scan_verdict_expires_at TEXT,
       hold_reason TEXT,
       owner_approved_at TEXT,
       owner_approved_by TEXT,
@@ -3777,6 +3836,8 @@ export function createSqliteStorage(config, options = {}) {
       ON secure_attachment_ingestions (communication_id, created_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_secure_attachment_ingestions_vault_document
       ON secure_attachment_ingestions (vault_document_id) WHERE vault_document_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_secure_attachment_ingestions_single_scanning
+      ON secure_attachment_ingestions ((1)) WHERE lifecycle_status = 'scanning';
 
     CREATE TABLE IF NOT EXISTS email_events (
       id TEXT PRIMARY KEY,
@@ -8946,12 +9007,16 @@ export function createSqliteStorage(config, options = {}) {
           'original_file_name', 'declared_mime_type', 'detected_mime_type', 'size_bytes', 'sha256',
           'quarantine_path', 'duplicate_of_id', 'lifecycle_status', 'scan_status', 'scan_attempt_count',
           'scanner_name', 'scanner_version', 'scan_last_error', 'next_scan_at', 'hold_reason', 'owner_approved_at',
+          'scan_request_id', 'scan_job_owner', 'scan_requested_at', 'scan_lease_expires_at',
+          'scan_completed_at', 'scan_request_digest', 'scan_signature_version',
+          'scan_signature_updated_at', 'scan_verdict_expires_at',
           'owner_approved_by', 'approved_submission_id', 'approved_document_type', 'vault_request_id',
           'vault_document_id', 'vault_relative_path', 'published_at', 'retention_status',
           'retention_review_at', 'created_at', 'updated_at',
         ];
+        const payload = Object.fromEntries(keys.map((key) => [key, record[key] ?? null]));
         database.prepare(`INSERT INTO secure_attachment_ingestions (${keys.join(', ')})
-          VALUES (${keys.map((key) => `@${key}`).join(', ')})`).run(record);
+          VALUES (${keys.map((key) => `@${key}`).join(', ')})`).run(payload);
         return normalizeCimAttachmentIntakeRow(
           database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(record.id),
         );
@@ -8962,6 +9027,9 @@ export function createSqliteStorage(config, options = {}) {
       const allowed = new Set([
         'updated_at', 'lifecycle_status', 'scan_status', 'scan_attempt_count', 'scanner_name',
         'scanner_version', 'scan_last_error', 'next_scan_at', 'hold_reason', 'duplicate_of_id', 'owner_approved_at',
+        'scan_request_id', 'scan_job_owner', 'scan_requested_at', 'scan_lease_expires_at',
+        'scan_completed_at', 'scan_request_digest', 'scan_signature_version',
+        'scan_signature_updated_at', 'scan_verdict_expires_at',
         'owner_approved_by', 'approved_submission_id', 'approved_document_type',
         'vault_request_id', 'vault_document_id', 'vault_relative_path', 'published_at',
         'retention_status', 'retention_review_at',
@@ -8982,6 +9050,172 @@ export function createSqliteStorage(config, options = {}) {
       }).immediate();
     },
 
+    async claimCimAttachmentScan({ intakeId, requestId, jobOwner, claimedAt, leaseExpiresAt }) {
+      const claimedMs = Date.parse(claimedAt);
+      const leaseMs = Date.parse(leaseExpiresAt);
+      const canonicalTime = (value, parsed) => Number.isFinite(parsed)
+        && new Date(parsed).toISOString() === value;
+      if (!canonicalTime(claimedAt, claimedMs) || !canonicalTime(leaseExpiresAt, leaseMs)
+        || leaseMs <= claimedMs || leaseMs - claimedMs > 4 * 60 * 1000) {
+        throw new Error('Attachment scan lease is outside the bounded window.');
+      }
+      if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/.test(String(requestId || ''))
+        || typeof jobOwner !== 'string' || jobOwner.length < 1 || jobOwner.length > 120
+        || [...jobOwner].some((character) => character.codePointAt(0) <= 31 || character.codePointAt(0) === 127)) {
+        throw new Error('Attachment scan ownership identity is invalid.');
+      }
+      return database.transaction(() => {
+        const active = normalizeCimAttachmentIntakeRow(database.prepare(`SELECT *
+          FROM secure_attachment_ingestions WHERE lifecycle_status = 'scanning' LIMIT 1`).get());
+        if (active) {
+          if (!active.scan_lease_expires_at || active.scan_lease_expires_at > claimedAt) return null;
+          const attempt = Number(active.scan_attempt_count || 0);
+          const exhausted = attempt >= 3;
+          database.prepare(`UPDATE secure_attachment_ingestions SET
+            lifecycle_status = 'scan-unavailable', scan_status = 'unavailable',
+            scan_last_error = 'scan_lease_expired', hold_reason = ?, next_scan_at = ?,
+            scan_completed_at = ?, updated_at = ?
+            WHERE id = ? AND lifecycle_status = 'scanning' AND scan_request_id = ?
+              AND scan_job_owner = ? AND scan_attempt_count = ? AND scan_lease_expires_at <= ?`)
+            .run(
+              exhausted ? 'retry_exhausted' : 'scan_lease_expired',
+              exhausted ? null : new Date(Date.parse(claimedAt) + (attempt === 1 ? 15 * 60_000 : 2 * 60 * 60_000)).toISOString(),
+              claimedAt, claimedAt, active.id, active.scan_request_id, active.scan_job_owner,
+              attempt, claimedAt,
+            );
+        }
+        let intake = normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+        );
+        if (!intake) return null;
+        if (intake.lifecycle_status === 'awaiting-owner-approval'
+          && intake.scan_status === 'clean'
+          && (!intake.scan_verdict_expires_at || intake.scan_verdict_expires_at <= claimedAt)) {
+          const exhausted = Number(intake.scan_attempt_count || 0) >= 3;
+          database.prepare(`UPDATE secure_attachment_ingestions SET
+            lifecycle_status = 'scan-unavailable', scan_status = 'unavailable', hold_reason = ?,
+            scan_last_error = 'scan_verdict_expired', next_scan_at = ?, updated_at = ? WHERE id = ?
+            AND lifecycle_status = 'awaiting-owner-approval'
+            AND (scan_verdict_expires_at IS NULL OR scan_verdict_expires_at <= ?)`)
+            .run(exhausted ? 'retry_exhausted' : 'scan_verdict_expired', exhausted ? null : claimedAt,
+              claimedAt, intakeId, claimedAt);
+          intake = normalizeCimAttachmentIntakeRow(
+            database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+          );
+        }
+        if (!['scan-pending', 'scan-unavailable'].includes(intake.lifecycle_status)
+          || Number(intake.scan_attempt_count || 0) >= 3
+          || (intake.next_scan_at && intake.next_scan_at > claimedAt)) return null;
+        const nextAttempt = Number(intake.scan_attempt_count || 0) + 1;
+        try {
+          const result = database.prepare(`UPDATE secure_attachment_ingestions SET
+            lifecycle_status = 'scanning', scan_status = 'pending', scan_attempt_count = ?,
+            scan_request_id = ?, scan_job_owner = ?, scan_requested_at = ?,
+            scan_lease_expires_at = ?, scan_completed_at = NULL, scan_request_digest = NULL,
+            scan_last_error = NULL, next_scan_at = NULL, hold_reason = NULL, updated_at = ?
+            WHERE id = ? AND lifecycle_status = ? AND scan_attempt_count = ?`)
+            .run(nextAttempt, requestId, jobOwner, claimedAt, leaseExpiresAt, claimedAt,
+              intakeId, intake.lifecycle_status, Number(intake.scan_attempt_count || 0));
+          if (result.changes !== 1) return null;
+        } catch (error) {
+          if (String(error?.code || '').includes('CONSTRAINT')) return null;
+          throw error;
+        }
+        return normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+        );
+      }).immediate();
+    },
+
+    async expireCimAttachmentScanLease({ intakeId, requestId, jobOwner, attempt, now }) {
+      normalizeCanonicalUtcIso(now, 'Attachment scan lease expiry time');
+      return database.transaction(() => {
+        const intake = normalizeCimAttachmentIntakeRow(database.prepare(`SELECT * FROM secure_attachment_ingestions
+          WHERE id = ? AND lifecycle_status = 'scanning' AND scan_request_id = ?
+            AND scan_job_owner = ? AND scan_attempt_count = ? AND scan_lease_expires_at <= ?`)
+          .get(intakeId, requestId, jobOwner, attempt, now));
+        if (!intake) return null;
+        const exhausted = Number(attempt) >= 3;
+        const nextScanAt = exhausted ? null
+          : new Date(Date.parse(now) + (Number(attempt) === 1 ? 15 * 60_000 : 2 * 60 * 60_000)).toISOString();
+        const result = database.prepare(`UPDATE secure_attachment_ingestions SET
+          lifecycle_status = 'scan-unavailable', scan_status = 'unavailable',
+          scan_last_error = 'scan_lease_expired', hold_reason = ?, next_scan_at = ?,
+          scan_completed_at = ?, updated_at = ? WHERE id = ? AND lifecycle_status = 'scanning'
+          AND scan_request_id = ? AND scan_job_owner = ? AND scan_attempt_count = ?
+          AND scan_lease_expires_at <= ?`)
+          .run(exhausted ? 'retry_exhausted' : 'scan_lease_expired', nextScanAt, now, now,
+            intakeId, requestId, jobOwner, attempt, now);
+        if (result.changes !== 1) return null;
+        return normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+        );
+      }).immediate();
+    },
+
+    async completeCimAttachmentScan({
+      intakeId, requestId, jobOwner, attempt, completedAt, verdictExpiresAt, result,
+    }) {
+      return database.transaction(() => {
+        const intake = normalizeCimAttachmentIntakeRow(database.prepare(`SELECT * FROM secure_attachment_ingestions
+          WHERE id = ? AND lifecycle_status = 'scanning' AND scan_request_id = ?
+            AND scan_job_owner = ? AND scan_attempt_count = ? AND scan_lease_expires_at > ?`)
+          .get(intakeId, requestId, jobOwner, attempt, completedAt));
+        if (!intake) return null;
+        validateCimScanCompletionEvidence({ completedAt, verdictExpiresAt, result });
+        const outcome = result?.outcome;
+        const isClean = outcome === 'clean';
+        const isUnsafe = outcome === 'unsafe';
+        const exhausted = Number(attempt) >= 3;
+        const lifecycleStatus = isClean ? 'awaiting-owner-approval'
+          : isUnsafe ? 'unsafe' : 'scan-unavailable';
+        const scanStatus = isClean ? 'clean' : isUnsafe ? 'unsafe' : 'unavailable';
+        const reason = String(result?.reasonCode || (outcome === 'ambiguous' ? 'scan_ambiguous' : 'scan_unavailable'));
+        const holdReason = isClean ? null : isUnsafe ? 'unsafe'
+          : exhausted ? 'retry_exhausted' : outcome === 'ambiguous' ? 'scan_ambiguous' : reason;
+        const nextScanAt = (!isClean && !isUnsafe && !exhausted)
+          ? new Date(Date.parse(completedAt) + (Number(attempt) === 1 ? 15 * 60_000 : 2 * 60 * 60_000)).toISOString()
+          : null;
+        const update = database.prepare(`UPDATE secure_attachment_ingestions SET
+          lifecycle_status = ?, scan_status = ?, scanner_name = ?, scanner_version = ?,
+          scan_signature_version = ?, scan_signature_updated_at = ?, scan_completed_at = ?,
+          scan_verdict_expires_at = ?, scan_request_digest = ?, scan_last_error = ?,
+          hold_reason = ?, next_scan_at = ?, updated_at = ?
+          WHERE id = ? AND lifecycle_status = 'scanning' AND scan_request_id = ?
+            AND scan_job_owner = ? AND scan_attempt_count = ? AND scan_lease_expires_at > ?`)
+          .run(lifecycleStatus, scanStatus, result?.engineVersion || null, result?.engineVersion || null,
+            result?.signatureVersion || null, result?.signatureUpdatedAt || null, completedAt,
+            isClean ? verdictExpiresAt : null, result?.requestDigest || null,
+            isClean || isUnsafe ? null : reason, holdReason, nextScanAt, completedAt,
+            intakeId, requestId, jobOwner, attempt, completedAt);
+        if (update.changes !== 1) return null;
+        return normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+        );
+      }).immediate();
+    },
+
+    async claimCimAttachmentPublication({
+      intakeId, approvedAt, ownerApprovedBy, approvedSubmissionId, approvedDocumentType,
+      vaultRequestId, vaultDocumentId, vaultRelativePath,
+    }) {
+      normalizeCanonicalUtcIso(approvedAt, 'Attachment publication approval time');
+      return database.transaction(() => {
+        const result = database.prepare(`UPDATE secure_attachment_ingestions SET
+          lifecycle_status = 'publishing', owner_approved_at = ?, owner_approved_by = ?,
+          approved_submission_id = ?, approved_document_type = ?, vault_request_id = ?,
+          vault_document_id = ?, vault_relative_path = ?, hold_reason = NULL, updated_at = ?
+          WHERE id = ? AND lifecycle_status = 'awaiting-owner-approval' AND scan_status = 'clean'
+            AND scan_verdict_expires_at IS NOT NULL AND scan_verdict_expires_at > ?`)
+          .run(approvedAt, ownerApprovedBy, approvedSubmissionId, approvedDocumentType,
+            vaultRequestId, vaultDocumentId, vaultRelativePath, approvedAt, intakeId, approvedAt);
+        if (result.changes !== 1) return null;
+        return normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+        );
+      }).immediate();
+    },
+
     async publishCimAttachmentToVault({ intakeId, expectedStatus, request, document, publishedAt }) {
       return database.transaction(() => {
         const intake = normalizeCimAttachmentIntakeRow(
@@ -8989,6 +9223,8 @@ export function createSqliteStorage(config, options = {}) {
         );
         if (!intake || intake.lifecycle_status !== expectedStatus) return null;
         if (intake.scan_status !== 'clean'
+          || !intake.scan_verdict_expires_at || !intake.owner_approved_at
+          || intake.owner_approved_at >= intake.scan_verdict_expires_at
           || intake.approved_submission_id !== request.submission_id
           || intake.vault_request_id !== request.id
           || intake.vault_document_id !== document.id

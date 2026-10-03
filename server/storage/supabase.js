@@ -2286,6 +2286,38 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeCimAttachmentIntakeRow(data);
     },
 
+    async claimCimAttachmentScan(command) {
+      const { data, error } = await client.rpc('claim_cim_attachment_scan_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
+    async completeCimAttachmentScan(command) {
+      const { data, error } = await client.rpc('complete_cim_attachment_scan_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
+    async expireCimAttachmentScanLease(command) {
+      const { data, error } = await client.rpc('expire_cim_attachment_scan_lease_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
+    async claimCimAttachmentPublication(command) {
+      const { data, error } = await client.rpc('claim_cim_attachment_publication_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
     async publishCimAttachmentToVault(command) {
       const { data, error } = await client.rpc('publish_cim_attachment_to_vault_v1', {
         p_command: command,
