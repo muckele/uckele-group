@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "status": "blocked-pending-authoritative-digests",
+  "clamav": {
+    "repository": "clamav/clamav",
+    "tag": "1.4.6_base",
+    "digest": null
+  },
+  "nodeRuntime": {
+    "repository": "node",
+    "tag": "22-alpine",
+    "digest": null
+  }
+}
