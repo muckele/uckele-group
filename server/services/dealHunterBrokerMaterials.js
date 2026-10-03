@@ -70,6 +70,93 @@ function currentTimestamp(row = {}) {
   return iso(row.updated_at || row.updatedAt || row.observed_at || row.observedAt || row.created_at || row.createdAt);
 }
 
+function projectAttachmentStatus({ communications = [], currentRequest = null, secureDocuments = [], submission = null } = {}) {
+  const requestId = text(currentRequest?.id, 200);
+  const submissionId = text(submission?.id, 200);
+  const relevant = (Array.isArray(communications) ? communications : [])
+    .filter((communication) => (
+      text(communication?.direction, 40).toLowerCase() === 'inbound'
+      && (!submissionId || text(communication?.submission_id ?? communication?.submissionId, 200) === submissionId)
+      && (!requestId || text(communication?.cim_request_id ?? communication?.cimRequestId, 200) === requestId)
+    ))
+    .sort((left, right) => {
+      const leftOccurred = Date.parse(left?.occurred_at || left?.occurredAt || '') || 0;
+      const rightOccurred = Date.parse(right?.occurred_at || right?.occurredAt || '') || 0;
+      if (leftOccurred !== rightOccurred) return rightOccurred - leftOccurred;
+      const leftUpdated = Date.parse(left?.updated_at || left?.updatedAt || '') || 0;
+      const rightUpdated = Date.parse(right?.updated_at || right?.updatedAt || '') || 0;
+      if (leftUpdated !== rightUpdated) return rightUpdated - leftUpdated;
+      const byId = text(left?.id, 200).localeCompare(text(right?.id, 200));
+      if (byId !== 0) return byId;
+      return stableCanonicalJson({
+        state: text(left?.content_state ?? left?.contentState, 40).toLowerCase(),
+        attachmentCount: Array.isArray(left?.attachment_metadata ?? left?.attachmentMetadata)
+          ? (left.attachment_metadata ?? left.attachmentMetadata).length
+          : 0,
+      }).localeCompare(stableCanonicalJson({
+        state: text(right?.content_state ?? right?.contentState, 40).toLowerCase(),
+        attachmentCount: Array.isArray(right?.attachment_metadata ?? right?.attachmentMetadata)
+          ? (right.attachment_metadata ?? right.attachmentMetadata).length
+          : 0,
+      }));
+    });
+  const seen = new Set();
+  const signals = relevant.filter((communication) => {
+    const provider = text(communication?.provider, 80);
+    const providerMessageId = text(communication?.provider_message_id ?? communication?.providerMessageId, 240);
+    const communicationId = text(communication?.id, 200);
+    const identity = providerMessageId
+      ? `provider-message:${provider}:${providerMessageId}`
+      : communicationId
+        ? `communication:${communicationId}`
+        : `unidentified:${stableCanonicalJson({
+          state: text(communication?.content_state ?? communication?.contentState, 40).toLowerCase(),
+          occurredAt: text(communication?.occurred_at ?? communication?.occurredAt, 80),
+          updatedAt: text(communication?.updated_at ?? communication?.updatedAt, 80),
+        })}`;
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    const state = text(communication?.content_state ?? communication?.contentState, 40).toLowerCase();
+    const attachments = Array.isArray(communication?.attachment_metadata)
+      ? communication.attachment_metadata
+      : Array.isArray(communication?.attachmentMetadata)
+        ? communication.attachmentMetadata
+        : [];
+    return ['pending', 'failed'].includes(state) || attachments.length > 0;
+  });
+  const states = new Set(signals.map((communication) => (
+    text(communication?.content_state ?? communication?.contentState, 40).toLowerCase()
+  )));
+  const attachmentCount = Math.min(25, signals.reduce((total, communication) => {
+    const attachments = Array.isArray(communication?.attachment_metadata)
+      ? communication.attachment_metadata
+      : Array.isArray(communication?.attachmentMetadata)
+        ? communication.attachmentMetadata
+        : [];
+    return total + attachments.length;
+  }, 0));
+  const inboundStatus = states.has('failed')
+    ? 'error'
+    : states.has('pending')
+      ? 'pending'
+      : attachmentCount > 0
+        ? 'metadata_observed'
+        : 'none';
+  const vaultCount = Math.min(100, Array.isArray(secureDocuments) ? secureDocuments.length : 0);
+  return {
+    inbound: {
+      status: inboundStatus,
+      count: attachmentCount,
+      provenance: 'inbound_communication',
+    },
+    vault: {
+      status: vaultCount > 0 ? 'available' : 'none',
+      count: vaultCount,
+      provenance: 'secure_document',
+    },
+  };
+}
+
 function blocker(code, message) {
   return { code, message };
 }
@@ -553,6 +640,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   const state = pursuedState(score);
   const materialsState = evaluateAcquisitionMaterialsState({ submission, secureDocuments, latestUploadRequest });
   const currentRequest = selectCurrentRequest(requests);
+  const attachmentStatus = projectAttachmentStatus({ communications, currentRequest, secureDocuments, submission });
   const eventAuthority = currentRequest
     ? await loadManualFollowUpRequestEvents(storage, currentRequest, eventMatchesCimRequest)
     : { available: true, events: [] };
@@ -568,6 +656,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     communications: communications.filter((item) => !currentRequest || item.cim_request_id === currentRequest.id),
     events: eventAuthority.events,
     materialsState,
+    attachmentStatus,
     currentDispositionState,
     passed: currentDispositionState === 'dismissed',
     suppression: suppressionAuthority.value,
@@ -658,6 +747,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     suppression: suppressionAuthority.value,
     suppressionAuthorityAvailable: suppressionAuthority.available,
     materialsState,
+    attachmentStatus,
     materialsAuthorityAvailable,
     communicationsAuthorityAvailable,
     terminalReason,
@@ -710,6 +800,7 @@ export async function projectDealHunterBrokerMaterials({ opportunityId = '', sto
   const sendBlockers = autoSelected ? await selectedSendBlockers({ authority, selectedRecipient: autoSelected, storage, now }) : [];
   return {
     existingRequest: authority.existingRequest,
+    attachmentStatus: authority.attachmentStatus,
     pursued: authority.pursued,
     preparationBlockers: authority.preparationBlockers,
     sendBlockers,

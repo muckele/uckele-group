@@ -478,6 +478,127 @@ test('projected broker materials exposes current Pursue, bounded lifecycle, warn
   for (const secret of ['secret-provider-id', 'providerPayload', 'signature']) assert.equal(serialized.includes(secret), false);
 });
 
+test('Broker Materials projects bounded attachment intake truth without granting materials authority', async (t) => {
+  const request = {
+    id: 'request-attachment-status', opportunity_id: opportunityId, submission_id: 'submission-1', deal_key: 'deal-42',
+    status: 'responded', request_state: 'responded', delivery_state: 'delivered', follow_up_state: 'stopped',
+    recipient_email: 'source-broker@example.test', created_at: '2026-09-01T16:00:00.000Z',
+    updated_at: '2026-09-01T17:00:00.000Z', responded_at: '2026-09-01T17:00:00.000Z',
+  };
+  const communication = (overrides = {}) => ({
+    id: 'communication-attachment-status', submission_id: 'submission-1', cim_request_id: request.id,
+    direction: 'inbound', channel: 'email', content_state: 'complete',
+    provider: 'resend', provider_message_id: 'provider-message-attachment-status',
+    occurred_at: '2026-09-01T17:00:00.000Z', updated_at: '2026-09-01T17:01:00.000Z',
+    attachment_metadata: [{
+      id: 'private-attachment-id', filename: 'private-cim-name.pdf', contentType: 'application/pdf',
+      downloadUrl: 'https://temporary-secret.example/attachment',
+    }],
+    ...overrides,
+  });
+  const storageFor = ({ communications, secureDocuments = [] }) => {
+    const storage = authorityStorage({ requests: [request], secureDocuments });
+    storage.listCrmCommunications = async () => ({ rows: communications });
+    return storage;
+  };
+  const projected = async (fixture) => {
+    const storage = storageFor(fixture);
+    return projectDealHunterBrokerMaterials({ opportunityId, storage, now });
+  };
+
+  await t.test('metadata is observed without implying retrieval scan vault or review', async () => {
+    const result = await projected({ communications: [communication()] });
+    assert.deepEqual(result.attachmentStatus, {
+      inbound: { status: 'metadata_observed', count: 1, provenance: 'inbound_communication' },
+      vault: { status: 'none', count: 0, provenance: 'secure_document' },
+    });
+    const authority = await loadBrokerMaterialsAuthority({
+      opportunityId, storage: storageFor({ communications: [communication()] }), now,
+    });
+    assert.equal(authority.materialsState.materialsReceived, false);
+    const serialized = JSON.stringify(result.attachmentStatus);
+    for (const privateValue of ['private-attachment-id', 'private-cim-name.pdf', 'temporary-secret.example']) {
+      assert.equal(serialized.includes(privateValue), false);
+    }
+  });
+
+  await t.test('pending and failed content retrieval remain distinct', async () => {
+    const pending = await projected({ communications: [communication({ content_state: 'pending' })] });
+    const failed = await projected({ communications: [communication({ content_state: 'failed' })] });
+    assert.equal(pending.attachmentStatus.inbound.status, 'pending');
+    assert.equal(pending.attachmentStatus.inbound.count, 1);
+    assert.equal(failed.attachmentStatus.inbound.status, 'error');
+    assert.equal(failed.attachmentStatus.inbound.count, 1);
+  });
+
+  await t.test('distinct messages aggregate bounded metadata while unresolved errors remain visible', async () => {
+    const result = await projected({ communications: [
+      communication({ id: 'communication-new', provider_message_id: 'provider-message-new' }),
+      communication({
+        id: 'communication-failed', provider_message_id: 'provider-message-failed', content_state: 'failed',
+        occurred_at: '2026-08-31T17:00:00.000Z', updated_at: '2026-08-31T17:01:00.000Z',
+      }),
+    ] });
+    assert.deepEqual(result.attachmentStatus.inbound, {
+      status: 'error', count: 2, provenance: 'inbound_communication',
+    });
+  });
+
+  await t.test('same-provider messages without provider IDs remain distinct', async () => {
+    const result = await projected({ communications: [
+      communication({
+        id: 'communication-no-signal', provider_message_id: null,
+        occurred_at: '2026-09-02T17:00:00.000Z', content_state: 'complete', attachment_metadata: [],
+      }),
+      communication({
+        id: 'communication-pending-without-provider-id', provider_message_id: null,
+        content_state: 'pending', attachment_metadata: [],
+      }),
+    ] });
+    assert.equal(result.attachmentStatus.inbound.status, 'pending');
+  });
+
+  await t.test('a secure vault document is reported separately from inbound metadata', async () => {
+    const result = await projected({
+      communications: [communication()],
+      secureDocuments: [{
+        id: 'private-document-id', submission_id: 'submission-1', document_type: 'cim',
+        original_name: 'vaulted-private-name.pdf', storage_path: '/private/vault/path',
+      }],
+    });
+    assert.deepEqual(result.attachmentStatus, {
+      inbound: { status: 'metadata_observed', count: 1, provenance: 'inbound_communication' },
+      vault: { status: 'available', count: 1, provenance: 'secure_document' },
+    });
+    assert.equal(JSON.stringify(result.attachmentStatus).includes('vaulted-private-name.pdf'), false);
+  });
+
+  await t.test('request mismatch is ignored and input ordering cannot change the result', async () => {
+    const current = communication();
+    const older = communication({
+      id: 'communication-older', provider_message_id: 'provider-message-older',
+      occurred_at: '2026-08-31T17:00:00.000Z', updated_at: '2026-08-31T17:01:00.000Z',
+      content_state: 'failed', attachment_metadata: [],
+    });
+    const mismatched = communication({
+      id: 'communication-mismatch', provider_message_id: 'provider-message-mismatch',
+      cim_request_id: 'another-request', occurred_at: '2026-09-02T17:00:00.000Z',
+      attachment_metadata: [{ id: 'wrong-business-attachment' }, { id: 'wrong-business-attachment-2' }],
+    });
+    const unassigned = communication({
+      id: 'communication-unassigned', provider_message_id: 'provider-message-unassigned',
+      submission_id: null, occurred_at: '2026-09-03T17:00:00.000Z',
+      attachment_metadata: [{ id: 'unassigned-attachment' }, { id: 'unassigned-attachment-2' }, { id: 'unassigned-attachment-3' }],
+    });
+    const forward = await projected({ communications: [older, unassigned, mismatched, current] });
+    const reverse = await projected({ communications: [current, mismatched, unassigned, older] });
+    assert.deepEqual(forward.attachmentStatus, reverse.attachmentStatus);
+    assert.deepEqual(forward.attachmentStatus.inbound, {
+      status: 'error', count: 1, provenance: 'inbound_communication',
+    });
+  });
+});
+
 test('canonical CIM owner uses stable first-request order across claim maintenance and deterministic ties', async (t) => {
   // Break caught: operational updated_at writes from claiming or renewing an
   // older request can replace the newer business conversation owner.

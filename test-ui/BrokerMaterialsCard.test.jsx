@@ -143,6 +143,44 @@ describe('Broker Materials card', () => {
     expect(within(card).getAllByRole('status')).toHaveLength(1);
   });
 
+  test.each([
+    ['metadata_observed', 'Metadata observed', '1 inbound attachment metadata record is observed. Metadata alone does not establish retrieval, scanning, secure vault availability, or review.'],
+    ['pending', 'Retrieval pending', 'Inbound content or attachment retrieval is still pending. 1 attachment metadata record is observed.'],
+    ['error', 'Retrieval error', 'Inbound content or attachment retrieval failed and remains unresolved. 1 attachment metadata record is observed.'],
+  ])('renders the bounded %s attachment state without claiming material completion', (status, label, sentence) => {
+    render(<BrokerMaterialsCard
+      brokerMaterials={projection({
+        attachmentStatus: {
+          inbound: { status, count: 1, provenance: 'inbound_communication' },
+          vault: { status: 'none', count: 0, provenance: 'secure_document' },
+        },
+        existingRequest: existingRequest({
+          status: 'responded', requestState: 'responded', deliveryState: 'responded',
+          respondedAt: '2026-09-01T18:00:00.000Z',
+        }),
+      })}
+      onViewRequest={vi.fn()}
+    />);
+    const card = screen.getByRole('region', { name: 'Broker Materials' });
+    expect(within(card).getByText(`Attachment status: ${label}`)).toBeVisible();
+    expect(within(card).getByText(sentence)).toBeVisible();
+    expect(within(card).getByText('Provenance: inbound communication')).toBeVisible();
+    expect(within(card).queryByText(/CIM received|CIM reviewed|safe material/i)).not.toBeInTheDocument();
+  });
+
+  test('distinguishes a separate secure vault document without inferring scan or owner review', () => {
+    render(<BrokerMaterialsCard brokerMaterials={projection({
+      attachmentStatus: {
+        inbound: { status: 'metadata_observed', count: 2, provenance: 'inbound_communication' },
+        vault: { status: 'available', count: 1, provenance: 'secure_document' },
+      },
+    })} onPrepare={vi.fn()} />);
+    const card = screen.getByRole('region', { name: 'Broker Materials' });
+    expect(within(card).getByText('2 inbound attachment metadata records are observed. Metadata alone does not establish retrieval, scanning, secure vault availability, or review.')).toBeVisible();
+    expect(within(card).getByText('1 separate secure vault document is available. Scan and owner-review status are not inferred here.')).toBeVisible();
+    expect(within(card).getByText('Provenance: secure document')).toBeVisible();
+  });
+
   test('renders one continuous Prepared review in the required order with copyable exact subject and body', () => {
     render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={preparation()} />);
     const card = screen.getByRole('region', { name: 'Broker Materials' });
