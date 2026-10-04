@@ -1,8 +1,12 @@
 import { performance } from 'node:perf_hooks';
 import { CIM_SCAN_PROTOCOL_LIMITS } from './cimScanProtocol.js';
+import { isScannerPreconnectionRefusedError } from './nodePinnedHttpsExchange.js';
 
 const maximumLeaseMs = 4 * 60 * 1000;
 const maximumStartupMs = 60_000;
+const maximumStartupAttempts = 17;
+const initialRetryDelayMs = 250;
+const maximumRetryDelayMs = 5_000;
 const boundedIdentityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
 
 function validateDependencies({ machineId, machineController, requestClient } = {}) {
@@ -27,8 +31,13 @@ function leaseBudget(leaseExpiresAt) {
   return remaining;
 }
 
-async function beforeDeadline(operation, { deadlineAt, controller, onTimeout } = {}) {
-  const remaining = Math.ceil(deadlineAt - performance.now());
+async function beforeDeadline(operation, {
+  deadlineAt,
+  controller,
+  monotonicNow = () => performance.now(),
+  onTimeout,
+} = {}) {
+  const remaining = Math.ceil(deadlineAt - monotonicNow());
   if (remaining <= 0) {
     const error = new Error('Machine scan transport exceeded its lease deadline.');
     controller?.abort(error);
@@ -51,9 +60,36 @@ async function beforeDeadline(operation, { deadlineAt, controller, onTimeout } =
   }
 }
 
+function startupRetryDelay(attempt) {
+  return Math.min(initialRetryDelayMs * (2 ** (attempt - 1)), maximumRetryDelayMs);
+}
+
+function defaultWaitBeforeRetry({ delayMs, signal } = {}) {
+  if (!Number.isSafeInteger(delayMs) || delayMs < 1 || !signal
+    || typeof signal.aborted !== 'boolean' || typeof signal.addEventListener !== 'function'
+    || typeof signal.removeEventListener !== 'function' || signal.aborted) {
+    return Promise.reject(new Error('Machine scan startup retry was aborted.'));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('Machine scan startup retry was aborted.'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export function createFlyMachineScanTransport(options = {}) {
   validateDependencies(options);
   const { machineId, machineController, requestClient } = options;
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  const waitBeforeRetry = options.waitBeforeRetry ?? defaultWaitBeforeRetry;
+  if (typeof monotonicNow !== 'function') throw new Error('An injected monotonic clock is required.');
+  if (typeof waitBeforeRetry !== 'function') throw new Error('An injected startup retry wait is required.');
   return Object.freeze({
     async run({ requestWire, requestId, leaseExpiresAt, openByteStream } = {}) {
       if (typeof requestWire !== 'string' || !requestWire) throw new Error('Signed scan request is required.');
@@ -61,10 +97,10 @@ export function createFlyMachineScanTransport(options = {}) {
       if (typeof openByteStream !== 'function') throw new Error('A lazy attachment stream factory is required.');
       const controller = new AbortController();
       const budget = leaseBudget(leaseExpiresAt);
-      const leaseDeadlineAt = performance.now() + budget;
+      const leaseDeadlineAt = monotonicNow() + budget;
       const shutdownReserveMs = Math.min(5_000, Math.max(20, Math.floor(budget / 4)));
       const workDeadlineAt = leaseDeadlineAt - shutdownReserveMs;
-      const startupDeadlineAt = Math.min(workDeadlineAt, performance.now() + maximumStartupMs);
+      const startupDeadlineAt = Math.min(workDeadlineAt, monotonicNow() + maximumStartupMs);
       let upload = null;
       let session = null;
       let resultWire;
@@ -79,11 +115,13 @@ export function createFlyMachineScanTransport(options = {}) {
       const runWork = (operation) => beforeDeadline(operation, {
         deadlineAt: workDeadlineAt,
         controller,
+        monotonicNow,
         onTimeout: () => upload?.abort?.(),
       });
       const runStartup = (operation) => beforeDeadline(operation, {
         deadlineAt: startupDeadlineAt,
         controller,
+        monotonicNow,
         onTimeout: () => upload?.abort?.(),
       });
       try {
@@ -97,13 +135,31 @@ export function createFlyMachineScanTransport(options = {}) {
           throw new Error('Machine did not provide a stopped generation-fenced session.');
         }
         await runStartup(() => machineController.startSession(command(startupDeadlineAt)));
-        if (await runStartup(() => machineController.ownsSession(command(startupDeadlineAt))) !== true) {
-          throw new Error('Machine session generation ownership was lost before admission.');
+        for (let attempt = 1; attempt <= maximumStartupAttempts; attempt += 1) {
+          if (await runStartup(() => machineController.ownsSession(command(startupDeadlineAt))) !== true) {
+            throw new Error('Machine session generation ownership was lost before admission.');
+          }
+          try {
+            upload = await runStartup(() => requestClient.authorize({
+              ...command(startupDeadlineAt), requestWire, redirects: 'error',
+              maxResponseBytes: CIM_SCAN_PROTOCOL_LIMITS.maxEnvelopeBytes,
+            }));
+            break;
+          } catch (error) {
+            if (!isScannerPreconnectionRefusedError(error) || attempt === maximumStartupAttempts) {
+              throw error;
+            }
+            const delayMs = startupRetryDelay(attempt);
+            if (startupDeadlineAt - monotonicNow() <= delayMs) {
+              throw new Error('Machine scan transport exceeded its startup deadline.');
+            }
+            await runStartup(() => waitBeforeRetry({
+              delayMs,
+              deadlineAt: startupDeadlineAt,
+              signal: controller.signal,
+            }));
+          }
         }
-        upload = await runWork(() => requestClient.authorize({
-          ...command(), requestWire, redirects: 'error',
-          maxResponseBytes: CIM_SCAN_PROTOCOL_LIMITS.maxEnvelopeBytes,
-        }));
         if (!upload || typeof upload.sendBody !== 'function') {
           throw new Error('Worker admission did not return an upload handle.');
         }
@@ -131,6 +187,7 @@ export function createFlyMachineScanTransport(options = {}) {
         const runShutdown = (operation) => beforeDeadline(operation, {
           deadlineAt: leaseDeadlineAt,
           controller: shutdownController,
+          monotonicNow,
         });
         if (session && await runShutdown(() => machineController.ownsSession(shutdownCommand())).catch(() => false)) {
           stopConfirmed = await runShutdown(

@@ -9,6 +9,7 @@ import {
   CIM_SCAN_PROTOCOL_LIMITS,
   createSignedScanResult,
   parseAndVerifyScanRequest,
+  parseAndVerifyScanResult,
 } from './cimScanProtocol.js';
 
 const maximumOrphanEntries = 100;
@@ -293,15 +294,22 @@ function scannerByteStream(attachmentPath) {
 export async function runOnDemandScanTask({
   requestWire,
   openByteStream,
+  admitRequest,
+  requireAttachment = false,
   keyResolver,
   replayStore,
   admission,
   ephemeralRoot,
   scanner,
   now = () => new Date(),
+  signatureNow = now,
   cleanupOwnedTask = defaultCleanupOwnedTask,
 } = {}) {
   const current = nowDate(now);
+  const signatureCurrent = nowDate(signatureNow);
+  if (typeof requireAttachment !== 'boolean') {
+    throw new Error('Worker attachment requirement is invalid.');
+  }
   const request = parseAndVerifyScanRequest(requestWire, { keyResolver, now: current });
   const deadlineAt = performance.now() + initialDeadlineMs(request, current);
   const controller = new AbortController();
@@ -326,10 +334,26 @@ export async function runOnDemandScanTask({
       deadlineAt,
       signal: controller.signal,
     }));
-    if (replay.status === 'replay') return replay.resultWire;
+    if (replay.status === 'replay') {
+      parseAndVerifyScanResult(replay.resultWire, {
+        request,
+        keyResolver,
+        now: nowDate(now),
+      });
+      return replay.resultWire;
+    }
     if (replay.status === 'conflict') throw new Error('Worker replay identity conflicts with another request.');
     if (replay.status === 'inflight') throw new Error('Worker replay outcome is ambiguous and still in flight.');
     if (replay.status !== 'accepted') throw new Error('Worker replay capacity is unavailable.');
+    if (admitRequest !== undefined) {
+      if (typeof admitRequest !== 'function') throw new Error('Worker request admission seam is invalid.');
+      await runBounded(() => admitRequest({
+        requestId: request.requestId,
+        requestDigest: request.requestDigest,
+        deadlineAt,
+        signal: controller.signal,
+      }));
+    }
 
     const { root, realRoot } = await runBounded(() => ensureEphemeralRoot(ephemeralRoot));
     await runBounded(() => inspectOrphans({ root, realRoot, keyResolver, now: current }));
@@ -347,13 +371,15 @@ export async function runOnDemandScanTask({
     let staged = { outcome: 'unavailable', reasonCode: 'scanner_unavailable' };
     let cleanupStatus = 'cleaned';
     let taskPath = null;
-    if (!validHealth(preHealth, current)) {
+    const scannerHealthy = validHealth(preHealth, signatureCurrent);
+    if (!scannerHealthy) {
       staged = { outcome: 'unavailable', reasonCode: 'stale_signatures' };
       preHealth = {
         daemonId: 'unavailable', engineVersion: 'unavailable', signatureVersion: 'unavailable',
         signatureUpdatedAt: current.toISOString(),
       };
-    } else {
+    }
+    if (scannerHealthy || requireAttachment) {
       taskPath = path.join(root, `task-${request.requestId}`);
       await runBounded(() => fsp.mkdir(taskPath, { mode: 0o700 }));
       const markerPath = path.join(taskPath, 'owner.json');
@@ -366,7 +392,7 @@ export async function runOnDemandScanTask({
         });
         if (identity.size !== request.sizeBytes || identity.sha256 !== request.sha256) {
           staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
-        } else {
+        } else if (scannerHealthy) {
           let receivedScannerResult = false;
           try {
             staged = await runBounded(() => scanner.scan({

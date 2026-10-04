@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { createNodePinnedHttpsExchange } from '../server/services/nodePinnedHttpsExchange.js';
+import {
+  createNodePinnedHttpsExchange,
+  isScannerPreconnectionRefusedError,
+} from '../server/services/nodePinnedHttpsExchange.js';
 
 class FakeRequest extends EventEmitter {
   constructor(events, respond) {
@@ -46,6 +49,7 @@ function setup() {
   const openExchange = createNodePinnedHttpsExchange({
     machineId: 'machine-1',
     appName: 'ug-scanner',
+    port: 8443,
     monotonicNow: () => performance.now(),
     requestImpl(url, options, respond) {
       requestUrl = url;
@@ -65,7 +69,7 @@ function setup() {
 
 function exchangeCommand(pin, overrides = {}) {
   return {
-    endpoint: 'https://machine-1.vm.ug-scanner.internal/v1/cim-scan',
+    endpoint: 'https://machine-1.vm.ug-scanner.internal:8443/v1/cim-scan',
     method: 'POST',
     redirects: 'error',
     certificatePinSha256: pin,
@@ -88,7 +92,7 @@ test('HTTPS exchange pins one exact Machine hostname, SNI, and SPKI identity', a
   const exchange = await fixture.openExchange(exchangeCommand(pin));
 
   assert.equal(fixture.requestUrl().toString(),
-    'https://machine-1.vm.ug-scanner.internal/v1/cim-scan');
+    'https://machine-1.vm.ug-scanner.internal:8443/v1/cim-scan');
   assert.equal(fixture.requestOptions().servername, 'machine-1.vm.ug-scanner.internal');
   assert.equal(fixture.requestOptions().rejectUnauthorized, true);
   assert.equal(fixture.requestOptions().minVersion, 'TLSv1.2');
@@ -142,8 +146,9 @@ test('HTTPS exchange returns an early final status without admitting or writing 
     signal: new AbortController().signal,
     deadlineAt: performance.now() + 1_000,
   });
-  fixture.request().respond({ statusCode: 403, destroy() {} });
-  assert.deepEqual(await admission, { status: 403 });
+  const incoming = { statusCode: 403, destroy() {} };
+  fixture.request().respond(incoming);
+  assert.deepEqual(await admission, { status: 403, body: incoming });
   assert.equal(fixture.events.some(([name]) => name === 'write'), false);
   exchange.abort();
 });
@@ -154,6 +159,8 @@ test('HTTPS exchange rejects alternate endpoints before transport access', async
     'https://ug-scanner.internal/v1/cim-scan',
     'https://other.vm.ug-scanner.internal/v1/cim-scan',
     'https://machine-1.vm.ug-scanner.internal/other',
+    'https://machine-1.vm.ug-scanner.internal/v1/cim-scan',
+    'https://machine-1.vm.ug-scanner.internal:443/v1/cim-scan',
     'https://machine-1.vm.ug-scanner.internal:444/v1/cim-scan',
     'http://machine-1.vm.ug-scanner.internal/v1/cim-scan',
   ]) {
@@ -195,14 +202,65 @@ test('HTTPS exchange makes an admitted request unusable after a transport error'
   assert.equal(fixture.events.filter(([name]) => name === 'destroy').length, 1);
 });
 
+test('HTTPS exchange marks only a refused TCP preconnection as retryable readiness', async () => {
+  const fixture = setup();
+  const exchange = await fixture.openExchange(exchangeCommand('a'.repeat(64)));
+  const admission = exchange.awaitAdmission({
+    signal: new AbortController().signal,
+    deadlineAt: performance.now() + 1_000,
+  });
+  const refused = Object.assign(new Error('raw refused detail'), { code: 'ECONNREFUSED' });
+  fixture.request().emit('error', refused);
+  await assert.rejects(admission, (error) => isScannerPreconnectionRefusedError(error)
+    && !error.message.includes('raw refused detail'));
+  assert.deepEqual(fixture.events.map(([name]) => name), ['flush', 'destroy']);
+});
+
+test('HTTPS exchange never marks connected, TLS, certificate, or ambiguous failures retryable', async () => {
+  for (const scenario of [
+    { socketEvents: ['connect'], code: 'ECONNREFUSED' },
+    { socketEvents: ['connect', 'secureConnect'], code: 'ECONNREFUSED' },
+    { socketEvents: [], code: 'ERR_TLS_CERT_ALTNAME_INVALID' },
+    { socketEvents: [], code: 'ECONNRESET' },
+  ]) {
+    const fixture = setup();
+    const exchange = await fixture.openExchange(exchangeCommand('a'.repeat(64)));
+    const admission = exchange.awaitAdmission({
+      signal: new AbortController().signal,
+      deadlineAt: performance.now() + 1_000,
+    });
+    const socket = new EventEmitter();
+    fixture.request().emit('socket', socket);
+    for (const event of scenario.socketEvents) socket.emit(event);
+    fixture.request().emit('error', Object.assign(new Error('raw transport detail'), {
+      code: scenario.code,
+    }));
+    await assert.rejects(admission, (error) => !isScannerPreconnectionRefusedError(error)
+      && /exchange failed/i.test(error.message)
+      && !error.message.includes('raw transport detail'));
+  }
+});
+
 test('HTTPS exchange import and construction have no network side effects or default transport', async () => {
   let calls = 0;
   assert.throws(() => createNodePinnedHttpsExchange({
     machineId: 'machine-1', appName: 'ug-scanner',
+    port: 8443,
     monotonicNow: () => performance.now(),
   }), /injected.*request/i);
+  assert.throws(() => createNodePinnedHttpsExchange({
+    machineId: 'machine-1', appName: 'ug-scanner',
+    monotonicNow: () => performance.now(),
+    requestImpl() {},
+  }), /port/i);
+  assert.throws(() => createNodePinnedHttpsExchange({
+    machineId: 'machine-1', appName: 'ug-scanner', port: 443,
+    monotonicNow: () => performance.now(),
+    requestImpl() {},
+  }), /port/i);
   const openExchange = createNodePinnedHttpsExchange({
     machineId: 'machine-1', appName: 'ug-scanner',
+    port: 8443,
     monotonicNow: () => performance.now(),
     requestImpl() { calls += 1; throw new Error('must not be called during construction'); },
   });

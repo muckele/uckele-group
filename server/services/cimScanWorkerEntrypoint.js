@@ -6,6 +6,7 @@ import { CIM_SCAN_PROTOCOL_LIMITS } from './cimScanProtocol.js';
 import { runOnDemandScanTask } from './cimScanWorker.js';
 import { createClamavUnixSocketScanner } from './clamavUnixSocketScanner.js';
 import { createFilesystemCimReplayStore } from './filesystemCimReplayStore.js';
+import { createSingleCimScanAdmission } from './cimScanWorkerAdmission.js';
 
 const identityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
 
@@ -92,17 +93,6 @@ export function createNodeClamavUnixConnector({
   };
 }
 
-function createSingleTaskAdmission() {
-  let owner = null;
-  return {
-    async acquire(requestId) {
-      if (owner !== null) return null;
-      owner = requestId;
-      return () => { if (owner === requestId) owner = null; };
-    },
-  };
-}
-
 export async function runCimScanWorkerEntrypoint({
   config = loadCimScanWorkerConfig(),
   createReplayStore = createFilesystemCimReplayStore,
@@ -138,7 +128,7 @@ export async function runCimScanWorkerEntrypoint({
       },
       keyResolver: (candidate) => candidate === config.keyId ? key : null,
       replayStore: createReplayStore({ root: config.replayRoot }),
-      admission: createSingleTaskAdmission(),
+      admission: createSingleCimScanAdmission(),
       ephemeralRoot: config.ephemeralRoot,
       scanner: createScanner({ socketPath: config.clamavSocketPath }),
     });
