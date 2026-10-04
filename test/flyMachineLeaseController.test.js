@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createFlyMachineLeaseController } from '../server/services/flyMachineLeaseController.js';
+import { createFlyMachineLeaseController as createControllerSubject } from '../server/services/flyMachineLeaseController.js';
+
+const expectedImageDigest = `sha256:${'a'.repeat(64)}`;
+
+function createFlyMachineLeaseController(options) {
+  return createControllerSubject({ expectedImageDigest, ...options });
+}
 
 function command(overrides = {}) {
   return {
@@ -17,12 +23,13 @@ function harness({ leaseExpiresAt = 1_700_000_180 } = {}) {
   let state = 'stopped';
   let leaseNonce = null;
   let instanceId = 'instance-before-start';
+  let imageDigest = expectedImageDigest;
   const apiClient = {
     async inspect(options) {
       calls.push(['inspect', options]);
       return {
         machineId: 'machine-1', state, instanceId, leaseNonce,
-        privateIp: 'fdaa::7', imageDigest: `sha256:${'a'.repeat(64)}`,
+        privateIp: 'fdaa::7', imageDigest,
       };
     },
     async acquireLease(options) {
@@ -62,9 +69,35 @@ function harness({ leaseExpiresAt = 1_700_000_180 } = {}) {
       if (Object.hasOwn(next, 'state')) state = next.state;
       if (Object.hasOwn(next, 'instanceId')) instanceId = next.instanceId;
       if (Object.hasOwn(next, 'leaseNonce')) leaseNonce = next.leaseNonce;
+      if (Object.hasOwn(next, 'imageDigest')) imageDigest = next.imageDigest;
     },
   };
 }
+
+test('lease controller refuses image drift before and after lease acquisition without starting', async () => {
+  const beforeLease = harness();
+  beforeLease.setMachine({ imageDigest: `sha256:${'b'.repeat(64)}` });
+  const first = createFlyMachineLeaseController({
+    machineId: 'machine-1', apiClient: beforeLease.apiClient,
+    wallNowMs: () => 1_700_000_000_000, monotonicNow: () => 100_000,
+  });
+  await assert.rejects(first.acquireStoppedSession(command({ deadlineAt: 160_000 })), /image|stopped/i);
+  assert.equal(beforeLease.calls.some(([name]) => name === 'acquireLease'), false);
+
+  const underLease = harness();
+  const originalAcquire = underLease.apiClient.acquireLease;
+  underLease.apiClient.acquireLease = async (options) => {
+    const lease = await originalAcquire(options);
+    underLease.setMachine({ imageDigest: `sha256:${'c'.repeat(64)}` });
+    return lease;
+  };
+  const second = createFlyMachineLeaseController({
+    machineId: 'machine-1', apiClient: underLease.apiClient,
+    wallNowMs: () => 1_700_000_000_000, monotonicNow: () => 100_000,
+  });
+  await assert.rejects(second.acquireStoppedSession(command({ deadlineAt: 160_000 })), /ownership|stopped/i);
+  assert.equal(underLease.calls.some(([name]) => name === 'start'), false);
+});
 
 test('lease controller owns one 240-second non-renewing Machine session through stop and release', async () => {
   const fixture = harness();

@@ -6,6 +6,7 @@ import { performance } from 'node:perf_hooks';
 import {
   createNodePinnedHttpsExchange,
   isScannerPreconnectionRefusedError,
+  isScannerWorkerDeadlineError,
 } from '../server/services/nodePinnedHttpsExchange.js';
 
 class FakeRequest extends EventEmitter {
@@ -151,6 +152,24 @@ test('HTTPS exchange returns an early final status without admitting or writing 
   assert.deepEqual(await admission, { status: 403, body: incoming });
   assert.equal(fixture.events.some(([name]) => name === 'write'), false);
   exchange.abort();
+});
+
+test('HTTPS exchange types only an exact post-admission worker deadline response', async () => {
+  for (const statusCode of [408, 500]) {
+    const fixture = setup();
+    const exchange = await fixture.openExchange(exchangeCommand('a'.repeat(64)));
+    const admission = exchange.awaitAdmission({
+      signal: new AbortController().signal,
+      deadlineAt: performance.now() + 1_000,
+    });
+    fixture.request().emit('continue');
+    assert.deepEqual(await admission, { status: 100 });
+    fixture.request().respond({ statusCode, destroy() {} });
+    await assert.rejects(exchange.write(Buffer.from('x'), {
+      signal: new AbortController().signal,
+      deadlineAt: performance.now() + 1_000,
+    }), (error) => isScannerWorkerDeadlineError(error) === (statusCode === 408));
+  }
 });
 
 test('HTTPS exchange rejects alternate endpoints before transport access', async () => {

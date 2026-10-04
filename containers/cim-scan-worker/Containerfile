@@ -30,6 +30,7 @@ COPY server/services/cimScanWorker.js /opt/uckele/server/services/cimScanWorker.
 COPY server/services/cimScanWorkerAdmission.js /opt/uckele/server/services/cimScanWorkerAdmission.js
 COPY server/services/cimScanWorkerHttp.js /opt/uckele/server/services/cimScanWorkerHttp.js
 COPY server/services/cimScanSyntheticCloudCaller.js /opt/uckele/server/services/cimScanSyntheticCloudCaller.js
+COPY server/services/cimScanCloudBenchmark.js /opt/uckele/server/services/cimScanCloudBenchmark.js
 COPY server/services/flyMachineLeaseController.js /opt/uckele/server/services/flyMachineLeaseController.js
 COPY server/services/flyMachineOperabilityAdapters.js /opt/uckele/server/services/flyMachineOperabilityAdapters.js
 COPY server/services/flyMachineScanTransport.js /opt/uckele/server/services/flyMachineScanTransport.js

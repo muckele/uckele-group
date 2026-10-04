@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import {
   createFlyMachineController,
   createPinnedHttpScanRequestClient,
+  isScannerReplayConflictError,
 } from '../server/services/flyMachineOperabilityAdapters.js';
 
 test('concrete Fly controller fences every action through the injected control seam', async () => {
@@ -161,7 +162,7 @@ test('pinned HTTP request client rejects every other early final status and over
     await assert.rejects(client.authorize({
       requestWire: JSON.stringify({ sizeBytes: 1 }), redirects: 'error', maxResponseBytes: 64,
       signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
-    }), /admit/i, String(status));
+    }), /admit|conflict/i, String(status));
     assert.equal(aborts, 1, String(status));
   }
 
@@ -180,6 +181,24 @@ test('pinned HTTP request client rejects every other early final status and over
     signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
   }), /cap|exceed/i);
   assert.equal(aborts, 1);
+});
+
+test('pinned HTTP request client types only the exact worker replay-conflict status', async () => {
+  for (const status of [409, 400]) {
+    const client = createPinnedHttpScanRequestClient({
+      endpoint: 'https://scanner.internal/v1/cim-scan', certificatePinSha256: 'a'.repeat(64),
+      async openExchange() {
+        return {
+          async awaitAdmission() { return { status, body: [] }; },
+          async write() {}, async finish() {}, abort() {},
+        };
+      },
+    });
+    await assert.rejects(client.authorize({
+      requestWire: JSON.stringify({ sizeBytes: 1 }), redirects: 'error', maxResponseBytes: 64,
+      signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
+    }), (error) => isScannerReplayConflictError(error) === (status === 409));
+  }
 });
 
 test('pinned HTTP request client requires HTTPS pinning, redirect refusal, and exact upload length', async () => {

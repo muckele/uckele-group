@@ -1,6 +1,7 @@
 const leaseTtlSeconds = 240;
 const maximumLeaseMs = leaseTtlSeconds * 1_000;
 const identityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
+const imageDigestPattern = /^sha256:[a-f0-9]{64}$/;
 
 function requireIdentity(value, label) {
   if (!identityPattern.test(String(value || ''))) throw new Error(`${label} is invalid.`);
@@ -19,8 +20,13 @@ function requireCommand(command, machineId, { providerGeneration = false } = {})
   return sessionGeneration;
 }
 
-function requireDependencies({ machineId, apiClient, wallNowMs, monotonicNow } = {}) {
+function requireDependencies({
+  machineId, expectedImageDigest, apiClient, wallNowMs, monotonicNow,
+} = {}) {
   const exactMachineId = requireIdentity(machineId, 'Fly Machine identity');
+  if (!imageDigestPattern.test(String(expectedImageDigest || ''))) {
+    throw new Error('Expected Fly Machine image digest is invalid.');
+  }
   const methods = ['inspect', 'acquireLease', 'releaseLease', 'start', 'wait', 'stop'];
   if (!apiClient || methods.some((method) => typeof apiClient[method] !== 'function')) {
     throw new Error('An injected Fly Machines API client is required.');
@@ -28,7 +34,7 @@ function requireDependencies({ machineId, apiClient, wallNowMs, monotonicNow } =
   if (typeof wallNowMs !== 'function' || typeof monotonicNow !== 'function') {
     throw new Error('Injected wall and monotonic clocks are required.');
   }
-  return exactMachineId;
+  return { exactMachineId, expectedImageDigest };
 }
 
 function waitSeconds(deadlineAt, monotonicNow) {
@@ -46,7 +52,7 @@ function recoveryDeadline(deadlineAt, monotonicNow) {
 
 export function createFlyMachineLeaseController(options = {}) {
   const { apiClient, wallNowMs, monotonicNow } = options;
-  const machineId = requireDependencies(options);
+  const { exactMachineId: machineId, expectedImageDigest } = requireDependencies(options);
   let acquisitionAttempted = false;
   let session = null;
 
@@ -74,7 +80,8 @@ export function createFlyMachineLeaseController(options = {}) {
 
   async function inspectOwned(command, ownedSession) {
     const inspected = await apiClient.inspect(apiCommand(command, ownedSession));
-    if (inspected?.machineId !== machineId || inspected.leaseNonce !== ownedSession.nonce) {
+    if (inspected?.machineId !== machineId || inspected.imageDigest !== expectedImageDigest
+      || inspected.leaseNonce !== ownedSession.nonce) {
       ownedSession.lost = true;
       return null;
     }
@@ -89,7 +96,8 @@ export function createFlyMachineLeaseController(options = {}) {
       }
       acquisitionAttempted = true;
       const initial = await apiClient.inspect(apiCommand(command, null));
-      if (initial?.machineId !== machineId || initial.state !== 'stopped' || initial.leaseNonce !== null) {
+      if (initial?.machineId !== machineId || initial.imageDigest !== expectedImageDigest
+        || initial.state !== 'stopped' || initial.leaseNonce !== null) {
         throw new Error('Fly Machine is not initially stopped and unleased.');
       }
       const lease = await apiClient.acquireLease({

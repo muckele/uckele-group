@@ -9,6 +9,7 @@ import { createSingleCimScanAdmission } from './cimScanWorkerAdmission.js';
 
 export function createFlyCimScannerComposition({
   machineId,
+  expectedImageDigest,
   appName,
   port,
   apiBaseUrl,
@@ -22,6 +23,8 @@ export function createFlyCimScannerComposition({
   keyId,
   keyResolver,
   now,
+  resultNow = now,
+  requestMaxDurationMs = 90_000,
 } = {}) {
   if (typeof now !== 'function') throw new Error('An explicit scanner clock is required.');
   const apiClient = createFlyMachinesApiClient({
@@ -34,6 +37,7 @@ export function createFlyCimScannerComposition({
   });
   const machineController = createFlyMachineLeaseController({
     machineId,
+    expectedImageDigest,
     apiClient,
     wallNowMs,
     monotonicNow,
@@ -61,6 +65,8 @@ export function createFlyCimScannerComposition({
     keyResolver,
     transport,
     now,
+    resultNow,
+    requestMaxDurationMs,
   });
   return Object.freeze({ scanner });
 }

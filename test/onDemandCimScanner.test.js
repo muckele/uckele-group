@@ -17,7 +17,10 @@ const claim = {
   leaseExpiresAt: '2026-10-03T12:04:00.000Z',
 };
 
-function transportFixture({ outcome = 'clean', stopConfirmed = true, tamper = false } = {}) {
+function transportFixture({
+  outcome = 'clean', stopConfirmed = true, tamper = false,
+  scannedAt = '2026-10-03T12:00:10.000Z',
+} = {}) {
   return {
     request: null,
     async run(command) {
@@ -29,7 +32,7 @@ function transportFixture({ outcome = 'clean', stopConfirmed = true, tamper = fa
         engineVersion: 'ClamAV synthetic',
         signatureVersion: 'db-1',
         signatureUpdatedAt: '2026-10-03T11:55:00.000Z',
-        scannedAt: '2026-10-03T12:00:10.000Z',
+        scannedAt,
         expiresAt: '2026-10-03T12:02:00.000Z',
         cleanupStatus: 'cleaned',
       }, { keyResolver });
@@ -39,14 +42,43 @@ function transportFixture({ outcome = 'clean', stopConfirmed = true, tamper = fa
   };
 }
 
-function adapter(transport) {
+function adapter(transport, requestMaxDurationMs, resultNow) {
   return createOnDemandScannerAdapter({
     keyId: 'test-key-1',
     keyResolver,
     transport,
     now: () => new Date(current),
+    ...(resultNow === undefined ? {} : { resultNow }),
+    ...(requestMaxDurationMs === undefined ? {} : { requestMaxDurationMs }),
   });
 }
+
+test('on-demand adapter binds an explicitly shortened benchmark worker deadline', async () => {
+  const transport = transportFixture();
+  await adapter(transport, 20_000).scan({
+    claim,
+    sha256: 'a'.repeat(64),
+    sizeBytes: 123,
+    mimeType: 'application/pdf',
+    openByteStream: () => (async function* () {})(),
+  });
+  assert.equal(transport.request.maxDurationMs, 20_000);
+  assert.throws(() => adapter(transport, 0), /duration|limit/i);
+});
+
+test('result verification uses its live clock without changing frozen request issuance', async () => {
+  const transport = transportFixture({ scannedAt: '2026-10-03T12:00:40.000Z' });
+  const result = await adapter(transport, undefined,
+    () => new Date('2026-10-03T12:00:40.000Z')).scan({
+    claim,
+    sha256: 'a'.repeat(64),
+    sizeBytes: 123,
+    mimeType: 'application/pdf',
+    openByteStream: () => (async function* () {})(),
+  });
+  assert.equal(transport.request.issuedAt, current.toISOString());
+  assert.equal(result.scannedAt, '2026-10-03T12:00:40.000Z');
+});
 
 test('on-demand adapter binds request identity, limits, hash, MIME, and claim', async () => {
   const transport = transportFixture();

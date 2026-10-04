@@ -12,8 +12,19 @@ export class ScannerPreconnectionRefusedError extends Error {
   }
 }
 
+export class ScannerWorkerDeadlineError extends Error {
+  constructor() {
+    super('Scanner worker exceeded its authenticated deadline after body admission.');
+    this.name = 'ScannerWorkerDeadlineError';
+  }
+}
+
 export function isScannerPreconnectionRefusedError(error) {
   return error instanceof ScannerPreconnectionRefusedError;
+}
+
+export function isScannerWorkerDeadlineError(error) {
+  return error instanceof ScannerWorkerDeadlineError;
 }
 
 function requireLabel(value, label) {
@@ -229,6 +240,10 @@ export function createNodePinnedHttpsExchange({
       },
 
       async write(chunk, operation = {}) {
+        requireOperation(operation, monotonicNow);
+        if (admitted && response?.statusCode === 408 && !finished && !aborted) {
+          throw new ScannerWorkerDeadlineError();
+        }
         if (!admitted || response || finished || aborted) {
           throw new Error('Scanner HTTPS exchange is not admitted for body data.');
         }

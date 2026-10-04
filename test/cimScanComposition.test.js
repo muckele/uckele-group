@@ -14,6 +14,7 @@ function options(overrides = {}) {
   return {
     value: {
       machineId: 'machine-1',
+      expectedImageDigest: `sha256:${'b'.repeat(64)}`,
       appName: 'ug-scanner',
       port: 8443,
       apiBaseUrl: 'https://api.machines.dev',
@@ -47,6 +48,7 @@ test('inert composition wires the reviewed Fly scanner stack without network or 
 test('inert composition requires every network, credential, clock, and pin input explicitly', () => {
   for (const [field, pattern] of [
     ['accessToken', /token|credential/i],
+    ['expectedImageDigest', /image|digest/i],
     ['fetchImpl', /transport|injected/i],
     ['wallNowMs', /clock/i],
     ['monotonicNow', /clock/i],

@@ -14,16 +14,29 @@ function dateFromClock(now) {
   return date;
 }
 
-function validateFactory({ keyId, keyResolver, transport, now } = {}) {
+function validateFactory({
+  keyId, keyResolver, transport, now, resultNow,
+  requestMaxDurationMs = CIM_SCAN_PROTOCOL_LIMITS.maxWorkerDurationMs,
+} = {}) {
   if (typeof keyId !== 'string' || !keyId) throw new Error('An explicit protocol key id is required.');
   if (typeof keyResolver !== 'function') throw new Error('An explicit protocol key resolver is required.');
   if (!transport || typeof transport.run !== 'function') throw new Error('An injected scan transport is required.');
   if (now !== undefined && typeof now !== 'function') throw new Error('Scanner clock must be injected as a function.');
+  if (resultNow !== undefined && typeof resultNow !== 'function') {
+    throw new Error('Scanner result clock must be injected as a function.');
+  }
+  if (!Number.isSafeInteger(requestMaxDurationMs) || requestMaxDurationMs < 1
+    || requestMaxDurationMs > CIM_SCAN_PROTOCOL_LIMITS.maxWorkerDurationMs) {
+    throw new Error('Scanner request duration limit is invalid.');
+  }
 }
 
 export function createOnDemandScannerAdapter(options = {}) {
   validateFactory(options);
-  const { keyId, keyResolver, transport, now = () => new Date() } = options;
+  const {
+    keyId, keyResolver, transport, now = () => new Date(), resultNow = now,
+    requestMaxDurationMs = CIM_SCAN_PROTOCOL_LIMITS.maxWorkerDurationMs,
+  } = options;
   return Object.freeze({
     name: 'offline-on-demand-protocol',
     version: 'uckele.cim-scan.v1',
@@ -51,7 +64,7 @@ export function createOnDemandScannerAdapter(options = {}) {
         sizeBytes,
         mimeType,
         maxBytes: CIM_SCAN_PROTOCOL_LIMITS.maxAttachmentBytes,
-        maxDurationMs: 90_000,
+        maxDurationMs: requestMaxDurationMs,
         keyId,
       }, { keyResolver });
       const request = parseAndVerifyScanRequest(requestWire, { keyResolver, now: issuedAt });
@@ -62,7 +75,7 @@ export function createOnDemandScannerAdapter(options = {}) {
         openByteStream,
       });
       const result = parseAndVerifyScanResult(transportResult.resultWire, {
-        request, keyResolver, now: dateFromClock(now),
+        request, keyResolver, now: dateFromClock(resultNow),
       });
       if (transportResult.stopConfirmed !== true && result.outcome !== 'unsafe') {
         return { outcome: 'unavailable', reasonCode: 'machine_stop_uncertain' };

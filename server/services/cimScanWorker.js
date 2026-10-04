@@ -170,6 +170,12 @@ function workerDeadlineError(message = 'Worker task exceeded its shared deadline
   return error;
 }
 
+function replayConflictError() {
+  const error = new Error('Worker replay identity conflicts with another request.');
+  error.code = 'CIM_SCAN_REPLAY_CONFLICT';
+  return error;
+}
+
 function isWorkerDeadlineError(error) {
   return error?.code === 'CIM_SCAN_DEADLINE';
 }
@@ -342,7 +348,7 @@ export async function runOnDemandScanTask({
       });
       return replay.resultWire;
     }
-    if (replay.status === 'conflict') throw new Error('Worker replay identity conflicts with another request.');
+    if (replay.status === 'conflict') throw replayConflictError();
     if (replay.status === 'inflight') throw new Error('Worker replay outcome is ambiguous and still in flight.');
     if (replay.status !== 'accepted') throw new Error('Worker replay capacity is unavailable.');
     if (admitRequest !== undefined) {

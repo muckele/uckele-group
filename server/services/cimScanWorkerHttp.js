@@ -4,6 +4,7 @@ import {
   parseAndVerifyScanResult,
 } from './cimScanProtocol.js';
 import { runOnDemandScanTask } from './cimScanWorker.js';
+import { PassThrough } from 'node:stream';
 
 const exactPath = '/v1/cim-scan';
 const base64UrlPattern = /^[A-Za-z0-9_-]+$/;
@@ -49,7 +50,10 @@ function validateHttpRequest(request) {
   if (!Number.isSafeInteger(sizeBytes) || sizeBytes > CIM_SCAN_PROTOCOL_LIMITS.maxAttachmentBytes) {
     throw new Error('Worker scan content length is outside its allowed range.');
   }
-  if (typeof request[Symbol.asyncIterator] !== 'function' || typeof request.destroy !== 'function') {
+  if (typeof request[Symbol.asyncIterator] !== 'function' || typeof request.destroy !== 'function'
+    || typeof request.pipe !== 'function' || typeof request.unpipe !== 'function'
+    || typeof request.pause !== 'function' || typeof request.once !== 'function'
+    || typeof request.removeListener !== 'function') {
     throw new Error('Worker scan request body is not an abortable byte stream.');
   }
   return {
@@ -73,6 +77,29 @@ function writeResponse(response, status, body = '') {
     ...(status === 200 ? { 'content-type': 'application/json; charset=utf-8' } : { connection: 'close' }),
   }));
   response.end(bytes);
+}
+
+function responsePreservingRequestBody(request) {
+  const body = new PassThrough();
+  const onRequestError = () => body.destroy(new Error('Worker request body failed.'));
+  const detach = () => {
+    request.unpipe?.(body);
+    request.pause?.();
+    request.removeListener?.('error', onRequestError);
+  };
+  request.once?.('error', onRequestError);
+  body.once('close', detach);
+  request.pipe(body);
+  return body;
+}
+
+function closeRequestAfterResponse(request, response) {
+  const close = () => {
+    try { request.destroy(); } catch { /* response status remains authoritative */ }
+  };
+  if (typeof response.once === 'function') {
+    try { response.once('finish', close); } catch { queueMicrotask(close); }
+  } else queueMicrotask(close);
 }
 
 export function createCimScanWorkerCheckContinueHandler({
@@ -134,7 +161,7 @@ export function createCimScanWorkerCheckContinueHandler({
           if (!continued) throw new Error('Worker request body opened before admission.');
           if (opened) throw new Error('Worker request body opened more than once.');
           opened = true;
-          return request;
+          return responsePreservingRequestBody(request);
         },
       });
       parseAndVerifyScanResult(resultWire, {
@@ -143,9 +170,13 @@ export function createCimScanWorkerCheckContinueHandler({
         now: now(),
       });
       writeResponse(response, 200, resultWire);
-    } catch {
-      try { writeResponse(response, continued ? 500 : 400); } catch {
+    } catch (error) {
+      const status = error?.code === 'CIM_SCAN_REPLAY_CONFLICT' && !continued
+        ? 409 : error?.code === 'CIM_SCAN_DEADLINE' && continued ? 408 : continued ? 500 : 400;
+      if (continued) closeRequestAfterResponse(request, response);
+      try { writeResponse(response, status); } catch {
         try { response.destroy?.(); } catch { /* preserve a closed fail-safe response */ }
+        try { request.destroy(); } catch { /* preserve a closed fail-safe response */ }
       }
     }
   };
