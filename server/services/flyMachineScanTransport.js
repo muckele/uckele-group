@@ -107,8 +107,13 @@ export function createFlyMachineScanTransport(options = {}) {
         if (!upload || typeof upload.sendBody !== 'function') {
           throw new Error('Worker admission did not return an upload handle.');
         }
-        if (await runWork(() => machineController.ownsSession(command())) !== true) {
-          throw new Error('Machine session generation ownership was lost after admission.');
+        try {
+          if (await runWork(() => machineController.ownsSession(command())) !== true) {
+            throw new Error('Machine session generation ownership was lost after admission.');
+          }
+        } catch (error) {
+          try { upload.abort?.(error); } catch { /* ownership failure remains authoritative */ }
+          throw error;
         }
         resultWire = await runWork(() => upload.sendBody({
           openByteStream,

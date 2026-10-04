@@ -118,7 +118,32 @@ test('Fly transport rechecks generation ownership after admission before opening
     openByteStream() { opened += 1; return (async function* () {})(); },
   }), /ownership|generation/i);
   assert.equal(opened, 0);
+  assert.equal(fixture.events.some(([name]) => name === 'abort'), true);
   assert.equal(fixture.events.some(([name]) => name === 'stop'), false);
+});
+
+test('Fly transport aborts an admitted upload when its ownership recheck fails', async () => {
+  const fixture = harness();
+  let ownershipChecks = 0;
+  fixture.machineController.ownsSession = async (command) => {
+    fixture.events.push(['owns', command.providerGeneration]);
+    ownershipChecks += 1;
+    if (ownershipChecks === 2) throw new Error('synthetic ownership inspection failure');
+    return true;
+  };
+  const transport = createFlyMachineScanTransport({
+    machineId: 'synthetic-machine-1',
+    machineController: fixture.machineController,
+    requestClient: fixture.requestClient,
+  });
+  await assert.rejects(transport.run({
+    requestWire: '{}',
+    requestId: '41111111-1111-4111-8111-111111111111',
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    openByteStream: () => (async function* () {})(),
+  }), /ownership inspection failure/i);
+  assert.equal(fixture.events.some(([name]) => name === 'abort'), true);
+  assert.equal(fixture.events.some(([name]) => name === 'open-body'), false);
 });
 
 test('Fly transport reports stop uncertainty separately from an obtained result', async () => {

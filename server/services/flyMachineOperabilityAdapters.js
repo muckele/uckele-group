@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { CIM_SCAN_PROTOCOL_LIMITS } from './cimScanProtocol.js';
 
 const identityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
@@ -106,7 +107,39 @@ function parseRequestSize(requestWire) {
   return request.sizeBytes;
 }
 
-async function readResponseBody(body, maximum) {
+function responseBodyNext(iterator, { signal, deadlineAt }) {
+  const remaining = Math.ceil(deadlineAt - performance.now());
+  if (!signal || typeof signal.aborted !== 'boolean'
+    || typeof signal.addEventListener !== 'function'
+    || typeof signal.removeEventListener !== 'function'
+    || signal.aborted || !Number.isFinite(deadlineAt) || remaining <= 0) {
+    return Promise.reject(new Error('Scanner HTTP response was aborted or exceeded its deadline.'));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(reject,
+      new Error('Scanner HTTP response was aborted or exceeded its deadline.'));
+    const timer = setTimeout(onAbort, Math.max(1, remaining));
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve().then(() => iterator.next()).then(
+      (result) => finish(resolve, result),
+      () => finish(reject, new Error('Scanner HTTP response could not be read.')),
+    );
+  });
+}
+
+async function readResponseBody(body, maximum, operation) {
+  if (!Number.isFinite(operation?.deadlineAt) || operation.deadlineAt <= performance.now()
+    || operation?.signal?.aborted) {
+    throw new Error('Scanner HTTP response was aborted or exceeded its deadline.');
+  }
   if (typeof body === 'string' || Buffer.isBuffer(body) || body instanceof Uint8Array) {
     const value = Buffer.from(body);
     if (value.length > maximum) throw new Error('Scanner response exceeds the configured cap.');
@@ -118,7 +151,15 @@ async function readResponseBody(body, maximum) {
   }
   const chunks = [];
   let size = 0;
-  for await (const value of body) {
+  const iterator = typeof body[Symbol.asyncIterator] === 'function'
+    ? body[Symbol.asyncIterator]() : body[Symbol.iterator]();
+  while (true) {
+    const result = await responseBodyNext(iterator, operation);
+    if (!result || typeof result !== 'object') {
+      throw new Error('Scanner HTTP response could not be read.');
+    }
+    if (result.done) break;
+    const value = result.value;
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     size += chunk.length;
     if (size > maximum) throw new Error('Scanner response exceeds the configured cap.');
@@ -214,7 +255,9 @@ export function createPinnedHttpScanRequestClient({
               throw new Error('Scanner HTTP redirect was refused.');
             }
             if (response?.status !== 200) throw new Error('Scanner HTTP response was not successful.');
-            return await readResponseBody(response.body, maxResponseBytes);
+            return await readResponseBody(response.body, maxResponseBytes, {
+              signal: bodySignal, deadlineAt: bodyDeadline,
+            });
           } catch (error) {
             abortExchange(exchange, error);
             try { stream?.destroy?.(error); } catch { /* preserve the authoritative failure */ }
