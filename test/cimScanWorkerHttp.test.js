@@ -15,7 +15,10 @@ import {
 import { createCimScanWorkerHttpComposition } from '../server/services/cimScanComposition.js';
 import { createCimScanWorkerCheckContinueHandler } from '../server/services/cimScanWorkerHttp.js';
 import { createSingleCimScanAdmission } from '../server/services/cimScanWorkerAdmission.js';
-import { createPinnedHttpScanRequestClient } from '../server/services/flyMachineOperabilityAdapters.js';
+import {
+  createPinnedHttpScanRequestClient,
+  isScannerReplayConflictError,
+} from '../server/services/flyMachineOperabilityAdapters.js';
 import {
   createSyntheticReplayStore,
   createSyntheticWorkerScanner,
@@ -62,16 +65,44 @@ function fakeRequest(requestWire, bytes = attachment, overrides = {}) {
   return { request, reads: () => reads };
 }
 
+function stalledFakeRequest(requestWire) {
+  let reads = 0;
+  let sent = false;
+  const request = new Readable({
+    read() {
+      if (sent) return;
+      sent = true;
+      reads += 1;
+      this.push(attachment.subarray(0, 1));
+    },
+  });
+  request.method = 'POST';
+  request.url = '/v1/cim-scan';
+  request.headers = {
+    expect: '100-continue',
+    'content-type': 'application/octet-stream',
+    'content-length': String(attachment.length),
+    'x-cim-scan-request': Buffer.from(requestWire, 'utf8').toString('base64url'),
+  };
+  return { request, reads: () => reads };
+}
+
 function fakeResponse() {
   const events = [];
   let status = null;
   let headers = null;
   let body = Buffer.alloc(0);
+  const finishListeners = [];
   return {
     response: {
+      once(event, callback) { if (event === 'finish') finishListeners.push(callback); },
       writeContinue() { events.push('continue'); },
       writeHead(value, values) { status = value; headers = values; events.push(`status:${value}`); },
-      end(value = Buffer.alloc(0)) { body = Buffer.from(value); events.push('end'); },
+      end(value = Buffer.alloc(0)) {
+        body = Buffer.from(value);
+        events.push('end');
+        for (const listener of finishListeners.splice(0)) listener();
+      },
     },
     events,
     result: () => ({ status, headers, body: body.toString('utf8') }),
@@ -219,6 +250,15 @@ test('fake client-to-handler exchange uploads a new job and reuses only its earl
   const replay = await run();
   assert.equal(replay, first);
   assert.equal(opened, 1);
+  const conflictController = new AbortController();
+  await assert.rejects(client.authorize({
+    requestWire: signedRequest({ sha256: 'f'.repeat(64) }),
+    redirects: 'error',
+    maxResponseBytes: CIM_SCAN_PROTOCOL_LIMITS.maxEnvelopeBytes,
+    signal: conflictController.signal,
+    deadlineAt: performance.now() + 1_000,
+  }), isScannerReplayConflictError);
+  assert.equal(opened, 1);
   const request = parseAndVerifyScanRequest(wire, { keyResolver, now: worker.now() });
   assert.equal(parseAndVerifyScanResult(replay, {
     request, keyResolver, now: worker.now(),
@@ -305,7 +345,7 @@ test('HTTP worker refuses tampered, conflicting, and expired cached authority wi
   const conflictInput = fakeRequest(conflictingWire);
   const conflictOutput = fakeResponse();
   await worker.handleCheckContinue(conflictInput.request, conflictOutput.response);
-  assert.equal(conflictOutput.result().status, 400);
+  assert.equal(conflictOutput.result().status, 409);
   assert.equal(conflictOutput.events.includes('continue'), false);
   assert.equal(conflictInput.reads(), 0);
 
@@ -337,6 +377,25 @@ test('HTTP worker bounds admission timeout before continue and exposes no failur
   assert.equal(output.result().body, '');
   assert.equal(output.events.includes('continue'), false);
   assert.equal(input.reads(), 0);
+});
+
+test('real worker timeout flushes bodyless 408 before closing its stalled request', async (t) => {
+  const wire = signedRequest({ maxDurationMs: 20 });
+  const input = stalledFakeRequest(wire);
+  const output = fakeResponse();
+  const worker = await withWorker(t);
+  const closed = new Promise((resolve) => input.request.once('close', () => {
+    assert.equal(output.events.at(-1), 'end');
+    resolve();
+  }));
+
+  await worker.handleCheckContinue(input.request, output.response);
+  await closed;
+
+  assert.equal(output.result().status, 408);
+  assert.equal(output.result().body, '');
+  assert.equal(output.events.includes('continue'), true);
+  assert.equal(input.reads(), 1);
 });
 
 test('one composed worker admission rejects a concurrent job before bytes and releases afterward', async (t) => {

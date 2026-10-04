@@ -139,6 +139,8 @@ test('scanner package has explicit HTTP-worker and synthetic-caller targets with
     /ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint"\]/);
   assert.match(dockerfile, /FROM node-runtime AS cim-scan-synthetic-caller/);
   assert.doesNotMatch(callerStage, /cimScanWorkerBenchmarkClock/);
+  assert.match(callerStage,
+    /COPY server\/services\/cimScanCloudBenchmark\.js \/opt\/uckele\/server\/services\/cimScanCloudBenchmark\.js/);
   assert.match(dockerfile,
     /ENTRYPOINT \["node", "scripts\/run-cim-scan-cloud-synthetic\.js"\]/);
   assert.match(dockerfile, /FROM cim-scan-worker-base AS cim-scan-one-shot[\s\S]*ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-entrypoint"\]\s*$/);

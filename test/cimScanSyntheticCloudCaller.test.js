@@ -13,6 +13,7 @@ const environment = Object.freeze({
   CIM_SCAN_FLY_MACHINE_ID: 'machine-1',
   CIM_SCAN_FLY_APP_NAME: 'ug-cim-scan-benchmark',
   CIM_SCAN_FLY_API_BASE_URL: 'https://api.machines.dev',
+  CIM_SCAN_FLY_IMAGE_DIGEST: `sha256:${'b'.repeat(64)}`,
   CIM_SCAN_FLY_TOKEN_FILE: '/run/secrets/fly-scanner-token',
   CIM_SCAN_CA_FILE: '/run/config/cim-scan-ca.pem',
   CIM_SCAN_CERTIFICATE_PIN_SHA256: 'a'.repeat(64),
@@ -26,6 +27,7 @@ test('synthetic caller requires exact identities, pins, and file-backed credenti
     machineId: environment.CIM_SCAN_FLY_MACHINE_ID,
     appName: environment.CIM_SCAN_FLY_APP_NAME,
     apiBaseUrl: environment.CIM_SCAN_FLY_API_BASE_URL,
+    expectedImageDigest: environment.CIM_SCAN_FLY_IMAGE_DIGEST,
     accessTokenFile: environment.CIM_SCAN_FLY_TOKEN_FILE,
     caFile: environment.CIM_SCAN_CA_FILE,
     certificatePinSha256: environment.CIM_SCAN_CERTIFICATE_PIN_SHA256,
@@ -35,6 +37,7 @@ test('synthetic caller requires exact identities, pins, and file-backed credenti
   });
   for (const field of [
     'CIM_SCAN_FLY_MACHINE_ID', 'CIM_SCAN_FLY_APP_NAME', 'CIM_SCAN_FLY_API_BASE_URL',
+    'CIM_SCAN_FLY_IMAGE_DIGEST',
     'CIM_SCAN_FLY_TOKEN_FILE', 'CIM_SCAN_CA_FILE', 'CIM_SCAN_CERTIFICATE_PIN_SHA256',
     'CIM_SCAN_KEY_ID', 'CIM_SCAN_KEY_FILE', 'CIM_SCAN_JOB_OWNER',
   ]) {
@@ -160,22 +163,26 @@ test('caller factory reads explicit files once and creates a new exact-port comp
     environment.CIM_SCAN_CA_FILE,
     environment.CIM_SCAN_KEY_FILE,
   ]);
-  assert.notEqual(factory(), factory());
+  const issuedNow = () => new Date('2026-10-03T12:00:00.000Z');
+  const resultNow = () => new Date('2026-10-03T12:00:40.000Z');
+  assert.notEqual(factory({ now: issuedNow, resultNow, requestMaxDurationMs: 500 }), factory());
   assert.equal(compositions.length, 2);
   for (const options of compositions) {
     assert.equal(options.port, 8443);
+    assert.equal(options.expectedImageDigest, environment.CIM_SCAN_FLY_IMAGE_DIGEST);
     assert.equal(options.accessToken, 'synthetic-token');
     assert.equal(options.keyResolver('synthetic-key-1').length, 32);
     assert.equal(options.keyResolver('other'), null);
     assert.equal(typeof options.requestImpl, 'function');
   }
+  assert.equal(compositions[0].now, issuedNow);
+  assert.equal(compositions[0].resultNow, resultNow);
+  assert.equal(compositions[0].requestMaxDurationMs, 500);
 });
 
-test('standalone caller exposes only bounded generated scenarios and no production registration', async () => {
+test('standalone caller delegates only to the bounded eight-job benchmark harness without production registration', async () => {
   const source = await fsp.readFile('scripts/run-cim-scan-cloud-synthetic.js', 'utf8');
-  assert.match(source, /clean-1k/);
-  assert.match(source, /clean-8m/);
-  assert.match(source, /stale-1k/);
+  assert.match(source, /runCimScanCloudBenchmarkScenario/);
   assert.match(source, /createSyntheticCloudScannerFactory/);
   assert.doesNotMatch(source, /BenchmarkClock|createSyntheticScenarioClock|CLOCK_OFFSET/);
   assert.doesNotMatch(source, /server\/index|server\/app|secureDocuments|scannerReady|intake\.enabled/);

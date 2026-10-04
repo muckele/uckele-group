@@ -4,6 +4,17 @@ import { CIM_SCAN_PROTOCOL_LIMITS } from './cimScanProtocol.js';
 const identityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
 
+export class ScannerReplayConflictError extends Error {
+  constructor() {
+    super('Scanner worker rejected a conflicting replay before its body.');
+    this.name = 'ScannerReplayConflictError';
+  }
+}
+
+export function isScannerReplayConflictError(error) {
+  return error instanceof ScannerReplayConflictError;
+}
+
 function assertIdentity(value, label) {
   if (!identityPattern.test(String(value || ''))) throw new Error(`${label} is invalid.`);
 }
@@ -254,6 +265,7 @@ export function createPinnedHttpScanRequestClient({
       }
       if (admission?.status !== 100) {
         abortExchange(exchange);
+        if (admission?.status === 409) throw new ScannerReplayConflictError();
         throw new Error('Scanner worker did not admit the request before its body.');
       }
       let bodyOpened = false;

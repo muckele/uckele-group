@@ -10,6 +10,7 @@ import { createFlyCimScannerComposition } from './cimScanComposition.js';
 const dnsLabelPattern = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const identityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
+const imageDigestPattern = /^sha256:[a-f0-9]{64}$/;
 const generatedChunkBytes = 64 * 1024;
 
 function hasControlCharacter(value) {
@@ -54,6 +55,8 @@ export function loadCimScanSyntheticCallerConfig(environment = process.env) {
     appName: requiredIdentity(environment.CIM_SCAN_FLY_APP_NAME,
       'Fly application identity', dnsLabelPattern),
     apiBaseUrl: exactApiBaseUrl(environment.CIM_SCAN_FLY_API_BASE_URL),
+    expectedImageDigest: requiredIdentity(environment.CIM_SCAN_FLY_IMAGE_DIGEST,
+      'Fly Machine image digest', imageDigestPattern),
     accessTokenFile: absolutePath(environment.CIM_SCAN_FLY_TOKEN_FILE, 'Fly token file'),
     caFile: absolutePath(environment.CIM_SCAN_CA_FILE, 'Scanner CA file'),
     certificatePinSha256,
@@ -127,9 +130,14 @@ export async function createSyntheticCloudScannerFactory({
   const key = Buffer.from(keyValue);
   if (key.length < 32) throw new Error('Synthetic caller protocol key is too short.');
   const pinnedRequestImpl = createPinnedNodeHttpsRequestImpl({ ca, requestImpl });
-  return function createFreshScannerComposition() {
+  return function createFreshScannerComposition({
+    now: compositionNow = now,
+    resultNow: compositionResultNow = compositionNow,
+    requestMaxDurationMs = CIM_SCAN_PROTOCOL_LIMITS.maxWorkerDurationMs,
+  } = {}) {
     const composition = composeScanner({
       machineId: config.machineId,
+      expectedImageDigest: config.expectedImageDigest,
       appName: config.appName,
       port: 8443,
       apiBaseUrl: config.apiBaseUrl,
@@ -142,7 +150,9 @@ export async function createSyntheticCloudScannerFactory({
       requestImpl: pinnedRequestImpl,
       keyId: config.keyId,
       keyResolver: (candidate) => candidate === config.keyId ? key : null,
-      now,
+      now: compositionNow,
+      resultNow: compositionResultNow,
+      requestMaxDurationMs,
     });
     if (!composition?.scanner || typeof composition.scanner.scan !== 'function') {
       throw new Error('Synthetic caller scanner composition is invalid.');
@@ -159,13 +169,16 @@ function generatedDigest(sizeBytes, fillByte) {
   return hash.digest('hex');
 }
 
-export function createGeneratedSyntheticScanJob({
+function createSyntheticScanJob({
   name,
   sizeBytes,
+  sha256,
+  createByteStream,
   requestId,
   intakeId,
   jobOwner,
   now,
+  leaseDurationMs = 3 * 60 * 1_000,
 } = {}) {
   if (typeof name !== 'string' || !name || name.length > 80) {
     throw new Error('Synthetic scan job name is invalid.');
@@ -175,11 +188,18 @@ export function createGeneratedSyntheticScanJob({
     throw new Error('Synthetic scan job size is invalid.');
   }
   if (typeof now !== 'function') throw new Error('Synthetic scan job clock is required.');
+  if (!Number.isSafeInteger(leaseDurationMs) || leaseDurationMs < 1
+    || leaseDurationMs > 4 * 60 * 1_000) {
+    throw new Error('Synthetic scan job lease duration is invalid.');
+  }
+  if (!digestPattern.test(String(sha256 || '')) || typeof createByteStream !== 'function') {
+    throw new Error('Synthetic scan job byte source is invalid.');
+  }
   const issuedAt = now();
   const issued = issuedAt instanceof Date ? issuedAt : new Date(issuedAt);
   if (!Number.isFinite(issued.getTime())) throw new Error('Synthetic scan job clock is invalid.');
-  const fillByte = createHash('sha256').update(name, 'utf8').digest()[0];
   let opens = 0;
+  let bodyBytes = 0;
   return Object.freeze({
     name,
     claim: Object.freeze({
@@ -187,21 +207,55 @@ export function createGeneratedSyntheticScanJob({
       intakeId,
       attempt: 1,
       jobOwner: requiredIdentity(jobOwner, 'Synthetic job owner'),
-      leaseExpiresAt: new Date(issued.getTime() + 3 * 60 * 1_000).toISOString(),
+      leaseExpiresAt: new Date(issued.getTime() + leaseDurationMs).toISOString(),
     }),
-    sha256: generatedDigest(sizeBytes, fillByte),
+    sha256,
     sizeBytes,
     mimeType: 'application/pdf',
     openCount: () => opens,
+    bodyByteCount: () => bodyBytes,
     openByteStream() {
       if (opens !== 0) throw new Error('Synthetic scan bytes may be opened only once.');
       opens += 1;
-      return Readable.from((async function* generatedBytes() {
-        for (let offset = 0; offset < sizeBytes; offset += generatedChunkBytes) {
-          yield Buffer.alloc(Math.min(generatedChunkBytes, sizeBytes - offset), fillByte);
+      const source = createByteStream();
+      return Readable.from((async function* countedBytes() {
+        for await (const value of source) {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          bodyBytes += chunk.length;
+          yield chunk;
         }
       }()));
     },
+  });
+}
+
+export function createGeneratedSyntheticScanJob(options = {}) {
+  const name = String(options.name || '');
+  const sizeBytes = options.sizeBytes;
+  const fillByte = createHash('sha256').update(name, 'utf8').digest()[0];
+  const boundedSize = Number.isSafeInteger(sizeBytes) && sizeBytes > 0
+    && sizeBytes <= CIM_SCAN_PROTOCOL_LIMITS.maxAttachmentBytes;
+  return createSyntheticScanJob({
+    ...options,
+    sha256: boundedSize ? generatedDigest(sizeBytes, fillByte) : '',
+    createByteStream: () => Readable.from((async function* generatedBytes() {
+      for (let offset = 0; offset < sizeBytes; offset += generatedChunkBytes) {
+        yield Buffer.alloc(Math.min(generatedChunkBytes, sizeBytes - offset), fillByte);
+      }
+    }())),
+  });
+}
+
+export function createExactSyntheticScanJob({ bytes, ...options } = {}) {
+  const byteSource = Buffer.isBuffer(bytes) || bytes instanceof Uint8Array ? bytes : null;
+  const exactBytes = byteSource && byteSource.length >= 1
+    && byteSource.length <= CIM_SCAN_PROTOCOL_LIMITS.maxAttachmentBytes
+    ? Buffer.from(byteSource) : null;
+  return createSyntheticScanJob({
+    ...options,
+    sizeBytes: exactBytes?.length,
+    sha256: exactBytes ? createHash('sha256').update(exactBytes).digest('hex') : '',
+    createByteStream: () => Readable.from([exactBytes]),
   });
 }
 
