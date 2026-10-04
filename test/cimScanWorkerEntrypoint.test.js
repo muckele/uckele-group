@@ -71,11 +71,25 @@ test('scanner package locks official sources for linux/amd64', async () => {
   assert.match(dockerfile, /^ARG NODE_BASE_DIGEST=sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402\nARG CLAMAV_BASE_DIGEST=sha256:90effb795234e6a93b070310a4bab5a58d93d94b9a077a09ce2229947679782b\nFROM node:22-alpine@\$\{NODE_BASE_DIGEST\}/);
   assert.match(dockerfile, /FROM clamav\/clamav:1\.4\.6_base@\$\{CLAMAV_BASE_DIGEST\}/);
   assert.match(dockerfile, /COPY package\.json package-lock\.json/);
-  const networkedRuns = [...dockerfile.matchAll(/^RUN --network=(default|host) (.+)$/gm)];
-  assert.deepEqual(networkedRuns.map((match) => match.slice(1)), [
-    ['default', 'npm ci --omit=dev'],
-  ]);
-  assert.doesNotMatch(dockerfile, /^RUN npm ci --omit=dev$/m);
+  const runLines = dockerfile.split('\n').filter((line) => line.startsWith('RUN '));
+  const npmRun = dockerfile.match(/^RUN [\s\S]*?(?=\n\nFROM )/m)?.[0];
+  assert.equal(runLines.length, 1);
+  assert.ok(npmRun);
+  assert.doesNotMatch(dockerfile, /^RUN --network=/m);
+  assert.match(npmRun, /env -i/);
+  assert.match(npmRun, /npm_config_userconfig=\/tmp\/uckele-npm-config\/user\.npmrc/);
+  assert.match(npmRun, /npm_config_globalconfig=\/tmp\/uckele-npm-config\/global\.npmrc/);
+  assert.match(npmRun, /npm_config_foreground_scripts=true/);
+  assert.match(npmRun, /npm_config_loglevel=silly/);
+  assert.match(npmRun, /npm_config_timing=true/);
+  assert.match(npmRun, /npm ci --omit=dev/);
+  assert.equal((dockerfile.match(/npm ci --omit=dev/g) ?? []).length, 1);
+  assert.doesNotMatch(dockerfile, /^RUN chmod\b/m);
+  for (const entrypoint of [
+    'http-entrypoint.sh', 'stale-benchmark-entrypoint.sh', 'entrypoint.sh',
+  ]) {
+    assert.match(dockerfile, new RegExp(`^COPY --chmod=0555 .*${entrypoint} `, 'm'));
+  }
   assert.match(dockerfile,
     /COPY server\/services\/cimScanWorkerAdmission\.js \/opt\/uckele\/server\/services\/cimScanWorkerAdmission\.js/);
   assert.match(clamConfig, /^LocalSocket \/run\/clamav\/clamd\.sock$/m);
@@ -120,7 +134,7 @@ test('scanner package has explicit HTTP-worker and synthetic-caller targets with
   assert.match(staleStage,
     /COPY scripts\/run-cim-scan-worker-stale-benchmark\.js \/opt\/uckele\/scripts\/run-cim-scan-worker-stale-benchmark\.js/);
   assert.match(staleStage,
-    /COPY containers\/cim-scan-worker\/stale-benchmark-entrypoint\.sh \/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint/);
+    /COPY --chmod=0555 containers\/cim-scan-worker\/stale-benchmark-entrypoint\.sh \/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint/);
   assert.match(staleStage,
     /ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint"\]/);
   assert.match(dockerfile, /FROM node-runtime AS cim-scan-synthetic-caller/);
