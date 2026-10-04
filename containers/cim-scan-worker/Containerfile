@@ -1,27 +1,68 @@
 ARG NODE_BASE_DIGEST=sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
 ARG CLAMAV_BASE_DIGEST=sha256:90effb795234e6a93b070310a4bab5a58d93d94b9a077a09ce2229947679782b
 FROM node:22-alpine@${NODE_BASE_DIGEST} AS node-runtime
-WORKDIR /build
+WORKDIR /opt/uckele
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-FROM clamav/clamav:1.4.6_base@${CLAMAV_BASE_DIGEST}
+FROM node-runtime AS cim-scan-synthetic-caller
+COPY server/services/cimScanProtocol.js /opt/uckele/server/services/cimScanProtocol.js
+COPY server/services/cimScanComposition.js /opt/uckele/server/services/cimScanComposition.js
+COPY server/services/cimScanWorker.js /opt/uckele/server/services/cimScanWorker.js
+COPY server/services/cimScanWorkerAdmission.js /opt/uckele/server/services/cimScanWorkerAdmission.js
+COPY server/services/cimScanWorkerHttp.js /opt/uckele/server/services/cimScanWorkerHttp.js
+COPY server/services/cimScanSyntheticCloudCaller.js /opt/uckele/server/services/cimScanSyntheticCloudCaller.js
+COPY server/services/flyMachineLeaseController.js /opt/uckele/server/services/flyMachineLeaseController.js
+COPY server/services/flyMachineOperabilityAdapters.js /opt/uckele/server/services/flyMachineOperabilityAdapters.js
+COPY server/services/flyMachineScanTransport.js /opt/uckele/server/services/flyMachineScanTransport.js
+COPY server/services/flyMachinesApiClient.js /opt/uckele/server/services/flyMachinesApiClient.js
+COPY server/services/nodePinnedHttpsExchange.js /opt/uckele/server/services/nodePinnedHttpsExchange.js
+COPY server/services/onDemandCimScanner.js /opt/uckele/server/services/onDemandCimScanner.js
+COPY scripts/run-cim-scan-cloud-synthetic.js /opt/uckele/scripts/run-cim-scan-cloud-synthetic.js
+ENTRYPOINT ["node", "scripts/run-cim-scan-cloud-synthetic.js"]
+
+FROM clamav/clamav:1.4.6_base@${CLAMAV_BASE_DIGEST} AS cim-scan-worker-base
 
 # Both official source tags are locked to immutable multi-platform index digests.
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
-COPY --from=node-runtime /build/node_modules /opt/uckele/node_modules
+COPY --from=node-runtime /opt/uckele/node_modules /opt/uckele/node_modules
 COPY package.json /opt/uckele/package.json
 COPY server/services/cimScanProtocol.js /opt/uckele/server/services/cimScanProtocol.js
+COPY server/services/cimScanComposition.js /opt/uckele/server/services/cimScanComposition.js
 COPY server/services/cimScanWorker.js /opt/uckele/server/services/cimScanWorker.js
 COPY server/services/cimScanWorkerAdmission.js /opt/uckele/server/services/cimScanWorkerAdmission.js
+COPY server/services/cimScanWorkerEntrypoint.js /opt/uckele/server/services/cimScanWorkerEntrypoint.js
+COPY server/services/cimScanWorkerHttp.js /opt/uckele/server/services/cimScanWorkerHttp.js
+COPY server/services/cimScanWorkerHttpRuntime.js /opt/uckele/server/services/cimScanWorkerHttpRuntime.js
 COPY server/services/clamavUnixSocketScanner.js /opt/uckele/server/services/clamavUnixSocketScanner.js
 COPY server/services/filesystemCimReplayStore.js /opt/uckele/server/services/filesystemCimReplayStore.js
-COPY server/services/cimScanWorkerEntrypoint.js /opt/uckele/server/services/cimScanWorkerEntrypoint.js
-COPY scripts/run-cim-scan-worker.js /opt/uckele/scripts/run-cim-scan-worker.js
+COPY server/services/flyMachineLeaseController.js /opt/uckele/server/services/flyMachineLeaseController.js
+COPY server/services/flyMachineOperabilityAdapters.js /opt/uckele/server/services/flyMachineOperabilityAdapters.js
+COPY server/services/flyMachineScanTransport.js /opt/uckele/server/services/flyMachineScanTransport.js
+COPY server/services/flyMachinesApiClient.js /opt/uckele/server/services/flyMachinesApiClient.js
+COPY server/services/nodePinnedHttpsExchange.js /opt/uckele/server/services/nodePinnedHttpsExchange.js
+COPY server/services/onDemandCimScanner.js /opt/uckele/server/services/onDemandCimScanner.js
 COPY scripts/check-cim-scan-worker-health.js /opt/uckele/scripts/check-cim-scan-worker-health.js
 COPY containers/cim-scan-worker/clamd.conf /etc/clamav/clamd.conf
-COPY containers/cim-scan-worker/entrypoint.sh /usr/local/bin/uckele-cim-scan-entrypoint
 
 WORKDIR /opt/uckele
 HEALTHCHECK --interval=5s --timeout=3s --start-period=60s --start-interval=1s --retries=3 CMD ["node", "scripts/check-cim-scan-worker-health.js"]
+
+FROM cim-scan-worker-base AS cim-scan-http-worker
+COPY scripts/run-cim-scan-worker-http.js /opt/uckele/scripts/run-cim-scan-worker-http.js
+COPY containers/cim-scan-worker/http-entrypoint.sh /usr/local/bin/uckele-cim-scan-http-entrypoint
+RUN chmod 0555 /usr/local/bin/uckele-cim-scan-http-entrypoint
+ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-http-entrypoint"]
+
+FROM cim-scan-worker-base AS cim-scan-stale-benchmark-worker
+COPY server/services/cimScanWorkerBenchmarkClock.js /opt/uckele/server/services/cimScanWorkerBenchmarkClock.js
+COPY scripts/run-cim-scan-worker-stale-benchmark.js /opt/uckele/scripts/run-cim-scan-worker-stale-benchmark.js
+COPY containers/cim-scan-worker/stale-benchmark-entrypoint.sh /usr/local/bin/uckele-cim-scan-stale-benchmark-entrypoint
+RUN chmod 0555 /usr/local/bin/uckele-cim-scan-stale-benchmark-entrypoint
+ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-stale-benchmark-entrypoint"]
+
+FROM cim-scan-worker-base AS cim-scan-one-shot
+COPY scripts/run-cim-scan-worker.js /opt/uckele/scripts/run-cim-scan-worker.js
+COPY containers/cim-scan-worker/entrypoint.sh /usr/local/bin/uckele-cim-scan-entrypoint
+RUN chmod 0555 /usr/local/bin/uckele-cim-scan-entrypoint
 ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-entrypoint"]

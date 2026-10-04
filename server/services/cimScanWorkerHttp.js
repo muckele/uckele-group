@@ -82,6 +82,7 @@ export function createCimScanWorkerCheckContinueHandler({
   ephemeralRoot,
   scanner,
   now,
+  signatureNow = now,
   runTask = runOnDemandScanTask,
 } = {}) {
   if (typeof keyResolver !== 'function') throw new Error('Worker protocol key resolver is required.');
@@ -98,6 +99,7 @@ export function createCimScanWorkerCheckContinueHandler({
     throw new Error('Worker scanner adapter is required.');
   }
   if (typeof now !== 'function') throw new Error('Worker clock is required.');
+  if (typeof signatureNow !== 'function') throw new Error('Worker signature clock is required.');
   if (typeof runTask !== 'function') throw new Error('Worker task runner is required.');
 
   return async function handleCheckContinue(request, response) {
@@ -121,6 +123,7 @@ export function createCimScanWorkerCheckContinueHandler({
         ephemeralRoot,
         scanner,
         now,
+        signatureNow,
         requireAttachment: true,
         admitRequest() {
           if (continued) throw new Error('Worker request was admitted more than once.');

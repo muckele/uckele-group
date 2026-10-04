@@ -3,6 +3,18 @@ import { checkServerIdentity as checkTlsServerIdentity } from 'node:tls';
 
 const dnsLabelPattern = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const digestPattern = /^[a-f0-9]{64}$/;
+const privateWorkerPort = 8443;
+
+export class ScannerPreconnectionRefusedError extends Error {
+  constructor() {
+    super('Scanner HTTPS listener refused a preconnection attempt.');
+    this.name = 'ScannerPreconnectionRefusedError';
+  }
+}
+
+export function isScannerPreconnectionRefusedError(error) {
+  return error instanceof ScannerPreconnectionRefusedError;
+}
 
 function requireLabel(value, label) {
   if (!dnsLabelPattern.test(String(value || ''))) throw new Error(`${label} is invalid.`);
@@ -22,12 +34,19 @@ function requireOperation({ signal, deadlineAt } = {}, monotonicNow) {
   return { signal, deadlineAt };
 }
 
-function requireEndpoint(value, expectedHostname) {
+function requirePort(value) {
+  if (value !== privateWorkerPort) {
+    throw new Error(`Scanner HTTPS port must be ${privateWorkerPort}.`);
+  }
+  return String(value);
+}
+
+function requireEndpoint(value, expectedHostname, expectedPort) {
   let endpoint;
   try { endpoint = new URL(value); } catch { throw new Error('Scanner HTTPS endpoint is invalid.'); }
   if (endpoint.protocol !== 'https:' || endpoint.hostname !== expectedHostname
     || endpoint.pathname !== '/v1/cim-scan' || endpoint.username || endpoint.password
-    || endpoint.port || endpoint.search || endpoint.hash) {
+    || endpoint.port !== expectedPort || endpoint.search || endpoint.hash) {
     throw new Error('Scanner HTTPS exchange requires one exact Machine endpoint.');
   }
   return endpoint;
@@ -51,12 +70,14 @@ function verifyIdentity(expectedHostname, expectedPin, hostname, certificate) {
 export function createNodePinnedHttpsExchange({
   machineId,
   appName,
+  port,
   monotonicNow,
   requestImpl,
 } = {}) {
   const exactMachineId = requireLabel(machineId, 'Fly Machine DNS identity');
   const exactAppName = requireLabel(appName, 'Fly application DNS identity');
   const expectedHostname = `${exactMachineId}.vm.${exactAppName}.internal`;
+  const expectedPort = requirePort(port);
   if (typeof monotonicNow !== 'function') throw new Error('An injected monotonic clock is required.');
   if (typeof requestImpl !== 'function') throw new Error('An injected HTTPS request implementation is required.');
 
@@ -68,7 +89,7 @@ export function createNodePinnedHttpsExchange({
     if (!digestPattern.test(String(command.certificatePinSha256 || ''))) {
       throw new Error('Scanner HTTPS exchange requires one explicit SPKI SHA-256 pin.');
     }
-    const endpoint = requireEndpoint(command.endpoint, expectedHostname);
+    const endpoint = requireEndpoint(command.endpoint, expectedHostname, expectedPort);
     if (!command.headers || typeof command.headers !== 'object') {
       throw new Error('Scanner HTTPS headers are required.');
     }
@@ -76,6 +97,8 @@ export function createNodePinnedHttpsExchange({
     let request;
     let response = null;
     let admitted = false;
+    let tcpConnected = false;
+    let tlsEstablished = false;
     let aborted = false;
     let finished = false;
     let rootAbortAttached = false;
@@ -85,12 +108,16 @@ export function createNodePinnedHttpsExchange({
     const admissionResult = new Promise((resolve) => { resolveAdmission = resolve; });
     const responseResult = new Promise((resolve) => { resolveResponse = resolve; });
 
-    function settleFailure() {
+    function settleFailure(error) {
+      const failure = error?.code === 'ECONNREFUSED' && !tcpConnected && !tlsEstablished
+        && !response && !admitted
+        ? new ScannerPreconnectionRefusedError()
+        : new Error('Scanner HTTPS exchange failed.');
       if (!admissionResolved) {
         admissionResolved = true;
-        resolveAdmission({ failed: true });
+        resolveAdmission({ failed: true, error: failure });
       }
-      resolveResponse({ failed: true });
+      resolveResponse({ failed: true, error: failure });
     }
 
     function detachRootAbort() {
@@ -99,13 +126,13 @@ export function createNodePinnedHttpsExchange({
       command.signal.removeEventListener('abort', abortRequest);
     }
 
-    function abortRequest() {
+    function abortRequest(error) {
       if (aborted) return;
       aborted = true;
       detachRootAbort();
       try { response?.destroy?.(); } catch { /* preserve bounded local failure */ }
       try { request?.destroy?.(); } catch { /* preserve bounded local failure */ }
-      settleFailure();
+      settleFailure(error);
     }
 
     function waitBounded(result, operation = {}) {
@@ -128,7 +155,8 @@ export function createNodePinnedHttpsExchange({
         signal.addEventListener('abort', onAbort, { once: true });
         result.then((value) => {
           if (value?.failed) {
-            finish(reject, new Error('Scanner HTTPS exchange failed.'));
+            finish(reject, isScannerPreconnectionRefusedError(value.error)
+              ? value.error : new Error('Scanner HTTPS exchange failed.'));
           } else {
             finish(resolve, value);
           }
@@ -148,6 +176,8 @@ export function createNodePinnedHttpsExchange({
           return verifyIdentity(expectedHostname, command.certificatePinSha256, hostname, certificate);
         },
       }, (incoming) => {
+        tcpConnected = true;
+        tlsEstablished = true;
         response = incoming;
         resolveResponse({ response: incoming });
         if (!admissionResolved) {
@@ -165,8 +195,21 @@ export function createNodePinnedHttpsExchange({
       abortRequest();
       throw new Error('Injected HTTPS request implementation returned an invalid request.');
     }
+    request.once('socket', (socket) => {
+      if (!socket || typeof socket.once !== 'function') {
+        tcpConnected = true;
+        return;
+      }
+      socket.once('connect', () => { tcpConnected = true; });
+      socket.once('secureConnect', () => {
+        tcpConnected = true;
+        tlsEstablished = true;
+      });
+    });
     request.once('continue', () => {
       if (admissionResolved) return;
+      tcpConnected = true;
+      tlsEstablished = true;
       admitted = true;
       admissionResolved = true;
       resolveAdmission({ status: 100 });

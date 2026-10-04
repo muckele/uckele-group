@@ -302,9 +302,11 @@ export async function runOnDemandScanTask({
   ephemeralRoot,
   scanner,
   now = () => new Date(),
+  signatureNow = now,
   cleanupOwnedTask = defaultCleanupOwnedTask,
 } = {}) {
   const current = nowDate(now);
+  const signatureCurrent = nowDate(signatureNow);
   if (typeof requireAttachment !== 'boolean') {
     throw new Error('Worker attachment requirement is invalid.');
   }
@@ -369,7 +371,7 @@ export async function runOnDemandScanTask({
     let staged = { outcome: 'unavailable', reasonCode: 'scanner_unavailable' };
     let cleanupStatus = 'cleaned';
     let taskPath = null;
-    const scannerHealthy = validHealth(preHealth, current);
+    const scannerHealthy = validHealth(preHealth, signatureCurrent);
     if (!scannerHealthy) {
       staged = { outcome: 'unavailable', reasonCode: 'stale_signatures' };
       preHealth = {

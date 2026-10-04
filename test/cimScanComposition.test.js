@@ -15,6 +15,7 @@ function options(overrides = {}) {
     value: {
       machineId: 'machine-1',
       appName: 'ug-scanner',
+      port: 8443,
       apiBaseUrl: 'https://api.machines.dev',
       accessToken: 'synthetic-token',
       apiMaxResponseBytes: 4_096,
@@ -50,6 +51,7 @@ test('inert composition requires every network, credential, clock, and pin input
     ['wallNowMs', /clock/i],
     ['monotonicNow', /clock/i],
     ['certificatePinSha256', /pin|digest/i],
+    ['port', /port/i],
     ['requestImpl', /request|injected/i],
     ['keyId', /key id/i],
     ['keyResolver', /key resolver/i],

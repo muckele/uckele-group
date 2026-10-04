@@ -10,6 +10,7 @@ import { createSingleCimScanAdmission } from './cimScanWorkerAdmission.js';
 export function createFlyCimScannerComposition({
   machineId,
   appName,
+  port,
   apiBaseUrl,
   accessToken,
   apiMaxResponseBytes,
@@ -40,11 +41,12 @@ export function createFlyCimScannerComposition({
   const openExchange = createNodePinnedHttpsExchange({
     machineId,
     appName,
+    port,
     monotonicNow,
     requestImpl,
   });
   const requestClient = createPinnedHttpScanRequestClient({
-    endpoint: `https://${machineId}.vm.${appName}.internal/v1/cim-scan`,
+    endpoint: `https://${machineId}.vm.${appName}.internal:${port}/v1/cim-scan`,
     certificatePinSha256,
     openExchange,
   });
@@ -52,6 +54,7 @@ export function createFlyCimScannerComposition({
     machineId,
     machineController,
     requestClient,
+    monotonicNow,
   });
   const scanner = createOnDemandScannerAdapter({
     keyId,
@@ -68,6 +71,7 @@ export function createCimScanWorkerHttpComposition({
   ephemeralRoot,
   scanner,
   now,
+  signatureNow = now,
   runTask,
 } = {}) {
   const handleCheckContinue = createCimScanWorkerCheckContinueHandler({
@@ -77,6 +81,7 @@ export function createCimScanWorkerHttpComposition({
     ephemeralRoot,
     scanner,
     now,
+    signatureNow,
     ...(runTask === undefined ? {} : { runTask }),
   });
   return Object.freeze({ handleCheckContinue });

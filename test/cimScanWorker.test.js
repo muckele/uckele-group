@@ -131,6 +131,32 @@ test('worker refuses stale signatures before opening attachment bytes', async (t
   assert.equal(opened, 0);
 });
 
+test('worker stale benchmark advances signature freshness only, not request or lease time', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-signature-clock-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  let opened = 0;
+  const scanner = createSyntheticWorkerScanner({
+    preHealth: {
+      healthy: true,
+      daemonId: 'ClamAV synthetic-daemon',
+      engineVersion: '1.synthetic',
+      signatureVersion: 'synthetic-db-1',
+      signatureUpdatedAt: '2026-10-03T11:55:00.000Z',
+    },
+  });
+  const wire = await runOnDemandScanTask(workerOptions(root, {
+    scanner,
+    signatureNow: () => new Date('2026-10-04T13:00:00.000Z'),
+    openByteStream() { opened += 1; return byteStream(); },
+  }));
+  const verified = parseAndVerifyScanResult(wire, {
+    request: verifiedRequest(), keyResolver, now,
+  });
+  assert.equal(verified.outcome, 'unavailable');
+  assert.equal(verified.reasonCode, 'stale_signatures');
+  assert.equal(opened, 0);
+});
+
 test('worker hash mismatch fails closed and removes its exact task copy', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-hash-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));

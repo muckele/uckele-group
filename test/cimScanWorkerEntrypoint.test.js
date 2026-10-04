@@ -90,3 +90,39 @@ test('scanner package locks official sources for linux/amd64', async () => {
   });
   assert.equal(sourceLock.dependencyLock, 'package-lock.json');
 });
+
+test('scanner package has explicit HTTP-worker and synthetic-caller targets without production startup', async () => {
+  const dockerfile = await fsp.readFile('containers/cim-scan-worker/Containerfile', 'utf8');
+  const callerStage = dockerfile.match(/FROM node-runtime AS cim-scan-synthetic-caller[\s\S]*?(?=\nFROM )/)?.[0];
+  const baseStage = dockerfile.match(/FROM clamav\/clamav:[^\n]+ AS cim-scan-worker-base[\s\S]*?(?=\nFROM )/)?.[0];
+  const normalStage = dockerfile.match(/FROM cim-scan-worker-base AS cim-scan-http-worker[\s\S]*?(?=\nFROM )/)?.[0];
+  const staleStage = dockerfile.match(/FROM cim-scan-worker-base AS cim-scan-stale-benchmark-worker[\s\S]*?(?=\nFROM )/)?.[0];
+  assert.ok(callerStage);
+  assert.ok(baseStage);
+  assert.ok(normalStage);
+  assert.ok(staleStage);
+  assert.match(dockerfile, /FROM clamav\/clamav:1\.4\.6_base@\$\{CLAMAV_BASE_DIGEST\} AS cim-scan-worker-base/);
+  assert.match(dockerfile, /FROM cim-scan-worker-base AS cim-scan-http-worker/);
+  assert.match(dockerfile,
+    /COPY server\/services\/cimScanWorkerHttpRuntime\.js \/opt\/uckele\/server\/services\/cimScanWorkerHttpRuntime\.js/);
+  assert.match(dockerfile,
+    /COPY scripts\/run-cim-scan-worker-http\.js \/opt\/uckele\/scripts\/run-cim-scan-worker-http\.js/);
+  assert.match(normalStage,
+    /ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-http-entrypoint"\]/);
+  assert.doesNotMatch(baseStage, /cimScanWorkerBenchmarkClock|stale-benchmark/);
+  assert.doesNotMatch(normalStage, /cimScanWorkerBenchmarkClock|stale-benchmark/);
+  assert.match(staleStage,
+    /COPY server\/services\/cimScanWorkerBenchmarkClock\.js \/opt\/uckele\/server\/services\/cimScanWorkerBenchmarkClock\.js/);
+  assert.match(staleStage,
+    /COPY scripts\/run-cim-scan-worker-stale-benchmark\.js \/opt\/uckele\/scripts\/run-cim-scan-worker-stale-benchmark\.js/);
+  assert.match(staleStage,
+    /COPY containers\/cim-scan-worker\/stale-benchmark-entrypoint\.sh \/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint/);
+  assert.match(staleStage,
+    /ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint"\]/);
+  assert.match(dockerfile, /FROM node-runtime AS cim-scan-synthetic-caller/);
+  assert.doesNotMatch(callerStage, /cimScanWorkerBenchmarkClock/);
+  assert.match(dockerfile,
+    /ENTRYPOINT \["node", "scripts\/run-cim-scan-cloud-synthetic\.js"\]/);
+  assert.match(dockerfile, /FROM cim-scan-worker-base AS cim-scan-one-shot[\s\S]*ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-entrypoint"\]\s*$/);
+  assert.doesNotMatch(dockerfile, /COPY server\/(?:index|app)\.js/);
+});

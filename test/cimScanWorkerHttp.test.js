@@ -8,6 +8,7 @@ import { PassThrough, Readable } from 'node:stream';
 import {
   CIM_SCAN_PROTOCOL_LIMITS,
   createSignedScanRequest,
+  createSignedScanResult,
   parseAndVerifyScanRequest,
   parseAndVerifyScanResult,
 } from '../server/services/cimScanProtocol.js';
@@ -402,4 +403,40 @@ test('HTTP handler construction is inert and requires explicit process authoriti
     assert.throws(() => createCimScanWorkerCheckContinueHandler({ ...base, [field]: undefined }),
       /required|authority|adapter/i, field);
   }
+});
+
+test('HTTP handler keeps protocol and signature-freshness clocks separate', async () => {
+  const wire = signedRequest();
+  const input = fakeRequest(wire);
+  const output = fakeResponse();
+  const protocolNow = () => new Date('2026-10-03T12:00:00.000Z');
+  const signatureNow = () => new Date('2026-10-04T13:00:00.000Z');
+  let observed;
+  const handler = createCimScanWorkerCheckContinueHandler({
+    keyResolver,
+    replayStore: createSyntheticReplayStore({ now: protocolNow }),
+    admission: createSingleCimScanAdmission(),
+    ephemeralRoot: '/tmp/synthetic-worker-http-clocks',
+    scanner: createSyntheticWorkerScanner(),
+    now: protocolNow,
+    signatureNow,
+    async runTask(options) {
+      observed = options;
+      return createSignedScanResult({
+        request: parseAndVerifyScanRequest(wire, { keyResolver, now: protocolNow() }),
+        outcome: 'unavailable',
+        reasonCode: 'stale_signatures',
+        engineVersion: 'unavailable',
+        signatureVersion: 'unavailable',
+        signatureUpdatedAt: protocolNow().toISOString(),
+        scannedAt: protocolNow().toISOString(),
+        expiresAt: '2026-10-03T12:02:00.000Z',
+        cleanupStatus: 'cleaned',
+      }, { keyResolver });
+    },
+  });
+  await handler(input.request, output.response);
+  assert.equal(output.result().status, 200);
+  assert.equal(observed.now, protocolNow);
+  assert.equal(observed.signatureNow, signatureNow);
 });
