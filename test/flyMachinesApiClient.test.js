@@ -131,6 +131,27 @@ test('Fly Machines API client starts waits and stops only with explicit lease an
   assert.equal(calls.every(({ options }) => options.headers['fly-machine-lease-nonce'] === 'nonce-1'), true);
 });
 
+test('Fly Machines API client waits for started without guessing an instance identity', async () => {
+  let requestedUrl;
+  const client = createFlyMachinesApiClient({
+    apiBaseUrl: 'https://api.machines.dev',
+    appName: 'ug-scanner',
+    machineId: 'machine-1',
+    accessToken: 'test-secret-token',
+    maxResponseBytes: 4_096,
+    async fetchImpl(url) {
+      requestedUrl = url;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    },
+  });
+
+  assert.deepEqual(await client.wait(command({
+    leaseNonce: 'nonce-1', state: 'started', timeoutSeconds: 20,
+  })), { ok: true });
+  assert.equal(requestedUrl,
+    'https://api.machines.dev/v1/apps/ug-scanner/machines/machine-1/wait?state=started&timeout=20');
+});
+
 test('Fly Machines API client stops reading and aborts an oversized streamed response', async () => {
   let streamClosed = false;
   const client = createFlyMachinesApiClient({

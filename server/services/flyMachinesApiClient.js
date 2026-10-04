@@ -269,13 +269,14 @@ export function createFlyMachinesApiClient({
     },
 
     async wait({ leaseNonce, instanceId, state, timeoutSeconds, ...command } = {}) {
-      if (!instancePattern.test(String(instanceId || ''))) {
+      if ((state === 'stopped' || instanceId !== undefined)
+        && !instancePattern.test(String(instanceId || ''))) {
         throw new Error('Fly Machine wait instance identity is invalid.');
       }
       if (!waitStates.has(state)) throw new Error('Fly Machine wait state is invalid.');
       const query = new URLSearchParams({
         state,
-        instance_id: instanceId,
+        ...(instanceId === undefined ? {} : { instance_id: instanceId }),
         timeout: String(requireSeconds(timeoutSeconds, 'Fly Machine wait timeout', 300)),
       });
       return normalizeOk(await request(`${machinePath}/wait?${query}`, {

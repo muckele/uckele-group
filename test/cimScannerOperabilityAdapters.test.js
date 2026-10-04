@@ -160,3 +160,79 @@ test('pinned HTTP request client aborts an admitted exchange when body setup fai
   }), (error) => error === original);
   assert.equal(aborts, 1);
 });
+
+test('pinned HTTP request client aborts a stalled response body at its deadline', async () => {
+  let aborts = 0;
+  const client = createPinnedHttpScanRequestClient({
+    endpoint: 'https://scanner.internal/v1/cim-scan', certificatePinSha256: 'a'.repeat(64),
+    async openExchange() {
+      return {
+        async awaitAdmission() { return { status: 100 }; },
+        async write() {},
+        async finish() {
+          return {
+            status: 200,
+            body: {
+              [Symbol.asyncIterator]() {
+                return { next: () => new Promise(() => {}) };
+              },
+            },
+          };
+        },
+        abort() { aborts += 1; },
+      };
+    },
+  });
+  const upload = await client.authorize({
+    requestWire: JSON.stringify({ sizeBytes: 0 }), redirects: 'error', maxResponseBytes: 64,
+    signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
+  });
+
+  const result = await Promise.race([
+    upload.sendBody({
+      openByteStream: () => Readable.from([]), maxResponseBytes: 64,
+      signal: new AbortController().signal, deadlineAt: performance.now() + 10,
+    }).then(() => ({ resolved: true }), (error) => ({ error })),
+    new Promise((resolve) => setTimeout(() => resolve({ stalled: true }), 80)),
+  ]);
+  assert.equal(result.stalled, undefined, 'response body consumption must obey the active deadline');
+  assert.match(result.error?.message || '', /deadline|aborted/i);
+  assert.equal(aborts, 1);
+});
+
+test('pinned HTTP request client redacts response body iterator failures', async () => {
+  let aborts = 0;
+  const client = createPinnedHttpScanRequestClient({
+    endpoint: 'https://scanner.internal/v1/cim-scan', certificatePinSha256: 'a'.repeat(64),
+    async openExchange() {
+      return {
+        async awaitAdmission() { return { status: 100 }; },
+        async write() {},
+        async finish() {
+          return {
+            status: 200,
+            body: {
+              [Symbol.asyncIterator]() {
+                return {
+                  async next() { throw new Error('raw peer detail should stay private'); },
+                };
+              },
+            },
+          };
+        },
+        abort() { aborts += 1; },
+      };
+    },
+  });
+  const upload = await client.authorize({
+    requestWire: JSON.stringify({ sizeBytes: 0 }), redirects: 'error', maxResponseBytes: 64,
+    signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
+  });
+
+  await assert.rejects(upload.sendBody({
+    openByteStream: () => Readable.from([]), maxResponseBytes: 64,
+    signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
+  }), (error) => /response.*read/i.test(error.message)
+    && !error.message.includes('raw peer detail'));
+  assert.equal(aborts, 1);
+});
