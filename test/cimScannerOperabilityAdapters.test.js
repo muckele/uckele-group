@@ -110,6 +110,78 @@ test('pinned HTTP request client admits before opening bytes and caps the exact 
   assert.deepEqual(events.map(([event]) => event), ['open', 'admit', 'write', 'finish']);
 });
 
+test('pinned HTTP request client accepts only an early bounded replay without opening body bytes', async () => {
+  const events = [];
+  const requestClient = createPinnedHttpScanRequestClient({
+    endpoint: 'https://scanner.internal.example/v1/cim-scan',
+    certificatePinSha256: 'a'.repeat(64),
+    async openExchange() {
+      return {
+        async awaitAdmission() {
+          events.push('admit');
+          return { status: 200, body: [Buffer.from('signed-replay')] };
+        },
+        async write() { events.push('write'); },
+        async finish() { events.push('finish'); },
+        abort() { events.push('abort'); },
+      };
+    },
+  });
+  const upload = await requestClient.authorize({
+    requestWire: JSON.stringify({ sizeBytes: 3 }),
+    redirects: 'error',
+    maxResponseBytes: 64,
+    signal: new AbortController().signal,
+    deadlineAt: performance.now() + 1_000,
+  });
+  let opened = 0;
+  const wire = await upload.sendBody({
+    openByteStream() { opened += 1; return Readable.from([Buffer.from('abc')]); },
+    maxResponseBytes: 64,
+    signal: new AbortController().signal,
+    deadlineAt: performance.now() + 1_000,
+  });
+  assert.equal(wire, 'signed-replay');
+  assert.equal(opened, 0);
+  assert.deepEqual(events, ['admit', 'abort']);
+});
+
+test('pinned HTTP request client rejects every other early final status and oversized replay', async () => {
+  for (const status of [101, 201, 204, 301, 400, 409, 500]) {
+    let aborts = 0;
+    const client = createPinnedHttpScanRequestClient({
+      endpoint: 'https://scanner.internal/v1/cim-scan', certificatePinSha256: 'a'.repeat(64),
+      async openExchange() {
+        return {
+          async awaitAdmission() { return { status, body: [] }; },
+          async write() {}, async finish() {}, abort() { aborts += 1; },
+        };
+      },
+    });
+    await assert.rejects(client.authorize({
+      requestWire: JSON.stringify({ sizeBytes: 1 }), redirects: 'error', maxResponseBytes: 64,
+      signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
+    }), /admit/i, String(status));
+    assert.equal(aborts, 1, String(status));
+  }
+
+  let aborts = 0;
+  const client = createPinnedHttpScanRequestClient({
+    endpoint: 'https://scanner.internal/v1/cim-scan', certificatePinSha256: 'a'.repeat(64),
+    async openExchange() {
+      return {
+        async awaitAdmission() { return { status: 200, body: [Buffer.alloc(65)] }; },
+        async write() {}, async finish() {}, abort() { aborts += 1; },
+      };
+    },
+  });
+  await assert.rejects(client.authorize({
+    requestWire: JSON.stringify({ sizeBytes: 1 }), redirects: 'error', maxResponseBytes: 64,
+    signal: new AbortController().signal, deadlineAt: performance.now() + 1_000,
+  }), /cap|exceed/i);
+  assert.equal(aborts, 1);
+});
+
 test('pinned HTTP request client requires HTTPS pinning, redirect refusal, and exact upload length', async () => {
   assert.throws(() => createPinnedHttpScanRequestClient({
     endpoint: 'http://scanner.internal/v1/cim-scan', certificatePinSha256: 'a'.repeat(64),

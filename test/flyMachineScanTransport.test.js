@@ -162,6 +162,31 @@ test('Fly transport reports stop uncertainty separately from an obtained result'
   assert.deepEqual(result, { resultWire: 'synthetic-result-wire', stopConfirmed: false });
 });
 
+test('Fly transport preserves ownership and stop guards for an early replay without opening bytes', async () => {
+  const fixture = harness();
+  let opened = 0;
+  fixture.requestClient.authorize = async () => ({
+    async sendBody() { return 'synthetic-replay-wire'; },
+    abort() { fixture.events.push(['abort']); },
+  });
+  const transport = createFlyMachineScanTransport({
+    machineId: 'synthetic-machine-1',
+    machineController: fixture.machineController,
+    requestClient: fixture.requestClient,
+  });
+  const result = await transport.run({
+    requestWire: '{}',
+    requestId: '41111111-1111-4111-8111-111111111111',
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    openByteStream() { opened += 1; return (async function* () {})(); },
+  });
+  assert.deepEqual(result, { resultWire: 'synthetic-replay-wire', stopConfirmed: true });
+  assert.equal(opened, 0);
+  assert.deepEqual(fixture.events.map(([name]) => name), [
+    'acquire', 'start', 'owns', 'owns', 'owns', 'stop',
+  ]);
+});
+
 test('Fly transport rejects a hung operation within the lease and preserves a bounded stop window', async () => {
   const fixture = harness();
   fixture.requestClient.authorize = async () => new Promise(() => {});
