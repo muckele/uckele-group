@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   CIM_SCAN_CLOUD_BENCHMARK_SCENARIOS,
+  CimScanBenchmarkAbruptExitObservedError,
   createEicarTestBytes,
   runCimScanCloudBenchmarkScenario,
 } from '../server/services/cimScanCloudBenchmark.js';
@@ -31,7 +32,7 @@ async function consume(job) {
   return bytes;
 }
 
-function result(outcome, reasonCode, requestDigest = 'a'.repeat(64)) {
+function result(outcome, reasonCode, requestDigest = 'a'.repeat(64), cleanupStatus = 'cleaned') {
   return Object.freeze({
     outcome,
     reasonCode,
@@ -41,6 +42,7 @@ function result(outcome, reasonCode, requestDigest = 'a'.repeat(64)) {
     scannedAt: '2026-10-03T12:00:01.000Z',
     protocolResultExpiresAt: '2026-10-03T12:02:00.000Z',
     requestDigest,
+    cleanupStatus,
   });
 }
 
@@ -49,6 +51,7 @@ function options(overrides = {}) {
     jobOwner: 'synthetic-cloud-caller',
     now: () => new Date('2026-10-03T12:00:00.000Z'),
     createUuid: uuids(),
+    ownedStopVerifier: (error) => error?.ownedStopConfirmed === true,
     ...overrides,
   };
 }
@@ -151,7 +154,7 @@ test('replay/conflict reuses one exact request identity and opens only the first
 
 test('timeout job requires post-admission abort and explicit expired-orphan recovery', async () => {
   const calls = [];
-  let waitedUntil;
+  const waitedUntil = [];
   const report = await runCimScanCloudBenchmarkScenario(options({
     scenario: 'timeout-cleanup-owned-stop',
     async executeScan({ phase, job, requestMaxDurationMs }) {
@@ -164,31 +167,49 @@ test('timeout job requires post-admission abort and explicit expired-orphan reco
         const timeout = new ScannerWorkerDeadlineError();
         stream.destroy(timeout);
         await assert.rejects(iterator.next(), (error) => error === timeout);
+        timeout.ownedStopConfirmed = true;
         throw timeout;
       }
+      if (phase === 'after-copy-crash' || phase === 'after-scan-crash') {
+        assert.equal(await consume(job), 1_024);
+        throw new CimScanBenchmarkAbruptExitObservedError({ ownedStopConfirmed: true });
+      }
       assert.equal(await consume(job), 1_024);
+      if (phase === 'cleanup-refusal') {
+        return result('ambiguous', 'cleanup_uncertain', 'a'.repeat(64), 'retained');
+      }
       return result('clean', 'clean');
     },
-    async waitUntil(value) { waitedUntil = value; },
+    async waitUntil(value) { waitedUntil.push(value); },
   }));
 
   assert.deepEqual(calls, [
     { phase: 'timeout', requestMaxDurationMs: 500 },
-    { phase: 'recovery', requestMaxDurationMs: 90_000 },
+    { phase: 'timeout-recovery', requestMaxDurationMs: 90_000 },
+    { phase: 'after-copy-crash', requestMaxDurationMs: 90_000 },
+    { phase: 'after-copy-recovery', requestMaxDurationMs: 90_000 },
+    { phase: 'after-scan-crash', requestMaxDurationMs: 90_000 },
+    { phase: 'after-scan-recovery', requestMaxDurationMs: 90_000 },
+    { phase: 'cleanup-refusal', requestMaxDurationMs: 90_000 },
+    { phase: 'cleanup-refusal-recovery', requestMaxDurationMs: 90_000 },
   ]);
-  assert.match(waitedUntil, /^2026-10-03T12:01:01\.000Z$/);
+  assert.deepEqual(waitedUntil, Array(4).fill('2026-10-03T12:01:01.000Z'));
   assert.deepEqual(report, {
     protocol: 'uckele.cim-scan-cloud-benchmark.v1',
     scenario: 'timeout-cleanup-owned-stop',
     passed: true,
-    outcome: 'expected_timeout',
-    reasonCode: 'deadline_and_orphan_recovery',
-    exchanges: 2,
-    bodyOpens: 2,
-    bodyBytes: 1_025,
+    outcome: 'fault_recovery_complete',
+    reasonCode: 'deadline_crash_cleanup_and_orphan_recovery',
+    exchanges: 8,
+    bodyOpens: 8,
+    bodyBytes: 7_169,
     timeoutBodyOpens: 1,
-    recoveryBodyOpens: 1,
-    recoveryOutcome: 'clean',
+    afterCopyBodyOpens: 1,
+    afterScanBodyOpens: 1,
+    cleanupRefusalBodyOpens: 1,
+    cleanupRefusalStatus: 'retained',
+    recoveryBodyOpens: 4,
+    recoveryOutcomes: 4,
     externalStopConfirmationRequired: true,
   });
 });
@@ -212,9 +233,94 @@ test('default executor forwards separate issuance/result clocks and the exact re
     },
   }));
   assert.equal(calls.length, 1);
+  assert.equal(calls[0].benchmarkPhase, 'single');
   assert.equal(calls[0].now, now);
   assert.equal(calls[0].resultNow, now);
   assert.equal(calls[0].requestMaxDurationMs, 90_000);
+});
+
+test('default executor exposes each fault phase to preflighted external image selection and wraps only stopped crashes', async () => {
+  const phases = [];
+  const createScannerComposition = ({ benchmarkPhase }) => {
+    phases.push(benchmarkPhase);
+    return {
+      scanner: {
+        async scan(job) {
+          if (benchmarkPhase === 'timeout') {
+            const stream = job.openByteStream();
+            await stream[Symbol.asyncIterator]().next();
+            const error = new ScannerWorkerDeadlineError();
+            error.ownedStopConfirmed = true;
+            stream.destroy(error);
+            throw error;
+          }
+          await consume(job);
+          if (benchmarkPhase === 'after-copy-crash' || benchmarkPhase === 'after-scan-crash') {
+            const error = new Error('expected benchmark image exited');
+            error.ownedStopConfirmed = true;
+            throw error;
+          }
+          if (benchmarkPhase === 'cleanup-refusal') {
+            return result('ambiguous', 'cleanup_uncertain', 'a'.repeat(64), 'retained');
+          }
+          return result('clean', 'clean');
+        },
+      },
+    };
+  };
+  const preflights = [];
+  createScannerComposition.assertBenchmarkScenarioSupported = async (scenario) => {
+    preflights.push(scenario);
+  };
+  const report = await runCimScanCloudBenchmarkScenario(options({
+    scenario: 'timeout-cleanup-owned-stop',
+    createScannerComposition,
+    async waitUntil() {},
+  }));
+  assert.equal(report.passed, true);
+  assert.deepEqual(preflights, ['timeout-cleanup-owned-stop']);
+  assert.deepEqual(phases, [
+    'timeout', 'timeout-recovery',
+    'after-copy-crash', 'after-copy-recovery',
+    'after-scan-crash', 'after-scan-recovery',
+    'cleanup-refusal', 'cleanup-refusal-recovery',
+  ]);
+});
+
+test('mandatory composite scenario rejects missing target preflight before executing any job', async () => {
+  let compositions = 0;
+  await assert.rejects(runCimScanCloudBenchmarkScenario(options({
+    scenario: 'timeout-cleanup-owned-stop',
+    createScannerComposition() {
+      compositions += 1;
+      return { scanner: { async scan() { throw new Error('must stay inert'); } } };
+    },
+    async waitUntil() { throw new Error('must stay inert'); },
+  })), /preflight|target|topology/i);
+  assert.equal(compositions, 0);
+});
+
+test('cleanup-refusal phase rejects signed cleaned status despite ambiguous outcome', async () => {
+  await assert.rejects(runCimScanCloudBenchmarkScenario(options({
+    scenario: 'timeout-cleanup-owned-stop',
+    async executeScan({ phase, job }) {
+      if (phase === 'timeout') {
+        const stream = job.openByteStream();
+        await stream[Symbol.asyncIterator]().next();
+        const error = new ScannerWorkerDeadlineError();
+        error.ownedStopConfirmed = true;
+        stream.destroy(error);
+        throw error;
+      }
+      await consume(job);
+      if (phase === 'after-copy-crash' || phase === 'after-scan-crash') {
+        throw new CimScanBenchmarkAbruptExitObservedError({ ownedStopConfirmed: true });
+      }
+      if (phase === 'cleanup-refusal') return result('ambiguous', 'cleanup_uncertain');
+      return result('clean', 'clean');
+    },
+    async waitUntil() {},
+  })), /expected result/i);
 });
 
 test('conflict proof refuses unrelated pre-body failures', async () => {
@@ -241,12 +347,41 @@ test('timeout proof requires its typed post-admission failure and observed strea
         const error = leaveOpen
           ? new ScannerWorkerDeadlineError()
           : new Error('unrelated mid-body failure');
+        error.ownedStopConfirmed = true;
         if (!leaveOpen) stream.destroy(error);
         throw error;
       },
       async waitUntil() { throw new Error('must not recover after invalid timeout evidence'); },
     })), /timeout did not abort/i);
     stream?.destroy();
+  }
+});
+
+test('mandatory crash phases require typed abrupt exit and exact owned-stop proof', async () => {
+  for (const invalid of [
+    new Error('generic disconnect'),
+    new CimScanBenchmarkAbruptExitObservedError({ ownedStopConfirmed: false }),
+  ]) {
+    await assert.rejects(runCimScanCloudBenchmarkScenario(options({
+      scenario: 'timeout-cleanup-owned-stop',
+      async executeScan({ phase, job }) {
+        if (phase === 'timeout') {
+          const stream = job.openByteStream();
+          await stream[Symbol.asyncIterator]().next();
+          const error = new ScannerWorkerDeadlineError();
+          error.ownedStopConfirmed = true;
+          stream.destroy(error);
+          throw error;
+        }
+        if (phase === 'after-copy-crash') {
+          await consume(job);
+          throw invalid;
+        }
+        await consume(job);
+        return result('clean', 'clean');
+      },
+      async waitUntil() {},
+    })), /abrupt|owned stop|crash/i);
   }
 });
 

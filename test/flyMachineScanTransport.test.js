@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createFlyMachineScanTransport } from '../server/services/flyMachineScanTransport.js';
+import {
+  createFlyMachineScanTransport,
+  hasExactOwnedStopProof,
+} from '../server/services/flyMachineScanTransport.js';
 import { ScannerPreconnectionRefusedError } from '../server/services/nodePinnedHttpsExchange.js';
 
 function harness({ authorized = true, owns = true, stopConfirmed = true } = {}) {
@@ -78,6 +81,27 @@ test('Fly transport never opens bytes when worker admission fails and still fenc
   }), /admission rejected/i);
   assert.equal(opened, 0);
   assert.equal(fixture.events.some(([name]) => name === 'stop'), true);
+});
+
+test('Fly transport attaches non-enumerable exact owned-stop proof to a failed exchange', async () => {
+  for (const stopConfirmed of [true, false]) {
+    const fixture = harness({ authorized: false, stopConfirmed });
+    const transport = createFlyMachineScanTransport({
+      machineId: 'synthetic-machine-1',
+      machineController: fixture.machineController,
+      requestClient: fixture.requestClient,
+    });
+    let failure;
+    await assert.rejects(transport.run({
+      requestWire: '{}',
+      requestId: '41111111-1111-4111-8111-111111111111',
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      openByteStream: () => (async function* () {})(),
+    }), (error) => { failure = error; return true; });
+    assert.equal(hasExactOwnedStopProof(failure), stopConfirmed);
+    assert.equal(Object.keys(failure).includes('ownedStopConfirmed'), false);
+    assert.equal(JSON.stringify(failure), '{}');
+  }
 });
 
 test('Fly transport non-owner cannot send bytes or stop a newer generation', async () => {

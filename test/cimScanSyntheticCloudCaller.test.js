@@ -180,6 +180,101 @@ test('caller factory reads explicit files once and creates a new exact-port comp
   assert.equal(compositions[0].requestMaxDurationMs, 500);
 });
 
+test('caller factory preflights exact phase targets and preserves orphan state for each recovery', async () => {
+  const compositions = [];
+  const normalDigest = environment.CIM_SCAN_FLY_IMAGE_DIGEST;
+  const target = (machineId, expectedImageDigest) => ({
+    machineId,
+    appName: environment.CIM_SCAN_FLY_APP_NAME,
+    expectedImageDigest,
+  });
+  const targets = new Map([
+    ['timeout', target('timeout-machine', normalDigest)],
+    ['timeout-recovery', target('timeout-machine', normalDigest)],
+    ['after-copy-crash', target('copy-machine', `sha256:${'c'.repeat(64)}`)],
+    ['after-copy-recovery', target('copy-machine', normalDigest)],
+    ['after-scan-crash', target('scan-machine', `sha256:${'d'.repeat(64)}`)],
+    ['after-scan-recovery', target('scan-machine', normalDigest)],
+    ['cleanup-refusal', target('cleanup-machine', `sha256:${'e'.repeat(64)}`)],
+    ['cleanup-refusal-recovery', target('cleanup-machine', normalDigest)],
+  ]);
+  const resolved = [];
+  const factory = await createSyntheticCloudScannerFactory({
+    config: loadCimScanSyntheticCallerConfig(environment),
+    async readFile(file) {
+      if (file === environment.CIM_SCAN_FLY_TOKEN_FILE) return Buffer.from('synthetic-token\n');
+      if (file === environment.CIM_SCAN_CA_FILE) return Buffer.from('synthetic-ca');
+      return Buffer.alloc(32, 9);
+    },
+    fetchImpl: async () => { throw new Error('must stay inert'); },
+    requestImpl() { throw new Error('must stay inert'); },
+    async resolveBenchmarkTarget({ phase }) {
+      resolved.push(phase);
+      return targets.get(phase);
+    },
+    composeScanner(options) {
+      compositions.push(options);
+      return { scanner: { scan() {} } };
+    },
+  });
+  await factory.assertBenchmarkScenarioSupported('timeout-cleanup-owned-stop');
+  assert.deepEqual(resolved, [...targets.keys()]);
+  for (const phase of targets.keys()) factory({ benchmarkPhase: phase });
+  assert.deepEqual(compositions.map(({ machineId, appName, expectedImageDigest }) => ({
+    machineId, appName, expectedImageDigest,
+  })), [...targets.values()]);
+});
+
+test('caller factory rejects missing or state-divergent composite targets before composition', async () => {
+  const makeFactory = async (resolveBenchmarkTarget) => {
+    let compositions = 0;
+    const factory = await createSyntheticCloudScannerFactory({
+      config: loadCimScanSyntheticCallerConfig(environment),
+      async readFile(file) {
+        if (file === environment.CIM_SCAN_FLY_TOKEN_FILE) return Buffer.from('synthetic-token\n');
+        if (file === environment.CIM_SCAN_CA_FILE) return Buffer.from('synthetic-ca');
+        return Buffer.alloc(32, 9);
+      },
+      fetchImpl: async () => { throw new Error('must stay inert'); },
+      requestImpl() { throw new Error('must stay inert'); },
+      resolveBenchmarkTarget,
+      composeScanner() {
+        compositions += 1;
+        return { scanner: { scan() {} } };
+      },
+    });
+    return { factory, compositionCount: () => compositions };
+  };
+
+  const missing = await makeFactory(undefined);
+  await assert.rejects(missing.factory.assertBenchmarkScenarioSupported(
+    'timeout-cleanup-owned-stop'), /resolver|required|target/i);
+  assert.equal(missing.compositionCount(), 0);
+
+  const incomplete = await makeFactory(async ({ phase }) => phase === 'cleanup-refusal-recovery'
+    ? undefined
+    : {
+      machineId: 'shared-machine',
+      appName: environment.CIM_SCAN_FLY_APP_NAME,
+      expectedImageDigest: environment.CIM_SCAN_FLY_IMAGE_DIGEST,
+    });
+  await assert.rejects(incomplete.factory.assertBenchmarkScenarioSupported(
+    'timeout-cleanup-owned-stop'), /exact target|required/i);
+  assert.throws(() => incomplete.factory({ benchmarkPhase: 'request-selected-fault' }),
+    /unexpected/i);
+  assert.equal(incomplete.compositionCount(), 0);
+
+  const divergent = await makeFactory(async ({ phase }) => ({
+    machineId: phase === 'after-copy-recovery' ? 'different-machine' : 'shared-machine',
+    appName: environment.CIM_SCAN_FLY_APP_NAME,
+    expectedImageDigest: phase === 'after-copy-crash'
+      ? `sha256:${'c'.repeat(64)}` : environment.CIM_SCAN_FLY_IMAGE_DIGEST,
+  }));
+  await assert.rejects(divergent.factory.assertBenchmarkScenarioSupported(
+    'timeout-cleanup-owned-stop'), /state|recovery|machine/i);
+  assert.equal(divergent.compositionCount(), 0);
+});
+
 test('standalone caller delegates only to the bounded eight-job benchmark harness without production registration', async () => {
   const source = await fsp.readFile('scripts/run-cim-scan-cloud-synthetic.js', 'utf8');
   assert.match(source, /runCimScanCloudBenchmarkScenario/);

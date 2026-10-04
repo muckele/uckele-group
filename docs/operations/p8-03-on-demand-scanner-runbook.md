@@ -66,6 +66,28 @@ The smoke is exactly eight jobs, not 284 cases: cold/warm clean 1 KiB, cold/warm
 - forced timeout/abort, crash-after-copy, crash-after-scan, cleanup refusal, and restart-orphan behavior; and
 - provider-billed runtime granularity plus volume/rootfs/signature-transfer charges.
 
+The final timeout/owned-cleanup/owned-stop job is one top-level acceptance job with distinct
+timeout/recovery, crash-after-copy/recovery, crash-after-scan/recovery, and cleanup-refusal/recovery
+exchanges. Crash acceptance requires both an expected benchmark-only image and proof that the exact
+owned Machine generation stopped; a generic disconnect is insufficient. The crash images terminate
+only through injected lifecycle seams after an authenticated exact copy or a completed scanner call.
+Cleanup refusal uses the existing injected cleanup seam and must return signed
+`ambiguous`/`cleanup_uncertain` with retained cleanup status, never clean. Every recovery waits until
+the preceding authenticated request expires before removing its HMAC-owned orphan.
+
+These modes are packaged only in separately named benchmark image targets with immutable entrypoint
+selection. The normal HTTP worker rejects all `CIM_SCAN_BENCHMARK_*` environment values, and no
+request field, header, listener route, production startup registration, or runtime activation flag
+selects a fault. Offline doubles cover the state transitions; they do not qualify an image or grant
+live execution. A later live orchestrator must select each reviewed benchmark image externally and
+retain the control-plane stop evidence for that exact phase. The caller exposes an injected target
+resolver and fail-closed preflight for that integration: all eight phase targets must be present,
+each fault/recovery pair must name the same exact Machine and app (preserving its orphan state), all
+recoveries must use the reviewed normal image digest, and the three fault phases must use distinct
+reviewed fault-image digests. The standalone CLI intentionally supplies no resolver, so this
+composite scenario stops before its first Machine composition until an approved live orchestrator
+provides that exact mapping; the other seven scenarios retain their single reviewed target.
+
 Project monthly cost from measured provider billing for 0, 1, 10, and 25 running hours, including persistent storage and signature refresh overhead. The prior $1–$3/month figure is not a guarantee; it was a provisional estimate assuming about 10 running hours and remains unaccepted until this smoke supplies actual startup, root filesystem, signature, compute, and storage costs.
 
 Permanent volume deletion or any other unrecoverable data deletion is never preapproved by this runbook. It requires action-time approval naming the exact target.

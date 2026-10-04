@@ -310,7 +310,15 @@ export async function runOnDemandScanTask({
   now = () => new Date(),
   signatureNow = now,
   cleanupOwnedTask = defaultCleanupOwnedTask,
+  afterCopy,
+  afterScan,
 } = {}) {
+  if (afterCopy !== undefined && typeof afterCopy !== 'function') {
+    throw new Error('Worker after-copy lifecycle hook is invalid.');
+  }
+  if (afterScan !== undefined && typeof afterScan !== 'function') {
+    throw new Error('Worker after-scan lifecycle hook is invalid.');
+  }
   const current = nowDate(now);
   const signatureCurrent = nowDate(signatureNow);
   if (typeof requireAttachment !== 'boolean') {
@@ -392,13 +400,19 @@ export async function runOnDemandScanTask({
       await runBounded(() => fsp.writeFile(markerPath, createMarker(request, resolveKey(keyResolver, request.keyId)), {
         mode: 0o600, flag: 'wx',
       }));
+      let identity = null;
       try {
-        const identity = await writeTaskCopy({
+        identity = await writeTaskCopy({
           request, taskPath, openByteStream, deadlineAt, controller,
         });
-        if (identity.size !== request.sizeBytes || identity.sha256 !== request.sha256) {
-          staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
-        } else if (scannerHealthy) {
+      } catch {
+        staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
+      }
+      if (identity && (identity.size !== request.sizeBytes || identity.sha256 !== request.sha256)) {
+        staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
+      } else if (identity) {
+        if (afterCopy) await runBounded(() => afterCopy());
+        if (scannerHealthy) {
           let receivedScannerResult = false;
           try {
             staged = await runBounded(() => scanner.scan({
@@ -411,6 +425,7 @@ export async function runOnDemandScanTask({
           } catch {
             staged = { outcome: 'unavailable', reasonCode: 'scanner_unavailable' };
           }
+          if (receivedScannerResult && afterScan) await runBounded(() => afterScan());
           let postHealth;
           try {
             postHealth = await runBounded(
@@ -427,8 +442,6 @@ export async function runOnDemandScanTask({
               reasonCode: staged.outcome === 'unsafe' ? 'malware_found' : 'signature_evidence_changed' };
           }
         }
-      } catch {
-        staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
       }
     }
 

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { CIM_SCAN_PROTOCOL_LIMITS } from './cimScanProtocol.js';
 import { isScannerReplayConflictError } from './flyMachineOperabilityAdapters.js';
+import { hasExactOwnedStopProof } from './flyMachineScanTransport.js';
 import { isScannerWorkerDeadlineError } from './nodePinnedHttpsExchange.js';
 import {
   createGeneratedSyntheticScanJob,
@@ -15,6 +16,22 @@ const timeoutLeaseMs = 60_000;
 const timeoutProbeDelayMs = 750;
 const timeoutRemainderDelayMs = 2_000;
 const orphanExpiryGraceMs = 1_000;
+
+export class CimScanBenchmarkAbruptExitObservedError extends Error {
+  constructor({ ownedStopConfirmed = false, cause } = {}) {
+    super('CIM scan benchmark observed an expected abrupt worker exit.',
+      cause === undefined ? undefined : { cause });
+    this.name = 'CimScanBenchmarkAbruptExitObservedError';
+    Object.defineProperty(this, 'ownedStopConfirmed', {
+      value: ownedStopConfirmed === true,
+      enumerable: false,
+    });
+  }
+}
+
+function defaultOwnedStopVerifier(error) {
+  return hasExactOwnedStopProof(error) || hasExactOwnedStopProof(error?.cause);
+}
 
 export const CIM_SCAN_CLOUD_BENCHMARK_SCENARIOS = Object.freeze([
   'cold-clean-1k',
@@ -66,7 +83,9 @@ function scanInput(job) {
 }
 
 function requireExpectedResult(result, expected) {
-  if (!result || result.outcome !== expected.outcome || result.reasonCode !== expected.reasonCode) {
+  if (!result || result.outcome !== expected.outcome || result.reasonCode !== expected.reasonCode
+    || (expected.cleanupStatus !== undefined
+      && result.cleanupStatus !== expected.cleanupStatus)) {
     throw new Error('Cloud benchmark scenario did not return its expected result.');
   }
   return result;
@@ -101,6 +120,7 @@ function resultIdentity(result) {
     scannedAt: result?.scannedAt,
     protocolResultExpiresAt: result?.protocolResultExpiresAt,
     requestDigest: result?.requestDigest,
+    cleanupStatus: result?.cleanupStatus,
   });
 }
 
@@ -113,15 +133,28 @@ function defaultWaitUntil(value) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
-function createExecutor({ executeScan, createScannerComposition }) {
+function createExecutor({ executeScan, createScannerComposition, ownedStopVerifier }) {
   if (executeScan !== undefined) return requireFunction(executeScan, 'Benchmark scan executor');
   requireFunction(createScannerComposition, 'Benchmark scanner composition factory');
-  return async ({ job, now, resultNow = now, requestMaxDurationMs }) => {
-    const composition = createScannerComposition({ now, resultNow, requestMaxDurationMs });
+  return async ({ phase, job, now, resultNow = now, requestMaxDurationMs }) => {
+    const composition = createScannerComposition({
+      benchmarkPhase: phase, now, resultNow, requestMaxDurationMs,
+    });
     if (!composition?.scanner || typeof composition.scanner.scan !== 'function') {
       throw new Error('Benchmark scanner composition is invalid.');
     }
-    return composition.scanner.scan(scanInput(job));
+    try {
+      return await composition.scanner.scan(scanInput(job));
+    } catch (error) {
+      if ((phase === 'after-copy-crash' || phase === 'after-scan-crash')
+        && ownedStopVerifier(error)) {
+        throw new CimScanBenchmarkAbruptExitObservedError({
+          cause: error,
+          ownedStopConfirmed: true,
+        });
+      }
+      throw error;
+    }
   };
 }
 
@@ -271,7 +304,9 @@ async function runReplayConflict({ scenario, execute, jobOwner, now, createUuid 
   });
 }
 
-async function runTimeout({ scenario, execute, jobOwner, now, createUuid, waitUntil }) {
+async function runTimeout({
+  scenario, execute, jobOwner, now, createUuid, waitUntil, ownedStopVerifier,
+}) {
   const issuedAt = exactDate(now());
   const timeoutNow = () => new Date(issuedAt);
   const timed = stalledJob({
@@ -285,32 +320,86 @@ async function runTimeout({ scenario, execute, jobOwner, now, createUuid, waitUn
       resultNow: now,
       requestMaxDurationMs: timeoutDurationMs,
     });
-  } catch (error) { timedOut = isScannerWorkerDeadlineError(error); }
+  } catch (error) {
+    timedOut = isScannerWorkerDeadlineError(error) && ownedStopVerifier(error);
+  }
   if (!timedOut || timed.openCount() !== 1
     || timed.bodyByteCount() < 1 || timed.bodyByteCount() >= timed.sizeBytes
     || timed.streamClosed() !== true) {
     throw new Error('Cloud benchmark timeout did not abort an admitted partial body.');
   }
-  const cleanupAt = new Date(Date.parse(timed.claim.leaseExpiresAt) + orphanExpiryGraceMs).toISOString();
-  await waitUntil(cleanupAt);
-  const recovery = generatedJob({
-    name: 'timeout-recovery', sizeBytes: 1_024, requestId: createUuid(), intakeId: createUuid(),
-    jobOwner, now,
+  const jobs = [timed];
+  let recoveryOutcomes = 0;
+  const waitForExpiry = async (job) => waitUntil(new Date(
+    Date.parse(job.claim.leaseExpiresAt) + orphanExpiryGraceMs,
+  ).toISOString());
+  const recover = async (phase) => {
+    const recovery = generatedJob({
+      name: phase, sizeBytes: 1_024, requestId: createUuid(), intakeId: createUuid(),
+      jobOwner, now,
+    });
+    jobs.push(recovery);
+    requireExpectedResult(await execute({
+      phase, job: recovery, now, resultNow: now,
+      requestMaxDurationMs: standardDurationMs,
+    }), { outcome: 'clean', reasonCode: 'clean' });
+    requireExactBody(recovery);
+    recoveryOutcomes += 1;
+  };
+  await waitForExpiry(timed);
+  await recover('timeout-recovery');
+
+  const runCrash = async (phase, recoveryPhase) => {
+    const job = generatedJob({
+      name: phase, sizeBytes: 1_024, requestId: createUuid(), intakeId: createUuid(),
+      jobOwner, now, leaseDurationMs: timeoutLeaseMs,
+    });
+    jobs.push(job);
+    let observed = false;
+    try {
+      await execute({
+        phase, job, now, resultNow: now,
+        requestMaxDurationMs: standardDurationMs,
+      });
+    } catch (error) {
+      observed = error instanceof CimScanBenchmarkAbruptExitObservedError
+        && ownedStopVerifier(error);
+    }
+    if (!observed) throw new Error('Cloud benchmark crash lacked abrupt-exit and exact owned-stop proof.');
+    requireExactBody(job);
+    await waitForExpiry(job);
+    await recover(recoveryPhase);
+    return job;
+  };
+  const afterCopy = await runCrash('after-copy-crash', 'after-copy-recovery');
+  const afterScan = await runCrash('after-scan-crash', 'after-scan-recovery');
+
+  const cleanupRefusal = generatedJob({
+    name: 'cleanup-refusal', sizeBytes: 1_024, requestId: createUuid(), intakeId: createUuid(),
+    jobOwner, now, leaseDurationMs: timeoutLeaseMs,
   });
-  const recoveryResult = requireExpectedResult(await execute({
-    phase: 'recovery', job: recovery, now, resultNow: now,
+  jobs.push(cleanupRefusal);
+  const cleanupRefusalResult = requireExpectedResult(await execute({
+    phase: 'cleanup-refusal', job: cleanupRefusal, now, resultNow: now,
     requestMaxDurationMs: standardDurationMs,
-  }), { outcome: 'clean', reasonCode: 'clean' });
-  requireExactBody(recovery);
+  }), { outcome: 'ambiguous', reasonCode: 'cleanup_uncertain', cleanupStatus: 'retained' });
+  requireExactBody(cleanupRefusal);
+  await waitForExpiry(cleanupRefusal);
+  await recover('cleanup-refusal-recovery');
+
   return report(scenario, {
-    outcome: 'expected_timeout',
-    reasonCode: 'deadline_and_orphan_recovery',
-    exchanges: 2,
-    bodyOpens: timed.openCount() + recovery.openCount(),
-    bodyBytes: timed.bodyByteCount() + recovery.bodyByteCount(),
+    outcome: 'fault_recovery_complete',
+    reasonCode: 'deadline_crash_cleanup_and_orphan_recovery',
+    exchanges: jobs.length,
+    bodyOpens: jobs.reduce((total, job) => total + job.openCount(), 0),
+    bodyBytes: jobs.reduce((total, job) => total + job.bodyByteCount(), 0),
     timeoutBodyOpens: timed.openCount(),
-    recoveryBodyOpens: recovery.openCount(),
-    recoveryOutcome: recoveryResult.outcome,
+    afterCopyBodyOpens: afterCopy.openCount(),
+    afterScanBodyOpens: afterScan.openCount(),
+    cleanupRefusalBodyOpens: cleanupRefusal.openCount(),
+    cleanupRefusalStatus: cleanupRefusalResult.cleanupStatus,
+    recoveryBodyOpens: jobs.length - 4,
+    recoveryOutcomes,
   });
 }
 
@@ -322,6 +411,7 @@ export async function runCimScanCloudBenchmarkScenario({
   now = () => new Date(),
   createUuid = randomUUID,
   waitUntil = defaultWaitUntil,
+  ownedStopVerifier = defaultOwnedStopVerifier,
 } = {}) {
   if (!CIM_SCAN_CLOUD_BENCHMARK_SCENARIOS.includes(scenario)) {
     throw new Error('One exact cloud benchmark scenario is required.');
@@ -330,9 +420,18 @@ export async function runCimScanCloudBenchmarkScenario({
   requireFunction(now, 'Benchmark clock');
   requireFunction(createUuid, 'Benchmark UUID factory');
   requireFunction(waitUntil, 'Benchmark orphan-recovery wait');
-  const execute = createExecutor({ executeScan, createScannerComposition });
+  requireFunction(ownedStopVerifier, 'Benchmark owned-stop verifier');
+  if (scenario === 'timeout-cleanup-owned-stop' && executeScan === undefined) {
+    if (typeof createScannerComposition?.assertBenchmarkScenarioSupported !== 'function') {
+      throw new Error('Composite benchmark target topology preflight is required.');
+    }
+    await createScannerComposition.assertBenchmarkScenarioSupported(scenario);
+  }
+  const execute = createExecutor({ executeScan, createScannerComposition, ownedStopVerifier });
   const common = { scenario, execute, jobOwner, now, createUuid };
   if (scenario === 'replay-conflict') return runReplayConflict(common);
-  if (scenario === 'timeout-cleanup-owned-stop') return runTimeout({ ...common, waitUntil });
+  if (scenario === 'timeout-cleanup-owned-stop') {
+    return runTimeout({ ...common, waitUntil, ownedStopVerifier });
+  }
   return runSimple({ ...common, definition: simpleScenarios[scenario] });
 }

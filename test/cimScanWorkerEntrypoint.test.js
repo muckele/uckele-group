@@ -86,7 +86,8 @@ test('scanner package locks official sources for linux/amd64', async () => {
   assert.equal((dockerfile.match(/npm ci --omit=dev/g) ?? []).length, 1);
   assert.doesNotMatch(dockerfile, /^RUN chmod\b/m);
   for (const entrypoint of [
-    'http-entrypoint.sh', 'stale-benchmark-entrypoint.sh', 'entrypoint.sh',
+    'http-entrypoint.sh', 'stale-benchmark-entrypoint.sh',
+    'fault-benchmark-entrypoint.sh', 'entrypoint.sh',
   ]) {
     assert.match(dockerfile, new RegExp(`^COPY --chmod=0555 .*${entrypoint} `, 'm'));
   }
@@ -115,10 +116,16 @@ test('scanner package has explicit HTTP-worker and synthetic-caller targets with
   const baseStage = dockerfile.match(/FROM clamav\/clamav:[^\n]+ AS cim-scan-worker-base[\s\S]*?(?=\nFROM )/)?.[0];
   const normalStage = dockerfile.match(/FROM cim-scan-worker-base AS cim-scan-http-worker[\s\S]*?(?=\nFROM )/)?.[0];
   const staleStage = dockerfile.match(/FROM cim-scan-worker-base AS cim-scan-stale-benchmark-worker[\s\S]*?(?=\nFROM )/)?.[0];
+  const afterCopyStage = dockerfile.match(/FROM cim-scan-worker-base AS cim-scan-after-copy-crash-benchmark-worker[\s\S]*?(?=\nFROM )/)?.[0];
+  const afterScanStage = dockerfile.match(/FROM cim-scan-worker-base AS cim-scan-after-scan-crash-benchmark-worker[\s\S]*?(?=\nFROM )/)?.[0];
+  const cleanupRefusalStage = dockerfile.match(/FROM cim-scan-worker-base AS cim-scan-cleanup-refusal-benchmark-worker[\s\S]*?(?=\nFROM )/)?.[0];
   assert.ok(callerStage);
   assert.ok(baseStage);
   assert.ok(normalStage);
   assert.ok(staleStage);
+  assert.ok(afterCopyStage);
+  assert.ok(afterScanStage);
+  assert.ok(cleanupRefusalStage);
   assert.match(dockerfile, /FROM clamav\/clamav:1\.4\.6_base@\$\{CLAMAV_BASE_DIGEST\} AS cim-scan-worker-base/);
   assert.match(dockerfile, /FROM cim-scan-worker-base AS cim-scan-http-worker/);
   assert.match(dockerfile,
@@ -129,6 +136,8 @@ test('scanner package has explicit HTTP-worker and synthetic-caller targets with
     /ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-http-entrypoint"\]/);
   assert.doesNotMatch(baseStage, /cimScanWorkerBenchmarkClock|stale-benchmark/);
   assert.doesNotMatch(normalStage, /cimScanWorkerBenchmarkClock|stale-benchmark/);
+  assert.doesNotMatch(baseStage, /cimScanWorkerFaultBenchmark|fault-benchmark/);
+  assert.doesNotMatch(normalStage, /cimScanWorkerFaultBenchmark|fault-benchmark|BENCHMARK_FAULT/);
   assert.match(staleStage,
     /COPY server\/services\/cimScanWorkerBenchmarkClock\.js \/opt\/uckele\/server\/services\/cimScanWorkerBenchmarkClock\.js/);
   assert.match(staleStage,
@@ -137,8 +146,22 @@ test('scanner package has explicit HTTP-worker and synthetic-caller targets with
     /COPY --chmod=0555 containers\/cim-scan-worker\/stale-benchmark-entrypoint\.sh \/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint/);
   assert.match(staleStage,
     /ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-stale-benchmark-entrypoint"\]/);
+  for (const [stage, script] of [
+    [afterCopyStage, 'run-cim-scan-worker-after-copy-crash-benchmark.js'],
+    [afterScanStage, 'run-cim-scan-worker-after-scan-crash-benchmark.js'],
+    [cleanupRefusalStage, 'run-cim-scan-worker-cleanup-refusal-benchmark.js'],
+  ]) {
+    assert.match(stage,
+      /COPY server\/services\/cimScanWorkerFaultBenchmark\.js \/opt\/uckele\/server\/services\/cimScanWorkerFaultBenchmark\.js/);
+    assert.match(stage, new RegExp(`COPY scripts\\/${script.replaceAll('.', '\\.')}`));
+    assert.match(stage,
+      /ENTRYPOINT \["\/usr\/local\/bin\/uckele-cim-scan-fault-benchmark-entrypoint"\]/);
+    assert.match(stage, new RegExp(`CMD \\["node", "scripts\\/${script.replaceAll('.', '\\.')}"\\]`));
+    assert.doesNotMatch(stage, /CIM_SCAN_BENCHMARK_FAULT_MODE|--fault|FAULT_MODE/);
+  }
   assert.match(dockerfile, /FROM node-runtime AS cim-scan-synthetic-caller/);
   assert.doesNotMatch(callerStage, /cimScanWorkerBenchmarkClock/);
+  assert.doesNotMatch(callerStage, /cimScanWorkerFaultBenchmark|fault-benchmark/);
   assert.match(callerStage,
     /COPY server\/services\/cimScanCloudBenchmark\.js \/opt\/uckele\/server\/services\/cimScanCloudBenchmark\.js/);
   assert.match(dockerfile,

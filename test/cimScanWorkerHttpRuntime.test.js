@@ -60,6 +60,15 @@ test('HTTP worker runtime configuration requires every explicit path and forbids
   assert.throws(() => loadCimScanWorkerHttpConfig({
     ...environment, CIM_SCAN_BENCHMARK_CLOCK_OFFSET_MS: '90000000',
   }), /clock|benchmark/i);
+  for (const field of [
+    'CIM_SCAN_BENCHMARK_FAULT_MODE',
+    'CIM_SCAN_BENCHMARK_AFTER_COPY',
+    'CIM_SCAN_BENCHMARK_AFTER_SCAN',
+    'CIM_SCAN_BENCHMARK_CLEANUP_REFUSAL',
+  ]) {
+    assert.throws(() => loadCimScanWorkerHttpConfig({ ...environment, [field]: '1' }),
+      /benchmark/i, field);
+  }
 });
 
 test('HTTP worker runtime builds one TLS composition and binds only private port 8443', async () => {
