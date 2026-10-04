@@ -152,7 +152,8 @@ export function createNodePinnedHttpsExchange({
         resolveResponse({ response: incoming });
         if (!admissionResolved) {
           admissionResolved = true;
-          resolveAdmission({ status: incoming?.statusCode });
+          detachRootAbort();
+          resolveAdmission({ status: incoming?.statusCode, body: incoming });
         }
       });
     } catch {
@@ -173,6 +174,7 @@ export function createNodePinnedHttpsExchange({
     request.on('error', abortRequest);
     command.signal.addEventListener('abort', abortRequest, { once: true });
     rootAbortAttached = true;
+    if (response && !admitted) detachRootAbort();
     try { request.flushHeaders(); } catch {
       abortRequest();
       throw new Error('Scanner HTTPS exchange could not send its headers.');

@@ -72,6 +72,8 @@ test('scanner package locks official sources for linux/amd64', async () => {
   assert.match(dockerfile, /FROM clamav\/clamav:1\.4\.6_base@\$\{CLAMAV_BASE_DIGEST\}/);
   assert.match(dockerfile, /COPY package\.json package-lock\.json/);
   assert.match(dockerfile, /RUN npm ci --omit=dev/);
+  assert.match(dockerfile,
+    /COPY server\/services\/cimScanWorkerAdmission\.js \/opt\/uckele\/server\/services\/cimScanWorkerAdmission\.js/);
   assert.match(clamConfig, /^LocalSocket \/run\/clamav\/clamd\.sock$/m);
   assert.doesNotMatch(clamConfig, /^\s*(?:TCPAddr|TCPSocket)\b/m);
   assert.equal(sourceLock.status, 'locked');

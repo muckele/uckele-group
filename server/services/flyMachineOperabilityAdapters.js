@@ -224,6 +224,34 @@ export function createPinnedHttpScanRequestClient({
         abortExchange(exchange, error);
         throw error;
       }
+      if (admission?.status === 200) {
+        let replayWire;
+        try {
+          replayWire = await readResponseBody(admission.body, maxResponseBytes, {
+            signal, deadlineAt,
+          });
+        } catch (error) {
+          abortExchange(exchange, error);
+          throw error;
+        }
+        abortExchange(exchange);
+        let replayReturned = false;
+        return Object.freeze({
+          abort(reason) { abortExchange(exchange, reason); },
+          async sendBody({ maxResponseBytes: bodyCap, signal: bodySignal, deadlineAt: bodyDeadline } = {}) {
+            if (replayReturned) throw new Error('Scanner replay handle is single-use.');
+            replayReturned = true;
+            if (bodyCap !== maxResponseBytes) {
+              throw new Error('Scanner response cap changed after replay admission.');
+            }
+            if (!bodySignal || bodySignal.aborted || !Number.isFinite(bodyDeadline)
+              || bodyDeadline <= performance.now()) {
+              throw new Error('Scanner replay response was aborted or exceeded its deadline.');
+            }
+            return replayWire;
+          },
+        });
+      }
       if (admission?.status !== 100) {
         abortExchange(exchange);
         throw new Error('Scanner worker did not admit the request before its body.');

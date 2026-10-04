@@ -13,6 +13,7 @@ COPY --from=node-runtime /build/node_modules /opt/uckele/node_modules
 COPY package.json /opt/uckele/package.json
 COPY server/services/cimScanProtocol.js /opt/uckele/server/services/cimScanProtocol.js
 COPY server/services/cimScanWorker.js /opt/uckele/server/services/cimScanWorker.js
+COPY server/services/cimScanWorkerAdmission.js /opt/uckele/server/services/cimScanWorkerAdmission.js
 COPY server/services/clamavUnixSocketScanner.js /opt/uckele/server/services/clamavUnixSocketScanner.js
 COPY server/services/filesystemCimReplayStore.js /opt/uckele/server/services/filesystemCimReplayStore.js
 COPY server/services/cimScanWorkerEntrypoint.js /opt/uckele/server/services/cimScanWorkerEntrypoint.js

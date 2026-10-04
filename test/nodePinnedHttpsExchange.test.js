@@ -142,8 +142,9 @@ test('HTTPS exchange returns an early final status without admitting or writing 
     signal: new AbortController().signal,
     deadlineAt: performance.now() + 1_000,
   });
-  fixture.request().respond({ statusCode: 403, destroy() {} });
-  assert.deepEqual(await admission, { status: 403 });
+  const incoming = { statusCode: 403, destroy() {} };
+  fixture.request().respond(incoming);
+  assert.deepEqual(await admission, { status: 403, body: incoming });
   assert.equal(fixture.events.some(([name]) => name === 'write'), false);
   exchange.abort();
 });
