@@ -3,7 +3,7 @@ ARG CLAMAV_BASE_DIGEST=sha256:90effb795234e6a93b070310a4bab5a58d93d94b9a077a09ce
 FROM node:22-alpine@${NODE_BASE_DIGEST} AS node-runtime
 WORKDIR /opt/uckele
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN --network=default npm ci --omit=dev
 
 FROM node-runtime AS cim-scan-synthetic-caller
 COPY server/services/cimScanProtocol.js /opt/uckele/server/services/cimScanProtocol.js
