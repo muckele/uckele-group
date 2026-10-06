@@ -23,8 +23,8 @@ export function loadCimScanWorkerHttpConfig(environment = process.env) {
     || environment.CLAMD_HOST !== undefined || environment.CLAMD_PORT !== undefined) {
     throw new Error('ClamAV TCP configuration is forbidden.');
   }
-  if (environment.CIM_SCAN_BENCHMARK_CLOCK_OFFSET_MS !== undefined) {
-    throw new Error('Benchmark clock configuration is forbidden in the normal worker runtime.');
+  if (Object.keys(environment).some((name) => name.startsWith('CIM_SCAN_BENCHMARK_'))) {
+    throw new Error('Benchmark configuration is forbidden in the normal worker runtime.');
   }
   const keyId = String(environment.CIM_SCAN_KEY_ID || '');
   if (!identityPattern.test(keyId)) throw new Error('Worker key id is invalid.');

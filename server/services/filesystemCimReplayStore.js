@@ -170,7 +170,8 @@ async function immediateTransaction(database, input, operation) {
       assertActive(input);
       database.exec('COMMIT');
       transactionOpen = false;
-      assertActive(input);
+      // Once COMMIT returns, its result is authoritative.  A post-commit
+      // deadline assertion could report a timeout after durable publication.
       return result;
     } catch (error) {
       if (transactionOpen) {

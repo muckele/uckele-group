@@ -8,6 +8,11 @@ const maximumStartupAttempts = 17;
 const initialRetryDelayMs = 250;
 const maximumRetryDelayMs = 5_000;
 const boundedIdentityPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/;
+const exactOwnedStopFailures = new WeakSet();
+
+export function hasExactOwnedStopProof(error) {
+  return Boolean(error && typeof error === 'object' && exactOwnedStopFailures.has(error));
+}
 
 function validateDependencies({ machineId, machineController, requestClient } = {}) {
   if (!boundedIdentityPattern.test(String(machineId || ''))) {
@@ -105,6 +110,7 @@ export function createFlyMachineScanTransport(options = {}) {
       let session = null;
       let resultWire;
       let stopConfirmed = false;
+      let failure = null;
       const command = (deadlineAt = workDeadlineAt, signal = controller.signal) => ({
         machineId,
         sessionGeneration: requestId,
@@ -181,6 +187,8 @@ export function createFlyMachineScanTransport(options = {}) {
           || Buffer.byteLength(resultWire, 'utf8') > CIM_SCAN_PROTOCOL_LIMITS.maxEnvelopeBytes) {
           throw new Error('Machine scan response exceeds the bounded envelope size.');
         }
+      } catch (error) {
+        failure = error;
       } finally {
         const shutdownController = new AbortController();
         const shutdownCommand = () => command(leaseDeadlineAt, shutdownController.signal);
@@ -194,6 +202,10 @@ export function createFlyMachineScanTransport(options = {}) {
             () => machineController.stopSessionIfOwned(shutdownCommand()),
           ).catch(() => false);
         }
+      }
+      if (failure) {
+        if (stopConfirmed && typeof failure === 'object') exactOwnedStopFailures.add(failure);
+        throw failure;
       }
       return { resultWire, stopConfirmed };
     },

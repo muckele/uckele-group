@@ -78,6 +78,30 @@ COPY scripts/run-cim-scan-worker-stale-benchmark.js /opt/uckele/scripts/run-cim-
 COPY --chmod=0555 containers/cim-scan-worker/stale-benchmark-entrypoint.sh /usr/local/bin/uckele-cim-scan-stale-benchmark-entrypoint
 ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-stale-benchmark-entrypoint"]
 
+FROM cim-scan-worker-base AS cim-scan-after-copy-crash-benchmark-worker
+COPY server/services/cimScanWorkerFaultBenchmark.js /opt/uckele/server/services/cimScanWorkerFaultBenchmark.js
+COPY server/services/cimScanWorkerFaultBenchmarkEntrypoint.js /opt/uckele/server/services/cimScanWorkerFaultBenchmarkEntrypoint.js
+COPY scripts/run-cim-scan-worker-after-copy-crash-benchmark.js /opt/uckele/scripts/run-cim-scan-worker-after-copy-crash-benchmark.js
+COPY --chmod=0555 containers/cim-scan-worker/fault-benchmark-entrypoint.sh /usr/local/bin/uckele-cim-scan-fault-benchmark-entrypoint
+ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-fault-benchmark-entrypoint"]
+CMD ["node", "scripts/run-cim-scan-worker-after-copy-crash-benchmark.js"]
+
+FROM cim-scan-worker-base AS cim-scan-after-scan-crash-benchmark-worker
+COPY server/services/cimScanWorkerFaultBenchmark.js /opt/uckele/server/services/cimScanWorkerFaultBenchmark.js
+COPY server/services/cimScanWorkerFaultBenchmarkEntrypoint.js /opt/uckele/server/services/cimScanWorkerFaultBenchmarkEntrypoint.js
+COPY scripts/run-cim-scan-worker-after-scan-crash-benchmark.js /opt/uckele/scripts/run-cim-scan-worker-after-scan-crash-benchmark.js
+COPY --chmod=0555 containers/cim-scan-worker/fault-benchmark-entrypoint.sh /usr/local/bin/uckele-cim-scan-fault-benchmark-entrypoint
+ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-fault-benchmark-entrypoint"]
+CMD ["node", "scripts/run-cim-scan-worker-after-scan-crash-benchmark.js"]
+
+FROM cim-scan-worker-base AS cim-scan-cleanup-refusal-benchmark-worker
+COPY server/services/cimScanWorkerFaultBenchmark.js /opt/uckele/server/services/cimScanWorkerFaultBenchmark.js
+COPY server/services/cimScanWorkerFaultBenchmarkEntrypoint.js /opt/uckele/server/services/cimScanWorkerFaultBenchmarkEntrypoint.js
+COPY scripts/run-cim-scan-worker-cleanup-refusal-benchmark.js /opt/uckele/scripts/run-cim-scan-worker-cleanup-refusal-benchmark.js
+COPY --chmod=0555 containers/cim-scan-worker/fault-benchmark-entrypoint.sh /usr/local/bin/uckele-cim-scan-fault-benchmark-entrypoint
+ENTRYPOINT ["/usr/local/bin/uckele-cim-scan-fault-benchmark-entrypoint"]
+CMD ["node", "scripts/run-cim-scan-worker-cleanup-refusal-benchmark.js"]
+
 FROM cim-scan-worker-base AS cim-scan-one-shot
 COPY scripts/run-cim-scan-worker.js /opt/uckele/scripts/run-cim-scan-worker.js
 COPY --chmod=0555 containers/cim-scan-worker/entrypoint.sh /usr/local/bin/uckele-cim-scan-entrypoint

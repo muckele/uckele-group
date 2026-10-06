@@ -20,6 +20,8 @@ const claim = {
 function transportFixture({
   outcome = 'clean', stopConfirmed = true, tamper = false,
   scannedAt = '2026-10-03T12:00:10.000Z',
+  reasonCode = outcome === 'clean' ? 'clean' : outcome === 'unsafe' ? 'malware_found' : 'scanner_error',
+  cleanupStatus = 'cleaned',
 } = {}) {
   return {
     request: null,
@@ -28,13 +30,13 @@ function transportFixture({
       let resultWire = createSignedScanResult({
         request: this.request,
         outcome,
-        reasonCode: outcome === 'clean' ? 'clean' : outcome === 'unsafe' ? 'malware_found' : 'scanner_error',
+        reasonCode,
         engineVersion: 'ClamAV synthetic',
         signatureVersion: 'db-1',
         signatureUpdatedAt: '2026-10-03T11:55:00.000Z',
         scannedAt,
         expiresAt: '2026-10-03T12:02:00.000Z',
-        cleanupStatus: 'cleaned',
+        cleanupStatus,
       }, { keyResolver });
       if (tamper) resultWire = resultWire.replace('db-1', 'db-2');
       return { resultWire, stopConfirmed };
@@ -90,11 +92,28 @@ test('on-demand adapter binds request identity, limits, hash, MIME, and claim', 
     openByteStream: () => (async function* () {})(),
   });
   assert.equal(result.outcome, 'clean');
+  assert.equal(result.cleanupStatus, 'cleaned');
   assert.equal(result.engineVersion, 'ClamAV synthetic');
   assert.equal(transport.request.requestId, claim.requestId);
   assert.equal(transport.request.intakeId, claim.intakeId);
   assert.equal(transport.request.sha256, 'a'.repeat(64));
   assert.equal(transport.request.leaseExpiresAt, claim.leaseExpiresAt);
+});
+
+test('on-demand adapter preserves signed retained cleanup evidence', async () => {
+  const result = await adapter(transportFixture({
+    outcome: 'ambiguous',
+    reasonCode: 'cleanup_uncertain',
+    cleanupStatus: 'retained',
+  })).scan({
+    claim,
+    sha256: 'a'.repeat(64),
+    sizeBytes: 123,
+    mimeType: 'application/pdf',
+    openByteStream: () => (async function* () {})(),
+  });
+  assert.equal(result.cleanupStatus, 'retained');
+  assert.equal(result.reasonCode, 'cleanup_uncertain');
 });
 
 test('on-demand adapter rejects tampered or mismatched signed results', async () => {

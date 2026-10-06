@@ -83,6 +83,7 @@ export function createOnDemandScannerAdapter(options = {}) {
       return {
         outcome: result.outcome,
         reasonCode: result.reasonCode,
+        cleanupStatus: result.cleanupStatus,
         engineVersion: result.engineVersion,
         signatureVersion: result.signatureVersion,
         signatureUpdatedAt: result.signatureUpdatedAt,

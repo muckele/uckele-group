@@ -265,7 +265,7 @@ test('worker derives every operation budget from one decreasing monotonic deadli
   assert.ok(observed[2] <= observed[1], 'post-scan health must not receive a reset budget');
 });
 
-test('worker bounds admission and cleanup with the same task deadline before signing', async (t) => {
+test('worker bounds admission and gives timed-out cleanup one expiry-capped finalization attempt', async (t) => {
   const admissionRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-admission-timeout-'));
   const cleanupRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-cleanup-timeout-'));
   t.after(() => Promise.all([
@@ -280,19 +280,38 @@ test('worker bounds admission and cleanup with the same task deadline before sig
   })), /deadline/i);
   assert.equal(opened, 0);
 
-  const replayStore = createSyntheticReplayStore({ now: () => new Date(now) });
+  const issuedAt = new Date();
+  const expiresAt = new Date(issuedAt.getTime() + 160);
+  const leaseExpiresAt = new Date(issuedAt.getTime() + 1_000);
+  const dynamicNow = () => new Date();
+  const replayStore = createSyntheticReplayStore({ now: dynamicNow });
+  let cleanupCalls = 0;
+  const startedAt = performance.now();
   await assert.rejects(runOnDemandScanTask(workerOptions(cleanupRoot, {
     requestWire: requestWire({
       requestId: '41111111-1111-4111-8111-111111111111',
-      maxDurationMs: 60,
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      leaseExpiresAt: leaseExpiresAt.toISOString(),
+      maxDurationMs: 40,
     }),
+    now: dynamicNow,
+    requireAttachment: true,
     replayStore,
-    cleanupOwnedTask: async () => new Promise(() => {}),
-  })), /deadline/i);
+    cleanupOwnedTask: async () => {
+      cleanupCalls += 1;
+      return new Promise(() => {});
+    },
+  })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+  assert.equal(cleanupCalls, 1);
+  assert.ok(performance.now() - startedAt < 500,
+    'cleanup finalization must be capped by the authenticated request expiry');
   assert.equal([...replayStore.entries.values()][0].resultWire, null);
+  assert.equal((await fsp.readdir(cleanupRoot)).length, 1,
+    'uncertain cleanup must retain its exact authenticated task');
 });
 
-test('worker actively aborts a timed-out task copy before returning', async (t) => {
+test('worker aborts a timed-out task copy, cleans it within reserve, and leaves no late writer', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-copy-timeout-'));
   t.after(() => fsp.rm(root, { recursive: true, force: true }));
   let sourceClosed = false;
@@ -313,21 +332,571 @@ test('worker actively aborts a timed-out task copy before returning', async (t) 
     },
   });
   const startedAt = performance.now();
+  const replayStore = createSyntheticReplayStore({ now: () => new Date(now) });
+  const scanner = createSyntheticWorkerScanner();
   await assert.rejects(runOnDemandScanTask(workerOptions(root, {
     requestWire: requestWire({
       requestId: '51111111-1111-4111-8111-111111111111',
-      maxDurationMs: 40,
+      maxDurationMs: 120,
     }),
+    replayStore,
+    scanner,
     openByteStream: () => slowBytes,
   })), /deadline/i);
-  assert.ok(performance.now() - startedAt < 150, 'active abort must honor the shared deadline');
+  assert.ok(performance.now() - startedAt < 500,
+    'active abort and exact cleanup must remain well inside the cleanup reserve');
   assert.equal(sourceClosed, true, 'pipeline must close the source before the worker returns');
-  const [taskName] = await fsp.readdir(root);
-  const attachmentPath = path.join(root, taskName, 'attachment.bin');
-  const sizeAtReturn = (await fsp.stat(attachmentPath)).size;
+  assert.equal(scanner.scanCount, 0, 'timed-out attachment bytes must never reach the scanner');
+  assert.equal([...replayStore.entries.values()][0].resultWire, null,
+    'timeout must not complete durable replay authority');
+  assert.deepEqual(await fsp.readdir(root), [], 'timeout cleanup must prove empty state');
   await new Promise((resolve) => setTimeout(resolve, 260));
-  assert.equal((await fsp.stat(attachmentPath)).size, sizeAtReturn, 'no late writer may remain');
+  assert.deepEqual(await fsp.readdir(root), [], 'no late writer may recreate timeout state');
 });
+
+test('late task-directory creation is cleanup-uncertain and can never produce 408', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-late-mkdir-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const replayStore = createSyntheticReplayStore({ now: () => new Date(now) });
+  await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+    requestWire: requestWire({
+      requestId: '54111111-1111-4111-8111-111111111111',
+      maxDurationMs: 30,
+    }),
+    replayStore,
+    createTaskDirectory: async (taskPath) => {
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      await fsp.mkdir(taskPath, { mode: 0o700 });
+    },
+  })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(await fsp.readdir(root),
+    ['task-54111111-1111-4111-8111-111111111111']);
+  assert.equal([...replayStore.entries.values()][0].resultWire, null);
+});
+
+test('late owner-marker creation is retained behind cleanup-uncertain failure', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-late-marker-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const replayStore = createSyntheticReplayStore({ now: () => new Date(now) });
+  await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+    requestWire: requestWire({
+      requestId: '55111111-1111-4111-8111-111111111111',
+      maxDurationMs: 30,
+    }),
+    replayStore,
+    writeOwnerMarker: async (markerPath, markerWire) => {
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      await fsp.writeFile(markerPath, markerWire, { mode: 0o600, flag: 'wx' });
+    },
+  })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const taskPath = path.join(root, 'task-55111111-1111-4111-8111-111111111111');
+  assert.equal((await fsp.lstat(path.join(taskPath, 'owner.json'))).isFile(), true);
+  assert.equal([...replayStore.entries.values()][0].resultWire, null);
+});
+
+test('terminal replay completion aborts before late publication', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-replay-commit-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const authority = createSyntheticReplayStore({ now: () => new Date(now) });
+  const replayStore = {
+    claim: (input) => authority.claim(input),
+    async complete(input) {
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      if (input.signal.aborted) throw input.signal.reason;
+      return authority.complete(input);
+    },
+  };
+  const wire = requestWire({
+    requestId: '56111111-1111-4111-8111-111111111111',
+    maxDurationMs: 35,
+  });
+  await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+    requestWire: wire,
+    replayStore,
+  })), (error) => error?.code === 'CIM_SCAN_DEADLINE');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal([...authority.entries.values()][0].resultWire, null,
+    'aborted completion must never publish behind a timeout');
+});
+
+test('cleanup retains a same-name replacement instead of deleting an unbound task inode',
+  async (t) => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-task-swap-'));
+    const outside = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-task-original-'));
+    t.after(() => Promise.all([
+      fsp.rm(root, { recursive: true, force: true }),
+      fsp.rm(outside, { recursive: true, force: true }),
+    ]));
+    const requestId = '57111111-1111-4111-8111-111111111111';
+    const taskPath = path.join(root, `task-${requestId}`);
+    const originalPath = path.join(outside, 'authenticated-original');
+    await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+      requestWire: requestWire({ requestId }),
+      afterScan: async () => {
+        const marker = await fsp.readFile(path.join(taskPath, 'owner.json'));
+        const attachmentCopy = await fsp.readFile(path.join(taskPath, 'attachment.bin'));
+        await fsp.rename(taskPath, originalPath);
+        await fsp.mkdir(taskPath, { mode: 0o700 });
+        await fsp.writeFile(path.join(taskPath, 'owner.json'), marker, { mode: 0o600 });
+        await fsp.writeFile(path.join(taskPath, 'attachment.bin'), attachmentCopy, { mode: 0o600 });
+      },
+    })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+    assert.equal((await fsp.lstat(taskPath)).isDirectory(), true,
+      'same-name replacement must be retained');
+    assert.equal((await fsp.lstat(originalPath)).isDirectory(), true,
+      'original authenticated inode must not be confused with its replacement');
+  });
+
+test('timeout finalization retains a same-name replacement and the original task inode',
+  async (t) => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-timeout-swap-'));
+    const outside = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-timeout-original-'));
+    t.after(() => Promise.all([
+      fsp.rm(root, { recursive: true, force: true }),
+      fsp.rm(outside, { recursive: true, force: true }),
+    ]));
+    const requestId = '5b111111-1111-4111-8111-111111111111';
+    const taskPath = path.join(root, `task-${requestId}`);
+    const originalPath = path.join(outside, 'authenticated-original');
+    const slowBytes = new Readable({
+      read() {
+        if (this.pushed) return;
+        this.pushed = true;
+        this.push(bytes.subarray(0, 1));
+      },
+    });
+    const running = runOnDemandScanTask(workerOptions(root, {
+      requestWire: requestWire({ requestId, maxDurationMs: 120 }),
+      openByteStream: () => slowBytes,
+    }));
+    const markerPath = path.join(taskPath, 'owner.json');
+    const attachmentPath = path.join(taskPath, 'attachment.bin');
+    while (true) {
+      try {
+        await fsp.access(markerPath);
+        await fsp.access(attachmentPath);
+        break;
+      } catch {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    }
+    const marker = await fsp.readFile(markerPath);
+    const partial = await fsp.readFile(attachmentPath);
+    await fsp.rename(taskPath, originalPath);
+    await fsp.mkdir(taskPath, { mode: 0o700 });
+    await fsp.writeFile(markerPath, marker, { mode: 0o600 });
+    await fsp.writeFile(attachmentPath, partial, { mode: 0o600 });
+    await assert.rejects(running,
+      (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+    assert.equal((await fsp.lstat(taskPath)).isDirectory(), true);
+    assert.equal((await fsp.lstat(originalPath)).isDirectory(), true);
+  });
+
+test('timeout cleanup refuses a tampered owner marker and retains the exact task', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-timeout-owner-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const slowBytes = new Readable({
+    read() {
+      if (this.pushed) return;
+      this.pushed = true;
+      this.push(bytes.subarray(0, 1));
+    },
+  });
+  const running = runOnDemandScanTask(workerOptions(root, {
+    requestWire: requestWire({
+      requestId: '52111111-1111-4111-8111-111111111111',
+      maxDurationMs: 100,
+    }),
+    openByteStream: () => slowBytes,
+  }));
+  let taskName;
+  while (!taskName) {
+    [taskName] = await fsp.readdir(root);
+    if (!taskName) await new Promise((resolve) => setImmediate(resolve));
+  }
+  const markerPath = path.join(root, taskName, 'owner.json');
+  while (true) {
+    try {
+      await fsp.access(markerPath);
+      break;
+    } catch {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  await fsp.writeFile(markerPath, '{"tampered":true}', { mode: 0o600 });
+  await assert.rejects(running,
+    (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+  assert.deepEqual(await fsp.readdir(root), [taskName]);
+  assert.match(await fsp.readFile(markerPath, 'utf8'), /^\{"tampered":true\}/);
+});
+
+test('timeout cleanup retains unknown and symlinked task entries without touching targets',
+  async (t) => {
+    for (const variant of ['unknown', 'symlink']) {
+      const root = await fsp.mkdtemp(path.join(os.tmpdir(), `ug-cim-worker-${variant}-`));
+      const outside = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-target-'));
+      t.after(() => Promise.all([
+        fsp.rm(root, { recursive: true, force: true }),
+        fsp.rm(outside, { recursive: true, force: true }),
+      ]));
+      const target = path.join(outside, 'must-remain');
+      await fsp.writeFile(target, 'outside authority', { mode: 0o600 });
+      const requestId = variant === 'unknown'
+        ? '58111111-1111-4111-8111-111111111111'
+        : '59111111-1111-4111-8111-111111111111';
+      const slowBytes = new Readable({
+        read() {
+          if (this.pushed) return;
+          this.pushed = true;
+          this.push(bytes.subarray(0, 1));
+        },
+      });
+      const running = runOnDemandScanTask(workerOptions(root, {
+        requestWire: requestWire({ requestId, maxDurationMs: 300 }),
+        openByteStream: () => slowBytes,
+      }));
+      const taskPath = path.join(root, `task-${requestId}`);
+      const markerPath = path.join(taskPath, 'owner.json');
+      while (true) {
+        try {
+          await fsp.access(markerPath);
+          break;
+        } catch {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      }
+      if (variant === 'unknown') {
+        await fsp.writeFile(path.join(taskPath, 'unknown.bin'), 'unknown', { mode: 0o600 });
+      } else {
+        await fsp.symlink(target, path.join(taskPath, 'unknown.bin'));
+      }
+      await assert.rejects(running,
+        (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+      assert.equal(await fsp.readFile(target, 'utf8'), 'outside authority');
+      assert.equal((await fsp.lstat(taskPath)).isDirectory(), true);
+    }
+  });
+
+test('timeout cleanup reserve exposes one monotonic deadline capped at 2000 ms', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-reserve-cap-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  let reserveMs;
+  const slowBytes = new Readable({
+    read() {
+      if (this.pushed) return;
+      this.pushed = true;
+      this.push(bytes.subarray(0, 1));
+    },
+  });
+  await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+    requestWire: requestWire({
+      requestId: '5a111111-1111-4111-8111-111111111111',
+      maxDurationMs: 30,
+    }),
+    openByteStream: () => slowBytes,
+    cleanupOwnedTask: async ({ deadlineAt }) => {
+      reserveMs = deadlineAt - performance.now();
+      return { cleaned: false };
+    },
+  })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+  assert.ok(reserveMs > 1_900 && reserveMs <= 2_000,
+    `cleanup reserve must be one bounded 2000 ms window, observed ${reserveMs}`);
+});
+
+test('timeout cleanup reserve is capped by matching authenticated request and lease expiry', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-timeout-lease-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const issuedAt = new Date();
+  const dynamicNow = () => new Date();
+  let cleanupCalls = 0;
+  const startedAt = performance.now();
+  await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+    requestWire: requestWire({
+      requestId: '53111111-1111-4111-8111-111111111111',
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: new Date(issuedAt.getTime() + 160).toISOString(),
+      leaseExpiresAt: new Date(issuedAt.getTime() + 160).toISOString(),
+      maxDurationMs: 40,
+    }),
+    now: dynamicNow,
+    requireAttachment: true,
+    replayStore: createSyntheticReplayStore({ now: dynamicNow }),
+    cleanupOwnedTask: async () => {
+      cleanupCalls += 1;
+      return new Promise(() => {});
+    },
+  })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+  assert.equal(cleanupCalls, 1);
+  assert.ok(performance.now() - startedAt < 500,
+    'cleanup finalization must be capped by authenticated request and lease expiry');
+  assert.equal((await fsp.readdir(root)).length, 1);
+});
+
+test('authenticated recovery marker preserves every cleanup crash boundary and expires safely',
+  async (t) => {
+    const cases = [
+      {
+        step: 'recovery_marker_linked',
+        rootEntries: ['recovery-5c111111-1111-4111-8111-111111111111.json',
+          'task-5c111111-1111-4111-8111-111111111111'],
+        taskEntries: ['attachment.bin', 'owner.json'],
+      },
+      {
+        step: 'attachment_unlinked',
+        rootEntries: ['recovery-5d111111-1111-4111-8111-111111111111.json',
+          'task-5d111111-1111-4111-8111-111111111111'],
+        taskEntries: ['owner.json'],
+      },
+      {
+        step: 'owner_marker_unlinked',
+        rootEntries: ['recovery-5e111111-1111-4111-8111-111111111111.json',
+          'task-5e111111-1111-4111-8111-111111111111'],
+        taskEntries: [],
+      },
+      {
+        step: 'task_directory_removed',
+        rootEntries: ['recovery-5f111111-1111-4111-8111-111111111111.json'],
+        taskEntries: null,
+      },
+      {
+        step: 'recovery_marker_unlinked',
+        rootEntries: [],
+        taskEntries: null,
+      },
+    ];
+    for (const [index, expected] of cases.entries()) {
+      const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-recovery-step-'));
+      t.after(() => fsp.rm(root, { recursive: true, force: true }));
+      const requestId = expected.rootEntries.find((name) => name.startsWith('task-'))?.slice(5)
+        || expected.rootEntries[0]?.slice('recovery-'.length, -'.json'.length)
+        || `60111111-1111-4111-8111-${String(index + 1).padStart(12, '0')}`;
+      const replayStore = createSyntheticReplayStore({ now: () => new Date(now) });
+      const resultWire = await runOnDemandScanTask(workerOptions(root, {
+        requestWire: requestWire({ requestId }),
+        replayStore,
+        afterCleanupStep(step) {
+          if (step === expected.step) throw new Error(`synthetic crash after ${step}`);
+        },
+      }));
+      const result = parseAndVerifyScanResult(resultWire, {
+        request: parseAndVerifyScanRequest(requestWire({ requestId }), { keyResolver, now }),
+        keyResolver,
+        now,
+      });
+      assert.equal(result.cleanupStatus, 'retained');
+      assert.equal(result.outcome, 'ambiguous');
+      assert.deepEqual((await fsp.readdir(root)).sort(), expected.rootEntries);
+      if (expected.taskEntries) {
+        assert.deepEqual((await fsp.readdir(path.join(root, `task-${requestId}`))).sort(),
+          expected.taskEntries);
+      }
+
+      const recoveryAt = new Date('2026-10-03T12:03:01.000Z');
+      const successorId = `6${index}111111-1111-4111-8111-111111111111`;
+      const successorWire = requestWire({
+        requestId: successorId,
+        issuedAt: recoveryAt.toISOString(),
+        expiresAt: '2026-10-03T12:05:00.000Z',
+        leaseExpiresAt: '2026-10-03T12:06:00.000Z',
+      });
+      await runOnDemandScanTask(workerOptions(root, {
+        requestWire: successorWire,
+        replayStore: createSyntheticReplayStore({ now: () => new Date(recoveryAt) }),
+        now: () => new Date(recoveryAt),
+      }));
+      assert.deepEqual(await fsp.readdir(root), [],
+        `startup recovery must finish the ${expected.step} state`);
+    }
+  });
+
+test('unexpired transitional recovery state is fenced and left byte-for-byte intact', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-recovery-live-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const requestId = '65111111-1111-4111-8111-111111111111';
+  await runOnDemandScanTask(workerOptions(root, {
+    requestWire: requestWire({ requestId }),
+    afterCleanupStep(step) {
+      if (step === 'recovery_marker_linked') throw new Error('synthetic live-owner stop');
+    },
+  }));
+  const before = {};
+  for (const name of (await fsp.readdir(root)).sort()) {
+    const candidate = path.join(root, name);
+    before[name] = (await fsp.lstat(candidate)).isDirectory()
+      ? (await fsp.readdir(candidate)).sort()
+      : await fsp.readFile(candidate, 'utf8');
+  }
+  let opened = 0;
+  await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+    requestWire: requestWire({ requestId: '66111111-1111-4111-8111-111111111111' }),
+    replayStore: createSyntheticReplayStore({ now: () => new Date(now) }),
+    openByteStream() { opened += 1; return byteStream(); },
+  })), /unexpired|in-flight/i);
+  assert.equal(opened, 0);
+  const after = {};
+  for (const name of (await fsp.readdir(root)).sort()) {
+    const candidate = path.join(root, name);
+    after[name] = (await fsp.lstat(candidate)).isDirectory()
+      ? (await fsp.readdir(candidate)).sort()
+      : await fsp.readFile(candidate, 'utf8');
+  }
+  assert.deepEqual(after, before);
+});
+
+test('timed-out cleanup failure at every retained transition is typed and restart-recoverable',
+  async (t) => {
+    const cases = [
+      ['recovery_marker_linked', '6b111111-1111-4111-8111-111111111111'],
+      ['attachment_unlinked', '6c111111-1111-4111-8111-111111111111'],
+      ['owner_marker_unlinked', '6d111111-1111-4111-8111-111111111111'],
+      ['task_directory_removed', '6e111111-1111-4111-8111-111111111111'],
+    ];
+    for (const [index, [stepToStop, requestId]] of cases.entries()) {
+      const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-timeout-recovery-'));
+      t.after(() => fsp.rm(root, { recursive: true, force: true }));
+      const replayStore = createSyntheticReplayStore({ now: () => new Date(now) });
+      const slowBytes = new Readable({
+        read() {
+          if (this.pushed) return;
+          this.pushed = true;
+          this.push(bytes.subarray(0, 1));
+        },
+      });
+      await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+        requestWire: requestWire({ requestId, maxDurationMs: 35 }),
+        replayStore,
+        openByteStream: () => slowBytes,
+        afterCleanupStep(step) {
+          if (step === stepToStop) throw new Error(`synthetic timeout stop after ${step}`);
+        },
+      })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+      assert.equal([...replayStore.entries.values()][0].resultWire, null,
+        'cleanup uncertainty must never complete replay authority');
+      assert.ok((await fsp.readdir(root)).some((name) => name.startsWith('recovery-')),
+        'every nonempty timeout transition must retain authenticated recovery authority');
+
+      const recoveryAt = new Date('2026-10-03T12:03:01.000Z');
+      await runOnDemandScanTask(workerOptions(root, {
+        requestWire: requestWire({
+          requestId: `7${index}111111-1111-4111-8111-111111111111`,
+          issuedAt: recoveryAt.toISOString(),
+          expiresAt: '2026-10-03T12:05:00.000Z',
+          leaseExpiresAt: '2026-10-03T12:06:00.000Z',
+        }),
+        replayStore: createSyntheticReplayStore({ now: () => new Date(recoveryAt) }),
+        now: () => new Date(recoveryAt),
+      }));
+      assert.deepEqual(await fsp.readdir(root), []);
+    }
+  });
+
+test('startup orphan sweep settles its current step and fails cleanup-uncertain at work deadline',
+  async (t) => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-sweep-timeout-'));
+    t.after(() => fsp.rm(root, { recursive: true, force: true }));
+    const orphanId = '6f111111-1111-4111-8111-111111111111';
+    await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+      requestWire: requestWire({ requestId: orphanId }),
+      afterCopy() { throw new Error('synthetic abrupt process stop'); },
+    })), /synthetic abrupt process stop/);
+    assert.deepEqual((await fsp.readdir(path.join(root, `task-${orphanId}`))).sort(),
+      ['attachment.bin', 'owner.json']);
+
+    const recoveryAt = new Date('2026-10-03T12:03:01.000Z');
+    const replayStore = createSyntheticReplayStore({ now: () => new Date(recoveryAt) });
+    let cleanupStepSettled = false;
+    const startedAt = performance.now();
+    await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+      requestWire: requestWire({
+        requestId: '6a211111-1111-4111-8111-111111111111',
+        issuedAt: recoveryAt.toISOString(),
+        expiresAt: '2026-10-03T12:05:00.000Z',
+        leaseExpiresAt: '2026-10-03T12:06:00.000Z',
+        maxDurationMs: 30,
+      }),
+      replayStore,
+      now: () => new Date(recoveryAt),
+      async afterCleanupStep(step) {
+        if (step !== 'recovery_marker_linked') return;
+        await new Promise((resolve) => setTimeout(resolve, 90));
+        cleanupStepSettled = true;
+      },
+    })), (error) => error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN');
+    assert.equal(cleanupStepSettled, true,
+      'admission must remain held until the in-flight recovery step settles');
+    assert.ok(performance.now() - startedAt >= 80,
+      'startup sweep timeout must await its current step without starting a cleanup reserve');
+    assert.equal([...replayStore.entries.values()][0].resultWire, null);
+    assert.deepEqual((await fsp.readdir(root)).sort(), [
+      `recovery-${orphanId}.json`,
+      `task-${orphanId}`,
+    ]);
+
+    await runOnDemandScanTask(workerOptions(root, {
+      requestWire: requestWire({
+        requestId: '6a311111-1111-4111-8111-111111111111',
+        issuedAt: recoveryAt.toISOString(),
+        expiresAt: '2026-10-03T12:05:00.000Z',
+        leaseExpiresAt: '2026-10-03T12:06:00.000Z',
+      }),
+      replayStore: createSyntheticReplayStore({ now: () => new Date(recoveryAt) }),
+      now: () => new Date(recoveryAt),
+    }));
+    assert.deepEqual(await fsp.readdir(root), []);
+  });
+
+test('conflicting and symlinked recovery markers fail closed without deleting either authority',
+  async (t) => {
+    for (const variant of ['conflict', 'symlink']) {
+      const root = await fsp.mkdtemp(path.join(os.tmpdir(), `ug-cim-worker-recovery-${variant}-`));
+      const outside = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-recovery-target-'));
+      t.after(() => Promise.all([
+        fsp.rm(root, { recursive: true, force: true }),
+        fsp.rm(outside, { recursive: true, force: true }),
+      ]));
+      const requestId = variant === 'conflict'
+        ? '67111111-1111-4111-8111-111111111111'
+        : '68111111-1111-4111-8111-111111111111';
+      await runOnDemandScanTask(workerOptions(root, {
+        requestWire: requestWire({ requestId }),
+        afterCleanupStep(step) {
+          if (step === 'recovery_marker_linked') throw new Error('synthetic transition stop');
+        },
+      }));
+      const taskPath = path.join(root, `task-${requestId}`);
+      const ownerPath = path.join(taskPath, 'owner.json');
+      const recoveryPath = path.join(root, `recovery-${requestId}.json`);
+      if (variant === 'conflict') {
+        await fsp.unlink(recoveryPath);
+        await fsp.writeFile(recoveryPath, '{"conflicting":true}', { mode: 0o600, flag: 'wx' });
+      } else {
+        const target = path.join(outside, 'must-remain');
+        await fsp.writeFile(target, await fsp.readFile(ownerPath), { mode: 0o600 });
+        await fsp.unlink(recoveryPath);
+        await fsp.symlink(target, recoveryPath);
+      }
+      const recoveryAt = new Date('2026-10-03T12:03:01.000Z');
+      await assert.rejects(runOnDemandScanTask(workerOptions(root, {
+        requestWire: requestWire({
+          requestId: variant === 'conflict'
+            ? '69111111-1111-4111-8111-111111111111'
+            : '6a111111-1111-4111-8111-111111111111',
+          issuedAt: recoveryAt.toISOString(),
+          expiresAt: '2026-10-03T12:05:00.000Z',
+          leaseExpiresAt: '2026-10-03T12:06:00.000Z',
+        }),
+        replayStore: createSyntheticReplayStore({ now: () => new Date(recoveryAt) }),
+        now: () => new Date(recoveryAt),
+      })), /orphan|authentic|recovery/i);
+      assert.equal((await fsp.lstat(taskPath)).isDirectory(), true);
+      assert.equal((await fsp.lstat(ownerPath)).isFile(), true);
+      assert.equal(variant === 'symlink'
+        ? (await fsp.lstat(recoveryPath)).isSymbolicLink()
+        : (await fsp.lstat(recoveryPath)).isFile(), true);
+    }
+  });
 
 test('worker preserves scanner-unavailable semantics when the scanner throws', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-scan-unavailable-'));

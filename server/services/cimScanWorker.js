@@ -14,7 +14,13 @@ import {
 
 const maximumOrphanEntries = 100;
 const resultLifetimeMs = 2 * 60 * 1000;
+const cleanupFinalizationLimitMs = 2_000;
 const markerDomain = 'uckele.cim-scan.v1/task-owner';
+const requestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const digestPattern = /^[0-9a-f]{64}$/;
+const macPattern = /^[0-9a-f]{64}$/;
+const taskEntryPattern = new RegExp(`^task-(${requestIdPattern.source.slice(1, -1)})$`);
+const recoveryEntryPattern = new RegExp(`^recovery-(${requestIdPattern.source.slice(1, -1)})\\.json$`);
 
 function nowDate(now) {
   const value = typeof now === 'function' ? now() : new Date();
@@ -61,6 +67,16 @@ function verifyMarker(wire, keyResolver) {
     throw new Error('Worker orphan marker is noncanonical.');
   }
   const { mac, ...payload } = marker;
+  const parsedExpiry = new Date(marker.expiresAt);
+  if (typeof marker.keyId !== 'string' || !marker.keyId || marker.keyId.length > 120
+    || [...marker.keyId].some((character) => character.codePointAt(0) <= 31
+      || character.codePointAt(0) === 127)
+    || !requestIdPattern.test(marker.requestId)
+    || !digestPattern.test(marker.requestDigest)
+    || !Number.isFinite(parsedExpiry.getTime()) || parsedExpiry.toISOString() !== marker.expiresAt
+    || !macPattern.test(mac)) {
+    throw new Error('Worker orphan marker fields are invalid.');
+  }
   const expected = markerMac(payload, resolveKey(keyResolver, marker.keyId));
   const actualBytes = Buffer.from(String(mac || ''), 'hex');
   const expectedBytes = Buffer.from(expected, 'hex');
@@ -68,6 +84,29 @@ function verifyMarker(wire, keyResolver) {
     throw new Error('Worker orphan ownership marker failed authentication.');
   }
   return marker;
+}
+
+function recoveryPathFor(root, requestId) {
+  if (!requestIdPattern.test(requestId)) throw new Error('Worker recovery request id is invalid.');
+  return path.join(root, `recovery-${requestId}.json`);
+}
+
+async function lstatIfPresent(candidate) {
+  try {
+    return await fsp.lstat(candidate);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function readAuthenticatedMarker(markerPath, keyResolver) {
+  const stat = await fsp.lstat(markerPath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error('Worker orphan marker is not a regular file.');
+  }
+  const wire = await fsp.readFile(markerPath, 'utf8');
+  return { stat, wire, marker: verifyMarker(wire, keyResolver) };
 }
 
 function assertBeneath(realRoot, realCandidate) {
@@ -95,64 +134,319 @@ async function ensureEphemeralRoot(ephemeralRoot) {
   return { root, realRoot: await fsp.realpath(root) };
 }
 
-async function defaultCleanupOwnedTask({ root, realRoot, taskPath, request, keyResolver }) {
+function cleanupDeadlineError(code) {
+  const error = new Error(code === 'CIM_SCAN_CLEANUP_UNCERTAIN'
+    ? 'Worker owned-task cleanup could not be proven.'
+    : 'Worker task exceeded its shared deadline.');
+  error.code = code;
+  return error;
+}
+
+function assertCleanupActive({ deadlineAt, signal, deadlineCode = 'CIM_SCAN_DEADLINE' } = {}) {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : cleanupDeadlineError(deadlineCode);
+  }
+  if (deadlineAt !== undefined
+    && (!Number.isFinite(deadlineAt) || deadlineAt - performance.now() < 1)) {
+    throw cleanupDeadlineError(deadlineCode);
+  }
+}
+
+async function defaultCleanupOwnedTask({
+  root,
+  realRoot,
+  taskPath,
+  request,
+  keyResolver,
+  deadlineAt,
+  signal,
+  deadlineCode,
+  taskAuthority,
+  afterCleanupStep,
+}) {
+  const authorityError = (message) => {
+    const error = new Error(message);
+    error.code = 'CIM_SCAN_CLEANUP_UNCERTAIN';
+    return error;
+  };
+  const ensureActive = () => assertCleanupActive({ deadlineAt, signal, deadlineCode });
+  ensureActive();
+  if (path.dirname(taskPath) !== root) {
+    throw authorityError('Worker task directory parent is invalid.');
+  }
+  const rootStat = await fsp.lstat(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()
+    || await fsp.realpath(root) !== realRoot) {
+    throw authorityError('Worker ephemeral root identity changed.');
+  }
   const taskStat = await fsp.lstat(taskPath);
-  if (!taskStat.isDirectory() || taskStat.isSymbolicLink()) throw new Error('Worker task directory ownership is invalid.');
+  if (!taskStat.isDirectory() || taskStat.isSymbolicLink()
+    || (taskAuthority && (taskStat.dev !== taskAuthority.taskDev
+      || taskStat.ino !== taskAuthority.taskIno))) {
+    throw authorityError('Worker task directory ownership is invalid.');
+  }
   assertBeneath(realRoot, await fsp.realpath(taskPath));
   const names = (await fsp.readdir(taskPath)).sort();
   if (names.some((name) => !['attachment.bin', 'owner.json'].includes(name))) {
-    throw new Error('Worker task directory contains an unowned entry.');
+    throw authorityError('Worker task directory contains an unowned entry.');
   }
   const markerPath = path.join(taskPath, 'owner.json');
-  const markerStat = await fsp.lstat(markerPath);
-  if (!markerStat.isFile() || markerStat.isSymbolicLink()) throw new Error('Worker owner marker is invalid.');
-  const marker = verifyMarker(await fsp.readFile(markerPath, 'utf8'), keyResolver);
-  if (marker.requestId !== request.requestId || marker.requestDigest !== request.requestDigest) {
-    throw new Error('Worker owner marker does not match the authenticated request.');
+  const recoveryPath = recoveryPathFor(root, request.requestId);
+  if (path.dirname(recoveryPath) !== root) {
+    throw authorityError('Worker recovery marker parent is invalid.');
   }
-  const attachmentPath = path.join(taskPath, 'attachment.bin');
+  let markerRecord = null;
+  let recoveryRecord = null;
   try {
-    const attachmentStat = await fsp.lstat(attachmentPath);
+    if (await lstatIfPresent(markerPath)) {
+      markerRecord = await readAuthenticatedMarker(markerPath, keyResolver);
+    }
+    if (await lstatIfPresent(recoveryPath)) {
+      recoveryRecord = await readAuthenticatedMarker(recoveryPath, keyResolver);
+      assertBeneath(realRoot, await fsp.realpath(recoveryPath));
+    }
+  } catch {
+    throw authorityError('Worker cleanup marker state cannot be authenticated.');
+  }
+  const matchesRequest = (record) => record?.marker.requestId === request.requestId
+    && record.marker.requestDigest === request.requestDigest;
+  if (markerRecord) {
+    if (!matchesRequest(markerRecord)
+      || (taskAuthority?.markerDev !== undefined
+        && (markerRecord.stat.dev !== taskAuthority.markerDev
+          || markerRecord.stat.ino !== taskAuthority.markerIno))) {
+      throw authorityError('Worker owner marker does not match the authenticated request.');
+    }
+    if (recoveryRecord) {
+      if (taskAuthority || !matchesRequest(recoveryRecord)
+        || recoveryRecord.wire !== markerRecord.wire
+        || recoveryRecord.stat.dev !== markerRecord.stat.dev
+        || recoveryRecord.stat.ino !== markerRecord.stat.ino) {
+        throw authorityError('Worker transitional recovery markers conflict.');
+      }
+    } else {
+      ensureActive();
+      try {
+        await fsp.link(markerPath, recoveryPath);
+        recoveryRecord = await readAuthenticatedMarker(recoveryPath, keyResolver);
+        assertBeneath(realRoot, await fsp.realpath(recoveryPath));
+      } catch {
+        throw authorityError('Worker recovery marker could not be preserved atomically.');
+      }
+      if (!matchesRequest(recoveryRecord)
+        || recoveryRecord.wire !== markerRecord.wire
+        || recoveryRecord.stat.dev !== markerRecord.stat.dev
+        || recoveryRecord.stat.ino !== markerRecord.stat.ino) {
+        throw authorityError('Worker recovery marker identity is invalid.');
+      }
+      await afterCleanupStep?.('recovery_marker_linked');
+    }
+  } else {
+    if (taskAuthority || !recoveryRecord || !matchesRequest(recoveryRecord) || names.length !== 0) {
+      throw authorityError('Worker transitional cleanup state is invalid.');
+    }
+  }
+  ensureActive();
+  const attachmentPath = path.join(taskPath, 'attachment.bin');
+  let attachmentStat = null;
+  try {
+    attachmentStat = await fsp.lstat(attachmentPath);
     if (!attachmentStat.isFile() || attachmentStat.isSymbolicLink()) {
-      throw new Error('Worker attachment copy is not an owned regular file.');
+      throw authorityError('Worker attachment copy is not an owned regular file.');
+    }
+    if (taskAuthority?.attachmentDev !== undefined
+      && (attachmentStat.dev !== taskAuthority.attachmentDev
+        || attachmentStat.ino !== taskAuthority.attachmentIno)) {
+      throw authorityError('Worker attachment identity changed before cleanup.');
     }
     assertBeneath(realRoot, await fsp.realpath(attachmentPath));
-    await fsp.unlink(attachmentPath);
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  await fsp.unlink(markerPath);
+
+  if (attachmentStat) {
+    if (!markerRecord) {
+      throw authorityError('Worker attachment has no in-directory ownership marker.');
+    }
+    const finalAttachmentStat = await fsp.lstat(attachmentPath);
+    if (!finalAttachmentStat.isFile() || finalAttachmentStat.isSymbolicLink()
+      || finalAttachmentStat.dev !== attachmentStat.dev
+      || finalAttachmentStat.ino !== attachmentStat.ino) {
+      throw authorityError('Worker attachment identity changed before cleanup.');
+    }
+    ensureActive();
+    await fsp.unlink(attachmentPath);
+    await afterCleanupStep?.('attachment_unlinked');
+  }
+  if (markerRecord) {
+    const finalMarkerStat = await fsp.lstat(markerPath);
+    const finalRecoveryStat = await fsp.lstat(recoveryPath);
+    const finalTaskStat = await fsp.lstat(taskPath);
+    const finalRootStat = await fsp.lstat(root);
+    if (!finalMarkerStat.isFile() || finalMarkerStat.isSymbolicLink()
+      || finalMarkerStat.dev !== markerRecord.stat.dev
+      || finalMarkerStat.ino !== markerRecord.stat.ino
+      || !finalRecoveryStat.isFile() || finalRecoveryStat.isSymbolicLink()
+      || finalRecoveryStat.dev !== recoveryRecord.stat.dev
+      || finalRecoveryStat.ino !== recoveryRecord.stat.ino
+      || finalTaskStat.dev !== taskStat.dev || finalTaskStat.ino !== taskStat.ino
+      || finalRootStat.dev !== rootStat.dev || finalRootStat.ino !== rootStat.ino
+      || await fsp.realpath(root) !== realRoot
+      || JSON.stringify((await fsp.readdir(taskPath)).sort()) !== '["owner.json"]') {
+      throw authorityError('Worker owner marker identity changed before cleanup.');
+    }
+    ensureActive();
+    await fsp.unlink(markerPath);
+    await afterCleanupStep?.('owner_marker_unlinked');
+  }
+  const finalTaskStat = await fsp.lstat(taskPath);
+  const finalRecoveryStat = await fsp.lstat(recoveryPath);
+  const finalRootStat = await fsp.lstat(root);
+  if (finalTaskStat.dev !== taskStat.dev || finalTaskStat.ino !== taskStat.ino
+    || !finalRecoveryStat.isFile() || finalRecoveryStat.isSymbolicLink()
+    || finalRecoveryStat.dev !== recoveryRecord.stat.dev
+    || finalRecoveryStat.ino !== recoveryRecord.stat.ino
+    || finalRootStat.dev !== rootStat.dev || finalRootStat.ino !== rootStat.ino
+    || await fsp.realpath(root) !== realRoot
+    || (await fsp.readdir(taskPath)).length !== 0) {
+    throw authorityError('Worker task directory is not empty after owned cleanup.');
+  }
+  ensureActive();
   await fsp.rmdir(taskPath);
-  if (path.dirname(taskPath) !== root) throw new Error('Worker task directory parent changed unexpectedly.');
+  await afterCleanupStep?.('task_directory_removed');
+  const lastRecoveryStat = await fsp.lstat(recoveryPath);
+  const lastRootStat = await fsp.lstat(root);
+  if (!lastRecoveryStat.isFile() || lastRecoveryStat.isSymbolicLink()
+    || lastRecoveryStat.dev !== recoveryRecord.stat.dev
+    || lastRecoveryStat.ino !== recoveryRecord.stat.ino
+    || lastRootStat.dev !== rootStat.dev || lastRootStat.ino !== rootStat.ino
+    || await fsp.realpath(root) !== realRoot
+    || await fsp.readFile(recoveryPath, 'utf8') !== recoveryRecord.wire) {
+    throw authorityError('Worker recovery marker identity changed before final removal.');
+  }
+  ensureActive();
+  await fsp.unlink(recoveryPath);
+  await afterCleanupStep?.('recovery_marker_unlinked');
   return { cleaned: true };
 }
 
-async function inspectOrphans({ root, realRoot, keyResolver, now }) {
+async function inspectOrphans({
+  root,
+  realRoot,
+  keyResolver,
+  now,
+  afterCleanupStep,
+  deadlineAt,
+  signal,
+}) {
+  const ensureActive = () => assertCleanupActive({
+    deadlineAt, signal, deadlineCode: 'CIM_SCAN_CLEANUP_UNCERTAIN',
+  });
+  ensureActive();
   const entries = await fsp.readdir(root, { withFileTypes: true });
   if (entries.length > maximumOrphanEntries) throw new Error('Worker ephemeral root has excessive orphan state.');
+  const groups = new Map();
   for (const entry of entries) {
-    if (!entry.name.startsWith('task-') || !entry.isDirectory() || entry.isSymbolicLink()) {
+    const taskMatch = taskEntryPattern.exec(entry.name);
+    const recoveryMatch = recoveryEntryPattern.exec(entry.name);
+    if (taskMatch && entry.isDirectory() && !entry.isSymbolicLink()) {
+      const group = groups.get(taskMatch[1]) || { requestId: taskMatch[1] };
+      group.taskPath = path.join(root, entry.name);
+      groups.set(group.requestId, group);
+    } else if (recoveryMatch && entry.isFile() && !entry.isSymbolicLink()) {
+      const group = groups.get(recoveryMatch[1]) || { requestId: recoveryMatch[1] };
+      group.recoveryPath = path.join(root, entry.name);
+      groups.set(group.requestId, group);
+    } else {
       throw new Error('Worker ephemeral root contains unknown orphan state.');
     }
-    const taskPath = path.join(root, entry.name);
-    assertBeneath(realRoot, await fsp.realpath(taskPath));
-    const markerPath = path.join(taskPath, 'owner.json');
-    let marker;
+  }
+  const plans = [];
+  for (const group of groups.values()) {
     try {
-      const markerStat = await fsp.lstat(markerPath);
-      if (!markerStat.isFile() || markerStat.isSymbolicLink()) throw new Error('invalid');
-      marker = verifyMarker(await fsp.readFile(markerPath, 'utf8'), keyResolver);
+      let ownerRecord = null;
+      let recoveryRecord = null;
+      if (group.taskPath) {
+        assertBeneath(realRoot, await fsp.realpath(group.taskPath));
+        const taskStat = await fsp.lstat(group.taskPath);
+        if (!taskStat.isDirectory() || taskStat.isSymbolicLink()) throw new Error('invalid task');
+        const names = (await fsp.readdir(group.taskPath)).sort();
+        if (names.some((name) => !['attachment.bin', 'owner.json'].includes(name))) {
+          throw new Error('unknown task entry');
+        }
+        if (names.includes('attachment.bin')) {
+          const attachmentPath = path.join(group.taskPath, 'attachment.bin');
+          const attachmentStat = await fsp.lstat(attachmentPath);
+          if (!attachmentStat.isFile() || attachmentStat.isSymbolicLink()) {
+            throw new Error('invalid attachment');
+          }
+          assertBeneath(realRoot, await fsp.realpath(attachmentPath));
+        }
+        if (names.includes('owner.json')) {
+          ownerRecord = await readAuthenticatedMarker(
+            path.join(group.taskPath, 'owner.json'), keyResolver,
+          );
+        } else if (names.length !== 0) {
+          throw new Error('attachment without owner');
+        }
+      }
+      if (group.recoveryPath) {
+        assertBeneath(realRoot, await fsp.realpath(group.recoveryPath));
+        recoveryRecord = await readAuthenticatedMarker(group.recoveryPath, keyResolver);
+      }
+      const authority = ownerRecord || recoveryRecord;
+      if (!authority || authority.marker.requestId !== group.requestId) {
+        throw new Error('marker filename mismatch');
+      }
+      if (ownerRecord && recoveryRecord
+        && (ownerRecord.wire !== recoveryRecord.wire
+          || ownerRecord.stat.dev !== recoveryRecord.stat.dev
+          || ownerRecord.stat.ino !== recoveryRecord.stat.ino)) {
+        throw new Error('marker conflict');
+      }
+      if (!ownerRecord && group.taskPath && !recoveryRecord) throw new Error('missing authority');
+      plans.push({ ...group, marker: authority.marker });
     } catch {
       throw new Error('Worker orphan state cannot be authenticated.');
     }
-    if (Date.parse(marker.expiresAt) > now.getTime()) {
+  }
+  for (const plan of plans) {
+    if (Date.parse(plan.marker.expiresAt) > now.getTime()) {
       throw new Error('Worker has an unexpired in-flight orphan task.');
     }
-    await defaultCleanupOwnedTask({
-      root, realRoot, taskPath,
-      request: { requestId: marker.requestId, requestDigest: marker.requestDigest },
-      keyResolver,
-    });
+  }
+  for (const plan of plans) {
+    ensureActive();
+    if (plan.taskPath) {
+      await defaultCleanupOwnedTask({
+        root, realRoot, taskPath: plan.taskPath,
+        request: { requestId: plan.marker.requestId, requestDigest: plan.marker.requestDigest },
+        keyResolver,
+        afterCleanupStep,
+        deadlineAt,
+        signal,
+        deadlineCode: 'CIM_SCAN_CLEANUP_UNCERTAIN',
+      });
+    } else {
+      const expectedPath = recoveryPathFor(root, plan.marker.requestId);
+      if (plan.recoveryPath !== expectedPath || await lstatIfPresent(path.join(
+        root, `task-${plan.marker.requestId}`,
+      ))) {
+        throw new Error('Worker standalone recovery state is invalid.');
+      }
+      const record = await readAuthenticatedMarker(plan.recoveryPath, keyResolver);
+      const rootStat = await fsp.lstat(root);
+      assertBeneath(realRoot, await fsp.realpath(plan.recoveryPath));
+      if (record.marker.requestId !== plan.marker.requestId
+        || record.marker.requestDigest !== plan.marker.requestDigest
+        || !rootStat.isDirectory() || rootStat.isSymbolicLink()
+        || await fsp.realpath(root) !== realRoot) {
+        throw new Error('Worker standalone recovery marker changed.');
+      }
+      ensureActive();
+      await fsp.unlink(plan.recoveryPath);
+      await afterCleanupStep?.('recovery_marker_unlinked');
+    }
   }
 }
 
@@ -170,6 +464,10 @@ function workerDeadlineError(message = 'Worker task exceeded its shared deadline
   return error;
 }
 
+function workerCleanupUncertainError() {
+  return cleanupDeadlineError('CIM_SCAN_CLEANUP_UNCERTAIN');
+}
+
 function replayConflictError() {
   const error = new Error('Worker replay identity conflicts with another request.');
   error.code = 'CIM_SCAN_REPLAY_CONFLICT';
@@ -178,6 +476,10 @@ function replayConflictError() {
 
 function isWorkerDeadlineError(error) {
   return error?.code === 'CIM_SCAN_DEADLINE';
+}
+
+export function isWorkerCleanupUncertainError(error) {
+  return error?.code === 'CIM_SCAN_CLEANUP_UNCERTAIN';
 }
 
 function remainingDeadlineMs(deadlineAt) {
@@ -214,6 +516,117 @@ async function beforeWorkerDeadline(operation, {
     return await Promise.race([pending, timeout]);
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function beforeWorkerDeadlineAndSettleCleanup(operation, {
+  deadlineAt,
+  controller,
+} = {}) {
+  const remaining = Math.floor(deadlineAt - performance.now());
+  if (!Number.isFinite(remaining) || remaining < 1) throw workerCleanupUncertainError();
+  let timedOut = false;
+  let timer;
+  const pending = Promise.resolve().then(operation);
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(workerDeadlineError());
+      reject(workerCleanupUncertainError());
+    }, remaining);
+  });
+  try {
+    return await Promise.race([pending, timeout]);
+  } catch (error) {
+    if (!timedOut) throw error;
+    try {
+      await pending;
+    } catch {
+      // The typed cleanup-uncertain timeout remains authoritative only after
+      // the current recovery operation has settled and can no longer mutate.
+    }
+    throw workerCleanupUncertainError();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function beforeCleanupFinalizationDeadline(operation, { deadlineAt, controller } = {}) {
+  const remaining = Math.floor(deadlineAt - performance.now());
+  if (!Number.isFinite(remaining) || remaining < 1) throw workerCleanupUncertainError();
+  let timer;
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = workerCleanupUncertainError();
+      controller.abort(error);
+      reject(error);
+    }, remaining);
+  });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyEphemeralRootEmpty({ root, realRoot }) {
+  const stat = await fsp.lstat(root);
+  if (!stat.isDirectory() || stat.isSymbolicLink()
+    || await fsp.realpath(root) !== realRoot
+    || (await fsp.readdir(root)).length !== 0) {
+    throw workerCleanupUncertainError();
+  }
+  return true;
+}
+
+async function finalizeTimedOutOwnedTask({
+  root,
+  realRoot,
+  taskPath,
+  request,
+  keyResolver,
+  cleanupOwnedTask,
+  taskAuthority,
+  now,
+  afterCleanupStep,
+}) {
+  let remainingMs;
+  try {
+    const current = nowDate(now);
+    remainingMs = Math.floor(Math.min(
+      cleanupFinalizationLimitMs,
+      Date.parse(request.expiresAt) - current.getTime(),
+      Date.parse(request.leaseExpiresAt) - current.getTime(),
+    ));
+  } catch {
+    throw workerCleanupUncertainError();
+  }
+  if (!Number.isFinite(remainingMs) || remainingMs < 1) throw workerCleanupUncertainError();
+  const deadlineAt = performance.now() + remainingMs;
+  const controller = new AbortController();
+  try {
+    const cleaned = await beforeCleanupFinalizationDeadline(
+      () => cleanupOwnedTask({
+        root,
+        realRoot,
+        taskPath,
+        request,
+        keyResolver,
+        taskAuthority,
+        afterCleanupStep,
+        deadlineAt,
+        signal: controller.signal,
+        deadlineCode: 'CIM_SCAN_CLEANUP_UNCERTAIN',
+      }),
+      { deadlineAt, controller },
+    );
+    if (cleaned?.cleaned !== true) throw workerCleanupUncertainError();
+    await beforeCleanupFinalizationDeadline(
+      () => verifyEphemeralRootEmpty({ root, realRoot }),
+      { deadlineAt, controller },
+    );
+  } catch {
+    throw workerCleanupUncertainError();
   }
 }
 
@@ -310,7 +723,26 @@ export async function runOnDemandScanTask({
   now = () => new Date(),
   signatureNow = now,
   cleanupOwnedTask = defaultCleanupOwnedTask,
+  createTaskDirectory = (taskPath) => fsp.mkdir(taskPath, { mode: 0o700 }),
+  writeOwnerMarker = (markerPath, markerWire) => fsp.writeFile(markerPath, markerWire, {
+    mode: 0o600, flag: 'wx',
+  }),
+  afterCleanupStep,
+  afterCopy,
+  afterScan,
 } = {}) {
+  if (afterCopy !== undefined && typeof afterCopy !== 'function') {
+    throw new Error('Worker after-copy lifecycle hook is invalid.');
+  }
+  if (afterScan !== undefined && typeof afterScan !== 'function') {
+    throw new Error('Worker after-scan lifecycle hook is invalid.');
+  }
+  if (afterCleanupStep !== undefined && typeof afterCleanupStep !== 'function') {
+    throw new Error('Worker cleanup lifecycle hook is invalid.');
+  }
+  if (typeof createTaskDirectory !== 'function' || typeof writeOwnerMarker !== 'function') {
+    throw new Error('Worker owned-task filesystem seam is invalid.');
+  }
   const current = nowDate(now);
   const signatureCurrent = nowDate(signatureNow);
   if (typeof requireAttachment !== 'boolean') {
@@ -362,7 +794,15 @@ export async function runOnDemandScanTask({
     }
 
     const { root, realRoot } = await runBounded(() => ensureEphemeralRoot(ephemeralRoot));
-    await runBounded(() => inspectOrphans({ root, realRoot, keyResolver, now: current }));
+    await beforeWorkerDeadlineAndSettleCleanup(() => inspectOrphans({
+      root,
+      realRoot,
+      keyResolver,
+      now: current,
+      afterCleanupStep,
+      deadlineAt,
+      signal: controller.signal,
+    }), { deadlineAt, controller });
     if (!scanner || typeof scanner.health !== 'function' || typeof scanner.scan !== 'function') {
       throw new Error('Worker scanner adapter is unavailable.');
     }
@@ -377,6 +817,7 @@ export async function runOnDemandScanTask({
     let staged = { outcome: 'unavailable', reasonCode: 'scanner_unavailable' };
     let cleanupStatus = 'cleaned';
     let taskPath = null;
+    let taskAuthority = null;
     const scannerHealthy = validHealth(preHealth, signatureCurrent);
     if (!scannerHealthy) {
       staged = { outcome: 'unavailable', reasonCode: 'stale_signatures' };
@@ -387,18 +828,85 @@ export async function runOnDemandScanTask({
     }
     if (scannerHealthy || requireAttachment) {
       taskPath = path.join(root, `task-${request.requestId}`);
-      await runBounded(() => fsp.mkdir(taskPath, { mode: 0o700 }));
-      const markerPath = path.join(taskPath, 'owner.json');
-      await runBounded(() => fsp.writeFile(markerPath, createMarker(request, resolveKey(keyResolver, request.keyId)), {
-        mode: 0o600, flag: 'wx',
-      }));
       try {
-        const identity = await writeTaskCopy({
+        await runBounded(() => createTaskDirectory(taskPath));
+      } catch (error) {
+        if (isWorkerDeadlineError(error) || isWorkerDeadlineError(controller.signal.reason)) {
+          throw workerCleanupUncertainError();
+        }
+        throw error;
+      }
+      let createdTaskStat;
+      try {
+        createdTaskStat = await runBounded(() => fsp.lstat(taskPath));
+      } catch (error) {
+        if (isWorkerDeadlineError(error) || isWorkerDeadlineError(controller.signal.reason)) {
+          throw workerCleanupUncertainError();
+        }
+        throw error;
+      }
+      if (!createdTaskStat.isDirectory() || createdTaskStat.isSymbolicLink()) {
+        throw workerCleanupUncertainError();
+      }
+      taskAuthority = {
+        taskDev: createdTaskStat.dev,
+        taskIno: createdTaskStat.ino,
+      };
+      const markerPath = path.join(taskPath, 'owner.json');
+      try {
+        await runBounded(() => writeOwnerMarker(
+          markerPath,
+          createMarker(request, resolveKey(keyResolver, request.keyId)),
+        ));
+      } catch (error) {
+        if (isWorkerDeadlineError(error) || isWorkerDeadlineError(controller.signal.reason)) {
+          throw workerCleanupUncertainError();
+        }
+        throw error;
+      }
+      let createdMarkerStat;
+      try {
+        createdMarkerStat = await runBounded(() => fsp.lstat(markerPath));
+      } catch (error) {
+        if (isWorkerDeadlineError(error) || isWorkerDeadlineError(controller.signal.reason)) {
+          throw workerCleanupUncertainError();
+        }
+        throw error;
+      }
+      if (!createdMarkerStat.isFile() || createdMarkerStat.isSymbolicLink()) {
+        throw workerCleanupUncertainError();
+      }
+      taskAuthority.markerDev = createdMarkerStat.dev;
+      taskAuthority.markerIno = createdMarkerStat.ino;
+      let identity = null;
+      try {
+        identity = await writeTaskCopy({
           request, taskPath, openByteStream, deadlineAt, controller,
         });
-        if (identity.size !== request.sizeBytes || identity.sha256 !== request.sha256) {
-          staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
-        } else if (scannerHealthy) {
+        const createdAttachmentStat = await runBounded(() => fsp.lstat(identity.attachmentPath));
+        if (!createdAttachmentStat.isFile() || createdAttachmentStat.isSymbolicLink()) {
+          throw workerCleanupUncertainError();
+        }
+        identity.attachmentDev = createdAttachmentStat.dev;
+        identity.attachmentIno = createdAttachmentStat.ino;
+      } catch (error) {
+        if (isWorkerCleanupUncertainError(error)) throw error;
+        staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
+      }
+      if (identity && (identity.size !== request.sizeBytes || identity.sha256 !== request.sha256)) {
+        staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
+      } else if (identity) {
+        taskAuthority.attachmentDev = identity.attachmentDev;
+        taskAuthority.attachmentIno = identity.attachmentIno;
+        if (afterCopy) {
+          try {
+            await runBounded(() => afterCopy());
+          } catch (error) {
+            if (!isWorkerDeadlineError(error)
+              && !isWorkerDeadlineError(controller.signal.reason)) throw error;
+          }
+        }
+        if (scannerHealthy) {
           let receivedScannerResult = false;
           try {
             staged = await runBounded(() => scanner.scan({
@@ -410,6 +918,14 @@ export async function runOnDemandScanTask({
             receivedScannerResult = true;
           } catch {
             staged = { outcome: 'unavailable', reasonCode: 'scanner_unavailable' };
+          }
+          if (receivedScannerResult && afterScan) {
+            try {
+              await runBounded(() => afterScan());
+            } catch (error) {
+              if (!isWorkerDeadlineError(error)
+                && !isWorkerDeadlineError(controller.signal.reason)) throw error;
+            }
           }
           let postHealth;
           try {
@@ -427,22 +943,44 @@ export async function runOnDemandScanTask({
               reasonCode: staged.outcome === 'unsafe' ? 'malware_found' : 'signature_evidence_changed' };
           }
         }
-      } catch {
-        staged = { outcome: 'ambiguous', reasonCode: 'attachment_identity_mismatch' };
       }
     }
 
     if (taskPath) {
+      const cleanupArguments = {
+        root, realRoot, taskPath, request, keyResolver,
+        deadlineAt, signal: controller.signal, taskAuthority, afterCleanupStep,
+      };
+      const deadlineFailure = isWorkerDeadlineError(controller.signal.reason)
+        ? controller.signal.reason : null;
+      if (deadlineFailure) {
+        await finalizeTimedOutOwnedTask({
+          root, realRoot, taskPath, request, keyResolver, cleanupOwnedTask, taskAuthority, now,
+          afterCleanupStep,
+        });
+        throw deadlineFailure;
+      }
+      let cleanupStarted = false;
       try {
         const cleaned = await runBounded(
-          () => cleanupOwnedTask({ root, realRoot, taskPath, request, keyResolver }),
+          () => {
+            cleanupStarted = true;
+            return cleanupOwnedTask(cleanupArguments);
+          },
         );
         cleanupStatus = cleaned?.cleaned === true ? 'cleaned' : 'retained';
       } catch (error) {
         if (isWorkerDeadlineError(error)
           || isWorkerDeadlineError(controller.signal.reason)) {
-          throw isWorkerDeadlineError(error) ? error : controller.signal.reason;
+          const deadlineError = isWorkerDeadlineError(error) ? error : controller.signal.reason;
+          if (cleanupStarted) throw workerCleanupUncertainError();
+          await finalizeTimedOutOwnedTask({
+            root, realRoot, taskPath, request, keyResolver, cleanupOwnedTask, taskAuthority, now,
+            afterCleanupStep,
+          });
+          throw deadlineError;
         }
+        if (isWorkerCleanupUncertainError(error)) throw error;
         cleanupStatus = 'retained';
       }
       if (cleanupStatus !== 'cleaned' && staged.outcome === 'clean') {
@@ -463,6 +1001,9 @@ export async function runOnDemandScanTask({
       expiresAt: resultExpiry(request, scannedAt),
       cleanupStatus,
     }, { keyResolver });
+    // The concrete store checks the same signal immediately before its atomic
+    // commit.  The worker race bounds asynchronous waits; a committed
+    // synchronous transaction remains authoritative and cannot lose to a timer.
     const completed = await runBounded(() => replayStore.complete({
       keyId: request.keyId,
       requestId: request.requestId,

@@ -13,6 +13,33 @@ const digestPattern = /^[a-f0-9]{64}$/;
 const imageDigestPattern = /^sha256:[a-f0-9]{64}$/;
 const generatedChunkBytes = 64 * 1024;
 
+export const CIM_SCAN_COMPOSITE_BENCHMARK_PHASES = Object.freeze([
+  'timeout',
+  'timeout-recovery',
+  'after-copy-crash',
+  'after-copy-recovery',
+  'after-scan-crash',
+  'after-scan-recovery',
+  'cleanup-refusal',
+  'cleanup-refusal-recovery',
+]);
+
+const ordinaryBenchmarkPhases = new Set(['single', 'primary', 'replay', 'conflict']);
+const compositeBenchmarkPhases = new Set(CIM_SCAN_COMPOSITE_BENCHMARK_PHASES);
+const recoveryPairs = Object.freeze([
+  Object.freeze(['timeout', 'timeout-recovery']),
+  Object.freeze(['after-copy-crash', 'after-copy-recovery']),
+  Object.freeze(['after-scan-crash', 'after-scan-recovery']),
+  Object.freeze(['cleanup-refusal', 'cleanup-refusal-recovery']),
+]);
+const faultPhases = Object.freeze([
+  'after-copy-crash', 'after-scan-crash', 'cleanup-refusal',
+]);
+const normalPhases = Object.freeze([
+  'timeout', 'timeout-recovery', 'after-copy-recovery',
+  'after-scan-recovery', 'cleanup-refusal-recovery',
+]);
+
 function hasControlCharacter(value) {
   return [...value].some((character) => {
     const code = character.codePointAt(0);
@@ -42,6 +69,41 @@ function exactApiBaseUrl(value) {
     throw new Error('Fly API base URL must be one exact HTTPS origin.');
   }
   return parsed.toString().replace(/\/$/, '');
+}
+
+function exactBenchmarkTarget(value, phase) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).sort().join(',') !== 'appName,expectedImageDigest,machineId') {
+    throw new Error(`Benchmark phase ${phase} requires one exact target.`);
+  }
+  return Object.freeze({
+    machineId: requiredIdentity(value.machineId, `Benchmark phase ${phase} Machine identity`,
+      dnsLabelPattern),
+    appName: requiredIdentity(value.appName, `Benchmark phase ${phase} application identity`,
+      dnsLabelPattern),
+    expectedImageDigest: requiredIdentity(value.expectedImageDigest,
+      `Benchmark phase ${phase} image digest`, imageDigestPattern),
+  });
+}
+
+function requireCompositeTopology(targets, normalImageDigest) {
+  for (const [faultPhase, recoveryPhase] of recoveryPairs) {
+    const faultTarget = targets.get(faultPhase);
+    const recoveryTarget = targets.get(recoveryPhase);
+    if (faultTarget.machineId !== recoveryTarget.machineId
+      || faultTarget.appName !== recoveryTarget.appName) {
+      throw new Error(`Benchmark ${faultPhase} recovery does not preserve its exact state authority.`);
+    }
+  }
+  for (const phase of normalPhases) {
+    if (targets.get(phase).expectedImageDigest !== normalImageDigest) {
+      throw new Error(`Benchmark phase ${phase} must use the reviewed normal recovery image.`);
+    }
+  }
+  const faultDigests = faultPhases.map((phase) => targets.get(phase).expectedImageDigest);
+  if (faultDigests.includes(normalImageDigest) || new Set(faultDigests).size !== faultDigests.length) {
+    throw new Error('Benchmark fault phases require distinct reviewed fault images.');
+  }
 }
 
 export function loadCimScanSyntheticCallerConfig(environment = process.env) {
@@ -110,6 +172,7 @@ export async function createSyntheticCloudScannerFactory({
   monotonicNow = () => performance.now(),
   now = () => new Date(),
   composeScanner = createFlyCimScannerComposition,
+  resolveBenchmarkTarget,
 } = {}) {
   for (const [value, label] of [
     [readFile, 'file reader'], [fetchImpl, 'Fly API transport'], [requestImpl, 'HTTPS request'],
@@ -117,6 +180,9 @@ export async function createSyntheticCloudScannerFactory({
     [composeScanner, 'scanner composition'],
   ]) {
     if (typeof value !== 'function') throw new Error(`Synthetic caller ${label} is required.`);
+  }
+  if (resolveBenchmarkTarget !== undefined && typeof resolveBenchmarkTarget !== 'function') {
+    throw new Error('Synthetic caller benchmark target resolver must be a function.');
   }
   const [tokenBytes, ca, keyValue] = await Promise.all([
     readFile(config.accessTokenFile, { maximumBytes: 4 * 1024, privateFile: true }),
@@ -130,15 +196,30 @@ export async function createSyntheticCloudScannerFactory({
   const key = Buffer.from(keyValue);
   if (key.length < 32) throw new Error('Synthetic caller protocol key is too short.');
   const pinnedRequestImpl = createPinnedNodeHttpsRequestImpl({ ca, requestImpl });
-  return function createFreshScannerComposition({
+  const compositeTargets = new Map();
+  const baseTarget = Object.freeze({
+    machineId: config.machineId,
+    appName: config.appName,
+    expectedImageDigest: config.expectedImageDigest,
+  });
+  const createFreshScannerComposition = function createFreshScannerComposition({
+    benchmarkPhase = 'single',
     now: compositionNow = now,
     resultNow: compositionResultNow = compositionNow,
     requestMaxDurationMs = CIM_SCAN_PROTOCOL_LIMITS.maxWorkerDurationMs,
   } = {}) {
+    if (!ordinaryBenchmarkPhases.has(benchmarkPhase)
+      && !compositeBenchmarkPhases.has(benchmarkPhase)) {
+      throw new Error('Synthetic caller benchmark phase is unexpected.');
+    }
+    const target = compositeBenchmarkPhases.has(benchmarkPhase)
+      ? compositeTargets.get(benchmarkPhase)
+      : baseTarget;
+    if (!target) throw new Error('Composite benchmark target preflight is required.');
     const composition = composeScanner({
-      machineId: config.machineId,
-      expectedImageDigest: config.expectedImageDigest,
-      appName: config.appName,
+      machineId: target.machineId,
+      expectedImageDigest: target.expectedImageDigest,
+      appName: target.appName,
       port: 8443,
       apiBaseUrl: config.apiBaseUrl,
       accessToken,
@@ -159,6 +240,24 @@ export async function createSyntheticCloudScannerFactory({
     }
     return composition;
   };
+  Object.defineProperty(createFreshScannerComposition, 'assertBenchmarkScenarioSupported', {
+    enumerable: false,
+    value: async (scenario) => {
+      if (scenario !== 'timeout-cleanup-owned-stop') return;
+      if (typeof resolveBenchmarkTarget !== 'function') {
+        throw new Error('Composite benchmark target resolver is required.');
+      }
+      compositeTargets.clear();
+      const staged = new Map();
+      for (const phase of CIM_SCAN_COMPOSITE_BENCHMARK_PHASES) {
+        const resolved = await resolveBenchmarkTarget(Object.freeze({ phase, baseTarget }));
+        staged.set(phase, exactBenchmarkTarget(resolved, phase));
+      }
+      requireCompositeTopology(staged, config.expectedImageDigest);
+      for (const [phase, target] of staged) compositeTargets.set(phase, target);
+    },
+  });
+  return createFreshScannerComposition;
 }
 
 function generatedDigest(sizeBytes, fillByte) {
