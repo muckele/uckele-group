@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import { ChevronLeft, ChevronRight, Search } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import OpportunityDrawer, { PassForm } from './OpportunityDrawer.jsx';
+import { earningsPresentation } from '../../utils/earningsPresentation.js';
 
 const emptySummary = { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 };
 const summaryItems = [
@@ -35,21 +36,6 @@ function withoutApprovalAuthority(preparation) {
 function money(value) {
   if (value === null || value === undefined || value === '') return '—';
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(Number(value));
-}
-
-function earningsPresentation(financials = {}) {
-  const evidence = financials.annualProfitEvidence || {};
-  const metric = evidence.metric && evidence.metric !== 'unknown'
-    ? ['sde', 'ebitda'].includes(evidence.metric.toLowerCase())
-      ? evidence.metric.toUpperCase() : formatLabel(evidence.metric)
-    : 'Earnings metric unverified';
-  const period = evidence.period && evidence.period !== 'unknown'
-    ? formatLabel(evidence.period).toLowerCase() : 'period unverified';
-  const value = financials.annualProfit;
-  const amount = value === null || value === undefined || value === '' ? '—'
-    : evidence.currency === 'USD' ? money(value)
-      : `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(Number(value))} ${evidence.currency && evidence.currency !== 'unknown' ? evidence.currency : 'currency unverified'}`;
-  return { label: `${metric} · ${period}`, amount };
 }
 
 function formatLabel(value) {

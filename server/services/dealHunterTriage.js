@@ -584,6 +584,9 @@ function currentDetailSourceRows(rows = []) {
       field,
       value,
       canonicalUrl,
+      sourceId: detailText(row.source_id ?? row.sourceId, 200),
+      sourceRecordId: detailText(row.source_record_id ?? row.sourceRecordId, 200),
+      acceptedEvidenceId: detailText(row.accepted_evidence_id ?? row.acceptedEvidenceId, 240),
       observedAt: authorityAt.value,
       timestamp: authorityAt.timestamp,
       fractionalNanoseconds: authorityAt.fractionalNanoseconds,
@@ -696,7 +699,7 @@ function currentDetailDisposition(records) {
     : { state: '', reason: '', note: '', dismissedAt: '', dismissedBy: '' };
 }
 
-function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceRows = [], submission = null, cimRequests = [], dispositions = [], materialEvent = null } = {}) {
+function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceRows = [], submission = null, cimRequests = [], dispositions = [], materialEvent = null, annualProfitEvidence = null } = {}) {
   const row = publicTriageRow(score, { includeOperatorNote: true });
   const sources = currentDetailSourceRows(sourceRows);
   const sourceLocation = currentDetailSourceValue(sources, ['location'], 240);
@@ -727,7 +730,19 @@ function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceR
     opportunityId: detailText(row.opportunityId, 200), dealKey: detailText(row.dealKey, 200), name: detailText(currentOpportunity?.canonical_name, 500) || currentDetailSourceValue(sources, ['name', 'business_name'], 500) || detailText(row.name, 500) || 'Unnamed opportunity', state: detailText(state, 40), listingUrl,
     fitScore: detailNumber(row.fitScore), scoreStatus: detailText(row.scoreStatus, 80), confidence: detailText(row.confidence, 80), completenessScore: detailNumber(row.completenessScore), missingEvidenceCount: detailNumber(row.missingEvidenceCount), contradictionCount: detailNumber(row.contradictionCount), shouldRemove: Boolean(row.shouldRemove), highFit: Boolean(row.highFit),
     geography: { city: detailText(city, 160), state: detailText(state, 40), label: detailText(location, 240) }, industry: currentDetailSourceValue(sources, ['industry'], 240) || detailText(row.industry, 240),
-    financials: { annualProfit: currentDetailSourceNumber(sources, ['annual_profit', 'ttm_ebitda'], row.financials?.annualProfit), annualRevenue: currentDetailSourceNumber(sources, ['annual_revenue', 'ttm_revenue'], row.financials?.annualRevenue), askingPrice: currentDetailSourceNumber(sources, ['asking_price'], row.financials?.askingPrice), profitMultiple: currentDetailSourceNumber(sources, ['profit_multiple', 'ebitda_multiple'], row.financials?.profitMultiple) },
+    financials: {
+      annualProfit: currentDetailSourceNumber(sources, ['annual_profit', 'ttm_ebitda'], row.financials?.annualProfit),
+      ...(annualProfitEvidence && typeof annualProfitEvidence === 'object' ? {
+        annualProfitEvidence: {
+          metric: detailText(annualProfitEvidence.metric, 80) || 'unknown',
+          period: detailText(annualProfitEvidence.period, 80) || 'unknown',
+          currency: detailText(annualProfitEvidence.currency, 16) || 'unknown',
+        },
+      } : {}),
+      annualRevenue: currentDetailSourceNumber(sources, ['annual_revenue', 'ttm_revenue'], row.financials?.annualRevenue),
+      askingPrice: currentDetailSourceNumber(sources, ['asking_price'], row.financials?.askingPrice),
+      profitMultiple: currentDetailSourceNumber(sources, ['profit_multiple', 'ebitda_multiple'], row.financials?.profitMultiple),
+    },
     topStrength, topConcern, workflow: { crmStatus, cimStatus }, observationFreshness, operatorPriority: detailText(row.operatorPriority, 40) || 'normal', operatorNote: detailText(row.operatorNote, 2000), reviewed: Boolean(row.reviewed), reviewedAt: detailText(row.reviewedAt, 80), reviewedBy: detailText(row.reviewedBy, 160), changedSinceReview: Boolean(row.changedSinceReview), disposition, dismissed, dismissedReason: dismissed ? disposition.reason : '', scoredAt: detailText(row.scoredAt, 80), scoreFingerprint: detailText(row.scoreFingerprint, 200), rulesVersion: detailText(row.rulesVersion, 160),
     freshness: { discoveryState: detailText(currentOpportunity?.discovery_state, 40) || 'untracked_legacy',
       firstAcceptedAt: detailText(currentOpportunity?.first_accepted_at, 80),
@@ -858,6 +873,17 @@ export async function getTriageOpportunityDetail({
     // for persisted canary copy, addressing, status, and stop revisions.
     storage.readPursueCimProjection?.({ opportunityId: id }) || null,
   ]);
+  const selectedAnnualProfit = currentDetailSourceRows(sourceRows)
+    .find((source) => source.field === 'annual_profit');
+  const annualProfitEvidence = selectedAnnualProfit?.acceptedEvidenceId
+    ? await storage.getDealHunterAnnualProfitEvidence?.({
+      opportunityId: id,
+      acceptedEvidenceId: selectedAnnualProfit.acceptedEvidenceId,
+      sourceId: selectedAnnualProfit.sourceId,
+      sourceRecordId: selectedAnnualProfit.sourceRecordId,
+      value: selectedAnnualProfit.value,
+    }) || null
+    : null;
   const sanitizedOperatorFacts = operatorFacts
     .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
     .slice(0, 100);
@@ -892,6 +918,7 @@ export async function getTriageOpportunityDetail({
     cimRequests: canonicalCimRequests,
     dispositions,
     materialEvent,
+    annualProfitEvidence,
   });
   const projectedScore = projectScore(score, byDimension, unattributed);
   const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({

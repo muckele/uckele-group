@@ -1169,6 +1169,88 @@ test('consolidated detail returns the exact bounded view with authority, conflic
   assert.equal(scoreWrites, 0);
 });
 
+test('detail carries the selected accepted earnings provenance without hiding source conflicts', async (t) => {
+  const { storage, opportunityId, sqlitePath } = await detailStorage(t);
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  database.exec(`INSERT INTO deal_hunter_freshness_evidence
+    (id, source_id, source_name, source_record_id, run_id, generation, event_type,
+      field_key, event_ordinal, current_canonical_id, after_value, metric, currency, period)
+    VALUES ('detail-earnings-core', 'deal-os', 'Deal OS', 'deal-1', 'detail-earnings-run', 1,
+      'accepted_source_record', '', 3, '${opportunityId}', NULL, 'unknown', 'unknown', 'unknown'),
+      ('detail-earnings-field', 'deal-os', 'Deal OS', 'deal-1', 'detail-earnings-run', 1,
+      'accepted_source_record', 'annual_profit', 3, '${opportunityId}', 200000,
+      'ebitda', 'USD', 'trailing-twelve-months');
+    INSERT INTO deal_hunter_freshness_evidence
+      (id, source_id, source_name, source_record_id, run_id, generation, event_type,
+        field_key, event_ordinal, current_canonical_id, after_value, metric, currency, period)
+      VALUES ('detail-earnings-wrong-ordinal', 'deal-os', 'Deal OS', 'deal-1',
+        'detail-earnings-run', 1, 'accepted_source_record', 'annual_profit', 0,
+        '${opportunityId}', 200000, 'sde', 'USD', 'annual');
+    UPDATE deal_hunter_opportunity_source_observations
+      SET accepted_evidence_id = 'detail-earnings-core'
+      WHERE id = 'source-conflict';`);
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+
+  assert.deepEqual(detail.opportunity.financials.annualProfitEvidence, {
+    metric: 'ebitda', period: 'trailing-twelve-months', currency: 'USD',
+  });
+  assert.equal(detail.opportunity.financials.annualProfit, 200000,
+    'provenance remains bound to the exact source row selected by detail authority');
+  assert.equal(detail.sourceObservations.some((source) => source.conflicts.some(
+    (conflict) => conflict.field === 'annual_profit',
+  )), true);
+});
+
+test('Supabase earnings provenance stays bound to the selected accepted source identity and value', async () => {
+  const calls = [];
+  const responses = [
+    { data: { run_id: 'earnings-run', source_id: 'deal-os', source_record_id: 'deal-1',
+      event_ordinal: 7, event_type: 'accepted_source_record', field_key: '',
+      current_canonical_id: 'opp-detail' }, error: null },
+    { data: { metric: 'sde', period: 'annual', currency: 'USD' }, error: null },
+  ];
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { from(table) {
+      calls.push(['from', table]);
+      return {
+        select(columns) { calls.push(['select', columns]); return this; },
+        eq(field, value) { calls.push(['eq', field, value]); return this; },
+        order(field, options) { calls.push(['order', field, options]); return this; },
+        limit(value) { calls.push(['limit', value]); return this; },
+        async maybeSingle() { calls.push(['maybeSingle']); return responses.shift(); },
+      };
+    } } },
+  );
+
+  assert.deepEqual(await storage.getDealHunterAnnualProfitEvidence({
+    opportunityId: 'opp-detail', acceptedEvidenceId: 'earnings-core', sourceId: 'deal-os',
+    sourceRecordId: 'deal-1', value: '425000',
+  }), { metric: 'sde', period: 'annual', currency: 'USD' });
+  assert.deepEqual(calls, [
+    ['from', 'deal_hunter_freshness_evidence'],
+    ['select', 'run_id,source_id,source_record_id,event_ordinal,event_type,field_key,current_canonical_id'],
+    ['eq', 'id', 'earnings-core'],
+    ['maybeSingle'],
+    ['from', 'deal_hunter_freshness_evidence'],
+    ['select', 'metric,period,currency'],
+    ['eq', 'run_id', 'earnings-run'],
+    ['eq', 'source_id', 'deal-os'],
+    ['eq', 'source_record_id', 'deal-1'],
+    ['eq', 'event_ordinal', 7],
+    ['eq', 'current_canonical_id', 'opp-detail'],
+    ['eq', 'event_type', 'accepted_source_record'],
+    ['eq', 'field_key', 'annual_profit'],
+    ['eq', 'after_value', 425000],
+    ['order', 'accepted_at', { ascending: false }],
+    ['order', 'id', undefined],
+    ['limit', 1],
+    ['maybeSingle'],
+  ]);
+});
+
 test('detail reads a phone-like legacy broker_contact without relabeling its source observation', async (t) => {
   // Break caught: legacy durable source rows either remain invisible to the
   // Broker & Seller fact model or are rewritten as if their original source
