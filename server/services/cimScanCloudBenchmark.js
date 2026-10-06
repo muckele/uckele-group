@@ -72,6 +72,13 @@ function requireFunction(value, label) {
   return value;
 }
 
+function benchmarkQualificationError(message, qualificationCode, qualificationFields) {
+  const error = new Error(message);
+  error.qualificationCode = qualificationCode;
+  error.qualificationFields = Object.freeze([...qualificationFields]);
+  return error;
+}
+
 function scanInput(job) {
   return {
     claim: job.claim,
@@ -365,7 +372,13 @@ async function runTimeout({
       observed = error instanceof CimScanBenchmarkAbruptExitObservedError
         && ownedStopVerifier(error);
     }
-    if (!observed) throw new Error('Cloud benchmark crash lacked abrupt-exit and exact owned-stop proof.');
+    if (!observed) {
+      throw benchmarkQualificationError(
+        'Cloud benchmark crash lacked abrupt-exit and exact owned-stop proof.',
+        'qualification_benchmark_abrupt_exit_proof_missing',
+        ['phase', 'exactStopConfirmed', 'ownedOrphanRetained'],
+      );
+    }
     requireExactBody(job);
     await waitForExpiry(job);
     await recover(recoveryPhase);

@@ -381,7 +381,14 @@ test('mandatory crash phases require typed abrupt exit and exact owned-stop proo
         return result('clean', 'clean');
       },
       async waitUntil() {},
-    })), /abrupt|owned stop|crash/i);
+    })), (error) => {
+      assert.match(error.message, /abrupt|owned stop|crash/i);
+      assert.equal(error.qualificationCode,
+        'qualification_benchmark_abrupt_exit_proof_missing');
+      assert.deepEqual(error.qualificationFields,
+        ['phase', 'exactStopConfirmed', 'ownedOrphanRetained']);
+      return true;
+    });
   }
 });
 

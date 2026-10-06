@@ -15,6 +15,7 @@ import {
 import { createCimScanWorkerHttpComposition } from '../server/services/cimScanComposition.js';
 import { createCimScanWorkerCheckContinueHandler } from '../server/services/cimScanWorkerHttp.js';
 import { createSingleCimScanAdmission } from '../server/services/cimScanWorkerAdmission.js';
+import { runOnDemandScanTask } from '../server/services/cimScanWorker.js';
 import {
   createPinnedHttpScanRequestClient,
   isScannerReplayConflictError,
@@ -124,6 +125,7 @@ async function withWorker(t, overrides = {}) {
   });
   return {
     ...composition,
+    root,
     replayStore,
     now,
     setClock(value) { clock = new Date(value); },
@@ -396,6 +398,147 @@ test('real worker timeout flushes bodyless 408 before closing its stalled reques
   assert.equal(output.result().body, '');
   assert.equal(output.events.includes('continue'), true);
   assert.equal(input.reads(), 1);
+  assert.deepEqual(await fsp.readdir(worker.root), []);
+});
+
+test('HTTP worker maps unproven timeout cleanup to bodyless 500 and retains owned state', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-http-uncertain-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const issuedAt = new Date();
+  const now = () => new Date();
+  const wire = signedRequest({
+    requestId: '93111111-1111-4111-8111-111111111111',
+    intakeId: '93222222-2222-4222-8222-222222222222',
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: new Date(issuedAt.getTime() + 160).toISOString(),
+    leaseExpiresAt: new Date(issuedAt.getTime() + 1_000).toISOString(),
+    maxDurationMs: 30,
+  });
+  const input = stalledFakeRequest(wire);
+  const output = fakeResponse();
+  const handler = createCimScanWorkerCheckContinueHandler({
+    keyResolver,
+    replayStore: createSyntheticReplayStore({ now }),
+    admission: createSingleCimScanAdmission(),
+    ephemeralRoot: root,
+    scanner: createSyntheticWorkerScanner(),
+    now,
+    runTask: (options) => runOnDemandScanTask({
+      ...options,
+      cleanupOwnedTask: async () => new Promise(() => {}),
+    }),
+  });
+
+  await handler(input.request, output.response);
+
+  assert.equal(output.result().status, 500);
+  assert.equal(output.result().body, '');
+  assert.equal(output.events.includes('continue'), true);
+  assert.equal(input.reads(), 1);
+  assert.equal((await fsp.readdir(root)).length, 1);
+});
+
+test('HTTP worker maps admitted startup-recovery deadline to bodyless 500 without opening bytes',
+  async (t) => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-http-sweep-timeout-'));
+    t.after(() => fsp.rm(root, { recursive: true, force: true }));
+    let clock = new Date('2026-10-03T12:00:00.000Z');
+    const now = () => new Date(clock);
+    const orphanWire = signedRequest({
+      requestId: '95111111-1111-4111-8111-111111111111',
+      intakeId: '95222222-2222-4222-8222-222222222222',
+    });
+    await assert.rejects(runOnDemandScanTask({
+      requestWire: orphanWire,
+      openByteStream: () => Readable.from([attachment]),
+      keyResolver,
+      replayStore: createSyntheticReplayStore({ now }),
+      admission: createSingleCimScanAdmission(),
+      ephemeralRoot: root,
+      scanner: createSyntheticWorkerScanner(),
+      now,
+      afterCopy() { throw new Error('synthetic abrupt process stop'); },
+    }), /synthetic abrupt process stop/);
+
+    clock = new Date('2026-10-03T12:03:01.000Z');
+    const replayStore = createSyntheticReplayStore({ now });
+    const wire = signedRequest({
+      requestId: '96111111-1111-4111-8111-111111111111',
+      intakeId: '96222222-2222-4222-8222-222222222222',
+      issuedAt: clock.toISOString(),
+      expiresAt: '2026-10-03T12:05:00.000Z',
+      leaseExpiresAt: '2026-10-03T12:06:00.000Z',
+      maxDurationMs: 30,
+    });
+    const input = fakeRequest(wire);
+    const output = fakeResponse();
+    let cleanupStepSettled = false;
+    const handler = createCimScanWorkerCheckContinueHandler({
+      keyResolver,
+      replayStore,
+      admission: createSingleCimScanAdmission(),
+      ephemeralRoot: root,
+      scanner: createSyntheticWorkerScanner(),
+      now,
+      runTask: (options) => runOnDemandScanTask({
+        ...options,
+        async afterCleanupStep(step) {
+          if (step !== 'recovery_marker_linked') return;
+          await new Promise((resolve) => setTimeout(resolve, 90));
+          cleanupStepSettled = true;
+        },
+      }),
+    });
+
+    await handler(input.request, output.response);
+
+    assert.equal(output.result().status, 500);
+    assert.equal(output.result().body, '');
+    assert.equal(output.events.includes('continue'), true);
+    assert.equal(input.reads(), 0);
+    assert.equal(cleanupStepSettled, true);
+    assert.equal([...replayStore.entries.values()][0].resultWire, null);
+    assert.deepEqual((await fsp.readdir(root)).sort(), [
+      'recovery-95111111-1111-4111-8111-111111111111.json',
+      'task-95111111-1111-4111-8111-111111111111',
+    ]);
+  });
+
+test('HTTP worker maps late post-admission task creation to bodyless 500', async (t) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'ug-cim-worker-http-late-create-'));
+  t.after(() => fsp.rm(root, { recursive: true, force: true }));
+  const wire = signedRequest({
+    requestId: '94111111-1111-4111-8111-111111111111',
+    intakeId: '94222222-2222-4222-8222-222222222222',
+    maxDurationMs: 25,
+  });
+  const input = fakeRequest(wire);
+  const output = fakeResponse();
+  const handler = createCimScanWorkerCheckContinueHandler({
+    keyResolver,
+    replayStore: createSyntheticReplayStore({
+      now: () => new Date('2026-10-03T12:00:00.000Z'),
+    }),
+    admission: createSingleCimScanAdmission(),
+    ephemeralRoot: root,
+    scanner: createSyntheticWorkerScanner(),
+    now: () => new Date('2026-10-03T12:00:00.000Z'),
+    runTask: (options) => runOnDemandScanTask({
+      ...options,
+      createTaskDirectory: async (taskPath) => {
+        await new Promise((resolve) => setTimeout(resolve, 70));
+        await fsp.mkdir(taskPath, { mode: 0o700 });
+      },
+    }),
+  });
+
+  await handler(input.request, output.response);
+  assert.equal(output.result().status, 500);
+  assert.equal(output.result().body, '');
+  assert.equal(output.events.includes('continue'), true);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(await fsp.readdir(root),
+    ['task-94111111-1111-4111-8111-111111111111']);
 });
 
 test('one composed worker admission rejects a concurrent job before bytes and releases afterward', async (t) => {

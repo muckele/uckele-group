@@ -213,9 +213,9 @@ async function timeoutCleanupAndStopCase() {
       bytes,
       now: clock,
       overrides: {
-        expiresAt: new Date(clock.getTime() + 60).toISOString(),
-        leaseExpiresAt: new Date(clock.getTime() + 80).toISOString(),
-        maxDurationMs: 40,
+        expiresAt: new Date(clock.getTime() + 5_000).toISOString(),
+        leaseExpiresAt: new Date(clock.getTime() + 6_000).toISOString(),
+        maxDurationMs: 120,
       },
     });
     let timer;
@@ -236,7 +236,8 @@ async function timeoutCleanupAndStopCase() {
       scanner: scanner(),
       now: () => clock,
     }), /deadline/i);
-    assert.equal((await fsp.readdir(roots.ephemeralRoot)).length, 1);
+    assert.deepEqual(await fsp.readdir(roots.ephemeralRoot), [],
+      'ordinary timeout must finish exact owned cleanup before reporting its deadline');
 
     clock = new Date(baseTime.getTime() + 1_000);
     const recoveryBytes = Buffer.alloc(1024, 10);
