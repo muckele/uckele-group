@@ -877,7 +877,8 @@ describe('Acquisition Inbox queue', () => {
       queueRow({
         opportunityId: 'opp-2', dealKey: 'deal-2', name: 'Passed Plumbing', reviewed: true,
         fitScore: 63, confidence: 'medium', operatorPriority: 'normal', scoreStatus: 'watchlist', dismissed: true,
-        dismissedReason: 'valuation', observationFreshness: '2026-08-28T17:00:00.000Z',
+        dismissedReason: 'valuation', dismissedNote: 'Price exceeds the approved range.',
+        dismissedAt: '2026-08-28T18:00:00.000Z', observationFreshness: '2026-08-28T17:00:00.000Z',
         geography: { city: 'Pasadena', state: 'CA', label: 'Pasadena, CA' }, industry: 'Plumbing services',
         financials: { annualProfit: 200000, annualRevenue: 1000000, askingPrice: 900000, profitMultiple: 4.5 },
         topStrength: 'Stable service demand.', topConcern: 'Margins need review.',
@@ -907,6 +908,8 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByText('Observed Aug 29, 2026')).toBeVisible();
     expect(screen.getByText('Review: Reviewed')).toBeVisible();
     expect(screen.getByText('Passed: Valuation')).toBeVisible();
+    expect(screen.getByText('Decision note: Price exceeds the approved range.')).toBeVisible();
+    expect(screen.getByText('Passed Aug 28, 2026')).toBeVisible();
     const passedRow = screen.getByRole('button', { name: 'Open Passed Plumbing' }).closest('li');
     expect(within(passedRow).queryByRole('button', { name: 'Pursue Passed Plumbing' })).not.toBeInTheDocument();
     expect(within(passedRow).queryByRole('button', { name: 'Watch Passed Plumbing' })).not.toBeInTheDocument();
@@ -920,6 +923,14 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByRole('searchbox', { name: 'Search opportunities' })).toHaveAttribute('placeholder', 'Business or deal key');
     expect(screen.getByRole('option', { name: 'Newest score' })).toHaveValue('scored-at');
     expect(screen.queryByRole('option', { name: 'Newest observation' })).not.toBeInTheDocument();
+  });
+
+  test('describes the durable decision fields searched by the Passed archive', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse())));
+    renderInbox();
+    fireEvent.click(await screen.findByRole('tab', { name: 'Passed' }));
+    expect(screen.getByRole('searchbox', { name: 'Search opportunities' }))
+      .toHaveAttribute('placeholder', 'Business, deal key, reason, or note');
   });
 
   test('keeps the current queue loading while a stale request resolves and finalizes', async () => {
