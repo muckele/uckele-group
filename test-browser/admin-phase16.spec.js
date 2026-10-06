@@ -311,8 +311,8 @@ function createPhase1FixtureState() {
   const scoreRows = [
     phase1ScoreRow({ opportunityId: 'opp-cascade', fitScore: 84, scoreStatus: 'watchlist', confidence: 'low', completenessScore: 61, missingEvidenceCount: 4, financials: { annualProfit: 360000, annualRevenue: 1900000, askingPrice: 1500000, profitMultiple: 4.17 }, observationFreshness: '2026-08-28T19:00:00.000Z', scoredAt: '2026-08-28T18:00:00.000Z', scoreFingerprint: 'phase1-machine-score-cascade-84' }),
     phase1ScoreRow({ opportunityId: 'opp-heritage', fitScore: 71, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 77, contradictionCount: 1, highFit: false, financials: { annualProfit: 275000, annualRevenue: 1400000, askingPrice: 1150000, profitMultiple: 4.18 }, reviewed: true, reviewedAt: '2026-08-27T18:00:00.000Z', reviewedBy: 'phase1-admin', observationFreshness: '2026-08-27T17:00:00.000Z', scoredAt: '2026-08-27T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-heritage-71' }),
-    phase1ScoreRow({ opportunityId: 'opp-evergreen', fitScore: 92, scoreStatus: 'high-fit', confidence: 'high', completenessScore: 91, financials: { annualProfit: 520000, annualRevenue: 2800000, askingPrice: 2100000, profitMultiple: 4.04 }, observationFreshness: '2026-08-30T16:00:00.000Z', scoredAt: '2026-08-30T15:00:00.000Z', evidenceObservedAt: '2026-08-30T14:30:00.000Z', scoreFingerprint: 'phase1-machine-score-evergreen-92' }),
-    phase1ScoreRow({ opportunityId: 'opp-summit', fitScore: 78, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 79, operatorPriority: 'high', financials: { annualProfit: 390000, annualRevenue: 2050000, askingPrice: 1600000, profitMultiple: 4.1 }, observationFreshness: '2026-08-26T17:00:00.000Z', scoredAt: '2026-08-26T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-summit-78' }),
+    phase1ScoreRow({ opportunityId: 'opp-evergreen', fitScore: 92, scoreStatus: 'high-fit', confidence: 'high', completenessScore: 91, financials: { annualProfit: 520000, annualProfitEvidence: { metric: 'sde', period: 'trailing-twelve-months', currency: 'USD' }, annualRevenue: 2800000, askingPrice: 2100000, profitMultiple: 4.04 }, observationFreshness: '2026-08-30T16:00:00.000Z', scoredAt: '2026-08-30T15:00:00.000Z', evidenceObservedAt: '2026-08-30T14:30:00.000Z', scoreFingerprint: 'phase1-machine-score-evergreen-92' }),
+    phase1ScoreRow({ opportunityId: 'opp-summit', fitScore: 78, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 79, operatorPriority: 'high', financials: { annualProfit: 390000, annualProfitEvidence: { metric: 'sde', period: 'trailing-twelve-months', currency: 'USD' }, annualRevenue: 2050000, askingPrice: 1600000, profitMultiple: 4.1 }, observationFreshness: '2026-08-26T17:00:00.000Z', scoredAt: '2026-08-26T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-summit-78' }),
   ];
   const sourceObservations = canonicalOpportunities.flatMap((opportunity) => {
     const score = scoreRows.find((row) => row.opportunityId === opportunity.opportunityId);
@@ -453,6 +453,7 @@ function phase1DetailOpportunity(state, opportunityId) {
     industry: value('industry') || current.industry,
     financials: {
       annualProfit: number(current.financials.annualProfit, 'annual_profit', 'ttm_ebitda'),
+      annualProfitEvidence: current.financials.annualProfitEvidence,
       annualRevenue: number(current.financials.annualRevenue, 'annual_revenue', 'ttm_revenue'),
       askingPrice: number(current.financials.askingPrice, 'asking_price'),
       profitMultiple: number(current.financials.profitMultiple, 'profit_multiple', 'ebitda_multiple'),
@@ -2409,6 +2410,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expectPhase1DetailValue(dialog, 'Confidence', 'High');
   await expectPhase1DetailValue(dialog, 'Machine state', 'High Fit');
   const businessFinancials = dialog.getByRole('heading', { name: 'Business & Financials' }).locator('..');
+  await expect(businessFinancials.getByText('SDE · trailing twelve months', { exact: true })).toBeVisible();
   await expect(businessFinancials.getByText('$535,000', { exact: true })).toBeVisible();
   await expect(businessFinancials.getByText('$2,800,000', { exact: true })).toBeVisible();
   await expect(businessFinancials.getByText('$2,100,000', { exact: true })).toBeVisible();
@@ -2617,6 +2619,9 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const drawerOverflow = await page.evaluate(() => ({ clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
   expect(drawerOverflow.scrollWidth).toBeLessThanOrEqual(drawerOverflow.clientWidth);
   await dialog.evaluate((element) => { element.scrollTop = 0; });
+  const mobileFinancials = dialog.getByRole('heading', { name: 'Business & Financials' }).locator('..');
+  await mobileFinancials.scrollIntoViewIfNeeded();
+  await expect(mobileFinancials.getByText('SDE · trailing twelve months', { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('phase1-mobile-drawer.png'), fullPage: false });
   await dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
 

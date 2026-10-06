@@ -4326,6 +4326,41 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
+    async getDealHunterAnnualProfitEvidence({ opportunityId, acceptedEvidenceId, sourceId, sourceRecordId, value } = {}) {
+      const id = String(opportunityId || '').trim();
+      const evidenceId = String(acceptedEvidenceId || '').trim();
+      const source = String(sourceId || '').trim();
+      const record = String(sourceRecordId || '').trim();
+      const amount = Number(value);
+      if (!id || !evidenceId || !source || !record || !Number.isFinite(amount)) return null;
+      const { data: core, error: coreError } = await client
+        .from('deal_hunter_freshness_evidence')
+        .select('run_id,source_id,source_record_id,event_ordinal,event_type,field_key,current_canonical_id')
+        .eq('id', evidenceId)
+        .maybeSingle();
+      if (coreError) throw coreError;
+      if (!core || core.source_id !== source || core.source_record_id !== record
+        || core.event_type !== 'accepted_source_record' || core.field_key !== ''
+        || core.current_canonical_id !== id || !Number.isSafeInteger(core.event_ordinal)) return null;
+      const { data: evidence, error: evidenceError } = await client
+        .from('deal_hunter_freshness_evidence')
+        .select('metric,period,currency')
+        .eq('run_id', core.run_id)
+        .eq('source_id', core.source_id)
+        .eq('source_record_id', core.source_record_id)
+        .eq('event_ordinal', core.event_ordinal)
+        .eq('current_canonical_id', id)
+        .eq('event_type', 'accepted_source_record')
+        .eq('field_key', 'annual_profit')
+        .eq('after_value', amount)
+        .order('accepted_at', { ascending: false })
+        .order('id')
+        .limit(1)
+        .maybeSingle();
+      if (evidenceError) throw evidenceError;
+      return evidence || null;
+    },
+
     async bindAcceptedDealHunterFreshness({ importId, opportunityId, sourceRecordId, expectedGeneration, snapshot } = {}) {
       const normalizedSnapshot = normalizeOpportunitySourceObservationSnapshot(snapshot);
       const runId = String(importId || '').trim();

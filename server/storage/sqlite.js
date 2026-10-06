@@ -13139,6 +13139,33 @@ export function createSqliteStorage(config, options = {}) {
       `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
+    async getDealHunterAnnualProfitEvidence({ opportunityId, acceptedEvidenceId, sourceId, sourceRecordId, value } = {}) {
+      const id = String(opportunityId || '').trim();
+      const evidenceId = String(acceptedEvidenceId || '').trim();
+      const source = String(sourceId || '').trim();
+      const record = String(sourceRecordId || '').trim();
+      const amount = Number(value);
+      if (!id || !evidenceId || !source || !record || !Number.isFinite(amount)) return null;
+      return database.prepare(`SELECT evidence.metric, evidence.period, evidence.currency
+        FROM deal_hunter_opportunity_source_observations AS source
+        JOIN deal_hunter_freshness_evidence AS core ON core.id = source.accepted_evidence_id
+        JOIN deal_hunter_freshness_evidence AS evidence ON evidence.run_id = core.run_id
+          AND evidence.source_id = core.source_id
+          AND evidence.source_record_id = core.source_record_id
+          AND evidence.event_ordinal = core.event_ordinal
+          AND evidence.event_type = 'accepted_source_record'
+          AND evidence.field_key = 'annual_profit'
+          AND evidence.current_canonical_id = source.opportunity_id
+        WHERE source.opportunity_id = ? AND source.source_id = ? AND source.source_record_id = ?
+          AND source.field = 'annual_profit' AND source.accepted_evidence_id = ?
+          AND core.event_type = 'accepted_source_record' AND core.field_key = ''
+          AND core.current_canonical_id = source.opportunity_id
+          AND CAST(source.value AS REAL) = evidence.after_value
+          AND evidence.after_value = ?
+        ORDER BY evidence.accepted_at DESC, evidence.id LIMIT 1`)
+        .get(id, source, record, evidenceId, amount) || null;
+    },
+
     async bindAcceptedDealHunterFreshness({ importId, opportunityId, sourceRecordId, expectedGeneration, snapshot } = {}) {
       const runId = String(importId || '').trim();
       const canonicalId = String(opportunityId || '').trim();
