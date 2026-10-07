@@ -683,7 +683,19 @@ function normalizeDealHunterScoreEvidenceRow(row) {
 }
 
 function normalizeDealHunterOpportunityFactRow(row) {
-  return row ? { ...row, verified: Boolean(row.verified) } : null;
+  if (!row) return null;
+  return {
+    id: row.id,
+    opportunity_id: row.opportunity_id,
+    field: row.field,
+    value: row.value,
+    source: row.source,
+    verified: Boolean(row.verified),
+    actor: row.actor,
+    note: row.note,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
 }
 
 function normalizeDealHunterOpportunitySourceObservationRow(row) {
@@ -4206,6 +4218,8 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       expectedCampaignAuthorityRevision,
       expectedPrimarySubmissionId = null,
       expectedSubmissionFactSnapshot = null,
+      idempotencyKeyDigest,
+      requestDigest,
     } = {}) {
       const record = normalizeOperatorOpportunityFactRecord(fact);
       const expectedRevision = Number(expectedCampaignAuthorityRevision);
@@ -4224,11 +4238,17 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         ))) {
         throw new Error('Opportunity fact expected submission revision is invalid.');
       }
+      if (![idempotencyKeyDigest, requestDigest].every((digest) =>
+        typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest))) {
+        throw new Error('Opportunity fact idempotency authority is invalid.');
+      }
       const { data, error } = await client.rpc('insert_current_deal_hunter_opportunity_fact', {
         p_fact: record,
         p_expected_campaign_authority_revision: expectedRevision,
         p_expected_primary_submission_id: expectedSubmissionId,
         p_expected_submission_fact_snapshot: expectedSnapshot,
+        p_idempotency_key_digest: idempotencyKeyDigest,
+        p_request_digest: requestDigest,
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityFactRow(data);

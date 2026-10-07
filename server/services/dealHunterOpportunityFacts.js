@@ -195,6 +195,10 @@ function sourceObservationDigest(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
 
+function operatorFactDigest(parts) {
+  return createHash('sha256').update(JSON.stringify(parts)).digest('hex');
+}
+
 function normalizeFreshnessClaim(claim, kind) {
   if (claim === null || claim === undefined) return null;
   if (!claim || typeof claim !== 'object' || Array.isArray(claim)) throw new Error('Freshness source claim must be bounded.');
@@ -442,6 +446,7 @@ export async function setCurrentOperatorOpportunityFact({
   actor,
   verified = false,
   note = null,
+  idempotencyKey,
   expectedRevision,
   storage,
 } = {}) {
@@ -471,16 +476,32 @@ export async function setCurrentOperatorOpportunityFact({
     || !validSnapshot) {
     throw new Error('Opportunity fact expected revision is invalid.');
   }
+  if (typeof idempotencyKey !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)) {
+    throw new Error('A valid client idempotency key is required.');
+  }
+  const normalizedField = normalizeOpportunityFactField(field);
+  const normalizedValue = normalizeText(value, 'Opportunity fact value');
+  const normalizedActor = normalizeText(actor, 'Opportunity fact actor', { maxLength: 200 });
+  const normalizedNote = normalizeText(note, 'Opportunity fact note', { required: false, maxLength: 4000 });
+  const idempotencyKeyDigest = operatorFactDigest([
+    'operator-fact-idempotency-key:v1', idempotencyKey.toLowerCase(),
+  ]);
+  const requestDigest = operatorFactDigest([
+    'operator-fact-idempotency-request:v1', id, normalizedField, normalizedValue,
+    verified, normalizedActor, normalizedNote,
+  ]);
   const fact = {
-    id: randomUUID(), opportunity_id: id, field: normalizeOpportunityFactField(field),
-    value: normalizeText(value, 'Opportunity fact value'), source: 'operator', verified,
-    actor: normalizeText(actor, 'Opportunity fact actor', { maxLength: 200 }),
-    note: normalizeText(note, 'Opportunity fact note', { required: false, maxLength: 4000 }), created_at: now, updated_at: now,
+    id: randomUUID(), opportunity_id: id, field: normalizedField,
+    value: normalizedValue, source: 'operator', verified,
+    actor: normalizedActor, note: normalizedNote, created_at: now, updated_at: now,
   };
   const saved = await storage.insertCurrentDealHunterOpportunityFact(fact, {
     expectedCampaignAuthorityRevision: revision,
     expectedPrimarySubmissionId: primarySubmissionId,
     expectedSubmissionFactSnapshot: submissionFactSnapshot,
+    idempotencyKeyDigest,
+    requestDigest,
   });
   if (!saved) throw new Error('The canonical opportunity is no longer current.');
   return saved;
