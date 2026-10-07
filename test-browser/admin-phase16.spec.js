@@ -2470,6 +2470,8 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(evergreenOriginalListing).toHaveAttribute('href', 'https://broker.example/evergreen');
   await expect(evergreenOriginalListing).toHaveAttribute('target', '_blank');
   await expect(evergreenOriginalListing).toHaveAttribute('rel', /noopener/);
+  await expect(queue.getByRole('button', { name: 'Pursue Evergreen Safety Services' }).locator('..'))
+    .toHaveCSS('justify-content', 'flex-start');
   await page.screenshot({ path: testInfo.outputPath('phase1-opportunity-links-desktop.png'), fullPage: false });
   await evergreenTrigger.click();
   let dialog = page.getByRole('dialog', { name: 'Evergreen Safety Services' });
@@ -2662,6 +2664,8 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const mobileSummitListing = queue.getByRole('link', { name: 'Open original listing for Summit Fire Systems' });
   await expect(mobileSummitDetails).toHaveText('Open opportunity');
   await expect(mobileSummitListing).toHaveAttribute('href', 'https://broker.example/summit');
+  const mobileSummitActions = queue.getByRole('button', { name: 'Pursue Summit Fire Systems' }).locator('..');
+  await expect(mobileSummitActions).toHaveCSS('justify-content', 'center');
   const mobileControls = [
     page.getByRole('searchbox', { name: 'Search opportunities' }),
     page.getByRole('combobox', { name: 'Confidence', exact: true }),

@@ -54,7 +54,7 @@ function isAbortError(error) {
 function ActionButtons({ context = '', disabled, name, onAction }) {
   const accessibleName = (action) => `${action}${context ? ` ${context}` : ''} ${name}`;
   return (
-    <div className="flex flex-wrap gap-1.5">
+    <div className="flex flex-wrap justify-center gap-1.5 md:justify-start">
       <button aria-label={accessibleName('Pursue')} className={primaryButtonClass} disabled={disabled} onClick={(event) => onAction('pursue', event)} type="button">Pursue</button>
       <button aria-label={accessibleName('Watch')} className={buttonClass} disabled={disabled} onClick={(event) => onAction('watch', event)} type="button">Watch</button>
       <button aria-label={accessibleName('Pass')} className={`${buttonClass} text-red-700`} disabled={disabled} onClick={(event) => onAction('pass', event)} type="button">Pass</button>
