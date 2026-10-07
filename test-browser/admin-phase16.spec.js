@@ -1340,7 +1340,9 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       const brokerFixture = state.brokerMaterialsByOpportunity[opportunityId];
       const allowedBrokerVerification = field === 'broker_email' && brokerFixture?.allowBrokerVerification;
       if (!opportunity || !score || (field !== 'seller_name' && !allowedBrokerVerification)) throw new Error(`Unexpected Phase 1 fact target: ${path}`);
-      if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['expectedRevision', 'note', 'value', 'verified'])) {
+      if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['expectedRevision', 'idempotencyKey', 'note', 'value', 'verified'])
+        || typeof body.idempotencyKey !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.idempotencyKey)) {
         throw new Error(`Malformed Phase 1 fact payload keys: ${JSON.stringify(body)}`);
       }
       state.factPayloads.push({ method, path, body });
@@ -2765,6 +2767,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     method: 'PUT',
     path: '/api/admin/deal-hunter/opportunities/opp-evergreen/facts/seller_name',
     body: { value: 'Morgan Verified Seller', note: 'Confirmed directly with the seller on Aug 30.', verified: true,
+      idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/i),
       expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } },
   }]);
   const prohibitedPath = /(?:\/send(?:\/|$)|\/cim(?:[-_/]|$)|stage[-_]?2|scores?\/refresh|\/refresh(?:\/|$)|backfill|deal-os-import|\/import(?:\/|$)|source-refresh|crm-sync|follow-up|outreach|\/review(?:\/|$)|scrap)/i;
@@ -2804,6 +2807,7 @@ test('Acquisition Inbox rejects a stale verified-fact save, refreshes authority,
       value: 'Owner draft from the stale drawer',
       note: 'Keep this draft while reviewing the newer source.',
       verified: true,
+      idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/i),
       expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null },
     },
   }]);
@@ -2974,6 +2978,7 @@ test('Request Broker Materials requires an explicit opaque contact and verified 
   await opened.card.getByRole('button', { name: 'Request Broker Materials' }).click();
   await expect(opened.card.getByText(/verified-browser-broker@example\.test/).first()).toBeVisible();
   expect(manualState.factPayloads.at(-1).body).toEqual({ value: 'verified-browser-broker@example.test', note: 'Verified for the broker materials request.', verified: true,
+    idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/i),
     expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } });
   expectBrokerRouteAuditClean(manualState);
 });
