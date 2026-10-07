@@ -7,7 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const preSliceRevision = 'ceac48dc7368607503bfe6a8ac414daec219d7be';
+const preSliceRevision = 'f863fe51eb40fb7a61b9b30ec4a8d45ef76a4844';
 const integrationEnabled = process.env.DEAL_HUNTER_PASSED_ARCHIVE_POSTGRES_INTEGRATION === '1';
 const dockerCommand = fs.existsSync('/usr/local/bin/docker') ? '/usr/local/bin/docker' : 'docker';
 

@@ -2247,16 +2247,23 @@ test('Fresh-first Inbox keeps new unlinked discovery visible beside overflowing 
     if (url.searchParams.get('view') !== 'inbox') return route.fallback();
     const area = url.searchParams.get('area');
     const cursor = url.searchParams.get('cursor');
+    const search = (url.searchParams.get('search') || '').toLowerCase();
+    const confidence = url.searchParams.get('confidence') || '';
+    const priority = url.searchParams.get('priority') || '';
+    const filterRows = (rows) => rows.filter((row) => (!search || row.name.toLowerCase().includes(search))
+      && (!confidence || row.confidence === confidence)
+      && (!priority || row.operatorPriority === priority));
     let areas;
     if (area === 'owner-priorities') areas = [{ id: area,
-      rows: cursor ? oldPriorities.slice(10) : oldPriorities.slice(0, 10),
-      total: 15, nextCursor: cursor ? null : 'synthetic-owner-page-2', revision: 'owner-r1', counts: {} }];
-    else if (area === 'due-actions') areas = [{ id: area, rows: due,
-      total: 5, nextCursor: null, revision: 'due-r1', counts: {} }];
-    else areas = [{ id: 'action-preview', rows: due.slice(0, 2).concat(oldPriorities[5]),
-      total: 3, revision: 'action-r1',
+      rows: filterRows(cursor ? oldPriorities.slice(10) : oldPriorities.slice(0, 10)),
+      total: filterRows(oldPriorities).length, nextCursor: cursor ? null : 'synthetic-owner-page-2', revision: 'owner-r1', counts: {} }];
+    else if (area === 'due-actions') areas = [{ id: area, rows: filterRows(due),
+      total: filterRows(due).length, nextCursor: null, revision: 'due-r1', counts: {} }];
+    else areas = [{ id: 'action-preview', rows: filterRows(due.slice(0, 2).concat(oldPriorities[5])),
+      total: filterRows(due.slice(0, 2).concat(oldPriorities[5])).length, revision: 'action-r1',
       counts: { due: 5, overdue: 5, ownerPriority: 15, urgent: 1 } },
-    { id: 'new-important', rows: [fresh], total: 1, revision: 'new-r1', counts: {} }];
+    { id: 'new-important', rows: filterRows([fresh]), total: filterRows([fresh]).length,
+      revision: 'new-r1', counts: {} }];
     await fulfillPhase1Json(route, response(areas));
   });
   await page.route('**/api/admin/deal-hunter/triage/opp-cascade', async (route) => {
@@ -2276,6 +2283,24 @@ test('Fresh-first Inbox keeps new unlinked discovery visible beside overflowing 
   await expect(discovery.getByText(/1 opportunity/)).toBeVisible();
   await expect(discovery.getByText(/CRM handoff prerequisite/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('fl01-fresh-first-desktop.png'), fullPage: true });
+
+  const searchBox = page.getByRole('searchbox', { name: 'Search opportunities' });
+  const confidenceFilter = page.getByRole('combobox', { name: 'Confidence', exact: true });
+  const priorityFilter = page.getByRole('combobox', { name: 'Operator priority', exact: true });
+  await searchBox.fill('Fresh worthwhile');
+  await confidenceFilter.selectOption('high');
+  await priorityFilter.selectOption('urgent');
+  await expect(action.getByRole('listitem')).toHaveCount(1);
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
+  await expect(page.getByText('Older owner priority 1')).toHaveCount(0);
+  await expect.poll(() => state.apiRequests.filter(({ method, path }) => method === 'GET'
+    && path === '/api/admin/deal-hunter/triage').at(-1)?.search)
+    .toBe('?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox&search=Fresh+worthwhile&confidence=high&priority=urgent');
+  await searchBox.fill('');
+  await confidenceFilter.selectOption('');
+  await priorityFilter.selectOption('');
+  await expect(action.getByRole('listitem')).toHaveCount(3);
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
 
   await action.getByRole('button', { name: 'View all priorities (15)' }).click();
   const priorities = page.getByRole('region', { name: 'Owner priorities' });
