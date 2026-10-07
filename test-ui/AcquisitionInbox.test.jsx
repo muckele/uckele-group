@@ -403,6 +403,9 @@ describe('Fresh-first Acquisition Inbox', () => {
     const action = await screen.findByRole('region', { name: 'Needs Your Action' });
     const discovery = screen.getByRole('region', { name: 'New & Important' });
     expect(within(action).getByText('Fresh due opportunity')).toBeVisible();
+    expect(within(action).getByRole('button', { name: 'Opportunity details for Fresh due opportunity' })).toBeVisible();
+    expect(within(action).getByRole('link', { name: 'Open original listing for Fresh due opportunity' }))
+      .toHaveAttribute('href', 'https://broker.example/evergreen');
     expect(within(discovery).getByRole('button', { name: 'Open Fresh due opportunity' })).toBeVisible();
     expect(within(discovery).getByText(/1 opportunity/)).toBeVisible();
     expect(within(action).getByRole('button', { name: 'View all due (5)' })).toBeVisible();
@@ -691,6 +694,8 @@ describe('Acquisition Inbox queue', () => {
       contradictionCount: 2,
       freshness: { discoveryRevision: 4, materialRevision: 7 },
     });
+    const briefingLead = { ...lead };
+    delete briefingLead.listingUrl;
     const writes = [];
     vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
       const url = String(input);
@@ -701,7 +706,7 @@ describe('Acquisition Inbox queue', () => {
       if (url.endsWith('/triage/opp-1')) return jsonResponse({ success: true, ...detailResponse(lead) });
       return jsonResponse(queueResponse({
         rows: [lead], total: 1,
-        dailyDigest: digestProjection({ topOpportunities: [lead] }),
+        dailyDigest: digestProjection({ topOpportunities: [briefingLead] }),
       }));
     }));
 
@@ -716,11 +721,14 @@ describe('Acquisition Inbox queue', () => {
     expect(within(briefing).getByText('3 missing evidence items')).toBeVisible();
     expect(within(briefing).getByText('2 source conflicts')).toBeVisible();
     expect(within(briefing).getByRole('button', { name: 'Open shortlist lead Evergreen Fire Protection' })).toBeEnabled();
+    expect(within(briefing).getByRole('button', { name: 'Opportunity details for Evergreen Fire Protection' })).toBeEnabled();
+    expect(within(briefing).queryByRole('link', { name: 'Open original listing for Evergreen Fire Protection' }))
+      .not.toBeInTheDocument();
     for (const action of ['Pursue', 'Watch', 'Pass']) {
       expect(within(briefing).getByRole('button', { name: `${action} shortlist lead Evergreen Fire Protection` })).toBeEnabled();
     }
 
-    fireEvent.click(within(briefing).getByRole('button', { name: 'Open shortlist lead Evergreen Fire Protection' }));
+    fireEvent.click(within(briefing).getByRole('button', { name: 'Opportunity details for Evergreen Fire Protection' }));
     expect(await screen.findByRole('dialog', { name: /Evergreen Fire Protection/ })).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
     fireEvent.click(within(briefing).getByRole('button', { name: 'Pass shortlist lead Evergreen Fire Protection' }));
@@ -2025,12 +2033,27 @@ describe('Acquisition Inbox queue', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     renderInbox({ readOnly: true });
-    fireEvent.click(await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ }));
+    const openDetails = await screen.findByRole('button', { name: 'Opportunity details for Evergreen Fire Protection' });
+    const originalListing = screen.getByRole('link', { name: 'Open original listing for Evergreen Fire Protection' });
+    expect(originalListing).toHaveAttribute('href', 'https://broker.example/evergreen');
+    expect(originalListing).toHaveAttribute('target', '_blank');
+    expect(originalListing).toHaveAttribute('rel', expect.stringContaining('noopener'));
+    fireEvent.click(openDetails);
 
     expect(await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
     expect(screen.getByRole('button', { name: /Open Evergreen Fire Protection/ })).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Pursue Evergreen Fire Protection' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Save verified fact/ })).not.toBeInTheDocument();
+  });
+
+  test('keeps opportunity details reachable while hiding unsafe original listing URLs', async () => {
+    const unsafe = queueRow({ listingUrl: 'javascript:alert(1)' });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ rows: [unsafe], total: 1 }))));
+
+    renderInbox({ readOnly: true });
+
+    expect(await screen.findByRole('button', { name: 'Opportunity details for Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.queryByRole('link', { name: 'Open original listing for Evergreen Fire Protection' })).not.toBeInTheDocument();
   });
 
   test('saves a verified operator fact through the bounded fact route and refreshes detail', async () => {

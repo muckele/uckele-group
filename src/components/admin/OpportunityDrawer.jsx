@@ -35,7 +35,7 @@ function formatExactInstant(value) {
   return new Date(value).toISOString();
 }
 
-function safeListingUrl(value) {
+export function safeListingUrl(value) {
   if (typeof value !== 'string' || [...value].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return '';
   try {
     const parsed = new URL(value.trim());

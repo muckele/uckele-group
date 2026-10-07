@@ -2464,7 +2464,13 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect.poll(() => state.requests.filter(({ method, path }) => method === 'GET' && path === '/api/admin/deal-hunter/triage').at(-1)?.search)
     .toBe('?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc&search=Evergreen');
 
-  const evergreenTrigger = page.getByRole('button', { name: 'Open Evergreen Safety Services' });
+  const evergreenTrigger = queue.getByRole('button', { name: 'Opportunity details for Evergreen Safety Services' });
+  await expect(evergreenTrigger).toHaveText('Open opportunity');
+  const evergreenOriginalListing = queue.getByRole('link', { name: 'Open original listing for Evergreen Safety Services' });
+  await expect(evergreenOriginalListing).toHaveAttribute('href', 'https://broker.example/evergreen');
+  await expect(evergreenOriginalListing).toHaveAttribute('target', '_blank');
+  await expect(evergreenOriginalListing).toHaveAttribute('rel', /noopener/);
+  await page.screenshot({ path: testInfo.outputPath('phase1-opportunity-links-desktop.png'), fullPage: false });
   await evergreenTrigger.click();
   let dialog = page.getByRole('dialog', { name: 'Evergreen Safety Services' });
   await expect(dialog).toBeVisible();
@@ -2652,6 +2658,10 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(needsReviewTab).toHaveAttribute('aria-selected', 'true');
   const mobileSummit = page.getByRole('button', { name: 'Open Summit Fire Systems' });
   await expect(mobileSummit).toBeVisible();
+  const mobileSummitDetails = queue.getByRole('button', { name: 'Opportunity details for Summit Fire Systems' });
+  const mobileSummitListing = queue.getByRole('link', { name: 'Open original listing for Summit Fire Systems' });
+  await expect(mobileSummitDetails).toHaveText('Open opportunity');
+  await expect(mobileSummitListing).toHaveAttribute('href', 'https://broker.example/summit');
   const mobileControls = [
     page.getByRole('searchbox', { name: 'Search opportunities' }),
     page.getByRole('combobox', { name: 'Confidence', exact: true }),
@@ -2660,12 +2670,15 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     page.getByRole('button', { name: 'Pursue Summit Fire Systems' }),
     page.getByRole('button', { name: 'Watch Summit Fire Systems' }),
     page.getByRole('button', { name: 'Pass Summit Fire Systems' }),
+    mobileSummitDetails,
+    mobileSummitListing,
   ];
   for (const control of mobileControls) await expectHorizontallyReachable(control, mobileWidth);
   const defaultOverflow = await page.evaluate(() => ({ clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
   expect(defaultOverflow.scrollWidth).toBeLessThanOrEqual(defaultOverflow.clientWidth);
 
-  await mobileSummit.click();
+  await page.screenshot({ path: testInfo.outputPath('phase1-opportunity-links-mobile.png'), fullPage: false });
+  await mobileSummitDetails.click();
   dialog = page.getByRole('dialog', { name: 'Summit Fire Systems' });
   const mobileDialogBox = await dialog.boundingBox();
   expect(mobileDialogBox).not.toBeNull();
