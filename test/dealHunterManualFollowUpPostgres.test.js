@@ -24,22 +24,51 @@ const enrolledAt = '2026-09-01T16:00:00.000Z';
 const firstDueAt = '2026-09-01T17:00:00.000Z';
 const integrationEnabled = process.env.DEAL_HUNTER_POSTGRES_INTEGRATION === '1';
 const dockerCommand = fs.existsSync('/usr/local/bin/docker') ? '/usr/local/bin/docker' : 'docker';
+const dockerCommandTimeoutMs = 30_000;
+const asyncPsqlTimeoutMs = 45_000;
+const postgresOptions = '-c statement_timeout=30000 -c lock_timeout=15000';
+const integrationGateTimeoutMs = 180_000;
+const cleanupReserveMs = 15_000;
 const waitSignal = new Int32Array(new SharedArrayBuffer(4));
+let activeCommandDeadline = Number.POSITIVE_INFINITY;
 
 function pause(milliseconds) {
   Atomics.wait(waitSignal, 0, 0, milliseconds);
 }
 
-function run(command, args, { input = undefined, allowFailure = false } = {}) {
+function boundedTimeout(deadline, maximum, label) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error(`${label} exceeded its absolute deadline.`);
+  return Math.max(1, Math.min(maximum, remaining));
+}
+
+function run(command, args, {
+  input = undefined,
+  allowFailure = false,
+  timeout = dockerCommandTimeoutMs,
+  deadline = activeCommandDeadline,
+} = {}) {
+  const boundedCommandTimeout = boundedTimeout(deadline, timeout, `${command} ${args[0] || ''}`.trim());
   const result = spawnSync(command, args, {
     cwd: repositoryRoot,
     encoding: 'utf8',
     input,
     maxBuffer: 64 * 1024 * 1024,
+    timeout: boundedCommandTimeout,
+    killSignal: 'SIGKILL',
   });
+  if (result.error) {
+    throw new Error([
+      `${command} ${args.join(' ')} failed before completion`,
+      result.error.message,
+      result.stdout,
+      result.stderr,
+    ].filter(Boolean).join('\n'));
+  }
   if (!allowFailure && result.status !== 0) {
     throw new Error([
       `${command} ${args.join(' ')} failed with status ${result.status}`,
+      result.error?.message,
       result.stdout,
       result.stderr,
     ].filter(Boolean).join('\n'));
@@ -52,37 +81,73 @@ function docker(args, options = {}) {
 }
 
 function waitForPostgres(containerName) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const logs = docker(['logs', containerName], { allowFailure: true });
+  const deadline = Math.min(activeCommandDeadline, Date.now() + 15_000);
+  while (Date.now() < deadline) {
+    const timeout = boundedTimeout(deadline, 2_000, 'PostgreSQL readiness');
+    const logs = docker(['logs', containerName], { allowFailure: true, timeout, deadline });
     const readyEvents = `${logs.stdout}\n${logs.stderr}`.match(/database system is ready to accept connections/g)?.length || 0;
-    const ready = docker(['exec', containerName, 'pg_isready', '-U', 'postgres'], { allowFailure: true });
+    const ready = docker(['exec', containerName, 'pg_isready', '-U', 'postgres'], {
+      allowFailure: true,
+      timeout: boundedTimeout(deadline, 2_000, 'PostgreSQL readiness'),
+      deadline,
+    });
     if (readyEvents >= 2 && ready.status === 0) return;
     pause(100);
   }
   throw new Error('Disposable PostgreSQL did not become ready.');
 }
 
-function psql(containerName, database, sql, { allowFailure = false } = {}) {
+function psql(containerName, database, sql, { allowFailure = false, timeout = dockerCommandTimeoutMs } = {}) {
   return docker([
-    'exec', '-i', containerName,
+    'exec', '-e', `PGOPTIONS=${postgresOptions}`, '-i', containerName,
     'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', database,
-  ], { input: sql, allowFailure });
+  ], { input: sql, allowFailure, timeout });
 }
 
 function psqlAsync(containerName, database, sql) {
   return new Promise((resolve, reject) => {
+    const timeout = boundedTimeout(activeCommandDeadline, asyncPsqlTimeoutMs, 'docker exec psql');
     const child = spawn(dockerCommand, [
-      'exec', '-i', containerName,
+      'exec', '-e', `PGOPTIONS=${postgresOptions}`, '-i', containerName,
       'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', database,
     ], { cwd: repositoryRoot, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(reject, new Error(`Timed out after ${timeout} ms waiting for docker exec psql.`));
+    }, timeout);
     child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
     child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-    child.on('error', reject);
-    child.on('close', (status) => resolve({ status, stdout, stderr, pid: child.pid }));
+    child.on('error', (error) => finish(reject, error));
+    child.on('close', (status) => finish(resolve, { status, stdout, stderr, pid: child.pid }));
     child.stdin.end(sql);
   });
+}
+
+function waitForActiveQuery(containerName, database, marker) {
+  const deadline = Math.min(activeCommandDeadline, Date.now() + 10_000);
+  while (Date.now() < deadline) {
+    const count = Number(psql(containerName, database, `
+      select count(*)
+      from pg_catalog.pg_stat_activity
+      where datname = current_database()
+        and pid <> pg_backend_pid()
+        and state = 'active'
+        and wait_event = 'PgSleep'
+        and query like ${quote(`%${marker}%`)};
+    `, { timeout: boundedTimeout(deadline, 2_000, 'PostgreSQL active-query handshake') }).stdout.trim());
+    if (count > 0) return;
+    pause(50);
+  }
+  throw new Error(`Timed out waiting for active PostgreSQL query marker ${marker}.`);
 }
 
 function quote(value) {
@@ -309,6 +374,14 @@ function seedFixture(containerName, database, suffix, {
       '', ${quote(`Contact ${suffix}`)}, ${quote(`${suffix}@example.test`)}, 'Storage integration fixture.',
       'broker', '{}'::jsonb
     );
+    insert into public.deal_hunter_opportunities (
+      opportunity_id, created_at, updated_at, canonical_name, canonical_recipient,
+      canonical_location, primary_submission_id, identity_version, status, metadata
+    ) values (
+      ${quote(opportunityId)}, ${quote(initialAt)}::timestamptz, ${quote(initialAt)}::timestamptz,
+      ${quote(`Synthetic ${suffix}`)}, ${quote(`${suffix}@example.test`)}, 'Test City, CA',
+      ${quote(submissionId)}::uuid, 'deal-hunter-identity-v1', 'active', '{"fixture":true}'::jsonb
+    );
     insert into public.deal_hunter_cim_requests (
       id, created_at, updated_at, opportunity_id, deal_key, recipient_email, requested_by,
       status, request_state, delivery_state, delivery_state_at, follow_up_state,
@@ -490,16 +563,41 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
   skip: integrationEnabled ? false : 'set DEAL_HUNTER_POSTGRES_INTEGRATION=1 for the required disposable PostgreSQL release gate',
   timeout: 180_000,
 }, async (t) => {
+  const hardDeadline = Date.now() + integrationGateTimeoutMs;
+  activeCommandDeadline = hardDeadline - cleanupReserveMs;
+  const containerName = `uckele-task2-postgres-${process.pid}-${randomUUID().slice(0, 8)}`;
+  t.after(() => {
+    try {
+      const cleanupOptions = { allowFailure: true, timeout: 10_000, deadline: hardDeadline };
+      const existing = docker(['inspect', containerName], cleanupOptions);
+      if (existing.status !== 0) {
+        assert.match(existing.stderr, /No such (?:object|container)/i, 'Could not verify disposable PostgreSQL absence.');
+        return;
+      }
+      const removed = docker(['rm', '-f', '-v', containerName], cleanupOptions);
+      assert.equal(removed.status, 0, `Disposable PostgreSQL cleanup failed.\n${removed.stderr}`);
+      const retained = docker(['inspect', containerName], cleanupOptions);
+      assert.notEqual(retained.status, 0, 'Disposable PostgreSQL container remained after cleanup.');
+      assert.match(retained.stderr, /No such (?:object|container)/i, 'Could not verify disposable PostgreSQL removal.');
+    } finally {
+      activeCommandDeadline = Number.POSITIVE_INFINITY;
+    }
+  });
+
   const dockerInfo = docker(['info'], { allowFailure: true });
   assert.equal(dockerInfo.status, 0, `Docker is required for this release gate.\n${dockerInfo.stderr}`);
 
-  const containerName = `uckele-task2-postgres-${process.pid}-${randomUUID().slice(0, 8)}`;
   docker([
     'run', '--name', containerName,
+    '--pull', 'never',
+    '--network', 'none',
+    '--tmpfs', '/var/lib/postgresql/data:rw,noexec,nosuid,size=512m',
+    '--cpus', '1',
+    '--memory', '1g',
+    '--pids-limit', '256',
     '-e', 'POSTGRES_PASSWORD=task2-integration-only',
     '-d', 'postgres:16',
   ]);
-  t.after(() => docker(['rm', '-f', containerName], { allowFailure: true }));
   waitForPostgres(containerName);
 
   const schema = fs.readFileSync(schemaPath, 'utf8');
@@ -509,6 +607,8 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
     cwd: repositoryRoot,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
+    timeout: boundedTimeout(activeCommandDeadline, 10_000, 'git show parent schema'),
+    killSignal: 'SIGKILL',
   });
   psql(containerName, 'postgres', `
     create role anon nologin;
@@ -792,13 +892,14 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
       execute function public.${holdFunction}();
     `);
     try {
+      const blockerMarker = `task2-owner-blocker-${fixtureNumber}`;
       const blocker = psqlAsync(containerName, database, `
         begin;
         update public.${holdTable} set id = id where id = 1;
-        select pg_sleep(3);
+        select pg_sleep(3) /* ${blockerMarker} */;
         commit;
       `);
-      pause(100);
+      waitForActiveQuery(containerName, database, blockerMarker);
       const completionOrder = [];
       const finalizer = psqlAsync(containerName, database, finalizeStatement(fixture, {
         expectedRequestUpdatedAt: claimed.request.updated_at,
@@ -952,13 +1053,14 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
       execute function public.${holdFunction}();
     `);
     try {
+      const blockerMarker = `task2-repair-owner-blocker-${fixtureNumber}`;
       const blocker = psqlAsync(containerName, database, `
         begin;
         update public.${holdTable} set id = id where id = 1;
-        select pg_sleep(3);
+        select pg_sleep(3) /* ${blockerMarker} */;
         commit;
       `);
-      pause(100);
+      waitForActiveQuery(containerName, database, blockerMarker);
       const completionOrder = [];
       const finalizer = psqlAsync(containerName, database, finalizeStatement(fixture, {
         expectedRequestUpdatedAt: claimed.request.updated_at,
