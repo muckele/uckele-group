@@ -68,12 +68,12 @@ test.after(() => {
 test('manual follow-up routes require authenticated administrator mutation authority', async () => {
   await withServer(async (origin) => {
     const target = routes(origin);
-    for (const url of [target.start, target.stop, target.prepare, target.approve]) {
+    for (const url of [target.start, target.stop, target.prepare, target.approve, target.status]) {
       const response = await post(url, {});
       assert.equal(response.status, 401);
     }
     const viewerCookie = await login(origin, 'manual-follow-up-viewer', 'manual-follow-up-viewer-password');
-    for (const url of [target.start, target.stop, target.approve]) {
+    for (const url of [target.start, target.stop, target.approve, target.status]) {
       const response = await post(url, {}, viewerCookie);
       assert.equal(response.status, 401);
     }
@@ -88,7 +88,7 @@ test('manual follow-up routes require authenticated administrator mutation autho
 test('manual follow-up routes bind canonical opportunity and request instead of trusting path ids', async () => {
   await withServer(async (origin) => {
     const adminCookie = await login(origin, 'admin', 'change-me-now');
-    for (const url of Object.values(routes(origin, 'wrong-opportunity', 'wrong-request')).slice(0, 4)) {
+    for (const url of Object.values(routes(origin, 'wrong-opportunity', 'wrong-request'))) {
       const response = await post(url, {}, adminCookie);
       assert.notEqual(response.status, 200);
       assert.notEqual(response.status, 201);
@@ -105,6 +105,7 @@ test('manual follow-up Start body accepts no keys Stop accepts only reason Prepa
       [target.stop, { reason: 'bounded', restart: true }],
       [target.prepare, { greeting: 'Hello,', subject: 'Browser subject' }],
       [target.approve, { preparationToken: 'x.y', approvedProposalDigest: 'a'.repeat(64), recipient: 'attacker@example.test' }],
+      [target.status, { reconcile: true }],
     ];
     for (const [url, body] of invalid) {
       const response = await post(url, body, adminCookie);
@@ -128,7 +129,7 @@ test('manual follow-up Approve route is the only route that verifies a signed pr
   });
 });
 
-test('manual follow-up status uses opportunity detail GET and adds no status mutation', async () => {
+test('manual follow-up status is an explicit administrator mutation while opportunity detail remains a GET', async () => {
   await withServer(async (origin) => {
     const adminCookie = await login(origin, 'admin', 'change-me-now');
     const target = routes(origin);

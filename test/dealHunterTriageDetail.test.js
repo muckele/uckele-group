@@ -6,6 +6,7 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
+import { buildManualFollowUpCommunicationId } from '../server/services/dealHunterManualFollowUpPolicy.js';
 import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
@@ -739,15 +740,13 @@ test('SQLite and Supabase reject new noncanonical CIM IDs while preserving bound
   assert.equal((await sqlite.upsertDealHunterCimRequest(request(validId, 'sqlite-valid'))).id, validId);
 
   const supabaseUpserts = [];
-  const query = {
-    payload: null,
-    upsert(payload) { this.payload = payload; supabaseUpserts.push(payload); return this; },
-    select() { return this; },
-    async single() { return { data: this.payload, error: null }; },
-  };
   const supabase = createSupabaseStorage(
     { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
-    { client: { from(table) { assert.equal(table, 'deal_hunter_cim_requests'); return query; } } },
+    { client: { async rpc(name, parameters) {
+      assert.equal(name, 'upsert_deal_hunter_cim_request');
+      supabaseUpserts.push(parameters.p_request);
+      return { data: parameters.p_request, error: null };
+    } } },
   );
   for (const [index, id] of invalidIds.entries()) {
     await assert.rejects(supabase.upsertDealHunterCimRequest(request(id, `supabase-${index}`)), /canonical CIM request ID/i);
@@ -1356,7 +1355,7 @@ test('Broker Materials lifecycle projection is invariant to provider/request row
   assert.equal(forward.brokerMaterials.existingRequest.id, 'cim-current');
 });
 
-test('opportunity detail projects authoritative Phase 3 follow-up status and blockers', async (t) => {
+test('opportunity detail remains read-only even when a caller requests legacy reconciliation', async (t) => {
   const { storage, opportunityId } = await detailStorage(t);
   let reconciliationCalls = 0;
   storage.finalizeDealHunterApprovedFollowUp = async () => {
@@ -1379,9 +1378,33 @@ test('opportunity detail projects authoritative Phase 3 follow-up status and blo
       },
     },
   };
+  const communicationId = buildManualFollowUpCommunicationId({ requestId: request.id, followUpNumber: 3 });
+  const communication = {
+    id: communicationId,
+    submission_id: request.submission_id,
+    cim_request_id: request.id,
+    direction: 'outbound',
+    kind: 'deal-hunter-cim-follow-up',
+    idempotency_key: `deal-hunter-cim-${request.id}-follow-up-3`,
+    to_addresses: [request.recipient_email],
+    provider_message_id: 'provider-accepted-follow-up-3',
+    delivery_state: 'accepted',
+    delivery_state_at: '2026-09-01T17:01:00.000Z',
+    metadata: { followUpNumber: 3, manualFollowUp: { firstProviderAcceptedAt: '2026-09-01T17:01:00.000Z' } },
+  };
+  const authorityStorage = new Proxy(withDetailAuthorityRows(storage, { cimRequests: [request] }), {
+    get(target, property) {
+      if (property === 'getDealHunterCimRequestById') return async () => request;
+      if (property === 'getCrmCommunication') return async (id) => id === communicationId ? communication : null;
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
   const detail = await getTriageOpportunityDetail({
     opportunityId,
-    storage: withDetailAuthorityRows(storage, { cimRequests: [request] }),
+    storage: authorityStorage,
+    reconcileAcceptedManualFollowUps: true,
+    actor: 'detail-admin',
   });
   const followUps = detail.brokerMaterials.existingRequest.followUps;
   assert.deepEqual({
@@ -1400,7 +1423,7 @@ test('opportunity detail projects authoritative Phase 3 follow-up status and blo
   assert.equal(Array.isArray(followUps.preparationBlockers), true);
   assert.equal(Array.isArray(followUps.sendBlockers), true);
   assert.equal(JSON.stringify(followUps).includes('manualApproval'), false);
-  assert.equal(reconciliationCalls, 0, 'default/viewer detail projection remains read-only');
+  assert.equal(reconciliationCalls, 0, 'detail projection never finalizes a follow-up');
 });
 
 test('detail keeps date-like and ZIP-plus-four legacy broker_contact generic and marks broker_phone missing', async (t) => {

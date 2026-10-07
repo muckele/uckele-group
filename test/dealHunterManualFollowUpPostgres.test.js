@@ -13,6 +13,10 @@ const migrationPath = path.join(
   repositoryRoot,
   'supabase/migrations/20260901120000_deal_hunter_manual_follow_up_atomicity.sql',
 );
+const currentOwnerMigrationPath = path.join(
+  repositoryRoot,
+  'supabase/migrations/20261013120000_deal_hunter_manual_follow_up_current_owner.sql',
+);
 const schemaPath = path.join(repositoryRoot, 'supabase/schema.sql');
 const parentCommit = 'd422f78a6bc2acb6531931b2da20614bd728401e';
 const initialAt = '2026-08-28T18:00:00.000Z';
@@ -20,6 +24,11 @@ const enrolledAt = '2026-09-01T16:00:00.000Z';
 const firstDueAt = '2026-09-01T17:00:00.000Z';
 const integrationEnabled = process.env.DEAL_HUNTER_POSTGRES_INTEGRATION === '1';
 const dockerCommand = fs.existsSync('/usr/local/bin/docker') ? '/usr/local/bin/docker' : 'docker';
+const waitSignal = new Int32Array(new SharedArrayBuffer(4));
+
+function pause(milliseconds) {
+  Atomics.wait(waitSignal, 0, 0, milliseconds);
+}
 
 function run(command, args, { input = undefined, allowFailure = false } = {}) {
   const result = spawnSync(command, args, {
@@ -43,13 +52,12 @@ function docker(args, options = {}) {
 }
 
 function waitForPostgres(containerName) {
-  const signal = new Int32Array(new SharedArrayBuffer(4));
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const logs = docker(['logs', containerName], { allowFailure: true });
     const readyEvents = `${logs.stdout}\n${logs.stderr}`.match(/database system is ready to accept connections/g)?.length || 0;
     const ready = docker(['exec', containerName, 'pg_isready', '-U', 'postgres'], { allowFailure: true });
     if (readyEvents >= 2 && ready.status === 0) return;
-    Atomics.wait(signal, 0, 0, 100);
+    pause(100);
   }
   throw new Error('Disposable PostgreSQL did not become ready.');
 }
@@ -286,6 +294,7 @@ function seedFixture(containerName, database, suffix, {
   const serial = String(fixtureNumber).padStart(12, '0');
   const submissionId = `00000000-0000-4000-8000-${serial}`;
   const requestId = `pg-${suffix}-${fixtureNumber}`;
+  const opportunityId = `opportunity-${requestId}`;
   const metadata = {
     manualApproval: { approvedAt: initialAt, approvedBy: 'phase-2-admin', followUpPolicy: 'none' },
     ...(marker === null ? {} : { manualFollowUp: marker }),
@@ -301,20 +310,20 @@ function seedFixture(containerName, database, suffix, {
       'broker', '{}'::jsonb
     );
     insert into public.deal_hunter_cim_requests (
-      id, created_at, updated_at, deal_key, recipient_email, requested_by,
+      id, created_at, updated_at, opportunity_id, deal_key, recipient_email, requested_by,
       status, request_state, delivery_state, delivery_state_at, follow_up_state,
       first_requested_at, first_provider_accepted_at, submission_id,
       follow_up_count, last_follow_up_at, next_follow_up_at, metadata
     ) values (
       ${quote(requestId)}, ${quote(initialAt)}::timestamptz, ${quote(initialAt)}::timestamptz,
-      ${quote(`deal-${suffix}`)}, ${quote(`${suffix}@example.test`)}, 'phase-2-admin',
+      ${quote(opportunityId)}, ${quote(`deal-${suffix}`)}, ${quote(`${suffix}@example.test`)}, 'phase-2-admin',
       ${quote(requestStatus)}, ${quote(requestState)}, ${quote(deliveryState)}, ${quote(initialAt)}::timestamptz,
       ${quote(followUpState)}, ${quote(initialAt)}::timestamptz, ${quote(initialAt)}::timestamptz,
       ${quote(submissionId)}::uuid, ${Number(followUpCount)}, null,
       ${nextFollowUpAt ? `${quote(nextFollowUpAt)}::timestamptz` : 'null'}, ${json(metadata)}
     );
   `);
-  return { submissionId, requestId, suffix };
+  return { submissionId, requestId, opportunityId, suffix };
 }
 
 function getRequest(containerName, database, requestId) {
@@ -495,6 +504,7 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
 
   const schema = fs.readFileSync(schemaPath, 'utf8');
   const migration = fs.readFileSync(migrationPath, 'utf8');
+  const currentOwnerMigration = fs.readFileSync(currentOwnerMigrationPath, 'utf8');
   const parentSchema = execFileSync('git', ['show', `${parentCommit}:supabase/schema.sql`], {
     cwd: repositoryRoot,
     encoding: 'utf8',
@@ -512,6 +522,7 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
     psql(containerName, 'task2_fresh', schema);
     psql(containerName, 'task2_upgrade', parentSchema);
     psql(containerName, 'task2_upgrade', migration);
+    psql(containerName, 'task2_upgrade', currentOwnerMigration);
     for (const database of ['task2_fresh', 'task2_upgrade']) {
       const count = Number(psql(containerName, database, `
         select count(*) from pg_proc
@@ -704,6 +715,314 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
     });
     assert.equal(wrongDue.applied, false);
     assert.equal(getRequest(containerName, database, wrongDueFixture.requestId).follow_up_count, 0);
+  });
+
+  await t.test('accepted finalization rejects a request that lost canonical opportunity ownership', () => {
+    const fixture = seedFixture(containerName, database, 'stale-owner');
+    const started = start(containerName, database, fixture);
+    const claimed = claim(containerName, database, fixture, {
+      expectedRequestUpdatedAt: started.request.updated_at,
+    });
+    const acceptedAt = '2026-09-01T17:10:00.000Z';
+    const communicationId = deterministicCommunicationId(fixture.requestId, 1);
+    insertCommunication(containerName, database, fixture, {
+      id: communicationId,
+      occurredAt: acceptedAt,
+    });
+    psql(containerName, database, `
+      insert into public.deal_hunter_cim_requests (
+        id, created_at, updated_at, opportunity_id, deal_key, recipient_email,
+        requested_by, status, request_state, delivery_state, delivery_state_at,
+        follow_up_state, first_requested_at, first_provider_accepted_at,
+        submission_id, follow_up_count, metadata
+      ) values (
+        ${quote(`A:${fixture.requestId}-new-owner`)}, ${quote(initialAt)}::timestamptz,
+        ${quote(initialAt)}::timestamptz, ${quote(fixture.opportunityId)},
+        ${quote(`deal-${fixture.suffix}-new-owner`)}, ${quote(`new-${fixture.suffix}@example.test`)},
+        'phase-2-admin', 'sent', 'provider_accepted', 'accepted',
+        ${quote(initialAt)}::timestamptz, 'not-scheduled',
+        ${quote(initialAt)}::timestamptz, ${quote(initialAt)}::timestamptz,
+        ${quote(fixture.submissionId)}::uuid, 0, '{}'::jsonb
+      );
+    `);
+
+    const result = finalize(containerName, database, fixture, {
+      expectedRequestUpdatedAt: claimed.request.updated_at,
+      expectedCommunicationId: communicationId,
+      acceptedAt,
+      nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+    });
+
+    assert.equal(result.applied, false);
+    assert.equal(result.alreadyFinalized, false);
+    assert.equal(result.reason, 'canonical-owner-changed');
+    assert.equal(getRequest(containerName, database, fixture.requestId).follow_up_count, 0);
+    assert.equal(activityCount(containerName, database, fixture.submissionId), 1);
+  });
+
+  await t.test('request upsert waits on in-flight accepted finalization opportunity ownership', async () => {
+    // Break caught: a writer can insert a newer owner after finalization reads
+    // the current owner but before it mutates the provider-accepted request.
+    const fixture = seedFixture(containerName, database, 'owner-overlap');
+    const started = start(containerName, database, fixture);
+    const claimed = claim(containerName, database, fixture, {
+      expectedRequestUpdatedAt: started.request.updated_at,
+    });
+    const acceptedAt = '2026-09-01T17:10:00.000Z';
+    const communicationId = deterministicCommunicationId(fixture.requestId, 1);
+    insertCommunication(containerName, database, fixture, {
+      id: communicationId,
+      occurredAt: acceptedAt,
+    });
+    const holdTable = `task2_owner_hold_${fixtureNumber}`;
+    const holdFunction = `task2_owner_hold_${fixtureNumber}`;
+    const holdTrigger = `task2_owner_hold_${fixtureNumber}`;
+    psql(containerName, database, `
+      create table public.${holdTable} (id integer primary key);
+      insert into public.${holdTable} values (1);
+      create function public.${holdFunction}() returns trigger language plpgsql as $$
+      begin
+        perform 1 from public.${holdTable} where id = 1 for update;
+        return new;
+      end;
+      $$;
+      create trigger ${holdTrigger}
+      before update on public.deal_hunter_cim_requests
+      for each row when (old.id = ${quote(fixture.requestId)})
+      execute function public.${holdFunction}();
+    `);
+    try {
+      const blocker = psqlAsync(containerName, database, `
+        begin;
+        update public.${holdTable} set id = id where id = 1;
+        select pg_sleep(3);
+        commit;
+      `);
+      pause(100);
+      const completionOrder = [];
+      const finalizer = psqlAsync(containerName, database, finalizeStatement(fixture, {
+        expectedRequestUpdatedAt: claimed.request.updated_at,
+        expectedCommunicationId: communicationId,
+        acceptedAt,
+        nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+      })).then((result) => {
+        completionOrder.push('finalizer');
+        return result;
+      });
+
+      let finalizerOwnsOpportunity = false;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const count = Number(psql(containerName, database, `
+          select count(*) from pg_catalog.pg_locks
+          where locktype = 'advisory' and granted;
+        `).stdout.trim());
+        if (count > 0) {
+          finalizerOwnsOpportunity = true;
+          break;
+        }
+        pause(50);
+      }
+      assert.equal(finalizerOwnsOpportunity, true, 'finalizer holds the opportunity advisory lock before request mutation');
+
+      const newerRequest = {
+        id: `A:${fixture.requestId}-new-owner`,
+        created_at: '2026-09-01T17:05:00.000Z',
+        updated_at: '2026-09-01T17:05:00.000Z',
+        opportunity_id: fixture.opportunityId,
+        deal_key: `deal-${fixture.suffix}-new-owner`,
+        recipient_email: `new-${fixture.suffix}@example.test`,
+        requested_by: 'phase-2-admin',
+        status: 'sent',
+        request_state: 'provider_accepted',
+        delivery_state: 'accepted',
+        delivery_state_at: '2026-09-01T17:05:00.000Z',
+        follow_up_state: 'not-scheduled',
+        first_requested_at: '2026-09-01T17:05:00.000Z',
+        first_provider_accepted_at: '2026-09-01T17:05:00.000Z',
+        submission_id: fixture.submissionId,
+        follow_up_count: 0,
+        metadata: {},
+      };
+      const writer = psqlAsync(containerName, database, `
+        select public.upsert_deal_hunter_cim_request(${json(newerRequest)});
+      `).then((result) => {
+        completionOrder.push('writer');
+        return result;
+      });
+
+      let writerWaitsOnOpportunity = false;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const count = Number(psql(containerName, database, `
+          select count(*) from pg_catalog.pg_stat_activity
+          where query like '%A:${fixture.requestId}-new-owner%'
+            and wait_event_type = 'Lock'
+            and wait_event = 'advisory';
+        `).stdout.trim());
+        if (count > 0) {
+          writerWaitsOnOpportunity = true;
+          break;
+        }
+        pause(50);
+      }
+      assert.equal(writerWaitsOnOpportunity, true, 'new owner writer waits on the finalizer opportunity lock');
+
+      const [blockerResult, finalizerResult, writerResult] = await Promise.all([blocker, finalizer, writer]);
+      assert.equal(blockerResult.status, 0, blockerResult.stderr);
+      assert.equal(finalizerResult.status, 0, finalizerResult.stderr);
+      assert.equal(writerResult.status, 0, writerResult.stderr);
+      assert.deepEqual(completionOrder, ['finalizer', 'writer']);
+      assert.equal(parseJsonResult(finalizerResult).applied, true);
+      assert.equal(parseJsonResult(writerResult).id, newerRequest.id);
+      assert.equal(getRequest(containerName, database, fixture.requestId).follow_up_count, 1);
+    } finally {
+      psql(containerName, database, `
+        drop trigger if exists ${holdTrigger} on public.deal_hunter_cim_requests;
+        drop function if exists public.${holdFunction}();
+        drop table if exists public.${holdTable};
+      `);
+    }
+  });
+
+  await t.test('identity repair waits on in-flight accepted finalization for source and destination ownership', async () => {
+    // Break caught: identity repair could move a newer request into an
+    // opportunity after finalization checked its canonical owner.
+    const fixture = seedFixture(containerName, database, 'repair-owner-overlap');
+    const sourceFixture = seedFixture(containerName, database, 'repair-owner-source');
+    const started = start(containerName, database, fixture);
+    const claimed = claim(containerName, database, fixture, {
+      expectedRequestUpdatedAt: started.request.updated_at,
+    });
+    const acceptedAt = '2026-09-01T17:10:00.000Z';
+    const communicationId = deterministicCommunicationId(fixture.requestId, 1);
+    insertCommunication(containerName, database, fixture, {
+      id: communicationId,
+      occurredAt: acceptedAt,
+    });
+    psql(containerName, database, `
+      update public.deal_hunter_cim_requests
+      set first_provider_accepted_at = '2026-09-01T17:05:00.000Z'::timestamptz
+      where id = ${quote(sourceFixture.requestId)};
+      insert into public.deal_hunter_cim_safety_settings (
+        id, updated_at, outreach_paused, updated_by, metadata
+      ) values (
+        'global', ${quote(initialAt)}::timestamptz, true, 'postgres-integration', '{}'::jsonb
+      ) on conflict (id) do update set
+        updated_at = excluded.updated_at,
+        outreach_paused = excluded.outreach_paused,
+        updated_by = excluded.updated_by,
+        metadata = excluded.metadata;
+    `);
+    const manifestId = `repair-owner-overlap-${fixtureNumber}`;
+    const repairBatch = {
+      requestLinks: [{
+        id: sourceFixture.requestId,
+        opportunity_id: fixture.opportunityId,
+        submission_id: sourceFixture.submissionId,
+        expected_updated_at: initialAt,
+        updated_at: '2026-09-01T17:11:00.000Z',
+      }],
+      manifest: {
+        id: manifestId,
+        created_at: acceptedAt,
+        updated_at: acceptedAt,
+        mode: 'apply',
+        status: 'applied',
+        actor: 'postgres-integration',
+        backup_reference: 'synthetic-postgres-integration',
+        checksum: manifestId,
+        manifest: {},
+        metadata: {},
+      },
+    };
+    const holdTable = `task2_repair_owner_hold_${fixtureNumber}`;
+    const holdFunction = `task2_repair_owner_hold_${fixtureNumber}`;
+    const holdTrigger = `task2_repair_owner_hold_${fixtureNumber}`;
+    psql(containerName, database, `
+      create table public.${holdTable} (id integer primary key);
+      insert into public.${holdTable} values (1);
+      create function public.${holdFunction}() returns trigger language plpgsql as $$
+      begin
+        perform 1 from public.${holdTable} where id = 1 for update;
+        return new;
+      end;
+      $$;
+      create trigger ${holdTrigger}
+      before update on public.deal_hunter_cim_requests
+      for each row when (old.id = ${quote(fixture.requestId)})
+      execute function public.${holdFunction}();
+    `);
+    try {
+      const blocker = psqlAsync(containerName, database, `
+        begin;
+        update public.${holdTable} set id = id where id = 1;
+        select pg_sleep(3);
+        commit;
+      `);
+      pause(100);
+      const completionOrder = [];
+      const finalizer = psqlAsync(containerName, database, finalizeStatement(fixture, {
+        expectedRequestUpdatedAt: claimed.request.updated_at,
+        expectedCommunicationId: communicationId,
+        acceptedAt,
+        nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+      })).then((result) => {
+        completionOrder.push('finalizer');
+        return result;
+      });
+
+      let finalizerOwnsOpportunity = false;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const count = Number(psql(containerName, database, `
+          select count(*) from pg_catalog.pg_locks
+          where locktype = 'advisory' and granted;
+        `).stdout.trim());
+        if (count > 0) {
+          finalizerOwnsOpportunity = true;
+          break;
+        }
+        pause(50);
+      }
+      assert.equal(finalizerOwnsOpportunity, true, 'finalizer holds the opportunity advisory lock before request mutation');
+
+      const writer = psqlAsync(containerName, database, `
+        select public.apply_deal_hunter_cim_identity_repair(${json(repairBatch)});
+      `).then((result) => {
+        completionOrder.push('writer');
+        return result;
+      });
+
+      let writerWaitsOnOpportunity = false;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const count = Number(psql(containerName, database, `
+          select count(*) from pg_catalog.pg_stat_activity
+          where query like ${quote(`%${manifestId}%`)}
+            and wait_event_type = 'Lock'
+            and wait_event = 'advisory';
+        `).stdout.trim());
+        if (count > 0) {
+          writerWaitsOnOpportunity = true;
+          break;
+        }
+        pause(50);
+      }
+      assert.equal(writerWaitsOnOpportunity, true, 'identity repair waits on the finalizer opportunity lock');
+
+      const [blockerResult, finalizerResult, writerResult] = await Promise.all([blocker, finalizer, writer]);
+      assert.equal(blockerResult.status, 0, blockerResult.stderr);
+      assert.equal(finalizerResult.status, 0, finalizerResult.stderr);
+      assert.equal(writerResult.status, 0, writerResult.stderr);
+      assert.deepEqual(completionOrder, ['finalizer', 'writer']);
+      assert.equal(parseJsonResult(finalizerResult).applied, true);
+      assert.equal(parseJsonResult(writerResult).requests, 1);
+      assert.equal(getRequest(containerName, database, fixture.requestId).follow_up_count, 1);
+      assert.equal(getRequest(containerName, database, sourceFixture.requestId).opportunity_id, fixture.opportunityId);
+    } finally {
+      psql(containerName, database, `
+        drop trigger if exists ${holdTrigger} on public.deal_hunter_cim_requests;
+        drop function if exists public.${holdFunction}();
+        drop table if exists public.${holdTable};
+      `);
+    }
   });
 
   await t.test('canonical accepted finalization derives Thursday Friday and DST cadence and replays once', () => {

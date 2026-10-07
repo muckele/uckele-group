@@ -16,8 +16,10 @@ const {
   parseManualFollowUpApprovalInput,
   parseManualFollowUpPreparationInput,
   parseManualFollowUpStartInput,
+  parseManualFollowUpStatusInput,
   parseManualFollowUpStopInput,
   prepareDealHunterManualFollowUp,
+  reconcileDealHunterManualFollowUpStatus,
   startDealHunterManualFollowUps,
   stopDealHunterManualFollowUps,
 } = await import('../server/services/dealHunterManualFollowUps.js');
@@ -254,6 +256,30 @@ test('detail emits authoritative not-enrolled follow-up projection for eligible 
     preparationBlockers: [],
     sendBlockers: [],
   });
+});
+
+test('detail current request uses database-binary ID order when request times tie', async () => {
+  // Break caught: locale-sensitive ordering disagrees with SQLite BINARY and
+  // PostgreSQL C ordering for canonical mixed-case and punctuation IDs.
+  const tiedAt = acceptedAt.toISOString();
+  const binaryFirst = baseRequest({
+    id: 'A:request-task3-owner',
+    first_requested_at: tiedAt,
+    created_at: tiedAt,
+    updated_at: tiedAt,
+  });
+  const localeFirst = baseRequest({
+    id: 'a_request-task3-owner',
+    first_requested_at: tiedAt,
+    created_at: tiedAt,
+    updated_at: tiedAt,
+  });
+  const storage = task3Storage({ request: binaryFirst });
+  storage.state.requests = [localeFirst, binaryFirst];
+
+  const projection = await projectDealHunterBrokerMaterials({ opportunityId, storage, now: new Date() });
+
+  assert.equal(projection.existingRequest.id, binaryFirst.id);
 });
 
 test('not-enrolled projection blocks Start with bounded reasons for terminal authority', async (t) => {
@@ -895,6 +921,121 @@ test('ambiguous follow-up permits status and reconciliation but never retransmis
   assert.equal(result.success, false);
   assert.equal(result.code, 'outcome_unresolved');
   assert.equal(storage.state.calls.provider, 0);
+});
+
+test('explicit follow-up status is administrator-only strict and read-only without durable acceptance proof', async () => {
+  assert.deepEqual(parseManualFollowUpStatusInput({}), {});
+  assert.throws(() => parseManualFollowUpStatusInput({ requestId }), /unknown/i);
+  const storage = task3Storage({ request: markedRequest() });
+  const forbidden = await reconcileDealHunterManualFollowUpStatus({
+    opportunityId, requestId, input: {}, session: viewer, storage, now: new Date(), dependencies,
+  });
+  assert.equal(forbidden.status, 403);
+  const result = await reconcileDealHunterManualFollowUpStatus({
+    opportunityId, requestId, input: {}, session: administrator, storage, now: new Date(), dependencies,
+  });
+  assert.equal(result.success, true);
+  assert.equal(result.followUps.followUpCount, 0);
+  assert.equal(storage.state.calls.finalize, 0);
+  assert.equal(storage.state.calls.provider, 0);
+});
+
+test('explicit follow-up status finalizes exact durable acceptance once without provider work', async () => {
+  const communicationId = buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 });
+  const request = markedRequest({ follow_up_state: 'ambiguous', next_follow_up_at: null });
+  request.metadata.manualFollowUp.currentAttempt = {
+    followUpNumber: 1,
+    communicationId,
+    outcome: 'ambiguous',
+  };
+  const communication = acceptedFollowUpCommunication(1, new Date().toISOString(), {
+    idempotency_key: `deal-hunter-cim-${requestId}-follow-up-1`,
+  });
+  const storage = task3Storage({ request, communications: [initialCommunication(), communication] });
+  storage.finalizeDealHunterApprovedFollowUp = async (input) => {
+    storage.state.calls.finalize += 1;
+    assert.equal(input.requestId, requestId);
+    assert.equal(input.expectedCommunicationId, communicationId);
+    storage.state.request = {
+      ...storage.state.request,
+      follow_up_count: 1,
+      follow_up_state: 'scheduled',
+      next_follow_up_at: input.nextFollowUpAt,
+      updated_at: input.acceptedAt,
+      metadata: {
+        ...storage.state.request.metadata,
+        manualFollowUp: {
+          ...storage.state.request.metadata.manualFollowUp,
+          currentAttempt: null,
+        },
+      },
+    };
+    storage.state.requests = [storage.state.request];
+    return { applied: true, alreadyFinalized: false, request: storage.state.request };
+  };
+  const first = await reconcileDealHunterManualFollowUpStatus({
+    opportunityId, requestId, input: {}, session: administrator, storage, now: new Date(), dependencies,
+  });
+  const replay = await reconcileDealHunterManualFollowUpStatus({
+    opportunityId, requestId, input: {}, session: administrator, storage, now: new Date(), dependencies,
+  });
+  assert.equal(first.success, true);
+  assert.equal(first.followUps.followUpCount, 1);
+  assert.equal(replay.success, true);
+  assert.equal(replay.followUps.followUpCount, 1);
+  assert.equal(storage.state.calls.finalize, 1);
+  assert.equal(storage.state.calls.provider, 0);
+});
+
+test('explicit follow-up status fails closed when a newer request wins during reconciliation', async () => {
+  const communicationId = buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 });
+  const request = markedRequest({ follow_up_state: 'ambiguous', next_follow_up_at: null });
+  request.metadata.manualFollowUp.currentAttempt = {
+    followUpNumber: 1,
+    communicationId,
+    outcome: 'ambiguous',
+  };
+  const communication = acceptedFollowUpCommunication(1, new Date().toISOString(), {
+    idempotency_key: `deal-hunter-cim-${requestId}-follow-up-1`,
+  });
+  const storage = task3Storage({ request, communications: [initialCommunication(), communication] });
+  const newer = baseRequest({
+    id: 'request-task3-status-new-owner',
+    recipient_email: 'new-owner@example.test',
+    first_requested_at: new Date(acceptedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+    created_at: new Date(acceptedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+    updated_at: new Date(acceptedAt.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+  });
+  let installed = false;
+  storage.getDealHunterCimRequestById = async (id) => {
+    if (!installed) {
+      installed = true;
+      storage.state.requests.push(newer);
+    }
+    return id === requestId ? storage.state.request : null;
+  };
+  storage.finalizeDealHunterApprovedFollowUp = async () => {
+    storage.state.calls.finalize += 1;
+    const owner = [...storage.state.requests].sort((left, right) => (
+      Date.parse(right.first_requested_at || right.created_at || '')
+      - Date.parse(left.first_requested_at || left.created_at || '')
+      || String(left.id).localeCompare(String(right.id))
+    ))[0];
+    return owner.id === requestId
+      ? { applied: true, alreadyFinalized: false, request: storage.state.request }
+      : { applied: false, alreadyFinalized: false, reason: 'canonical-owner-changed', request: storage.state.request };
+  };
+
+  const result = await reconcileDealHunterManualFollowUpStatus({
+    opportunityId, requestId, input: {}, session: administrator, storage, now: new Date(), dependencies,
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.status, 503);
+  assert.equal(result.code, 'outcome_unresolved');
+  assert.equal(storage.state.calls.finalize, 1);
+  assert.equal(storage.state.calls.provider, 0);
+  assert.equal(storage.state.request.follow_up_count, 0);
 });
 
 test('ambiguity proof requires the communication exact ambiguous timestamp in SQLite and Supabase', async () => {

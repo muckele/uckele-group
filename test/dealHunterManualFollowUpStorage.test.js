@@ -768,6 +768,58 @@ test('SQLite accepted finalization is idempotent by communication identity and p
   assert.equal((await storage.listCrmActivityEvents({ submissionId: seeded.submission.id })).length, 3);
 });
 
+test('SQLite accepted finalization rejects an equal-time binary-first canonical owner', async (t) => {
+  // Break caught: status reconciliation can load the current request, then a
+  // newer request can become the opportunity owner before the atomic finalize.
+  const storage = createStorage(t, 'accepted-stale-owner');
+  const seeded = await seed(storage, 'accepted-stale-owner');
+  const started = await enroll(storage, seeded);
+  const claimed = await storage.claimDealHunterApprovedFollowUp({
+    requestId: started.request.id,
+    expectedRequestUpdatedAt: started.request.updated_at,
+    expectedSubmissionId: seeded.submission.id,
+    expectedSubmissionUpdatedAt: seeded.submission.updated_at,
+    expectedFollowUpCount: 0,
+    expectedFollowUpNumber: 1,
+    expectedNextFollowUpAt: firstDueAt,
+    claimedAt: firstDueAt,
+  });
+  const acceptedAt = '2026-09-01T17:10:00.000Z';
+  const exactCommunication = outboundCommunication({
+    requestId: started.request.id,
+    submissionId: seeded.submission.id,
+    followUpNumber: 1,
+    deliveryState: 'accepted',
+    occurredAt: acceptedAt,
+  });
+  await storage.insertCrmCommunication(exactCommunication);
+  await storage.upsertDealHunterCimRequest(request('A:accepted-stale-owner-new', seeded.submission.id, {
+    opportunity_id: started.request.opportunity_id,
+    created_at: initialAt,
+    updated_at: initialAt,
+    first_requested_at: initialAt,
+  }));
+
+  const result = await storage.finalizeDealHunterApprovedFollowUp({
+    requestId: started.request.id,
+    expectedRequestUpdatedAt: claimed.request.updated_at,
+    expectedSubmissionId: seeded.submission.id,
+    expectedFollowUpNumber: 1,
+    expectedCommunicationId: exactCommunication.id,
+    outcome: 'accepted',
+    acceptedAt,
+    nextFollowUpAt: nextManualFollowUpAt(acceptedAt),
+    activity: activity('accepted-stale-owner', seeded.submission.id, acceptedAt, 'cim.follow-up-accepted'),
+  });
+
+  assert.equal(result.applied, false);
+  assert.equal(result.alreadyFinalized, false);
+  assert.equal(result.reason, 'canonical-owner-changed');
+  const unchanged = await storage.getDealHunterCimRequestById(started.request.id);
+  assert.equal(unchanged.follow_up_count, 0);
+  assert.deepEqual(unchanged.metadata.manualFollowUp.acceptedTouches || [], []);
+});
+
 test('SQLite accepted finalization rejects a noncanonical communication ID without mutation', async (t) => {
   // Break caught: any communication sharing request/submission/N can be
   // counted even when it is not the deterministic logical Follow-Up N.

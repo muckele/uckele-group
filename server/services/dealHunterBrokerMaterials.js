@@ -364,7 +364,7 @@ function selectCurrentRequest(records = []) {
   return [...records].filter((item) => item?.id).sort((left, right) => (
     (Date.parse(right.first_requested_at || right.firstRequestedAt || right.created_at || right.createdAt || '') || 0)
     - (Date.parse(left.first_requested_at || left.firstRequestedAt || left.created_at || left.createdAt || '') || 0)
-    || String(left.id).localeCompare(String(right.id))
+    || (String(left.id) < String(right.id) ? -1 : String(left.id) > String(right.id) ? 1 : 0)
   ))[0] || null;
 }
 

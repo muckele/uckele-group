@@ -2279,6 +2279,66 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     expect(calls.at(-1)).toEqual({ url: '/api/admin/deal-hunter/triage/opp-1', method: 'GET' });
   });
 
+  test('unknown follow-up approval outcome reconciles through status POST before read-only detail refresh', async () => {
+    const calls = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ url, method: options.method || 'GET', body: options.body });
+      if (url.endsWith('/follow-ups/request-1/prepare')) return jsonResponse(preparedFollowUp());
+      if (url.endsWith('/follow-ups/request-1/approve')) throw new TypeError('Network connection lost');
+      if (url.endsWith('/follow-ups/request-1/status')) {
+        return jsonResponse({ success: true, requestId: 'request-1', followUps: manualFollowUps({ state: 'ambiguous' }) });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        return jsonResponse(detailWithFollowUps(manualFollowUps({ state: detailLoads === 1 ? 'due' : 'ambiguous' })));
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Review Follow-Up' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve & Send Follow-Up' }));
+
+    await waitFor(() => expect(detailLoads).toBe(2));
+    expect(calls.filter(({ url }) => url.endsWith('/follow-ups/request-1/approve'))).toHaveLength(1);
+    const recovery = calls.filter(({ url }) => url.endsWith('/follow-ups/request-1/status') || url.endsWith('/triage/opp-1')).slice(-2);
+    expect(recovery).toEqual([
+      expect.objectContaining({ url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/status', method: 'POST', body: '{}' }),
+      expect.objectContaining({ url: '/api/admin/deal-hunter/triage/opp-1', method: 'GET' }),
+    ]);
+  });
+
+  test('ambiguous follow-up Check Again reconciles through status POST before read-only detail refresh', async () => {
+    const calls = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ url, method: options.method || 'GET', body: options.body });
+      if (url.endsWith('/follow-ups/request-1/status')) {
+        return jsonResponse({ success: true, requestId: 'request-1', followUps: manualFollowUps({ state: 'scheduled' }) });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        return jsonResponse(detailWithFollowUps(manualFollowUps({ state: detailLoads === 1 ? 'ambiguous' : 'scheduled' })));
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Check Again' }));
+
+    expect(await screen.findByText('Scheduled')).toBeVisible();
+    const recovery = calls.filter(({ url }) => url.endsWith('/follow-ups/request-1/status') || url.endsWith('/triage/opp-1')).slice(-2);
+    expect(recovery).toEqual([
+      expect.objectContaining({ url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/status', method: 'POST', body: '{}' }),
+      expect.objectContaining({ url: '/api/admin/deal-hunter/triage/opp-1', method: 'GET' }),
+    ]);
+  });
+
   test('Stop transport failure never claims permanent Stop when authoritative refresh remains scheduled', async () => {
     const reconciliation = deferred();
     const calls = [];
@@ -2503,5 +2563,27 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     expect(calls.filter(({ method }) => method === 'POST')).toEqual([{
       url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/prepare', method: 'POST', body: {},
     }]);
+  });
+
+  test('viewer ambiguous status refresh remains a read-only detail GET', async () => {
+    const calls = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ url, method: options.method || 'GET' });
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        return jsonResponse(detailWithFollowUps(manualFollowUps({ state: detailLoads === 1 ? 'ambiguous' : 'scheduled' })));
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox({ readOnly: true });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Check Again' }));
+
+    expect(await screen.findByText('Scheduled')).toBeVisible();
+    expect(calls.filter(({ method }) => method === 'POST')).toEqual([]);
+    expect(calls.filter(({ url }) => url.endsWith('/triage/opp-1'))).toHaveLength(2);
   });
 });
