@@ -13,7 +13,7 @@ The checked-in Fly configuration deliberately keeps:
 - the central all-outreach control unchanged, so correctly gated manual Stage 1 can remain available;
 - Stage 3 non-transmitting.
 
-The daily Deal Hunter job owns CRM sync and the internal summary only. It never calls the broker-send path. The Stage 2 shadow/canary runner has its own durable run and per-candidate decision evidence.
+The daily Deal Hunter job refreshes current score authority and projects the internal summary only. It does not synchronize opportunities into CRM and never calls the broker-send path. CRM synchronization remains a separate, explicit administrator workflow. The Stage 2 shadow/canary runner has its own durable run and per-candidate decision evidence.
 
 ## Before deployment
 
