@@ -311,8 +311,8 @@ function createPhase1FixtureState() {
   const scoreRows = [
     phase1ScoreRow({ opportunityId: 'opp-cascade', fitScore: 84, scoreStatus: 'watchlist', confidence: 'low', completenessScore: 61, missingEvidenceCount: 4, financials: { annualProfit: 360000, annualRevenue: 1900000, askingPrice: 1500000, profitMultiple: 4.17 }, observationFreshness: '2026-08-28T19:00:00.000Z', scoredAt: '2026-08-28T18:00:00.000Z', scoreFingerprint: 'phase1-machine-score-cascade-84' }),
     phase1ScoreRow({ opportunityId: 'opp-heritage', fitScore: 71, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 77, contradictionCount: 1, highFit: false, financials: { annualProfit: 275000, annualRevenue: 1400000, askingPrice: 1150000, profitMultiple: 4.18 }, reviewed: true, reviewedAt: '2026-08-27T18:00:00.000Z', reviewedBy: 'phase1-admin', observationFreshness: '2026-08-27T17:00:00.000Z', scoredAt: '2026-08-27T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-heritage-71' }),
-    phase1ScoreRow({ opportunityId: 'opp-evergreen', fitScore: 92, scoreStatus: 'high-fit', confidence: 'high', completenessScore: 91, financials: { annualProfit: 520000, annualRevenue: 2800000, askingPrice: 2100000, profitMultiple: 4.04 }, observationFreshness: '2026-08-30T16:00:00.000Z', scoredAt: '2026-08-30T15:00:00.000Z', evidenceObservedAt: '2026-08-30T14:30:00.000Z', scoreFingerprint: 'phase1-machine-score-evergreen-92' }),
-    phase1ScoreRow({ opportunityId: 'opp-summit', fitScore: 78, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 79, operatorPriority: 'high', financials: { annualProfit: 390000, annualRevenue: 2050000, askingPrice: 1600000, profitMultiple: 4.1 }, observationFreshness: '2026-08-26T17:00:00.000Z', scoredAt: '2026-08-26T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-summit-78' }),
+    phase1ScoreRow({ opportunityId: 'opp-evergreen', fitScore: 92, scoreStatus: 'high-fit', confidence: 'high', completenessScore: 91, financials: { annualProfit: 520000, annualProfitEvidence: { metric: 'sde', period: 'trailing-twelve-months', currency: 'USD' }, annualRevenue: 2800000, askingPrice: 2100000, profitMultiple: 4.04 }, observationFreshness: '2026-08-30T16:00:00.000Z', scoredAt: '2026-08-30T15:00:00.000Z', evidenceObservedAt: '2026-08-30T14:30:00.000Z', scoreFingerprint: 'phase1-machine-score-evergreen-92' }),
+    phase1ScoreRow({ opportunityId: 'opp-summit', fitScore: 78, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 79, operatorPriority: 'high', financials: { annualProfit: 390000, annualProfitEvidence: { metric: 'sde', period: 'trailing-twelve-months', currency: 'USD' }, annualRevenue: 2050000, askingPrice: 1600000, profitMultiple: 4.1 }, observationFreshness: '2026-08-26T17:00:00.000Z', scoredAt: '2026-08-26T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-summit-78' }),
   ];
   const sourceObservations = canonicalOpportunities.flatMap((opportunity) => {
     const score = scoreRows.find((row) => row.opportunityId === opportunity.opportunityId);
@@ -453,6 +453,7 @@ function phase1DetailOpportunity(state, opportunityId) {
     industry: value('industry') || current.industry,
     financials: {
       annualProfit: number(current.financials.annualProfit, 'annual_profit', 'ttm_ebitda'),
+      annualProfitEvidence: current.financials.annualProfitEvidence,
       annualRevenue: number(current.financials.annualRevenue, 'annual_revenue', 'ttm_revenue'),
       askingPrice: number(current.financials.askingPrice, 'asking_price'),
       profitMultiple: number(current.financials.profitMultiple, 'profit_multiple', 'ebitda_multiple'),
@@ -2246,16 +2247,23 @@ test('Fresh-first Inbox keeps new unlinked discovery visible beside overflowing 
     if (url.searchParams.get('view') !== 'inbox') return route.fallback();
     const area = url.searchParams.get('area');
     const cursor = url.searchParams.get('cursor');
+    const search = (url.searchParams.get('search') || '').toLowerCase();
+    const confidence = url.searchParams.get('confidence') || '';
+    const priority = url.searchParams.get('priority') || '';
+    const filterRows = (rows) => rows.filter((row) => (!search || row.name.toLowerCase().includes(search))
+      && (!confidence || row.confidence === confidence)
+      && (!priority || row.operatorPriority === priority));
     let areas;
     if (area === 'owner-priorities') areas = [{ id: area,
-      rows: cursor ? oldPriorities.slice(10) : oldPriorities.slice(0, 10),
-      total: 15, nextCursor: cursor ? null : 'synthetic-owner-page-2', revision: 'owner-r1', counts: {} }];
-    else if (area === 'due-actions') areas = [{ id: area, rows: due,
-      total: 5, nextCursor: null, revision: 'due-r1', counts: {} }];
-    else areas = [{ id: 'action-preview', rows: due.slice(0, 2).concat(oldPriorities[5]),
-      total: 3, revision: 'action-r1',
+      rows: filterRows(cursor ? oldPriorities.slice(10) : oldPriorities.slice(0, 10)),
+      total: filterRows(oldPriorities).length, nextCursor: cursor ? null : 'synthetic-owner-page-2', revision: 'owner-r1', counts: {} }];
+    else if (area === 'due-actions') areas = [{ id: area, rows: filterRows(due),
+      total: filterRows(due).length, nextCursor: null, revision: 'due-r1', counts: {} }];
+    else areas = [{ id: 'action-preview', rows: filterRows(due.slice(0, 2).concat(oldPriorities[5])),
+      total: filterRows(due.slice(0, 2).concat(oldPriorities[5])).length, revision: 'action-r1',
       counts: { due: 5, overdue: 5, ownerPriority: 15, urgent: 1 } },
-    { id: 'new-important', rows: [fresh], total: 1, revision: 'new-r1', counts: {} }];
+    { id: 'new-important', rows: filterRows([fresh]), total: filterRows([fresh]).length,
+      revision: 'new-r1', counts: {} }];
     await fulfillPhase1Json(route, response(areas));
   });
   await page.route('**/api/admin/deal-hunter/triage/opp-cascade', async (route) => {
@@ -2275,6 +2283,24 @@ test('Fresh-first Inbox keeps new unlinked discovery visible beside overflowing 
   await expect(discovery.getByText(/1 opportunity/)).toBeVisible();
   await expect(discovery.getByText(/CRM handoff prerequisite/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('fl01-fresh-first-desktop.png'), fullPage: true });
+
+  const searchBox = page.getByRole('searchbox', { name: 'Search opportunities' });
+  const confidenceFilter = page.getByRole('combobox', { name: 'Confidence', exact: true });
+  const priorityFilter = page.getByRole('combobox', { name: 'Operator priority', exact: true });
+  await searchBox.fill('Fresh worthwhile');
+  await confidenceFilter.selectOption('high');
+  await priorityFilter.selectOption('urgent');
+  await expect(action.getByRole('listitem')).toHaveCount(1);
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
+  await expect(page.getByText('Older owner priority 1')).toHaveCount(0);
+  await expect.poll(() => state.apiRequests.filter(({ method, path }) => method === 'GET'
+    && path === '/api/admin/deal-hunter/triage').at(-1)?.search)
+    .toBe('?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox&search=Fresh+worthwhile&confidence=high&priority=urgent');
+  await searchBox.fill('');
+  await confidenceFilter.selectOption('');
+  await priorityFilter.selectOption('');
+  await expect(action.getByRole('listitem')).toHaveCount(3);
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
 
   await action.getByRole('button', { name: 'View all priorities (15)' }).click();
   const priorities = page.getByRole('region', { name: 'Owner priorities' });
@@ -2409,6 +2435,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expectPhase1DetailValue(dialog, 'Confidence', 'High');
   await expectPhase1DetailValue(dialog, 'Machine state', 'High Fit');
   const businessFinancials = dialog.getByRole('heading', { name: 'Business & Financials' }).locator('..');
+  await expect(businessFinancials.getByText('SDE · trailing twelve months', { exact: true })).toBeVisible();
   await expect(businessFinancials.getByText('$535,000', { exact: true })).toBeVisible();
   await expect(businessFinancials.getByText('$2,800,000', { exact: true })).toBeVisible();
   await expect(businessFinancials.getByText('$2,100,000', { exact: true })).toBeVisible();
@@ -2617,6 +2644,9 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const drawerOverflow = await page.evaluate(() => ({ clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
   expect(drawerOverflow.scrollWidth).toBeLessThanOrEqual(drawerOverflow.clientWidth);
   await dialog.evaluate((element) => { element.scrollTop = 0; });
+  const mobileFinancials = dialog.getByRole('heading', { name: 'Business & Financials' }).locator('..');
+  await mobileFinancials.scrollIntoViewIfNeeded();
+  await expect(mobileFinancials.getByText('SDE · trailing twelve months', { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('phase1-mobile-drawer.png'), fullPage: false });
   await dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
 

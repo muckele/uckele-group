@@ -106,6 +106,30 @@ test('operator full-backfill reconciles a stale supplemental score out of curren
     assert.equal(importInbox.areas.find((area) => area.id === 'new-important')?.rows.some(
       (row) => row.opportunityId === importedDeal.opportunity_id,
     ), true, JSON.stringify(importInbox.areas.map((area) => ({ id: area.id, total: area.total }))));
+    const importedInboxRow = importInbox.rows.find(
+      (row) => row.opportunityId === importedDeal.opportunity_id,
+    );
+    assert.ok(importedInboxRow?.confidence, JSON.stringify(importInbox.rows));
+    await getStorage().setDealHunterOpportunityOperatorDecision({
+      opportunityId: importedDeal.opportunity_id,
+      priority: 'urgent',
+    });
+    const assertFreshInboxFilter = async (query, expected) => {
+      const response = await fetch(`${origin}/api/admin/deal-hunter/triage?view=inbox&${query}`, {
+        headers: { Cookie: adminCookie },
+      });
+      const body = await response.json();
+      assert.equal(response.status, 200, JSON.stringify(body));
+      assert.equal(body.rows.some((row) => row.opportunityId === importedDeal.opportunity_id), expected,
+        JSON.stringify(body.rows));
+      return body;
+    };
+    await assertFreshInboxFilter('search=HTTP%20Supplemental', true);
+    await assertFreshInboxFilter('search=no-such-fresh-opportunity', false);
+    await assertFreshInboxFilter(`confidence=${importedInboxRow.confidence}`, true);
+    await assertFreshInboxFilter(`confidence=${importedInboxRow.confidence === 'high' ? 'low' : 'high'}`, false);
+    await assertFreshInboxFilter('priority=urgent', true);
+    await assertFreshInboxFilter('priority=watch', false);
     assert.equal(await getStorage().getDealHunterOpportunity(importedDeal.opportunity_id).then(
       (opportunity) => opportunity?.primary_submission_id || null,
     ), null);

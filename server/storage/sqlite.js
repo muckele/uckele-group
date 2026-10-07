@@ -10770,7 +10770,10 @@ export function createSqliteStorage(config, options = {}) {
         const parsedPageSize = Number(pageSize);
         const safePage = Number.isFinite(parsedPage) ? Math.max(1, Math.min(Math.trunc(parsedPage), 10000)) : 1;
         const safePageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(Math.trunc(parsedPageSize), 100)) : 25;
-        const clauses = ['scores.current_triage_eligible = 1'];
+        // Passed is a durable archive view. It must not disappear merely
+        // because a later source refresh removes the score from the current
+        // working set; every active view remains current-eligibility gated.
+        const clauses = view === 'dismissed' ? [] : ['scores.current_triage_eligible = 1'];
         const params = [];
 
         // Dismissal stays owned by the existing disposition record rather than
@@ -10807,8 +10810,19 @@ export function createSqliteStorage(config, options = {}) {
 
         const searchTerm = String(search || '').trim().toLowerCase();
         if (searchTerm) {
-          clauses.push('(LOWER(COALESCE(scores.name, \'\')) LIKE ? OR LOWER(COALESCE(scores.deal_key, \'\')) LIKE ?)');
-          params.push(`%${searchTerm}%`, `%${searchTerm}%`);
+          if (view === 'dismissed') {
+            clauses.push(`(LOWER(COALESCE(disposition.deal_name, '')) LIKE ?
+              OR LOWER(COALESCE(scores.name, '')) LIKE ?
+              OR LOWER(COALESCE(scores.deal_key, '')) LIKE ?
+              OR LOWER(COALESCE(disposition.listing_url, '')) LIKE ?
+              OR LOWER(COALESCE(scores.listing_url, '')) LIKE ?
+              OR LOWER(COALESCE(disposition.reason, '')) LIKE ?
+              OR LOWER(COALESCE(disposition.note, '')) LIKE ?)`);
+            params.push(...Array(7).fill(`%${searchTerm}%`));
+          } else {
+            clauses.push('(LOWER(COALESCE(scores.name, \'\')) LIKE ? OR LOWER(COALESCE(scores.deal_key, \'\')) LIKE ?)');
+            params.push(`%${searchTerm}%`, `%${searchTerm}%`);
+          }
         }
         if (Number.isFinite(Number(minScore)) && minScore !== null && minScore !== '') {
           clauses.push('scores.fit_score >= ?');
@@ -10885,13 +10899,17 @@ export function createSqliteStorage(config, options = {}) {
         `).get() || {};
         const rows = database.prepare(`
           SELECT
-            scores.opportunity_id, scores.deal_key, scores.name, scores.state, scores.listing_url,
+            scores.opportunity_id, scores.deal_key,
+            COALESCE(NULLIF(disposition.deal_name, ''), scores.name) AS name,
+            scores.state,
+            COALESCE(NULLIF(disposition.listing_url, ''), scores.listing_url) AS listing_url,
             scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
             scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
             scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
             scores.rules_version, scores.operator_priority, scores.reviewed_at,
             scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
-            disposition.reason AS dismissed_reason, disposition.dismissed_at AS dismissed_at,
+            disposition.reason AS dismissed_reason, disposition.note AS dismissed_note,
+            disposition.dismissed_at AS dismissed_at, disposition.dismissed_by AS dismissed_by,
             json_extract(scores.summary, '$.strengths[0]') AS top_strength,
             json_extract(scores.summary, '$.concerns[0]') AS top_concern,
             (SELECT value FROM deal_hunter_opportunity_source_observations AS source
@@ -12718,6 +12736,33 @@ export function createSqliteStorage(config, options = {}) {
         ORDER BY observed_at DESC, id ASC
         LIMIT ?
       `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunitySourceObservationRow);
+    },
+
+    async getDealHunterAnnualProfitEvidence({ opportunityId, acceptedEvidenceId, sourceId, sourceRecordId, value } = {}) {
+      const id = String(opportunityId || '').trim();
+      const evidenceId = String(acceptedEvidenceId || '').trim();
+      const source = String(sourceId || '').trim();
+      const record = String(sourceRecordId || '').trim();
+      const amount = Number(value);
+      if (!id || !evidenceId || !source || !record || !Number.isFinite(amount)) return null;
+      return database.prepare(`SELECT evidence.metric, evidence.period, evidence.currency
+        FROM deal_hunter_opportunity_source_observations AS source
+        JOIN deal_hunter_freshness_evidence AS core ON core.id = source.accepted_evidence_id
+        JOIN deal_hunter_freshness_evidence AS evidence ON evidence.run_id = core.run_id
+          AND evidence.source_id = core.source_id
+          AND evidence.source_record_id = core.source_record_id
+          AND evidence.event_ordinal = core.event_ordinal
+          AND evidence.event_type = 'accepted_source_record'
+          AND evidence.field_key = 'annual_profit'
+          AND evidence.current_canonical_id = source.opportunity_id
+        WHERE source.opportunity_id = ? AND source.source_id = ? AND source.source_record_id = ?
+          AND source.field = 'annual_profit' AND source.accepted_evidence_id = ?
+          AND core.event_type = 'accepted_source_record' AND core.field_key = ''
+          AND core.current_canonical_id = source.opportunity_id
+          AND CAST(source.value AS REAL) = evidence.after_value
+          AND evidence.after_value = ?
+        ORDER BY evidence.accepted_at DESC, evidence.id LIMIT 1`)
+        .get(id, source, record, evidenceId, amount) || null;
     },
 
     async bindAcceptedDealHunterFreshness({ importId, opportunityId, sourceRecordId, expectedGeneration, snapshot } = {}) {

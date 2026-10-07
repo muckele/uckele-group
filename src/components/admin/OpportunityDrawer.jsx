@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
 import BrokerMaterialsCard, { BrokerMaterialsAttachmentStatus } from './BrokerMaterialsCard.jsx';
+import { earningsPresentation } from '../../utils/earningsPresentation.js';
 
 const factFields = [
   ['seller_name', 'Seller name'], ['seller_email', 'Seller email'], ['seller_phone', 'Seller phone'],
@@ -9,7 +10,7 @@ const factFields = [
   ['management_structure', 'Management structure'], ['customer_concentration', 'Customer concentration'], ['operator_contact_notes', 'Operator contact notes'],
 ];
 const factLabels = Object.fromEntries(factFields);
-const missingLabels = { annual_profit: 'SDE / profit', annual_revenue: 'Revenue', asking_price: 'Asking price', listing_url: 'Original listing URL', ...factLabels };
+const missingLabels = { annual_profit: 'Earnings', annual_revenue: 'Revenue', asking_price: 'Asking price', listing_url: 'Original listing URL', ...factLabels };
 const sectionClass = 'rounded-2xl border border-line bg-white p-4 sm:p-5';
 const secondaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:opacity-50';
 const primaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-moss bg-moss px-4 py-2 text-sm font-semibold text-white transition hover:bg-pine disabled:opacity-50';
@@ -211,6 +212,7 @@ export default function OpportunityDrawer({
   const actionable = Boolean(onAction && opportunity && !opportunity.dismissed && !readOnly);
   const strengths = (detail?.score?.summary?.strengths || []).filter(hasValue);
   const concerns = (detail?.score?.summary?.concerns || []).filter(hasValue);
+  const earnings = earningsPresentation(opportunity?.financials);
   const reviewState = opportunity?.reviewed ? 'Reviewed' : 'Needs Review';
   const changedState = opportunity?.changedSinceReview ? 'Changed' : 'Current';
   useLayoutEffect(() => {
@@ -333,7 +335,7 @@ export default function OpportunityDrawer({
             </Section>
 
             <Section title="Business & Financials">
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[['SDE / profit', formatMoney(opportunity.financials?.annualProfit)], ['Revenue', formatMoney(opportunity.financials?.annualRevenue)], ['Asking price', formatMoney(opportunity.financials?.askingPrice)], ['Profit multiple', opportunity.financials?.profitMultiple === null || opportunity.financials?.profitMultiple === undefined ? '' : `${opportunity.financials.profitMultiple}×`]].filter(([, value]) => value).map(([label, value]) => <div className="rounded-xl bg-fog/70 p-3" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[[earnings.label, earnings.amount], ['Revenue', formatMoney(opportunity.financials?.annualRevenue)], ['Asking price', formatMoney(opportunity.financials?.askingPrice)], ['Profit multiple', opportunity.financials?.profitMultiple === null || opportunity.financials?.profitMultiple === undefined ? '' : `${opportunity.financials.profitMultiple}×`]].filter(([, value]) => value).map(([label, value]) => <div className="rounded-xl bg-fog/70 p-3" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
               <div className="mt-3 grid gap-3 sm:grid-cols-2">{['management_structure', 'customer_concentration', 'reason_for_sale', 'real_estate_included', 'seller_financing'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>
             </Section>
 

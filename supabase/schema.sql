@@ -6462,14 +6462,20 @@ set search_path = public
 as $$
   with candidates as (
     select
-           scores.opportunity_id, scores.deal_key, scores.name, scores.state, scores.listing_url,
+           scores.opportunity_id, scores.deal_key,
+           coalesce(nullif(disposition.deal_name, ''), scores.name) as name,
+           scores.name as score_name, scores.state,
+           coalesce(nullif(disposition.listing_url, ''), scores.listing_url) as listing_url,
+           scores.listing_url as score_listing_url,
            scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
            scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
            scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
-           scores.rules_version, scores.operator_priority, scores.reviewed_at,
+           scores.rules_version, scores.current_triage_eligible,
+           scores.operator_priority, scores.reviewed_at,
            scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
            disposition.deal_key as dismissed_deal_key,
-           disposition.reason as dismissed_reason, disposition.dismissed_at as dismissed_at,
+           disposition.reason as dismissed_reason, disposition.note as dismissed_note,
+           disposition.dismissed_at as dismissed_at, disposition.dismissed_by as dismissed_by,
            scores.summary->'strengths'->>0 as top_strength,
            scores.summary->'concerns'->>0 as top_concern,
            (select value from public.deal_hunter_opportunity_source_observations as source
@@ -6502,27 +6508,37 @@ as $$
      and opportunity.status = 'active'
     left join public.deal_hunter_dispositions as disposition
       on disposition.deal_key = scores.deal_key and disposition.disposition = 'dismissed'
-    where scores.current_triage_eligible = true
   ), filtered as (
     select * from candidates
     where (case
         when p_view = 'dismissed' then dismissed_deal_key is not null
-        when p_view = 'needs-review' then dismissed_deal_key is null and should_remove = false
+        when p_view = 'needs-review' then current_triage_eligible = true
+          and dismissed_deal_key is null and should_remove = false
           and (reviewed_at is null or (case
             when reviewed_semantic_digest is not null then reviewed_semantic_digest <> coalesce(semantic_digest, '')
             else reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint
           end))
-        when p_view = 'high-priority' then dismissed_deal_key is null and should_remove = false
+        when p_view = 'high-priority' then current_triage_eligible = true
+          and dismissed_deal_key is null and should_remove = false
           and (high_fit or operator_priority in ('urgent', 'high'))
-        when p_view = 'watchlist' then dismissed_deal_key is null and should_remove = false
+        when p_view = 'watchlist' then current_triage_eligible = true
+          and dismissed_deal_key is null and should_remove = false
           and ((fit_score >= 60 and fit_score < 75) or operator_priority = 'watch')
-        when p_view = 'low-confidence' then dismissed_deal_key is null and should_remove = false
+        when p_view = 'low-confidence' then current_triage_eligible = true
+          and dismissed_deal_key is null and should_remove = false
           and (confidence = 'low' or contradiction_count > 0)
-        else dismissed_deal_key is null
+        else current_triage_eligible = true and dismissed_deal_key is null
       end)
       and (coalesce(p_search, '') = ''
         or lower(coalesce(name, '')) like '%' || lower(p_search) || '%'
-        or lower(coalesce(deal_key, '')) like '%' || lower(p_search) || '%')
+        or lower(coalesce(score_name, '')) like '%' || lower(p_search) || '%'
+        or lower(coalesce(deal_key, '')) like '%' || lower(p_search) || '%'
+        or (p_view = 'dismissed' and (
+          lower(coalesce(listing_url, '')) like '%' || lower(p_search) || '%'
+          or lower(coalesce(score_listing_url, '')) like '%' || lower(p_search) || '%'
+          or lower(coalesce(dismissed_reason, '')) like '%' || lower(p_search) || '%'
+          or lower(coalesce(dismissed_note, '')) like '%' || lower(p_search) || '%'
+        )))
       and (p_min_score is null or fit_score >= p_min_score)
       and (coalesce(p_confidence, '') = '' or confidence = p_confidence)
       and (coalesce(p_priority, '') = '' or operator_priority = p_priority)
@@ -6577,19 +6593,25 @@ as $$
   select jsonb_build_object(
     'total', (select count(*) from filtered),
     'summary', (select jsonb_build_object(
-      'needsReview', count(*) filter (where dismissed_deal_key is null and should_remove = false
+      'needsReview', count(*) filter (where current_triage_eligible = true
+        and dismissed_deal_key is null and should_remove = false
         and (reviewed_at is null or (case when reviewed_semantic_digest is not null
           then reviewed_semantic_digest <> coalesce(semantic_digest, '')
           else reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint end))),
-      'highPriority', count(*) filter (where dismissed_deal_key is null and should_remove = false
+      'highPriority', count(*) filter (where current_triage_eligible = true
+        and dismissed_deal_key is null and should_remove = false
         and (high_fit or operator_priority in ('urgent', 'high'))),
-      'watchlist', count(*) filter (where dismissed_deal_key is null and should_remove = false
+      'watchlist', count(*) filter (where current_triage_eligible = true
+        and dismissed_deal_key is null and should_remove = false
         and ((fit_score >= 60 and fit_score < 75) or operator_priority = 'watch')),
-      'lowConfidence', count(*) filter (where dismissed_deal_key is null and should_remove = false
+      'lowConfidence', count(*) filter (where current_triage_eligible = true
+        and dismissed_deal_key is null and should_remove = false
         and (confidence = 'low' or contradiction_count > 0)),
-      'currentOpportunities', count(*) filter (where dismissed_deal_key is null)
+      'currentOpportunities', count(*) filter (where current_triage_eligible = true and dismissed_deal_key is null)
     ) from candidates),
-    'rows', coalesce((select jsonb_agg((to_jsonb(ordered) - 'ordinal') order by ordinal) from ordered), '[]'::jsonb)
+    'rows', coalesce((select jsonb_agg(
+      (to_jsonb(ordered) - 'ordinal' - 'score_name' - 'score_listing_url') order by ordinal
+    ) from ordered), '[]'::jsonb)
   );
 $$;
 

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import { ChevronLeft, ChevronRight, Search } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import OpportunityDrawer, { PassForm } from './OpportunityDrawer.jsx';
+import { earningsPresentation } from '../../utils/earningsPresentation.js';
 
 const emptySummary = { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 };
 const summaryItems = [
@@ -35,21 +36,6 @@ function withoutApprovalAuthority(preparation) {
 function money(value) {
   if (value === null || value === undefined || value === '') return '—';
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(Number(value));
-}
-
-function earningsPresentation(financials = {}) {
-  const evidence = financials.annualProfitEvidence || {};
-  const metric = evidence.metric && evidence.metric !== 'unknown'
-    ? ['sde', 'ebitda'].includes(evidence.metric.toLowerCase())
-      ? evidence.metric.toUpperCase() : formatLabel(evidence.metric)
-    : 'Earnings metric unverified';
-  const period = evidence.period && evidence.period !== 'unknown'
-    ? formatLabel(evidence.period).toLowerCase() : 'period unverified';
-  const value = financials.annualProfit;
-  const amount = value === null || value === undefined || value === '' ? '—'
-    : evidence.currency === 'USD' ? money(value)
-      : `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(Number(value))} ${evidence.currency && evidence.currency !== 'unknown' ? evidence.currency : 'currency unverified'}`;
-  return { label: `${metric} · ${period}`, amount };
 }
 
 function formatLabel(value) {
@@ -146,6 +132,8 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
           <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CIM: {formatLabel(row.workflow?.cimStatus || 'not-requested')}</span>
           {row.dismissed ? <span className="rounded-full bg-red-50 px-2 py-0.5 text-red-800">Passed: {formatLabel(row.dismissedReason || 'dismissed')}</span> : null}
         </div>
+        {row.dismissedNote ? <p className="mt-2 text-xs leading-5 text-ink/68">Decision note: {row.dismissedNote}</p> : null}
+        {row.dismissedAt ? <p className="mt-1 text-[11px] text-ink/50">Passed {formatDate(row.dismissedAt)}</p> : null}
         {row.freshness ? <p className="mt-2 text-xs text-ink/65">Why here? {row.freshness.dueAction ? 'Due owner action' : row.freshness.ownerPriority ? 'Deliberate owner priority' : row.freshness.newToUs ? `First accepted ${formatDate(row.freshness.firstAcceptedAt)}${row.freshness.recentlyListed ? '; supported recent listing' : '; listing age unknown or older'}` : row.freshness.updatedSinceReview ? `${formatLabel(row.freshness.materialField || 'Material value')} changed since review` : row.freshness.sourceConflictCount > 0 ? 'Sources disagree; research needed' : 'Current opportunity backlog'}</p> : null}
         {row.freshness && !row.freshness.crmLinked ? <p className="mt-2 text-xs text-amber-800">CRM handoff prerequisite: link or create a CRM record before outreach.</p> : null}
         {observed ? <p className="mt-2 text-[11px] text-ink/50">Observed {observed}</p> : null}
@@ -1114,7 +1102,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           {view === 'inbox' && newResultsAvailable ? <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-900" role="status"><span>New Inbox results are available. Your current rows and open draft remain in place.</span><button className={buttonClass} onClick={() => { queueQueryRef.current.areaCursor = ''; setAreaCursor(''); setCursorHistory([]); loadQueue(); }} type="button">Refresh Inbox results</button></div> : null}
           <div aria-label="Opportunity queues" className="flex gap-2 overflow-x-auto" role="tablist">{views.map(([id, itemLabel]) => <button aria-selected={view === id} className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold ${view === id ? 'border-moss bg-moss/10 text-moss' : 'border-line bg-white text-ink/62'}`} key={id} onClick={() => { setView(id); setArea('inbox'); resetPaging(); }} role="tab" type="button">{itemLabel}</button>)}</div>
           <div className="mt-4 grid gap-3 md:grid-cols-[minmax(15rem,1fr)_repeat(3,minmax(9rem,auto))]">
-            <label className="relative"><span className="sr-only">Search opportunities</span><Search aria-hidden="true" className="absolute left-3 top-3 h-4 w-4 text-ink/40" /><input aria-label="Search opportunities" className="form-control pl-9" onChange={(event) => { setSearch(event.target.value); resetPaging(); }} placeholder="Business or deal key" ref={searchInputRef} type="search" value={search} /></label>
+            <label className="relative"><span className="sr-only">Search opportunities</span><Search aria-hidden="true" className="absolute left-3 top-3 h-4 w-4 text-ink/40" /><input aria-label="Search opportunities" className="form-control pl-9" onChange={(event) => { setSearch(event.target.value); resetPaging(); }} placeholder={view === 'dismissed' ? 'Business, deal key, reason, or note' : 'Business or deal key'} ref={searchInputRef} type="search" value={search} /></label>
             <label className="text-xs font-semibold text-ink/58">Confidence<select className="form-control mt-1" onChange={(event) => { setConfidence(event.target.value); resetPaging(); }} value={confidence}><option value="">All</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
             <label className="text-xs font-semibold text-ink/58">Operator priority<select className="form-control mt-1" onChange={(event) => { setPriority(event.target.value); resetPaging(); }} value={priority}><option value="">All</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="watch">Watch</option></select></label>
             {view === 'inbox' && ['all-active', 'new-important'].includes(area)

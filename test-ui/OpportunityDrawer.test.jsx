@@ -310,6 +310,27 @@ describe('Opportunity drawer', () => {
     expect(within(dialog).getByText(/0 missing evidence · 0 contradictions/)).toBeVisible();
   });
 
+  test.each([
+    [{ metric: 'sde', period: 'annual', currency: 'USD' }, 'SDE · annual', '$425,000'],
+    [{ metric: 'ebitda', period: 'trailing-twelve-months', currency: 'USD' }, 'EBITDA · trailing twelve months', '$425,000'],
+    [{ metric: 'gross-profit', period: 'annual', currency: 'USD' }, 'Earnings metric unverified · annual', '$425,000'],
+    [undefined, 'Earnings metric unverified · period unverified', '425,000 currency unverified'],
+  ])('labels detail earnings only from accepted metric, period, and currency evidence',
+    (annualProfitEvidence, expectedLabel, expectedAmount) => {
+      const detail = detailFixture();
+      detail.opportunity.financials = {
+        ...detail.opportunity.financials,
+        ...(annualProfitEvidence ? { annualProfitEvidence } : {}),
+      };
+
+      render(<OpportunityDrawer detail={detail} onClose={vi.fn()} />);
+
+      const financials = screen.getByRole('heading', { name: 'Business & Financials' }).parentElement;
+      expect(within(financials).getByText(expectedLabel)).toBeVisible();
+      expect(within(financials).getByText(expectedAmount)).toBeVisible();
+      expect(within(financials).queryByText('SDE / profit')).not.toBeInTheDocument();
+    });
+
   test('adds or edits one verified operator fact without exposing machine-owned fields', () => {
     const onSaveFact = vi.fn();
     render(<OpportunityDrawer detail={detailFixture()} onClose={vi.fn()} onSaveFact={onSaveFact} />);

@@ -206,6 +206,8 @@ async function seedQueue(t) {
   await storage.upsertDealHunterDisposition({
     id: 'disposition-dismissed',
     deal_key: 'deal-dismissed',
+    deal_name: 'Archived Dismissed Services',
+    listing_url: 'https://archive.example.invalid/original-listing',
     created_at: '2026-08-16T11:00:00.000Z',
     updated_at: '2026-08-16T11:00:00.000Z',
     disposition: 'dismissed',
@@ -230,6 +232,47 @@ test('the default queue shows unreviewed opportunities and excludes dismissed an
   assert.equal(ids.includes('opp-removed'), false, 'a gated listing is not offered as work');
   assert.ok(ids.includes('opp-high'));
   assert.ok(queue.rows.every((row) => row.reviewed === false));
+});
+
+test('Passed archive remains searchable after current-score eligibility is removed', async (t) => {
+  const storage = await seedQueue(t);
+  await storage.reconcileDealHunterCurrentScoreEligibility([
+    'opp-high', 'opp-watch', 'opp-sparse', 'opp-removed',
+  ]);
+  const rescored = await refreshOpportunityScores({
+    deals: [scoredDeal('dismissed', {
+      name: 'Later Reimport Name',
+      listingUrl: 'https://current.example.invalid/reimported-listing',
+    })],
+    storage,
+  });
+  assert.equal(rescored.ok, true);
+
+  const searches = ['Archived Dismissed Services', 'Later Reimport Name', 'deal-dismissed',
+    'archive.example.invalid/original-listing', 'current.example.invalid/reimported-listing',
+    'not-a-fit', 'acquisition profile'];
+  const results = await Promise.all(searches.map((search) => listTriageQueue({
+    view: 'dismissed', search, storage,
+    getCachedSourceHealth: async () => briefingSourceHealth(),
+  })));
+  const [byDecisionNote] = results.slice(-1);
+
+  assert.equal(results.every((result) => result.ok && result.total === 1), true);
+  assert.equal(byDecisionNote.ok, true);
+  assert.equal(byDecisionNote.total, 1);
+  assert.deepEqual(byDecisionNote.rows.map((row) => row.opportunityId), ['opp-dismissed']);
+  assert.equal(byDecisionNote.rows[0].name, 'Archived Dismissed Services');
+  assert.equal(byDecisionNote.rows[0].listingUrl, 'https://archive.example.invalid/original-listing');
+  assert.equal(byDecisionNote.rows[0].dismissed, true);
+  assert.equal(byDecisionNote.rows[0].dismissedReason, 'not-a-fit');
+  assert.equal(byDecisionNote.rows[0].dismissedNote, 'Outside the acquisition profile.');
+  assert.equal(byDecisionNote.rows[0].dismissedAt, '2026-08-16T11:00:00.000Z');
+  assert.equal(byDecisionNote.dailyDigest.topOpportunities.some((row) => row.name === 'Synthetic Opportunity dismissed'), false,
+    'a durable archive read must not turn a Passed row into a current briefing recommendation');
+
+  const workingQueue = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  assert.equal(workingQueue.rows.some((row) => row.opportunityId === 'opp-dismissed'), false,
+    'removing the archive eligibility boundary must not reintroduce Passed rows to active views');
 });
 
 test('rows carry scan-ready fit and confidence values without blended scoring or full detail payloads', async (t) => {

@@ -75,8 +75,8 @@ const currentOperatorFactMigrationUrl = new URL(
   '../supabase/migrations/20260830170000_current_operator_fact_write.sql',
   import.meta.url,
 );
-const acquisitionInboxQueueMigrationUrl = new URL(
-  '../supabase/migrations/20260830150000_acquisition_inbox_queue.sql',
+const passedArchiveMigrationUrl = new URL(
+  '../supabase/migrations/20261012120000_deal_hunter_passed_archive.sql',
   import.meta.url,
 );
 const cimDetailAuthorityMigrationUrl = new URL(
@@ -225,7 +225,7 @@ function mutatesCanonicalOpportunityAliases(functionSql) {
 }
 
 test('Acquisition Inbox queue SQL keeps filtering, ordering, summary, and lightweight projection in the database', () => {
-  const migration = fs.readFileSync(acquisitionInboxQueueMigrationUrl, 'utf8');
+  const migration = fs.readFileSync(passedArchiveMigrationUrl, 'utf8');
   const schema = fs.readFileSync(schemaUrl, 'utf8');
   for (const [sourceLabel, sql] of [
     ['Acquisition Inbox migration', migration],
@@ -235,13 +235,15 @@ test('Acquisition Inbox queue SQL keeps filtering, ordering, summary, and lightw
     assertServiceRoleOnlyFunction(sql, sourceLabel, 'list_deal_hunter_opportunity_scores');
     assert.match(functionSql, /security definer[\s\S]*?set search_path = public/i);
     assert.match(functionSql, /current_triage_eligible = true[\s\S]*?row_number\(\) over \(order by[\s\S]*?\) as ordinal[\s\S]*?ordinal >/i);
+    assert.match(functionSql, /p_view = 'dismissed'[\s\S]*?dismissed_deal_key is not null[\s\S]*?current_triage_eligible = true/i);
+    assert.match(functionSql, /dismissed_reason[\s\S]*?dismissed_note[\s\S]*?dismissed_at/i);
     assert.match(functionSql, /needsReview[\s\S]*?highPriority[\s\S]*?watchlist[\s\S]*?lowConfidence[\s\S]*?currentOpportunities/i);
     assert.match(functionSql, /operator_priority in \('urgent', 'high'\)[\s\S]*?high_fit[\s\S]*?fit_score[\s\S]*?confidence[\s\S]*?observation_freshness[\s\S]*?opportunity_id asc/i);
     assert.match(functionSql, /when 'scored-at' then scored_at/i);
     assert.match(functionSql, /when 'name' then lower\(coalesce\(name, ''\)\)/i);
     assert.match(functionSql, /source\.field = 'annual_profit'[\s\S]*?source\.field = 'profit_multiple'/i);
     assert.match(functionSql, /row_number\(\) over \(order by[\s\S]*?\) as ordinal/i);
-    assert.match(functionSql, /jsonb_agg\(\(to_jsonb\(ordered\) - 'ordinal'\) order by ordinal\)/i);
+    assert.match(functionSql, /to_jsonb\(ordered\) - 'ordinal' - 'score_name' - 'score_listing_url'/i);
     assert.doesNotMatch(functionSql, /scores\.\*|scores\.(?:dimensions|gates|missing_evidence|confidence_reasons|operator_note)\b/i,
       `${sourceLabel} queue RPC must not return full score/evidence JSON`);
     assert.match(sql, /idx_deal_hunter_scores_acquisition_priority/i);
@@ -250,7 +252,7 @@ test('Acquisition Inbox queue SQL keeps filtering, ordering, summary, and lightw
 });
 
 test('Acquisition Inbox queue migration and fresh schema keep the same function contract', () => {
-  const migration = fs.readFileSync(acquisitionInboxQueueMigrationUrl, 'utf8');
+  const migration = fs.readFileSync(passedArchiveMigrationUrl, 'utf8');
   const schema = fs.readFileSync(schemaUrl, 'utf8');
   const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
   const definition = (sql) => {
