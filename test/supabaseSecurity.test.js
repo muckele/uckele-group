@@ -91,6 +91,10 @@ const manualFollowUpAtomicityMigrationUrl = new URL(
   '../supabase/migrations/20260901120000_deal_hunter_manual_follow_up_atomicity.sql',
   import.meta.url,
 );
+const manualFollowUpCurrentOwnerMigrationUrl = new URL(
+  '../supabase/migrations/20261013120000_deal_hunter_manual_follow_up_current_owner.sql',
+  import.meta.url,
+);
 const scheduledJobFencingMigrationUrl = new URL(
   '../supabase/migrations/20260904120000_daily_digest_scheduled_job_fencing.sql',
   import.meta.url,
@@ -212,6 +216,12 @@ function sqlFunctionDefinitions(sql) {
     name: match[1],
     sql: sql.slice(match.index, starts[index + 1]?.index ?? sql.length),
   }));
+}
+
+function sqlFunctionDefinition(sql, name) {
+  const start = sql.search(new RegExp(`^create or replace function public\\.${name}\\b`, 'im'));
+  const end = start < 0 ? -1 : sql.indexOf('\n$$;', start);
+  return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
 }
 
 function canonicalOpportunityRowLockIndex(functionSql) {
@@ -843,6 +853,45 @@ test('manual follow-up RPC migration changes functions only and adds no table or
   );
 });
 
+test('manual follow-up current-owner migration serializes every request writer before mutation', () => {
+  // Break caught: reconciliation can hold the opportunity lock while another
+  // application writer inserts a newer canonical owner without participating.
+  const migration = fs.existsSync(manualFollowUpCurrentOwnerMigrationUrl)
+    ? fs.readFileSync(manualFollowUpCurrentOwnerMigrationUrl, 'utf8')
+    : '';
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const names = [
+    'mutate_with_crm_activity',
+    'upsert_deal_hunter_cim_request',
+    'claim_deal_hunter_cim_request',
+    'mutate_communications_with_crm_activity',
+    'apply_deal_hunter_cim_identity_repair',
+    'finalize_deal_hunter_approved_follow_up',
+  ];
+  assert.deepEqual(sqlFunctionDefinitions(migration).map(({ name }) => name), names);
+  assert.doesNotMatch(migration, /\b(?:create|alter|drop|truncate)\s+table\b/i);
+  for (const name of names) {
+    const migrationFunction = sqlFunctionDefinition(migration, name);
+    const schemaFunction = sqlFunctionDefinition(schema, name);
+    assert.equal(normalize(migrationFunction), normalize(schemaFunction), `${name} schema/migration parity`);
+    assert.match(migrationFunction, /pg_advisory_xact_lock[\s\S]*?deal-hunter-cim-opportunity:/i, `${name} locks the opportunity`);
+  }
+  for (const name of names) assertServiceRoleOnlyFunction(migration, 'current-owner migration', name);
+
+  const identityRepair = sqlFunctionDefinition(migration, 'apply_deal_hunter_cim_identity_repair');
+  const globalRepairLock = identityRepair.indexOf('deal-hunter-cim-identity-repair');
+  const opportunityLock = identityRepair.indexOf('deal-hunter-cim-opportunity:');
+  const requestMutation = identityRepair.indexOf('update public.deal_hunter_cim_requests set');
+  assert.ok(globalRepairLock >= 0 && globalRepairLock < opportunityLock);
+  assert.ok(opportunityLock < requestMutation);
+  assert.match(
+    identityRepair,
+    /request_reference[\s\S]*repair_batch->'stopRequests'[\s\S]*select nullif\(btrim\(request_link\.value->>'opportunity_id'\), ''\) as opportunity_id[\s\S]*union[\s\S]*select request\.opportunity_id[\s\S]*join request_reference[\s\S]*order by opportunity_id collate "C"/i,
+    'identity repair locks every linked or stopped request source and every destination in deterministic binary order',
+  );
+});
+
 test('manual follow-up RPCs revoke public anon and authenticated and grant service_role only', () => {
   // Break caught: any Phase 3 atomic authority function is callable outside
   // the server's service-role boundary.
@@ -874,6 +923,9 @@ test('manual follow-up RPCs enforce strict marker identity cadence proof and ide
   const migration = fs.existsSync(manualFollowUpAtomicityMigrationUrl)
     ? fs.readFileSync(manualFollowUpAtomicityMigrationUrl, 'utf8')
     : '';
+  const currentOwnerMigration = fs.existsSync(manualFollowUpCurrentOwnerMigrationUrl)
+    ? fs.readFileSync(manualFollowUpCurrentOwnerMigrationUrl, 'utf8')
+    : '';
   const schema = fs.readFileSync(schemaUrl, 'utf8');
   const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
   const names = [
@@ -884,8 +936,11 @@ test('manual follow-up RPCs enforce strict marker identity cadence proof and ide
   ];
 
   for (const name of names) {
-    const migrationFunction = sqlFunctionDefinitions(migration).find((item) => item.name === name)?.sql || '';
-    const schemaFunction = sqlFunctionDefinitions(schema).find((item) => item.name === name)?.sql || '';
+    const migrationSource = name === 'finalize_deal_hunter_approved_follow_up'
+      ? currentOwnerMigration
+      : migration;
+    const migrationFunction = sqlFunctionDefinition(migrationSource, name);
+    const schemaFunction = sqlFunctionDefinition(schema, name);
     assert.equal(normalize(schemaFunction), normalize(migrationFunction), `${name} schema/migration parity`);
     assert.match(migrationFunction, /deal_hunter_cim_requests[\s\S]*?for update/i);
     assert.match(migrationFunction, /contact_submissions[\s\S]*?for update/i);
@@ -920,8 +975,11 @@ test('manual follow-up RPCs enforce strict marker identity cadence proof and ide
   assert.match(claim, /p_claimed_at\s*<\s*v_current\.next_follow_up_at/i);
   assert.match(claim, /v_submission\.status\s*=\s*'archived'/i);
 
-  const finalize = sqlFunctionDefinitions(migration)
-    .find(({ name }) => name === 'finalize_deal_hunter_approved_follow_up')?.sql || '';
+  const finalize = sqlFunctionDefinition(currentOwnerMigration, 'finalize_deal_hunter_approved_follow_up');
+  assert.match(finalize, /pg_advisory_xact_lock[\s\S]*?deal-hunter-cim-opportunity:/i);
+  assert.match(finalize, /deal_hunter_cim_opportunity_claims[\s\S]*?for update/i);
+  assert.match(finalize, /order by coalesce\(request\.first_requested_at, request\.created_at\) desc[\s\S]*?request\.id collate "C" asc/i);
+  assert.match(finalize, /canonical-owner-changed/i);
   assert.match(finalize, /sha256\([\s\S]*?crm-communication:[\s\S]*?:follow-up:/i);
   assert.match(finalize, /crm_communications[\s\S]*?expected_communication_id/i);
   assert.match(finalize, /crm_email_outbox[\s\S]*?ambiguous_at\s+is\s+null/i);

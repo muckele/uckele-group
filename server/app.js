@@ -67,8 +67,10 @@ import {
   parseManualFollowUpApprovalInput,
   parseManualFollowUpPreparationInput,
   parseManualFollowUpStartInput,
+  parseManualFollowUpStatusInput,
   parseManualFollowUpStopInput,
   prepareDealHunterManualFollowUp,
+  reconcileDealHunterManualFollowUpStatus,
   startDealHunterManualFollowUps,
   stopDealHunterManualFollowUps,
 } from './services/dealHunterManualFollowUps.js';
@@ -1763,8 +1765,6 @@ export function createApp({
       }
       const result = await getTriageOpportunityDetail({
         opportunityId: request.params.opportunityId,
-        reconcileAcceptedManualFollowUps: session.role === 'admin',
-        actor: session.username || session.principal_id,
       });
       if (!result.ok) {
         response.status(result.status || 400).json({ success: false, error: result.error || 'Opportunity detail is unavailable.' });
@@ -1862,6 +1862,32 @@ export function createApp({
           role: session.role,
           username: session.username,
         },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/follow-ups/:requestId/status',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseManualFollowUpStatusInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_status_input', error: error.message });
+        return;
+      }
+      const result = await reconcileDealHunterManualFollowUpStatus({
+        opportunityId: request.params.opportunityId,
+        requestId: request.params.requestId,
+        input,
+        session: { principal_id: session.principal_id, role: session.role, username: session.username },
         storage: getStorage(),
       });
       response.status(result.status || (result.success ? 200 : 409)).json(result);

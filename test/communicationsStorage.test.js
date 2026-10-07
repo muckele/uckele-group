@@ -126,7 +126,7 @@ function emailEvent(overrides = {}) {
 }
 
 function cimClaimRequest(overrides = {}) {
-  return {
+  const request = {
     id: '00000000-0000-4000-8000-000000000101',
     created_at: timestamp,
     updated_at: timestamp,
@@ -141,6 +141,10 @@ function cimClaimRequest(overrides = {}) {
     attempt_count: 0,
     metadata: {},
     ...overrides,
+  };
+  return {
+    opportunity_id: overrides.opportunity_id || `opportunity-${request.id}`,
+    ...request,
   };
 }
 

@@ -4774,11 +4774,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
 	    async upsertDealHunterCimRequest(request = {}) {
 	      const safeRequest = safeDealHunterCimRequest(request);
-	      const { data, error } = await client
-	        .from('deal_hunter_cim_requests')
-	        .upsert(safeRequest, { onConflict: 'deal_key,recipient_email' })
-	        .select()
-	        .single();
+	      const { data, error } = await client.rpc('upsert_deal_hunter_cim_request', {
+	        p_request: safeRequest,
+	      });
 
 	      if (error) {
 	        throw error;

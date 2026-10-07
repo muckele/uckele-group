@@ -365,6 +365,7 @@ function createPhase1FixtureState() {
     brokerDetailLoads: {},
     followUpStartPayloads: [],
     followUpStopPayloads: [],
+    followUpStatusPayloads: [],
     followUpPreparePayloads: [],
     followUpApprovePayloads: [],
     followUpApprovalCount: 0,
@@ -1087,6 +1088,35 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       return;
     }
 
+    const followUpStatusMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)\/broker-materials\/follow-ups\/([^/]+)\/status$/);
+    if (method === 'POST' && followUpStatusMatch && !url.search) {
+      const opportunityId = decodeURIComponent(followUpStatusMatch[1]);
+      const requestId = decodeURIComponent(followUpStatusMatch[2]);
+      const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+      const body = phase1Body(request);
+      if (state.sessionRole !== 'admin'
+        || !fixture?.existingRequest
+        || fixture.existingRequest.id !== requestId
+        || Object.keys(body).length !== 0) {
+        await rejectPhase1Request(route, state, `Malformed Phase 3 status request: ${path} ${JSON.stringify(body)}`);
+        return;
+      }
+      state.followUpStatusPayloads.push({ method, path, body });
+      if (fixture.followUpStopReconciliationPending) {
+        fixture.followUpStopReconciliationPending = false;
+        const reconciliationGate = fixture.followUpStopReconciliationGate;
+        fixture.followUpStopReconciliationGate = null;
+        if (reconciliationGate) await reconciliationGate;
+      }
+      await fulfillPhase1Json(route, {
+        success: true,
+        canonicalOpportunityId: opportunityId,
+        requestId,
+        followUps: fixture.existingRequest.followUps,
+      });
+      return;
+    }
+
     const followUpRouteMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)\/broker-materials\/follow-ups\/([^/]+)\/(start|stop|prepare|approve)$/);
     if (method === 'POST' && followUpRouteMatch && !url.search) {
       const opportunityId = decodeURIComponent(followUpRouteMatch[1]);
@@ -1433,12 +1463,6 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       if (!opportunity) throw new Error(`Unexpected Phase 1 detail target: ${path}`);
       state.brokerDetailLoads[opportunityId] = (state.brokerDetailLoads[opportunityId] || 0) + 1;
       const fixture = state.brokerMaterialsByOpportunity[opportunityId];
-      if (fixture?.followUpStopReconciliationPending) {
-        fixture.followUpStopReconciliationPending = false;
-        const reconciliationGate = fixture.followUpStopReconciliationGate;
-        fixture.followUpStopReconciliationGate = null;
-        if (reconciliationGate) await reconciliationGate;
-      }
       if (fixture?.detailFailuresRemaining > 0) {
         fixture.detailFailuresRemaining -= 1;
         await route.abort('failed');
@@ -3150,6 +3174,7 @@ test('Phase 3 Stop network uncertainty restores authoritative active state witho
   await expect(followUps.getByRole('heading', { name: 'Follow-Ups' })).toBeFocused();
   await expect.poll(() => state.brokerDetailLoads['opp-cascade']).toBe(detailLoadsBeforeStop + 1);
   expect(state.followUpStopPayloads).toHaveLength(1);
+  expect(state.followUpStatusPayloads.map(({ body }) => body)).toEqual([{}]);
   expect(state.followUpApprovePayloads).toHaveLength(0);
   expect(state.followUpApprovalCount).toBe(0);
   expect(state.followUpProviderCalls).toBe(0);
@@ -3232,6 +3257,7 @@ test('Phase 3 unknown approval outcome checks authoritative status without retra
   expect(state.followUpApprovalCount).toBe(1);
   expect(state.followUpProviderCalls).toBe(1);
   expect(state.followUpApprovePayloads).toHaveLength(1);
+  expect(state.followUpStatusPayloads.map(({ body }) => body)).toEqual([{}, {}]);
   expectBrokerRouteAuditClean(state);
 });
 

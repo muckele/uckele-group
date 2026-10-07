@@ -108,6 +108,11 @@ export function parseManualFollowUpStartInput(input = {}) {
   return {};
 }
 
+export function parseManualFollowUpStatusInput(input = {}) {
+  strictObject(input, new Set(), 'manual follow-up status input');
+  return {};
+}
+
 export function parseManualFollowUpStopInput(input = {}) {
   strictObject(input, new Set(['reason']), 'manual follow-up Stop input');
   return Object.hasOwn(input, 'reason')
@@ -331,6 +336,52 @@ function projection(authority, extra = {}) {
 
 function routeFailure() {
   return publicFailure('request_not_found', 'The canonical CIM request does not belong to this opportunity.', 404);
+}
+
+export async function reconcileDealHunterManualFollowUpStatus({
+  opportunityId = '', requestId = '', input = {}, session = {}, storage = getStorage(), now = new Date(), dependencies = {},
+} = {}) {
+  try { parseManualFollowUpStatusInput(input); } catch (error) { return publicFailure('invalid_status_input', error.message, 400); }
+  if (!isAdministrator(session)) return publicFailure('administrator_required', 'Administrator access is required.', 403);
+  const canonicalOpportunityId = text(opportunityId, 200);
+  const canonicalRequestId = text(requestId, 200);
+  const authority = await loadDealHunterManualFollowUpAuthority({
+    opportunityId: canonicalOpportunityId,
+    requestId: canonicalRequestId,
+    storage,
+    now,
+    dependencies,
+  });
+  if (!requestBelongsToRoute(authority, canonicalOpportunityId, canonicalRequestId)) return routeFailure();
+  if (!isOperatorApprovedFollowUpRequest(authority.request)) {
+    return publicFailure('approval_required', 'This request is not enrolled in human-approved follow-ups.');
+  }
+  if (criticalAuthorityUnavailable(authority)) {
+    return publicFailure('authority_unavailable', 'Current follow-up authority could not be verified.', 503);
+  }
+  const reconciliation = await reconcileDealHunterApprovedFollowUp({
+    storage,
+    request: authority.request,
+    actor: session.username || session.principal_id,
+  });
+  const current = {
+    ...authority,
+    request: reconciliation?.request || authority.request,
+  };
+  const durable = {
+    canonicalOpportunityId,
+    requestId: canonicalRequestId,
+    followUps: projection(current),
+  };
+  if (reconciliation && reconciliation.status !== 'sent') {
+    return publicFailure(
+      'outcome_unresolved',
+      'Provider acceptance is durable, but follow-up reconciliation is still pending.',
+      503,
+      durable,
+    );
+  }
+  return { success: true, status: 200, code: '', error: '', ...durable };
 }
 
 export async function startDealHunterManualFollowUps({

@@ -6964,6 +6964,27 @@ export function createSqliteStorage(config, options = {}) {
     if (!authority.submission) {
       return manualFollowUpResult({ reason: 'submission-missing', request: authority.request });
     }
+    const currentOwner = authority.request.opportunity_id
+      ? database.prepare(`
+        SELECT id
+        FROM deal_hunter_cim_requests
+        WHERE opportunity_id = ?
+        ORDER BY COALESCE(first_requested_at, created_at) DESC, id ASC
+        LIMIT 1
+      `).get(authority.request.opportunity_id)
+      : null;
+    const opportunityClaim = authority.request.opportunity_id
+      ? database.prepare(`
+        SELECT request_id
+        FROM deal_hunter_cim_opportunity_claims
+        WHERE opportunity_id = ?
+        LIMIT 1
+      `).get(authority.request.opportunity_id)
+      : null;
+    if (currentOwner?.id !== requestId
+      || (opportunityClaim && opportunityClaim.request_id !== requestId)) {
+      return manualFollowUpResult({ reason: 'canonical-owner-changed', request: authority.request });
+    }
     const deterministicCommunicationId = buildManualFollowUpCommunicationId({
       requestId,
       followUpNumber: expectedFollowUpNumber,

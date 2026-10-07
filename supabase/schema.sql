@@ -917,6 +917,7 @@ declare
   v_key text;
   v_value_expression text;
   v_applied boolean := false;
+  v_request_opportunity_id text;
 begin
   if p_activity is null then
     raise exception 'CRM activity is required';
@@ -1054,6 +1055,13 @@ begin
     v_applied := true;
 
   elsif p_operation = 'upsert_deal_hunter_cim_request' then
+    v_request_opportunity_id := nullif(btrim(p_payload #>> '{request,opportunity_id}'), '');
+    if v_request_opportunity_id is null then
+      raise exception 'CIM request opportunity id is required';
+    end if;
+    perform pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('deal-hunter-cim-opportunity:' || v_request_opportunity_id, 0)
+    );
     insert into public.deal_hunter_cim_requests
     select * from jsonb_populate_record(null::public.deal_hunter_cim_requests, p_payload -> 'request')
     on conflict (deal_key, recipient_email) do update set
@@ -1073,7 +1081,11 @@ begin
       next_follow_up_at = excluded.next_follow_up_at,
       responded_at = excluded.responded_at,
       metadata = excluded.metadata
+    where deal_hunter_cim_requests.opportunity_id is not distinct from excluded.opportunity_id
     returning to_jsonb(deal_hunter_cim_requests) into v_record;
+    if v_record is null then
+      raise exception 'CIM request opportunity ownership cannot change during upsert';
+    end if;
     v_applied := true;
 
   else
@@ -1234,6 +1246,85 @@ begin
 end;
 $$;
 
+create or replace function public.upsert_deal_hunter_cim_request(
+  p_request jsonb
+)
+returns jsonb
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_request public.deal_hunter_cim_requests%rowtype;
+  v_stored public.deal_hunter_cim_requests%rowtype;
+begin
+  select * into v_request
+  from jsonb_populate_record(null::public.deal_hunter_cim_requests, coalesce(p_request, '{}'::jsonb));
+
+  if v_request.id is null or v_request.id = ''
+    or v_request.opportunity_id is null or v_request.opportunity_id = ''
+    or v_request.deal_key is null or btrim(v_request.deal_key) = ''
+    or v_request.recipient_email is null or btrim(v_request.recipient_email) = '' then
+    raise exception 'CIM request id, opportunity id, deal key, and recipient email are required';
+  end if;
+  v_request.deal_key := btrim(v_request.deal_key);
+  v_request.recipient_email := lower(btrim(v_request.recipient_email));
+
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('deal-hunter-cim-opportunity:' || v_request.opportunity_id, 0)
+  );
+
+  insert into public.deal_hunter_cim_requests
+  select (v_request).*
+  on conflict (deal_key, recipient_email) do update set
+    id = excluded.id,
+    created_at = excluded.created_at,
+    updated_at = excluded.updated_at,
+    opportunity_id = excluded.opportunity_id,
+    requested_by = excluded.requested_by,
+    status = excluded.status,
+    delivery_error = excluded.delivery_error,
+    provider_message_id = excluded.provider_message_id,
+    subject = excluded.subject,
+    deal_name = excluded.deal_name,
+    source_name = excluded.source_name,
+    listing_url = excluded.listing_url,
+    score = excluded.score,
+    follow_up_count = excluded.follow_up_count,
+    last_follow_up_at = excluded.last_follow_up_at,
+    next_follow_up_at = excluded.next_follow_up_at,
+    responded_at = excluded.responded_at,
+    submission_id = excluded.submission_id,
+    request_state = excluded.request_state,
+    delivery_state = excluded.delivery_state,
+    delivery_state_at = excluded.delivery_state_at,
+    follow_up_state = excluded.follow_up_state,
+    first_requested_at = excluded.first_requested_at,
+    first_provider_accepted_at = excluded.first_provider_accepted_at,
+    delivered_at = excluded.delivered_at,
+    last_attempt_at = excluded.last_attempt_at,
+    last_delivery_event_at = excluded.last_delivery_event_at,
+    reply_to_address = excluded.reply_to_address,
+    retry_of_request_id = excluded.retry_of_request_id,
+    attempt_count = excluded.attempt_count,
+    last_activity_at = excluded.last_activity_at,
+    metadata = excluded.metadata
+  where deal_hunter_cim_requests.opportunity_id is not distinct from excluded.opportunity_id
+  returning * into v_stored;
+
+  if v_stored.id is null then
+    raise exception 'CIM request opportunity ownership cannot change during upsert';
+  end if;
+  return to_jsonb(v_stored);
+end;
+$$;
+
+revoke all on function public.upsert_deal_hunter_cim_request(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.upsert_deal_hunter_cim_request(jsonb)
+  to service_role;
+
 create or replace function public.claim_deal_hunter_cim_request(
   p_request jsonb,
   p_pending_cutoff timestamptz
@@ -1257,14 +1348,18 @@ begin
   v_new.deal_key := btrim(coalesce(v_new.deal_key, ''));
   v_new.recipient_email := lower(btrim(coalesce(v_new.recipient_email, '')));
 
-  if v_new.id is null or v_new.id = '' or v_new.deal_key = '' or v_new.recipient_email = '' then
-    raise exception 'CIM request id, deal key, and recipient email are required';
+  if v_new.id is null or v_new.id = '' or v_new.opportunity_id is null or v_new.opportunity_id = ''
+    or v_new.deal_key = '' or v_new.recipient_email = '' then
+    raise exception 'CIM request id, opportunity id, deal key, and recipient email are required';
   end if;
 
   if v_new.submission_id is null then
     return jsonb_build_object('claimed', false, 'reason', 'submission-missing', 'request', null);
   end if;
 
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('deal-hunter-cim-opportunity:' || v_new.opportunity_id, 0)
+  );
   perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(v_new.deal_key, 0));
 
   select *
@@ -1309,6 +1404,9 @@ begin
   end if;
 
   if v_current.id is not null then
+    if v_current.opportunity_id is distinct from v_new.opportunity_id then
+      return jsonb_build_object('claimed', false, 'reason', 'opportunity-owner-mismatch', 'request', to_jsonb(v_current));
+    end if;
     update public.deal_hunter_cim_requests as request
     set
       id = v_new.id,
@@ -1891,6 +1989,17 @@ begin
     select *
     into v_request
     from jsonb_populate_record(null::public.deal_hunter_cim_requests, p_payload -> 'request');
+    if v_request.opportunity_id is null or v_request.opportunity_id = '' then
+      return jsonb_build_object(
+        'applied', false,
+        'reason', 'opportunity-missing',
+        'record', null,
+        'activity', null
+      );
+    end if;
+    perform pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('deal-hunter-cim-opportunity:' || v_request.opportunity_id, 0)
+    );
     v_submission_id := v_request.submission_id;
 
     if v_submission_id is null and p_operation = 'finalize_deal_hunter_cim_request_claim' then
@@ -2021,7 +2130,17 @@ begin
       attempt_count = coalesce(excluded.attempt_count, deal_hunter_cim_requests.attempt_count, 0),
       last_activity_at = coalesce(excluded.last_activity_at, excluded.updated_at, deal_hunter_cim_requests.last_activity_at),
       metadata = excluded.metadata
+    where deal_hunter_cim_requests.opportunity_id is not distinct from excluded.opportunity_id
     returning to_jsonb(deal_hunter_cim_requests) into v_record;
+
+    if v_record is null then
+      return jsonb_build_object(
+        'applied', false,
+        'reason', 'opportunity-owner-mismatch',
+        'record', null,
+        'activity', null
+      );
+    end if;
 
   else
     raise exception 'Unsupported atomic communications operation: %', coalesce(p_operation, 'unknown');
@@ -4286,6 +4405,7 @@ set search_path = ''
 as $$
 declare
   v_item jsonb;
+  v_opportunity_id text;
   v_manifest jsonb := coalesce(repair_batch->'manifest', '{}'::jsonb);
   v_manifest_id text := v_manifest->>'id';
   v_changed integer := 0;
@@ -4313,6 +4433,41 @@ begin
   if exists (select 1 from public.deal_hunter_cim_repair_manifests where id = v_manifest_id) then
     return jsonb_build_object('alreadyApplied', true, 'manifestId', v_manifest_id);
   end if;
+
+  -- Identity repair is the only application writer permitted to move an
+  -- existing request between opportunities. Serialize repair batches before
+  -- discovering their source opportunities, then lock the complete source and
+  -- destination set in deterministic binary order before any repair mutation.
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('deal-hunter-cim-identity-repair', 0)
+  );
+  for v_opportunity_id in
+    with request_link as (
+      select item.value
+      from jsonb_array_elements(coalesce(repair_batch->'requestLinks', '[]'::jsonb)) as item(value)
+    ), request_reference as (
+      select request_link.value->>'id' as request_id
+      from request_link
+      union
+      select item.value->>'id'
+      from jsonb_array_elements(coalesce(repair_batch->'stopRequests', '[]'::jsonb)) as item(value)
+    ), opportunity_lock as (
+      select nullif(btrim(request_link.value->>'opportunity_id'), '') as opportunity_id
+      from request_link
+      union
+      select request.opportunity_id
+      from public.deal_hunter_cim_requests as request
+      join request_reference on request.id = request_reference.request_id
+    )
+    select opportunity_id
+    from opportunity_lock
+    where opportunity_id is not null
+    order by opportunity_id collate "C"
+  loop
+    perform pg_catalog.pg_advisory_xact_lock(
+      pg_catalog.hashtextextended('deal-hunter-cim-opportunity:' || v_opportunity_id, 0)
+    );
+  end loop;
 
   for v_item in select value from jsonb_array_elements(coalesce(repair_batch->'opportunityRecords', '[]'::jsonb)) loop
     insert into public.deal_hunter_opportunities (
@@ -7361,8 +7516,11 @@ security definer
 set search_path = public
 as $$
 declare
+  v_probe_opportunity_id text;
   v_current public.deal_hunter_cim_requests%rowtype;
   v_submission public.contact_submissions%rowtype;
+  v_current_owner_id text;
+  v_claim_owner_id text;
   v_communication public.crm_communications%rowtype;
   v_outbox public.crm_email_outbox%rowtype;
   v_expected_communication_id text;
@@ -7381,6 +7539,17 @@ declare
   v_due_date date;
   v_derived_next_follow_up_at timestamptz;
 begin
+  select request.opportunity_id into v_probe_opportunity_id
+  from public.deal_hunter_cim_requests as request
+  where request.id = p_request_id;
+
+  if v_probe_opportunity_id is null then
+    return jsonb_build_object('applied', false, 'reason', 'request-missing', 'request', null, 'activity', null, 'alreadyFinalized', false);
+  end if;
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('deal-hunter-cim-opportunity:' || v_probe_opportunity_id, 0)
+  );
+
   select * into v_submission
   from public.contact_submissions as submission
   where submission.id = p_expected_submission_id
@@ -7396,6 +7565,25 @@ begin
   end if;
   if v_submission.id is null or v_current.submission_id is distinct from v_submission.id then
     return jsonb_build_object('applied', false, 'reason', 'submission-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+  if v_current.opportunity_id is distinct from v_probe_opportunity_id then
+    return jsonb_build_object('applied', false, 'reason', 'canonical-owner-changed', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+
+  select claim.request_id into v_claim_owner_id
+  from public.deal_hunter_cim_opportunity_claims as claim
+  where claim.opportunity_id = v_probe_opportunity_id
+  for update;
+
+  select request.id into v_current_owner_id
+  from public.deal_hunter_cim_requests as request
+  where request.opportunity_id = v_probe_opportunity_id
+  order by coalesce(request.first_requested_at, request.created_at) desc, request.id collate "C" asc
+  limit 1;
+
+  if v_current_owner_id is distinct from p_request_id
+    or (v_claim_owner_id is not null and v_claim_owner_id is distinct from p_request_id) then
+    return jsonb_build_object('applied', false, 'reason', 'canonical-owner-changed', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
   end if;
 
   v_expected_communication_id := pg_catalog.encode(

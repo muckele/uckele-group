@@ -825,6 +825,20 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     setFollowUpState(emptyFollowUpState);
   }
 
+  async function reconcileFollowUpStatus(opportunityId, requestId, { signal } = {}) {
+    if (!opportunityId || !requestId || selectionRef.current !== opportunityId) return false;
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/follow-ups/${encodeURIComponent(requestId)}/status`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}), signal,
+      });
+      const result = await response.json();
+      return response.ok && result.success;
+    } catch (error) {
+      if (isAbortError(error)) return false;
+      return false;
+    }
+  }
+
   async function mutateFollowUps(opportunityId, requestId, action, requestedBody = {}) {
     if (!opportunityId || !requestId || selectionRef.current !== opportunityId || readOnly || followUpMutationPendingRef.current) return false;
     const body = action === 'stop' && requestedBody.reason ? { reason: requestedBody.reason } : {};
@@ -870,6 +884,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       }));
     }
 
+    if (stopStatus) await reconcileFollowUpStatus(opportunityId, requestId, { signal: controller.signal });
     const refreshed = await loadDetail(opportunityId, { preserveData: true });
     if (followUpMutationRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
     setFollowUpState((current) => ({
@@ -999,6 +1014,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       setFollowUpState((current) => ({ ...current, preparation: null, sending: false, checking: true, checkingFailed: false, stale: false, updated: false, error: '' }));
     }
 
+    if (unknownOutcome) await reconcileFollowUpStatus(opportunityId, requestId, { signal: controller.signal });
     const refreshed = await loadDetail(opportunityId, { preserveData: true });
     if (followUpApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
     setFollowUpState((current) => ({
@@ -1015,9 +1031,10 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     return responseOk;
   }
 
-  async function checkFollowUpStatus(opportunityId) {
-    if (!opportunityId || selectionRef.current !== opportunityId) return false;
+  async function checkFollowUpStatus(opportunityId, requestId) {
+    if (!opportunityId || !requestId || selectionRef.current !== opportunityId) return false;
     setFollowUpState((current) => ({ ...current, preparation: null, checking: true, checkingFailed: false, stale: false, updated: false, error: '' }));
+    if (!readOnly) await reconcileFollowUpStatus(opportunityId, requestId);
     const refreshed = await loadDetail(opportunityId, { preserveData: true });
     if (selectionRef.current !== opportunityId) return false;
     setFollowUpState((current) => ({
@@ -1122,7 +1139,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         {view === 'inbox' ? <MorningBriefing actionsAllowed={actionsAllowed} digest={dailyDigest} error={queueError} loading={loading} onAction={(row, _action, event) => openDetail(row.opportunityId, event.currentTarget)} onOpen={(row, event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} /> : null}
       </div>
 
-      {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onClose={closeDetail} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed} /> : null}
+      {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onClose={closeDetail} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );

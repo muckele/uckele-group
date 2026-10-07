@@ -34,7 +34,6 @@ import { normalizeCanonicalCimRequestId } from './cimRequestIdPolicy.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 import { projectDealHunterBrokerMaterials } from './dealHunterBrokerMaterials.js';
 import { orchestratePursuitEnrollment } from './pursueCimEnrollment.js';
-import { reconcileDealHunterApprovedFollowUp } from './dealHunter.js';
 
 export const triageViews = Object.freeze([
   'needs-review',
@@ -821,8 +820,6 @@ function projectCrmSubmission(submission) {
 export async function getTriageOpportunityDetail({
   opportunityId = '',
   storage = getStorage(),
-  reconcileAcceptedManualFollowUps = false,
-  actor = 'deal-hunter-status',
 } = {}) {
   const id = normalizeText(opportunityId, 200);
   const projectedAt = new Date();
@@ -890,14 +887,7 @@ export async function getTriageOpportunityDetail({
   const sanitizedOperatorFacts = operatorFacts
     .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
     .slice(0, 100);
-  let canonicalCimRequests = canonicalDetailCimRequests(cimRequests);
-  if (reconcileAcceptedManualFollowUps) {
-    canonicalCimRequests = await Promise.all(canonicalCimRequests.map(async (request) => {
-      if (request?.metadata?.manualFollowUp?.mode !== 'operator-approved') return request;
-      const reconciliation = await reconcileDealHunterApprovedFollowUp({ storage, request, actor });
-      return reconciliation?.status === 'sent' ? reconciliation.request || request : request;
-    }));
-  }
+  const canonicalCimRequests = canonicalDetailCimRequests(cimRequests);
   const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field) || row.field === 'broker_contact');
   const crmFacts = directCrmFactRows(submission);
   const effectiveFacts = getEffectiveOpportunityFacts({
