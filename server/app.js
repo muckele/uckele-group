@@ -50,7 +50,7 @@ import {
   restoreDealHunterOpportunityWithInboxAuthority,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
-import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
+import { opportunityFactFields, setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
 import { appendExplicitOpportunityTimezoneRevision } from './services/opportunityTimezoneRevision.js';
 import {
   getPursueCimReleaseReport,
@@ -2010,6 +2010,29 @@ export function createApp({
         response.status(400).json({ success: false, error: 'Opportunity fact verification state must be boolean.' });
         return;
       }
+      const expectedRevision = request.body?.expectedRevision;
+      const revisionKeys = expectedRevision && typeof expectedRevision === 'object' && !Array.isArray(expectedRevision)
+        ? Object.keys(expectedRevision).sort().join(',') : '';
+      const snapshot = expectedRevision?.submissionFactSnapshot;
+      const validSnapshot = snapshot === null || (
+        snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)
+        && Object.keys(snapshot).sort().join(',') === [...opportunityFactFields].sort().join(',')
+        && Object.values(snapshot).every((value) => value === null
+          || (typeof value === 'string' && [...value].length <= 4000))
+      );
+      const validSubmissionRevision = expectedRevision?.primarySubmissionId === null
+        ? snapshot === null
+        : typeof expectedRevision?.primarySubmissionId === 'string'
+          && expectedRevision.primarySubmissionId.length > 0
+          && expectedRevision.primarySubmissionId.length <= 240
+          && expectedRevision.primarySubmissionId.trim() === expectedRevision.primarySubmissionId
+          && validSnapshot;
+      if (revisionKeys !== 'campaignAuthorityRevision,primarySubmissionId,submissionFactSnapshot'
+        || !Number.isInteger(expectedRevision.campaignAuthorityRevision)
+        || expectedRevision.campaignAuthorityRevision < 1 || !validSubmissionRevision) {
+        response.status(400).json({ success: false, error: 'Opportunity fact expected revision is invalid.' });
+        return;
+      }
       try {
         const fact = await setCurrentOperatorOpportunityFact({
           opportunityId: request.params.opportunityId,
@@ -2017,14 +2040,16 @@ export function createApp({
           value: request.body?.value,
           verified: request.body.verified,
           note: request.body?.note ?? null,
+          expectedRevision: request.body.expectedRevision,
           actor: session.username || 'admin',
           storage: getStorage(),
         });
         response.status(200).json({ success: true, fact });
       } catch (error) {
         const message = String(error?.message || 'Opportunity fact could not be saved.');
-        const status = /no longer current|current canonical opportunity/i.test(message) ? 409 : /was not found/i.test(message) ? 404 : 400;
-        response.status(status).json({ success: false, error: message });
+        const conflict = /changed since this edit was opened/i.test(message);
+        const status = conflict || /no longer current|current canonical opportunity/i.test(message) ? 409 : /was not found/i.test(message) ? 404 : 400;
+        response.status(status).json({ success: false, ...(conflict ? { code: 'fact_edit_conflict' } : {}), error: message });
       }
     }),
   );

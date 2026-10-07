@@ -1078,7 +1078,8 @@ test('triage detail remains readable while only administrators may enrich facts 
 
     const viewerDetail = await fetch(detailPath.replace(/^/, origin), { headers: { Cookie: viewerCookie } });
     assert.equal(viewerDetail.status, 200);
-    assert.deepEqual(Object.keys(await viewerDetail.json()).sort(), [
+    const viewerDetailPayload = await viewerDetail.json();
+    assert.deepEqual(Object.keys(viewerDetailPayload).sort(), [
       'brokerMaterials', 'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
       'operatorFacts', 'opportunity', 'pursueCimReleaseAvailable', 'score', 'sourceObservations',
     ]);
@@ -1091,17 +1092,31 @@ test('triage detail remains readable while only administrators may enrich facts 
     })).status, 401);
     const savedFact = await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
-      body: JSON.stringify({ value: 'Verified Seller', verified: true, note: 'Called seller.' }),
+      body: JSON.stringify({ value: 'Verified Seller', verified: true, note: 'Called seller.', expectedRevision: viewerDetailPayload.opportunity.factEditRevision }),
     });
     assert.equal(savedFact.status, 200);
     const detailAfterFact = await (await fetch(detailPath.replace(/^/, origin), { headers: { Cookie: adminCookie } })).json();
     assert.equal(detailAfterFact.effectiveFacts.seller_name.value, 'Verified Seller');
     assert.equal(detailAfterFact.history.operatorFacts[0].note, 'Called seller.');
+    const staleFact = await fetch(factPath.replace(/^/, origin), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ value: 'Stale Seller', verified: true, expectedRevision: viewerDetailPayload.opportunity.factEditRevision }),
+    });
+    assert.equal(staleFact.status, 409);
+    assert.equal((await staleFact.json()).code, 'fact_edit_conflict');
+    assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).length, 1);
     const malformedVerification = await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
       body: JSON.stringify({ value: 'x', verified: 'yes' }),
     });
     assert.equal(malformedVerification.status, 400);
+    const missingRevision = await fetch(factPath.replace(/^/, origin), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ value: 'No authority', verified: true }),
+    });
+    assert.equal(missingRevision.status, 400);
+    assert.match((await missingRevision.json()).error, /expected revision is invalid/i);
+    assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).length, 1);
     const malformedField = await fetch(`${origin}/api/admin/deal-hunter/opportunities/${encodeURIComponent(opportunityId)}/facts/not_allowed`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ value: 'x', verified: false }),
     });

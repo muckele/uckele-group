@@ -655,7 +655,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     }
   }
 
-  async function saveFact(opportunityId, { field, value, note, verified }) {
+  async function saveFact(opportunityId, { field, value, note, verified, expectedRevision }) {
     if (!opportunityId || selectionRef.current !== opportunityId || mutationPendingRef.current) return false;
     mutationPendingRef.current = true;
     const mutationGeneration = mutationGenerationRef.current + 1;
@@ -665,10 +665,15 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     try {
       const response = await fetch(`/api/admin/deal-hunter/opportunities/${encodeURIComponent(opportunityId)}/facts/${encodeURIComponent(field)}`, {
         method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ value, note, verified }),
+        body: JSON.stringify({ value, note, verified, expectedRevision }),
       });
       const result = await response.json();
-      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save the verified fact.');
+      if (!response.ok || !result.success) {
+        if (response.status === 409 && result.code === 'fact_edit_conflict' && selectionRef.current === opportunityId) {
+          await loadDetail(opportunityId, { preserveData: true });
+        }
+        throw new Error(result.error || 'Unable to save the verified fact.');
+      }
       if (selectionRef.current === opportunityId) await loadDetail(opportunityId, { preserveData: true });
       return true;
     } catch (factError) {

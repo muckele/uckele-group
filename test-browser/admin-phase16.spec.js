@@ -343,6 +343,7 @@ function createPhase1FixtureState() {
       { opportunityId: 'opp-evergreen', id: 'fact-evergreen-broker', field: 'broker_name', value: 'Riley Verified Broker', verified: true, actor: 'phase1-admin', note: 'Broker identity confirmed by phone.', createdAt: '2026-08-29T18:00:00.000Z', updatedAt: '2026-08-29T18:00:00.000Z' },
       { opportunityId: 'opp-evergreen', id: 'fact-evergreen-broker-phone', field: 'broker_phone', value: '503-555-0198', verified: true, actor: 'phase1-admin', note: 'Direct broker callback number verified by phone.', createdAt: '2026-08-29T18:05:00.000Z', updatedAt: '2026-08-29T18:05:00.000Z' },
     ],
+    factEditRevisions: Object.fromEntries(canonicalOpportunities.map(({ opportunityId }) => [opportunityId, 7])),
     crmSubmissions,
     crmCommunications: canonicalOpportunities.flatMap((opportunity) => [
       { opportunityId: opportunity.opportunityId, id: `crm-email-${opportunity.opportunityId}`, direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T19:00:00.000Z', cimRequestId: `cim-${opportunity.opportunityId}` },
@@ -826,7 +827,9 @@ function phase1DetailResponse(state, opportunityId) {
   const submission = state.crmSubmissions.find((row) => row.opportunityId === opportunityId);
   const sourceProfit = String(scoreRow.financials.annualProfit);
   return {
-    opportunity: { ...phase1QueueRow(opportunity), operatorNote: opportunity.operatorNote },
+    opportunity: { ...phase1QueueRow(opportunity), operatorNote: opportunity.operatorNote,
+      factEditRevision: { campaignAuthorityRevision: state.factEditRevisions[opportunityId],
+        primarySubmissionId: null, submissionFactSnapshot: null } },
     effectiveFacts,
     operatorFacts,
     sourceObservations: sourceRows.map(({ opportunityId: _opportunityId, ...source }) => ({ ...source, values: { ...source.values }, conflicts })),
@@ -1337,8 +1340,19 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       const brokerFixture = state.brokerMaterialsByOpportunity[opportunityId];
       const allowedBrokerVerification = field === 'broker_email' && brokerFixture?.allowBrokerVerification;
       if (!opportunity || !score || (field !== 'seller_name' && !allowedBrokerVerification)) throw new Error(`Unexpected Phase 1 fact target: ${path}`);
-      if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['note', 'value', 'verified'])) {
+      if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['expectedRevision', 'note', 'value', 'verified'])) {
         throw new Error(`Malformed Phase 1 fact payload keys: ${JSON.stringify(body)}`);
+      }
+      state.factPayloads.push({ method, path, body });
+      if (body.expectedRevision?.campaignAuthorityRevision !== state.factEditRevisions[opportunityId]
+        || body.expectedRevision?.primarySubmissionId !== null
+        || body.expectedRevision?.submissionFactSnapshot !== null) {
+        await fulfillPhase1Json(route, {
+          success: false,
+          code: 'fact_edit_conflict',
+          error: 'The opportunity changed since this edit was opened. Reload the latest detail before saving again.',
+        }, 409);
+        return;
       }
       const validSellerFact = field === 'seller_name'
         && body.verified === true
@@ -1364,6 +1378,7 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
         updatedAt: '2026-08-30T20:00:00.000Z',
       };
       state.operatorFacts = [...state.operatorFacts.filter((item) => item.opportunityId !== opportunityId || item.field !== field), fact];
+      state.factEditRevisions[opportunityId] += 1;
       if (validBrokerFact) {
         brokerFixture.recipientOptions = [{
           recipientContactRef: `contact-${opportunityId}-verified-fact`,
@@ -1375,7 +1390,6 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
         }];
       }
       if (score.fitScore !== machineScore) throw new Error('Verified fact changed the machine score in the Phase 1 fixture.');
-      state.factPayloads.push({ method, path, body });
       const { opportunityId: _opportunityId, ...responseFact } = fact;
       await fulfillPhase1Json(route, { success: true, fact: responseFact });
       return;
@@ -2750,7 +2764,8 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   expect(state.factPayloads).toEqual([{
     method: 'PUT',
     path: '/api/admin/deal-hunter/opportunities/opp-evergreen/facts/seller_name',
-    body: { value: 'Morgan Verified Seller', note: 'Confirmed directly with the seller on Aug 30.', verified: true },
+    body: { value: 'Morgan Verified Seller', note: 'Confirmed directly with the seller on Aug 30.', verified: true,
+      expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } },
   }]);
   const prohibitedPath = /(?:\/send(?:\/|$)|\/cim(?:[-_/]|$)|stage[-_]?2|scores?\/refresh|\/refresh(?:\/|$)|backfill|deal-os-import|\/import(?:\/|$)|source-refresh|crm-sync|follow-up|outreach|\/review(?:\/|$)|scrap)/i;
   expect(state.requests.filter((request) => prohibitedPath.test(request.path))).toEqual([]);
@@ -2759,6 +2774,43 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   expect(state.offOriginRequests).toEqual([]);
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);
+});
+
+test('Acquisition Inbox rejects a stale verified-fact save, refreshes authority, and preserves the draft', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  await page.goto('/admin/deal-hunter');
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
+  const trigger = page.getByRole('button', { name: 'Open Evergreen Safety Services' });
+  await trigger.click();
+  const dialog = page.getByRole('dialog', { name: 'Evergreen Safety Services' });
+  await dialog.getByLabel('Verified fact field').selectOption('seller_name');
+  await dialog.getByLabel('Verified fact value').fill('Owner draft from the stale drawer');
+  await dialog.getByLabel('Verification note').fill('Keep this draft while reviewing the newer source.');
+
+  const sheet = state.sourceObservations.find((source) => source.opportunityId === 'opp-evergreen' && source.sourceId === 'sheet-0');
+  sheet.values.seller_name = 'Seller from newer source authority';
+  sheet.observedAt = '2026-08-30T21:00:00.000Z';
+  state.factEditRevisions['opp-evergreen'] += 1;
+
+  await dialog.getByRole('button', { name: 'Save verified fact' }).click();
+  await expect(dialog.getByRole('alert')).toContainText('The opportunity changed since this edit was opened.');
+  await expect(dialog.getByLabel('Verified fact value')).toHaveValue('Owner draft from the stale drawer');
+  await expect(dialog.getByRole('heading', { name: 'Sources' }).locator('..')
+    .getByText('Seller from newer source authority', { exact: true }).first()).toBeVisible();
+  expect(state.factPayloads).toEqual([{
+    method: 'PUT',
+    path: '/api/admin/deal-hunter/opportunities/opp-evergreen/facts/seller_name',
+    body: {
+      value: 'Owner draft from the stale drawer',
+      note: 'Keep this draft while reviewing the newer source.',
+      verified: true,
+      expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null },
+    },
+  }]);
+  expect(state.operatorFacts.some((fact) => fact.opportunityId === 'opp-evergreen' && fact.field === 'seller_name')).toBe(false);
+  expect(state.unexpectedRequests).toEqual([]);
+  expect(state.unexpectedApiRequests).toEqual([]);
+  expect(state.offOriginRequests).toEqual([]);
 });
 
 test('Request Broker Materials desktop review sends the exact approved proposal once and reloads durable lifecycle', async ({ page }) => {
@@ -2921,7 +2973,8 @@ test('Request Broker Materials requires an explicit opaque contact and verified 
   await expect(opened.card.getByRole('button', { name: 'Request Broker Materials' })).toBeVisible();
   await opened.card.getByRole('button', { name: 'Request Broker Materials' }).click();
   await expect(opened.card.getByText(/verified-browser-broker@example\.test/).first()).toBeVisible();
-  expect(manualState.factPayloads.at(-1).body).toEqual({ value: 'verified-browser-broker@example.test', note: 'Verified for the broker materials request.', verified: true });
+  expect(manualState.factPayloads.at(-1).body).toEqual({ value: 'verified-browser-broker@example.test', note: 'Verified for the broker materials request.', verified: true,
+    expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } });
   expectBrokerRouteAuditClean(manualState);
 });
 

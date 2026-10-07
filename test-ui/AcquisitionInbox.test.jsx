@@ -224,6 +224,7 @@ function queueRow(overrides = {}) {
     scoredAt: '2026-08-29T17:00:00.000Z',
     scoreFingerprint: 'fingerprint-1',
     rulesVersion: 'deal-hunter-fit-v2',
+    factEditRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null },
     freshness: { discoveryRevision: 0, materialRevision: 0 },
     ...overrides,
   };
@@ -1500,18 +1501,30 @@ describe('Acquisition Inbox queue', () => {
     expect(writes[1]).toEqual(writes[0]);
   });
 
-  test('keeps verified-fact edit open with its prior durable value after a deferred save failure, then permits one retry', async () => {
+  test('refreshes authority after a stale verified-fact save while preserving the draft for one retry', async () => {
     const first = deferred();
     const second = deferred();
     const writes = [];
     const reads = [];
-    const persistedDetail = detailResponse(queueRow());
+    const persistedDetail = detailResponse(queueRow({ factEditRevision: {
+      campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null,
+    } }));
     persistedDetail.effectiveFacts = { seller_name: { value: 'Existing durable seller', provenance: 'operator', note: '' } };
     vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
       const url = String(input);
       if (url.includes('/facts/seller_name')) { writes.push(JSON.parse(options.body)); return writes.length === 1 ? first.promise : second.promise; }
       reads.push(url);
-      return Promise.resolve(url.endsWith('/triage/opp-1') ? jsonResponse(persistedDetail) : jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+      if (url.endsWith('/triage/opp-1')) {
+        const detail = reads.filter((read) => read.endsWith('/triage/opp-1')).length === 1
+          ? persistedDetail
+          : { ...persistedDetail,
+            opportunity: { ...persistedDetail.opportunity, factEditRevision: {
+              campaignAuthorityRevision: 8, primarySubmissionId: null, submissionFactSnapshot: null,
+            } },
+            effectiveFacts: { seller_name: { value: 'Newer durable seller', provenance: 'operator', note: '' } } };
+        return Promise.resolve(jsonResponse(detail));
+      }
+      return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
     }));
 
     renderInbox();
@@ -1519,15 +1532,17 @@ describe('Acquisition Inbox queue', () => {
     const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
     fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Updated seller' } });
     fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
-    expect(writes).toHaveLength(1);
+    expect(writes).toEqual([{ value: 'Updated seller', note: '', verified: true,
+      expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } }]);
     expect(reads).toHaveLength(2);
-    await act(async () => first.resolve(jsonResponse({ success: false, error: 'Verified fact could not be saved.' }, { ok: false, status: 409 })));
-    expect(await within(drawer).findByRole('alert')).toHaveTextContent('Verified fact could not be saved.');
+    await act(async () => first.resolve(jsonResponse({ success: false, code: 'fact_edit_conflict', error: 'The opportunity changed since this edit was opened.' }, { ok: false, status: 409 })));
+    expect(await within(drawer).findByRole('alert')).toHaveTextContent('The opportunity changed since this edit was opened.');
     expect(within(drawer).getByLabelText('Verified fact value')).toHaveValue('Updated seller');
-    expect(within(drawer).getByText('Existing durable seller')).toBeVisible();
-    expect(reads).toHaveLength(2);
+    expect(await within(drawer).findByText('Newer durable seller')).toBeVisible();
+    expect(reads).toHaveLength(3);
     fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
-    expect(writes).toHaveLength(2);
+    expect(writes[1]).toEqual({ value: 'Updated seller', note: '', verified: true,
+      expectedRevision: { campaignAuthorityRevision: 8, primarySubmissionId: null, submissionFactSnapshot: null } });
   });
 
   test('announces a failed row Watch in queue context without a success refresh and permits one retry', async () => {
@@ -2048,7 +2063,8 @@ describe('Acquisition Inbox queue', () => {
 
     await waitFor(() => expect(writes).toEqual([{
       method: 'PUT',
-      body: { value: 'Alex Broker', note: 'Confirmed with seller.', verified: true },
+      body: { value: 'Alex Broker', note: 'Confirmed with seller.', verified: true,
+        expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } },
     }]));
     await waitFor(() => expect(detailLoads).toBe(2));
   });

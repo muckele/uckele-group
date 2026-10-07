@@ -1711,6 +1711,7 @@ test('detail closes every nested projection and strips injected storage metadata
   const nullableNumber = { type: 'number', nullable: true };
   const opportunityContract = {
     opportunityId: text(200), dealKey: text(200), name: text(500), state: text(40), listingUrl: text(2000),
+    factEditRevision: { type: 'object' },
     fitScore: number, scoreStatus: text(80), confidence: text(80), completenessScore: number,
     missingEvidenceCount: number, contradictionCount: number, shouldRemove: boolean, highFit: boolean,
     geography: { type: 'object' }, industry: text(240), financials: { type: 'object' }, topStrength: text(400),
@@ -1727,6 +1728,11 @@ test('detail closes every nested projection and strips injected storage metadata
   };
   const communicationContract = { id: text(200), direction: text(80), channel: text(80), kind: text(80), occurredAt: text(80), cimRequestId: text(200) };
   assertRecordContract(detail.opportunity, opportunityContract, 'opportunity');
+  assertRecordContract(detail.opportunity.factEditRevision, {
+    campaignAuthorityRevision: number,
+    primarySubmissionId: { type: 'string', max: 240, nullable: true },
+    submissionFactSnapshot: { type: 'object', nullable: true },
+  }, 'opportunity.factEditRevision');
   assertRecordContract(detail.opportunity.geography, { city: text(160), state: text(40), label: text(240) }, 'opportunity.geography');
   assertRecordContract(detail.opportunity.financials, { annualProfit: nullableNumber, annualRevenue: nullableNumber, askingPrice: nullableNumber, profitMultiple: nullableNumber }, 'opportunity.financials');
   assertRecordContract(detail.opportunity.workflow, { crmStatus: text(80), cimStatus: text(80) }, 'opportunity.workflow');
@@ -1918,12 +1924,21 @@ test('detail projects all thirteen scalar CRM facts and rejects non-scalar CRM v
   const values = {
     seller_name: 'crm-seller_name', seller_email: 'crm-seller_email', seller_phone: 'crm-seller_phone',
     broker_name: 'crm-broker_name', broker_company: 'crm-broker_company', broker_email: 'crm-broker_email', broker_phone: 'crm-broker_phone',
-    reason_for_sale: 'crm-reason_for_sale', real_estate_included: false, seller_financing: 0,
-    management_structure: 'crm-management_structure', customer_concentration: 'crm-customer_concentration', operator_contact_notes: 'crm-operator_contact_notes',
+    reason_for_sale: 'crm-reason_for_sale', real_estate_included: false,
+    seller_financing: Number.MAX_SAFE_INTEGER,
+    management_structure: Number.MAX_SAFE_INTEGER + 1, customer_concentration: 1e-7,
+    operator_contact_notes: '😀'.repeat(4100),
   };
   const hostile = new Proxy(storage, {
     get(target, property) {
-      if (property === 'getSubmission') return async () => ({ id: 'submission-detail', metadata: { dealHunter: { ...values, sellerName: { private: 'nope' } } } });
+      if (property === 'getSubmission') return async () => ({
+        id: 'submission-detail', seller_name: '   ',
+        metadata: { dealHunter: {
+          ...values, sellerName: { private: 'nope' },
+          managementStructure: 'unsafe integer fallback',
+          customerConcentration: 'fractional fallback',
+        } },
+      });
       if (property === 'listDealHunterOpportunityFacts') return async () => Object.entries(values).map(([field]) => ({
         id: `operator-${field}`, field, value: `operator-${field}`, verified: true, actor: 'admin', note: 'verified', created_at: '2026-08-30T12:00:00.000Z', updated_at: '2026-08-30T12:00:00.000Z',
       }));
@@ -1933,7 +1948,17 @@ test('detail projects all thirteen scalar CRM facts and rejects non-scalar CRM v
   const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
   assert.deepEqual(detail.crmSummary.factObservations.map((item) => item.field).sort(), Object.keys(values).sort());
   assert.equal(detail.crmSummary.factObservations.find((item) => item.field === 'real_estate_included').value, 'false');
-  assert.equal(detail.crmSummary.factObservations.find((item) => item.field === 'seller_financing').value, '0');
+  assert.equal(detail.crmSummary.factObservations.find((item) => item.field === 'seller_financing').value,
+    String(Number.MAX_SAFE_INTEGER));
+  assert.equal(detail.crmSummary.factObservations.find((item) => item.field === 'management_structure').value,
+    'unsafe integer fallback');
+  assert.equal(detail.crmSummary.factObservations.find((item) => item.field === 'customer_concentration').value,
+    'fractional fallback');
+  assert.equal(detail.opportunity.factEditRevision.submissionFactSnapshot.seller_name, 'crm-seller_name',
+    'empty direct CRM text falls through to normalized snake-case metadata');
+  assert.equal([...detail.opportunity.factEditRevision.submissionFactSnapshot.operator_contact_notes].length, 4000,
+    'CRM authority truncation counts Unicode code points without splitting astral text');
+  assert.equal(detail.opportunity.factEditRevision.submissionFactSnapshot.operator_contact_notes, '😀'.repeat(4000));
   assert.deepEqual(detail.crmSummary.conflicts.map((item) => item.field).sort(), Object.keys(values).sort());
   assert.equal(detail.crmSummary.conflicts.every((item) => item.winningProvenance === 'operator'), true);
   assert.equal(JSON.stringify(detail.crmSummary).includes('nope'), false);

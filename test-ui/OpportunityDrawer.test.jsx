@@ -35,6 +35,7 @@ function detailFixture(overrides = {}) {
       dismissedReason: '',
       scoredAt: '2026-08-29T16:00:00.000Z',
       rulesVersion: 'deal-hunter-fit-v2',
+      factEditRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null },
     },
     effectiveFacts: {
       broker_name: { value: 'Alex Broker', provenance: 'operator', verified: true, actor: 'admin@example.com', note: 'Confirmed by phone.' },
@@ -340,7 +341,8 @@ describe('Opportunity drawer', () => {
     fireEvent.change(screen.getByLabelText('Verification note'), { target: { value: 'Confirmed on today’s call.' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save verified fact' }));
 
-    expect(onSaveFact).toHaveBeenCalledWith({ field: 'broker_name', value: 'Alexandra Broker', note: 'Confirmed on today’s call.', verified: true });
+    expect(onSaveFact).toHaveBeenCalledWith({ field: 'broker_name', value: 'Alexandra Broker', note: 'Confirmed on today’s call.', verified: true,
+      expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } });
     expect(screen.queryByRole('option', { name: /fit score|confidence|canonical identity/i })).not.toBeInTheDocument();
   });
 

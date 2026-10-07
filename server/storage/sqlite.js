@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
   normalizeDealHunterSourceSnapshot,
+  normalizeOpportunityFactAuthorityValue,
   normalizeSourceFreshnessEvidence,
   normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
@@ -305,6 +306,57 @@ function normalizeSubmissionRow(row) {
     metadata: parseJsonColumn(row.metadata, {}),
     tags: parseJsonColumn(row.tags, []),
   };
+}
+
+const operatorFactCrmFieldKeys = [
+  ['seller_name', ['seller_name', 'sellerName']],
+  ['seller_email', ['seller_email', 'sellerEmail']],
+  ['seller_phone', ['seller_phone', 'sellerPhone']],
+  ['broker_name', ['broker_name', 'brokerName']],
+  ['broker_company', ['broker_company', 'brokerCompany']],
+  ['broker_email', ['broker_email', 'brokerEmail']],
+  ['broker_phone', ['broker_phone', 'brokerPhone']],
+  ['reason_for_sale', ['reason_for_sale', 'reasonForSale']],
+  ['real_estate_included', ['real_estate_included', 'realEstateIncluded']],
+  ['seller_financing', ['seller_financing', 'sellerFinancing']],
+  ['management_structure', ['management_structure', 'managementStructure']],
+  ['customer_concentration', ['customer_concentration', 'customerConcentration']],
+  ['operator_contact_notes', ['operator_contact_notes', 'operatorContactNotes']],
+];
+
+const operatorFactOpportunityAuthorityTriggerSql = `
+  CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_opportunity_identity_update
+  AFTER UPDATE OF canonical_name, canonical_recipient, canonical_location, primary_submission_id, identity_version, status, metadata
+  ON deal_hunter_opportunities
+  WHEN OLD.canonical_name IS NOT NEW.canonical_name
+    OR OLD.canonical_recipient IS NOT NEW.canonical_recipient
+    OR OLD.canonical_location IS NOT NEW.canonical_location
+    OR OLD.primary_submission_id IS NOT NEW.primary_submission_id
+    OR OLD.identity_version IS NOT NEW.identity_version
+    OR OLD.status IS NOT NEW.status
+    OR ((OLD.opportunity_id GLOB 'p10b-*'
+        OR OLD.identity_version = 'p10b-synthetic-v1'
+        OR NEW.identity_version = 'p10b-synthetic-v1'
+        OR (json_valid(OLD.metadata) AND json_extract(OLD.metadata, '$.p10bSynthetic') = 1)
+        OR (json_valid(NEW.metadata) AND json_extract(NEW.metadata, '$.p10bSynthetic') = 1))
+      AND OLD.metadata IS NOT NEW.metadata)
+  BEGIN
+    UPDATE deal_hunter_opportunities
+    SET campaign_authority_revision = campaign_authority_revision + 1
+    WHERE opportunity_id = NEW.opportunity_id;
+  END;
+`;
+
+function operatorFactSubmissionSnapshot(row = {}) {
+  const metadata = parseJsonColumn(row.metadata, {});
+  const dealHunter = metadata?.dealHunter && typeof metadata.dealHunter === 'object'
+    && !Array.isArray(metadata.dealHunter) ? metadata.dealHunter : {};
+  return Object.fromEntries(operatorFactCrmFieldKeys.map(([field, keys]) => [
+    field,
+    [row[field], ...keys.map((key) => dealHunter[key])]
+      .map(normalizeOpportunityFactAuthorityValue)
+      .find((value) => value !== null) ?? null,
+  ]));
 }
 
 const dealHunterCrmMatchAuthorityVersion = 'deal-hunter-crm-match-authority-v2';
@@ -5604,23 +5656,7 @@ export function createSqliteStorage(config, options = {}) {
       SELECT NEW.opportunity_id, MAX(revision) + 1, NEW.primary_submission_id
       FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = NEW.opportunity_id;
     END;
-    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_opportunity_identity_update
-    AFTER UPDATE OF canonical_name, primary_submission_id, identity_version, metadata
-    ON deal_hunter_opportunities
-    WHEN (OLD.opportunity_id GLOB 'p10b-*'
-      OR OLD.identity_version = 'p10b-synthetic-v1'
-      OR NEW.identity_version = 'p10b-synthetic-v1'
-      OR (json_valid(OLD.metadata) AND json_extract(OLD.metadata, '$.p10bSynthetic') = 1)
-      OR (json_valid(NEW.metadata) AND json_extract(NEW.metadata, '$.p10bSynthetic') = 1))
-      AND (OLD.canonical_name IS NOT NEW.canonical_name
-        OR OLD.primary_submission_id IS NOT NEW.primary_submission_id
-        OR OLD.identity_version IS NOT NEW.identity_version
-        OR OLD.metadata IS NOT NEW.metadata)
-    BEGIN
-      UPDATE deal_hunter_opportunities
-      SET campaign_authority_revision = campaign_authority_revision + 1
-      WHERE opportunity_id = NEW.opportunity_id;
-    END;
+    ${operatorFactOpportunityAuthorityTriggerSql}
     CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_submission_identity_update
     AFTER UPDATE OF source, metadata, deal_hunter_opportunity_id ON contact_submissions
     WHEN (OLD.source = 'p10b-controlled-mailbox' OR NEW.source = 'p10b-controlled-mailbox'
@@ -5734,6 +5770,12 @@ export function createSqliteStorage(config, options = {}) {
       UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
     END;
   `);
+  database.transaction(() => {
+    database.exec(`
+      DROP TRIGGER IF EXISTS trg_cim_campaign_revision_opportunity_identity_update;
+      ${operatorFactOpportunityAuthorityTriggerSql}
+    `);
+  }).immediate();
   for (const table of ['email_suppressions', 'secure_documents', 'secure_upload_requests',
     'crm_communications', 'deal_hunter_cim_requests', 'deal_hunter_cim_opportunity_claims']) {
     for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
@@ -12715,12 +12757,47 @@ export function createSqliteStorage(config, options = {}) {
       `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunityFactRow);
     },
 
-    async insertCurrentDealHunterOpportunityFact(fact = {}) {
+    async insertCurrentDealHunterOpportunityFact(fact = {}, {
+      expectedCampaignAuthorityRevision,
+      expectedPrimarySubmissionId = null,
+      expectedSubmissionFactSnapshot = null,
+    } = {}) {
       const record = normalizeOperatorOpportunityFactRecord(fact);
+      const expectedRevision = Number(expectedCampaignAuthorityRevision);
+      if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
+        throw new Error('Opportunity fact expected revision must be a positive integer.');
+      }
+      const expectedSubmissionId = expectedPrimarySubmissionId === null
+        ? null : String(expectedPrimarySubmissionId || '').trim();
+      const expectedSnapshot = expectedSubmissionFactSnapshot === null ? null : expectedSubmissionFactSnapshot;
+      if ((expectedSubmissionId === null) !== (expectedSnapshot === null)
+        || (expectedSnapshot !== null && (
+          typeof expectedSnapshot !== 'object' || Array.isArray(expectedSnapshot)
+          || Object.keys(expectedSnapshot).sort().join(',')
+            !== operatorFactCrmFieldKeys.map(([field]) => field).sort().join(',')
+          || Object.values(expectedSnapshot).some((value) => value !== null
+            && (typeof value !== 'string' || [...value].length > 4000))
+        ))) {
+        throw new Error('Opportunity fact expected submission revision is invalid.');
+      }
       const transaction = database.transaction(() => {
-        const current = database.prepare(`SELECT opportunity_id FROM deal_hunter_opportunities WHERE opportunity_id = ? AND status = 'active' LIMIT 1`)
+        const current = database.prepare(`SELECT opportunity_id, status, campaign_authority_revision, primary_submission_id FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1`)
           .get(record.opportunity_id);
-        if (!current) return null;
+        if (!current || current.status !== 'active') return null;
+        if (current.campaign_authority_revision !== expectedRevision) {
+          throw new Error('The opportunity changed since this edit was opened. Reload the latest detail before saving again.');
+        }
+        if ((current.primary_submission_id ?? null) !== expectedSubmissionId) {
+          throw new Error('The opportunity changed since this edit was opened. Reload the latest detail before saving again.');
+        }
+        if (expectedSubmissionId !== null) {
+          const submission = database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1')
+            .get(expectedSubmissionId);
+          const currentSnapshot = submission ? operatorFactSubmissionSnapshot(submission) : null;
+          if (!currentSnapshot || operatorFactCrmFieldKeys.some(([field]) => currentSnapshot[field] !== expectedSnapshot[field])) {
+            throw new Error('The opportunity changed since this edit was opened. Reload the latest detail before saving again.');
+          }
+        }
         database.prepare(`INSERT INTO deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at)
           VALUES (@id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at)`).run({ ...record, verified: record.verified ? 1 : 0 });
         return normalizeDealHunterOpportunityFactRow(database.prepare(`SELECT * FROM deal_hunter_opportunity_facts WHERE id = ?`).get(record.id));

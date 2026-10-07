@@ -16,6 +16,14 @@ export const opportunityFactFields = Object.freeze([
   'operator_contact_notes',
 ]);
 
+export function normalizeOpportunityFactAuthorityValue(value) {
+  if (!['string', 'number', 'boolean'].includes(typeof value)) return null;
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) return null;
+  const normalized = String(value).replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+  return [...normalized].slice(0, 4000).join('');
+}
+
 const opportunityFactFieldSet = new Set(opportunityFactFields);
 
 // This is intentionally broader than the operator-editable field set. It is
@@ -434,6 +442,7 @@ export async function setCurrentOperatorOpportunityFact({
   actor,
   verified = false,
   note = null,
+  expectedRevision,
   storage,
 } = {}) {
   if (!storage || typeof storage.insertCurrentDealHunterOpportunityFact !== 'function') {
@@ -442,13 +451,37 @@ export async function setCurrentOperatorOpportunityFact({
   const id = normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 });
   const now = new Date().toISOString();
   if (typeof verified !== 'boolean') throw new Error('Opportunity fact verification state must be boolean.');
+  const authority = expectedRevision && typeof expectedRevision === 'object' && !Array.isArray(expectedRevision)
+    ? expectedRevision : {};
+  const authorityKeys = Object.keys(authority).sort();
+  const revision = Number(authority.campaignAuthorityRevision);
+  const primarySubmissionId = authority.primarySubmissionId === null
+    ? null : normalizeText(authority.primarySubmissionId, 'Opportunity fact primary submission id', { maxLength: 240 });
+  const submissionFactSnapshot = authority.submissionFactSnapshot === null
+    ? null : authority.submissionFactSnapshot;
+  const validSnapshot = submissionFactSnapshot === null || (
+    typeof submissionFactSnapshot === 'object' && !Array.isArray(submissionFactSnapshot)
+    && Object.keys(submissionFactSnapshot).sort().join(',') === [...opportunityFactFields].sort().join(',')
+    && Object.values(submissionFactSnapshot).every((value) => value === null
+      || (typeof value === 'string' && [...value].length <= 4000))
+  );
+  if (authorityKeys.join(',') !== 'campaignAuthorityRevision,primarySubmissionId,submissionFactSnapshot'
+    || !Number.isInteger(revision) || revision < 1
+    || (primarySubmissionId === null) !== (submissionFactSnapshot === null)
+    || !validSnapshot) {
+    throw new Error('Opportunity fact expected revision is invalid.');
+  }
   const fact = {
     id: randomUUID(), opportunity_id: id, field: normalizeOpportunityFactField(field),
     value: normalizeText(value, 'Opportunity fact value'), source: 'operator', verified,
     actor: normalizeText(actor, 'Opportunity fact actor', { maxLength: 200 }),
     note: normalizeText(note, 'Opportunity fact note', { required: false, maxLength: 4000 }), created_at: now, updated_at: now,
   };
-  const saved = await storage.insertCurrentDealHunterOpportunityFact(fact);
+  const saved = await storage.insertCurrentDealHunterOpportunityFact(fact, {
+    expectedCampaignAuthorityRevision: revision,
+    expectedPrimarySubmissionId: primarySubmissionId,
+    expectedSubmissionFactSnapshot: submissionFactSnapshot,
+  });
   if (!saved) throw new Error('The canonical opportunity is no longer current.');
   return saved;
 }

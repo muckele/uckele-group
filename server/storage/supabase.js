@@ -4,6 +4,7 @@ import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow
 import {
   normalizeDealHunterSourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
+  opportunityFactFields,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
@@ -4201,10 +4202,33 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityFactRow(data);
     },
 
-    async insertCurrentDealHunterOpportunityFact(fact = {}) {
+    async insertCurrentDealHunterOpportunityFact(fact = {}, {
+      expectedCampaignAuthorityRevision,
+      expectedPrimarySubmissionId = null,
+      expectedSubmissionFactSnapshot = null,
+    } = {}) {
       const record = normalizeOperatorOpportunityFactRecord(fact);
+      const expectedRevision = Number(expectedCampaignAuthorityRevision);
+      if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
+        throw new Error('Opportunity fact expected revision must be a positive integer.');
+      }
+      const expectedSubmissionId = expectedPrimarySubmissionId === null
+        ? null : String(expectedPrimarySubmissionId || '').trim();
+      const expectedSnapshot = expectedSubmissionFactSnapshot === null ? null : expectedSubmissionFactSnapshot;
+      if ((expectedSubmissionId === null) !== (expectedSnapshot === null)
+        || (expectedSnapshot !== null && (
+          typeof expectedSnapshot !== 'object' || Array.isArray(expectedSnapshot)
+          || Object.keys(expectedSnapshot).sort().join(',') !== [...opportunityFactFields].sort().join(',')
+          || Object.values(expectedSnapshot).some((value) => value !== null
+            && (typeof value !== 'string' || [...value].length > 4000))
+        ))) {
+        throw new Error('Opportunity fact expected submission revision is invalid.');
+      }
       const { data, error } = await client.rpc('insert_current_deal_hunter_opportunity_fact', {
         p_fact: record,
+        p_expected_campaign_authority_revision: expectedRevision,
+        p_expected_primary_submission_id: expectedSubmissionId,
+        p_expected_submission_fact_snapshot: expectedSnapshot,
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityFactRow(data);
