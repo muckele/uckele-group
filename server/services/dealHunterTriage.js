@@ -26,6 +26,7 @@ import {
 } from './dealHunterScoringPolicy.js';
 import {
   getEffectiveOpportunityFacts,
+  normalizeOpportunityFactAuthorityValue,
   opportunityFactFields,
   opportunitySourceObservationFields,
 } from './dealHunterOpportunityFacts.js';
@@ -496,9 +497,10 @@ function directCrmFactRows(submission = {}) {
     ['operator_contact_notes', ['operator_contact_notes', 'operatorContactNotes']],
   ];
   return fields.flatMap(([field, keys]) => {
-    const value = keys.map((key) => submission[key] ?? dealHunter[key])
-      .find((item) => ['string', 'number', 'boolean'].includes(typeof item) && detailText(item, 4000));
-    return value === undefined ? [] : [{ field, value: detailText(value, 4000) }];
+    const value = [submission[field], ...keys.map((key) => dealHunter[key])]
+      .map(normalizeOpportunityFactAuthorityValue)
+      .find((item) => item !== null);
+    return value === undefined ? [] : [{ field, value }];
   });
 }
 
@@ -701,7 +703,7 @@ function currentDetailDisposition(records) {
     : { state: '', reason: '', note: '', dismissedAt: '', dismissedBy: '' };
 }
 
-function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceRows = [], submission = null, cimRequests = [], dispositions = [], materialEvent = null, annualProfitEvidence = null } = {}) {
+function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceRows = [], submission = null, crmFacts = [], cimRequests = [], dispositions = [], materialEvent = null, annualProfitEvidence = null } = {}) {
   const row = publicTriageRow(score, { includeOperatorNote: true });
   const sources = currentDetailSourceRows(sourceRows);
   const sourceLocation = currentDetailSourceValue(sources, ['location'], 240);
@@ -730,6 +732,15 @@ function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceR
   const listingUrl = currentDetailSourceListingUrl(sources) || safeListingUrl(row.listingUrl);
   return {
     opportunityId: detailText(row.opportunityId, 200), dealKey: detailText(row.dealKey, 200), name: detailText(currentOpportunity?.canonical_name, 500) || currentDetailSourceValue(sources, ['name', 'business_name'], 500) || detailText(row.name, 500) || 'Unnamed opportunity', state: detailText(state, 40), listingUrl,
+    factEditRevision: {
+      campaignAuthorityRevision: detailNumber(currentOpportunity?.campaign_authority_revision),
+      primarySubmissionId: currentOpportunity?.primary_submission_id
+        ? detailText(currentOpportunity.primary_submission_id, 240) : null,
+      submissionFactSnapshot: currentOpportunity?.primary_submission_id
+        ? Object.fromEntries(opportunityFactFields.map((field) => [
+            field, crmFacts.find((fact) => fact.field === field)?.value ?? null,
+          ])) : null,
+    },
     fitScore: detailNumber(row.fitScore), scoreStatus: detailText(row.scoreStatus, 80), confidence: detailText(row.confidence, 80), completenessScore: detailNumber(row.completenessScore), missingEvidenceCount: detailNumber(row.missingEvidenceCount), contradictionCount: detailNumber(row.contradictionCount), shouldRemove: Boolean(row.shouldRemove), highFit: Boolean(row.highFit),
     geography: { city: detailText(city, 160), state: detailText(state, 40), label: detailText(location, 240) }, industry: currentDetailSourceValue(sources, ['industry'], 240) || detailText(row.industry, 240),
     financials: {
@@ -908,6 +919,7 @@ export async function getTriageOpportunityDetail({
     currentOpportunity,
     sourceRows,
     submission,
+    crmFacts,
     cimRequests: canonicalCimRequests,
     dispositions,
     materialEvent,

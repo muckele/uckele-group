@@ -102,6 +102,12 @@ function DetailActions({ name, onAction, onPass, pending }) {
 
 function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
   const [draft, setDraft] = useState({ field: factFields[0][0], value: detail.effectiveFacts?.[factFields[0][0]]?.value || '', note: '' });
+  const expectedRevision = detail.opportunity?.factEditRevision;
+  const validExpectedRevision = Number.isInteger(expectedRevision?.campaignAuthorityRevision)
+    && expectedRevision.campaignAuthorityRevision > 0
+    && (expectedRevision.primarySubmissionId === null
+      ? expectedRevision.submissionFactSnapshot === null
+      : Boolean(expectedRevision.primarySubmissionId && expectedRevision.submissionFactSnapshot));
   const valueRef = useRef(null);
   function selectField(field) {
     const current = detail.effectiveFacts?.[field];
@@ -110,7 +116,7 @@ function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }
   function submit(event) {
     event.preventDefault();
     if (!String(draft.value).trim()) return;
-    onSaveFact({ field: draft.field, value: String(draft.value).trim(), note: draft.note.trim(), verified: true });
+    onSaveFact({ field: draft.field, value: String(draft.value).trim(), note: draft.note.trim(), verified: true, expectedRevision });
   }
   useEffect(() => {
     if (!focusFieldRequest) return;
@@ -125,7 +131,7 @@ function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }
       <p className="mt-1 text-xs leading-5 text-ink/58">Verified facts remain separate from machine scoring and outrank refreshed source observations.</p>
       <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-ink/62">Verified fact field<select aria-label="Verified fact field" className="form-control mt-1" onChange={(event) => selectField(event.target.value)} value={draft.field}>{factFields.map(([field, label]) => <option key={field} value={field}>{label}</option>)}</select></label><label className="text-xs font-semibold text-ink/62">Verified fact value<input aria-label="Verified fact value" className="form-control mt-1" onChange={(event) => setDraft((current) => ({ ...current, value: event.target.value }))} ref={valueRef} value={draft.value} /></label></div>
       <label className="mt-3 block text-xs font-semibold text-ink/62">Verification note<textarea aria-label="Verification note" className="form-control mt-1 min-h-20" onChange={(event) => setDraft((current) => ({ ...current, note: event.target.value }))} value={draft.note} /></label>
-      <button className={`${primaryButton} mt-3`} disabled={pending || !String(draft.value).trim()} type="submit">Save verified fact</button>
+      <button className={`${primaryButton} mt-3`} disabled={pending || !String(draft.value).trim() || !validExpectedRevision} type="submit">Save verified fact</button>
     </form>
   );
 }

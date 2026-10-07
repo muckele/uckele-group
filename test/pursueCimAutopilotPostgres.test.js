@@ -155,12 +155,24 @@ test('P6A PostgreSQL migration is mirrored and documents deterministic final-gat
   assert.match(migration, /revoke all on function public\.pursue_cim_read_final_gate_context_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
 });
 
-test('P10B synthetic identity authority correction is additive, mirrored, and service-owned', () => {
+test('P10B synthetic identity authority remains mirrored inside the broader service-owned stale-save trigger', () => {
   assert.equal(fs.existsSync(p10bAuthorityMigrationPath), true);
   const migration = fs.readFileSync(p10bAuthorityMigrationPath, 'utf8').trim();
   const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
-  assert.ok(schema.includes(migration),
-    'canonical schema must contain the exact additive P10B authority block');
+  const bumpFunctionAndPrivileges = migration.match(/create or replace function public\.pursue_cim_bump_controlled_mailbox_authority_v1\(\)[\s\S]*?grant execute on function public\.pursue_cim_bump_controlled_mailbox_authority_v1\(\)[\s\S]*?to service_role;/i)?.[0];
+  const contactTrigger = migration.match(/drop trigger if exists trg_cim_campaign_revision_submission_identity_update[\s\S]*?execute function public\.pursue_cim_bump_controlled_mailbox_authority_v1\(\);/i)?.[0];
+  const opportunityTrigger = schema.match(/drop trigger if exists trg_cim_campaign_revision_opportunity_identity_update[\s\S]*?execute function public\.pursue_cim_bump_controlled_mailbox_authority_v1\(\);/i)?.[0];
+  assert.ok(bumpFunctionAndPrivileges && schema.includes(bumpFunctionAndPrivileges),
+    'canonical schema must retain the exact P10B authority function and service-role privileges');
+  assert.ok(contactTrigger && schema.includes(contactTrigger),
+    'canonical schema must retain the exact P10B contact trigger');
+  assert.ok(opportunityTrigger, 'canonical schema must retain the canonical opportunity authority trigger');
+  assert.match(opportunityTrigger,
+    /create trigger trg_cim_campaign_revision_opportunity_identity_update[\s\S]*after update of canonical_name, canonical_recipient, canonical_location,[\s\S]*primary_submission_id, identity_version, status, metadata/i,
+    'the broader canonical trigger must retain all stale-save authority fields');
+  assert.match(opportunityTrigger,
+    /old\.opportunity_id like 'p10b-%'[\s\S]*old\.identity_version = 'p10b-synthetic-v1'[\s\S]*new\.identity_version = 'p10b-synthetic-v1'[\s\S]*old\.metadata @> '\{"p10bSynthetic":true\}'::jsonb[\s\S]*new\.metadata @> '\{"p10bSynthetic":true\}'::jsonb[\s\S]*old\.metadata is distinct from new\.metadata/i,
+    'the broader canonical trigger must preserve the P10B metadata authority condition');
   assert.match(migration, /security definer\s+set search_path = ''/i);
   assert.match(migration, /after update of canonical_name, primary_submission_id, identity_version, metadata/i);
   assert.match(migration, /after update of source, metadata, deal_hunter_opportunity_id/i);
