@@ -72,7 +72,7 @@ const opportunityFactWriteBoundaryMigrationUrl = new URL(
   import.meta.url,
 );
 const currentOperatorFactMigrationUrl = new URL(
-  '../supabase/migrations/20260830170000_current_operator_fact_write.sql',
+  '../supabase/migrations/20261014130000_operator_fact_idempotency.sql',
   import.meta.url,
 );
 const passedArchiveMigrationUrl = new URL(

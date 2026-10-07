@@ -1533,6 +1533,7 @@ describe('Acquisition Inbox queue', () => {
     fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Updated seller' } });
     fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
     expect(writes).toEqual([{ value: 'Updated seller', note: '', verified: true,
+      idempotencyKey: expect.any(String),
       expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } }]);
     expect(reads).toHaveLength(2);
     await act(async () => first.resolve(jsonResponse({ success: false, code: 'fact_edit_conflict', error: 'The opportunity changed since this edit was opened.' }, { ok: false, status: 409 })));
@@ -1542,7 +1543,9 @@ describe('Acquisition Inbox queue', () => {
     expect(reads).toHaveLength(3);
     fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
     expect(writes[1]).toEqual({ value: 'Updated seller', note: '', verified: true,
+      idempotencyKey: expect.any(String),
       expectedRevision: { campaignAuthorityRevision: 8, primarySubmissionId: null, submissionFactSnapshot: null } });
+    expect(writes[1].idempotencyKey).not.toBe(writes[0].idempotencyKey);
   });
 
   test('announces a failed row Watch in queue context without a success refresh and permits one retry', async () => {
@@ -2064,9 +2067,79 @@ describe('Acquisition Inbox queue', () => {
     await waitFor(() => expect(writes).toEqual([{
       method: 'PUT',
       body: { value: 'Alex Broker', note: 'Confirmed with seller.', verified: true,
+        idempotencyKey: expect.any(String),
         expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } },
     }]));
     await waitFor(() => expect(detailLoads).toBe(2));
+  });
+
+  test('reuses one verified-fact idempotency key across a confirmed repeat click', async () => {
+    const writes = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        return jsonResponse(detailResponse(queueRow({ factEditRevision: {
+          campaignAuthorityRevision: detailLoads === 1 ? 7 : 8,
+          primarySubmissionId: null,
+          submissionFactSnapshot: null,
+        } })));
+      }
+      if (url === '/api/admin/deal-hunter/opportunities/opp-1/facts/seller_name') {
+        writes.push(JSON.parse(options.body));
+        return jsonResponse({ success: true, fact: { id: 'fact-1', field: 'seller_name', value: 'Same save' } });
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Same save' } });
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
+    await waitFor(() => expect(detailLoads).toBe(2));
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+
+    expect(writes[0].idempotencyKey).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(writes[1].idempotencyKey).toBe(writes[0].idempotencyKey);
+    expect(writes.map(({ expectedRevision }) => expectedRevision.campaignAuthorityRevision)).toEqual([7, 8]);
+  });
+
+  test('retains a verified-fact key across transport retry and rotates it when the logical draft changes', async () => {
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailResponse(queueRow()));
+      if (url === '/api/admin/deal-hunter/opportunities/opp-1/facts/seller_name') {
+        writes.push(JSON.parse(options.body));
+        if (writes.length < 3) throw new Error('Synthetic transport failure.');
+        return jsonResponse({ success: true,
+          fact: { id: 'fact-transport-retry', field: 'seller_name', value: 'Changed draft' } });
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    const valueInput = within(drawer).getByLabelText('Verified fact value');
+    const saveButton = within(drawer).getByRole('button', { name: 'Save verified fact' });
+    fireEvent.change(valueInput, { target: { value: 'Transport retry' } });
+    fireEvent.click(saveButton);
+    expect(await within(drawer).findByRole('alert')).toHaveTextContent('Synthetic transport failure.');
+    await waitFor(() => expect(saveButton).toBeEnabled());
+
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1].idempotencyKey).toBe(writes[0].idempotencyKey);
+    await waitFor(() => expect(saveButton).toBeEnabled());
+
+    fireEvent.change(valueInput, { target: { value: 'Changed draft' } });
+    fireEvent.click(saveButton);
+    await waitFor(() => expect(writes).toHaveLength(3));
+    expect(writes[2].idempotencyKey).not.toBe(writes[0].idempotencyKey);
   });
 });
 

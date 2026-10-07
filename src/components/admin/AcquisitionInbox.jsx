@@ -251,6 +251,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const mutationGenerationRef = useRef(0);
   const mutationPendingRef = useRef(false);
   const pendingOwnerCommandRef = useRef(null);
+  const pendingFactCommandRef = useRef(null);
   const detailFocusGuardRef = useRef(false);
   const passFocusGuardRef = useRef(false);
   const detailTriggerRef = useRef(null);
@@ -663,13 +664,21 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     setPendingId(opportunityId);
     setMutationError('');
     try {
+      const signature = JSON.stringify([
+        opportunityId, field, String(value).trim(), String(note || '').trim(), verified,
+      ]);
+      if (pendingFactCommandRef.current?.signature !== signature) {
+        pendingFactCommandRef.current = { signature, key: globalThis.crypto.randomUUID() };
+      }
       const response = await fetch(`/api/admin/deal-hunter/opportunities/${encodeURIComponent(opportunityId)}/facts/${encodeURIComponent(field)}`, {
         method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ value, note, verified, expectedRevision }),
+        body: JSON.stringify({ value, note, verified, expectedRevision,
+          idempotencyKey: pendingFactCommandRef.current.key }),
       });
       const result = await response.json();
       if (!response.ok || !result.success) {
         if (response.status === 409 && result.code === 'fact_edit_conflict' && selectionRef.current === opportunityId) {
+          pendingFactCommandRef.current = null;
           await loadDetail(opportunityId, { preserveData: true });
         }
         throw new Error(result.error || 'Unable to save the verified fact.');

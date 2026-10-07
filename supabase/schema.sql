@@ -3490,6 +3490,8 @@ create table if not exists public.deal_hunter_opportunities (
 -- table accepts arbitrary raw source blobs.
 create table if not exists public.deal_hunter_opportunity_facts (
   id text primary key,
+  idempotency_key_digest text,
+  request_digest text,
   opportunity_id text not null references public.deal_hunter_opportunities(opportunity_id) on delete cascade,
   field text not null,
   value text not null,
@@ -3511,6 +3513,8 @@ create table if not exists public.deal_hunter_opportunity_facts (
     and source = 'operator'
     and actor = btrim(actor) and char_length(actor) between 1 and 200
     and (note is null or (note = btrim(note) and char_length(note) between 1 and 4000))
+    and ((idempotency_key_digest is null and request_digest is null)
+      or (idempotency_key_digest ~ '^[0-9a-f]{64}$' and request_digest ~ '^[0-9a-f]{64}$'))
   )
 );
 
@@ -3782,6 +3786,9 @@ create index if not exists idx_deal_hunter_opportunities_recipient
   on public.deal_hunter_opportunities(canonical_recipient, updated_at desc);
 create index if not exists idx_deal_hunter_opportunity_facts_history
   on public.deal_hunter_opportunity_facts(opportunity_id, created_at desc, id desc);
+create unique index if not exists idx_deal_hunter_opportunity_facts_idempotency
+  on public.deal_hunter_opportunity_facts(idempotency_key_digest)
+  where idempotency_key_digest is not null;
 create index if not exists idx_deal_hunter_source_observations_history
   on public.deal_hunter_opportunity_source_observations(opportunity_id, observed_at desc, id);
 create index if not exists idx_deal_hunter_source_observations_queue_projection
@@ -4814,7 +4821,9 @@ create or replace function public.insert_current_deal_hunter_opportunity_fact(
   p_fact jsonb,
   p_expected_campaign_authority_revision bigint,
   p_expected_primary_submission_id uuid,
-  p_expected_submission_fact_snapshot jsonb
+  p_expected_submission_fact_snapshot jsonb,
+  p_idempotency_key_digest text,
+  p_request_digest text
 )
 returns public.deal_hunter_opportunity_facts
 language plpgsql
@@ -4855,6 +4864,10 @@ begin
     or (p_fact ->> 'updated_at') <> btrim(p_fact ->> 'updated_at') or char_length(p_fact ->> 'updated_at') not between 1 and 80
     or p_expected_campaign_authority_revision is null
     or p_expected_campaign_authority_revision < 1
+    or p_idempotency_key_digest is null
+    or p_idempotency_key_digest !~ '^[0-9a-f]{64}$'
+    or p_request_digest is null
+    or p_request_digest !~ '^[0-9a-f]{64}$'
     or (p_expected_primary_submission_id is null) <> (p_expected_submission_fact_snapshot is null)
     or (p_expected_submission_fact_snapshot is not null and (
       pg_catalog.jsonb_typeof(p_expected_submission_fact_snapshot) <> 'object'
@@ -4875,6 +4888,17 @@ begin
   exception when others then
     raise exception 'operator fact timestamps must be valid' using errcode = '22023';
   end;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
+    'operator-fact-idempotency:' || p_idempotency_key_digest, 0));
+  select * into v_fact from public.deal_hunter_opportunity_facts
+  where idempotency_key_digest = p_idempotency_key_digest;
+  if found then
+    if v_fact.request_digest is distinct from p_request_digest then
+      raise exception 'Opportunity fact idempotency key conflicts with a different mutation.'
+        using errcode = '23505';
+    end if;
+    return v_fact;
+  end if;
   select * into v_opportunity from public.deal_hunter_opportunities where opportunity_id = p_fact ->> 'opportunity_id' and status = 'active' for update;
   if not found then raise exception 'current canonical opportunity is unavailable' using errcode = 'P0002'; end if;
   if v_opportunity.campaign_authority_revision <> p_expected_campaign_authority_revision then
@@ -4894,8 +4918,13 @@ begin
       raise exception 'The opportunity changed since this edit was opened. Reload the latest detail before saving again.' using errcode = '40001';
     end if;
   end if;
-  insert into public.deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at)
-  values (p_fact ->> 'id', p_fact ->> 'opportunity_id', p_fact ->> 'field', p_fact ->> 'value', p_fact ->> 'source', (p_fact ->> 'verified')::boolean, p_fact ->> 'actor', p_fact ->> 'note', v_created_at, v_updated_at)
+  insert into public.deal_hunter_opportunity_facts
+    (id, idempotency_key_digest, request_digest, opportunity_id, field, value,
+     source, verified, actor, note, created_at, updated_at)
+  values (p_fact ->> 'id', p_idempotency_key_digest, p_request_digest,
+    p_fact ->> 'opportunity_id', p_fact ->> 'field', p_fact ->> 'value',
+    p_fact ->> 'source', (p_fact ->> 'verified')::boolean, p_fact ->> 'actor',
+    p_fact ->> 'note', v_created_at, v_updated_at)
   returning * into v_fact;
   if p_expected_primary_submission_id is not null then
     select * into v_submission from public.contact_submissions
@@ -4909,8 +4938,8 @@ begin
 end;
 $$;
 
-revoke all privileges on function public.insert_current_deal_hunter_opportunity_fact(jsonb, bigint, uuid, jsonb) from public, anon, authenticated;
-grant execute on function public.insert_current_deal_hunter_opportunity_fact(jsonb, bigint, uuid, jsonb) to service_role;
+revoke all privileges on function public.insert_current_deal_hunter_opportunity_fact(jsonb, bigint, uuid, jsonb, text, text) from public, anon, authenticated;
+grant execute on function public.insert_current_deal_hunter_opportunity_fact(jsonb, bigint, uuid, jsonb, text, text) to service_role;
 
 revoke all privileges on function public.upsert_deal_hunter_opportunity_fact(jsonb) from public, anon, authenticated;
 grant execute on function public.upsert_deal_hunter_opportunity_fact(jsonb) to service_role;

@@ -1090,35 +1090,64 @@ test('triage detail remains readable while only administrators may enrich facts 
     assert.equal((await fetch(actionPath.replace(/^/, origin), {
       method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: viewerCookie }, body: JSON.stringify({ action: 'watch' }),
     })).status, 401);
+    const factBody = { value: 'Verified Seller', verified: true, note: 'Called seller.',
+      idempotencyKey: '30000000-0000-4000-8000-000000000003',
+      expectedRevision: viewerDetailPayload.opportunity.factEditRevision };
     const savedFact = await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
-      body: JSON.stringify({ value: 'Verified Seller', verified: true, note: 'Called seller.', expectedRevision: viewerDetailPayload.opportunity.factEditRevision }),
+      body: JSON.stringify(factBody),
     });
     assert.equal(savedFact.status, 200);
+    const savedFactPayload = await savedFact.json();
+    const replayedFact = await fetch(factPath.replace(/^/, origin), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify(factBody),
+    });
+    assert.equal(replayedFact.status, 200);
+    assert.equal((await replayedFact.json()).fact.id, savedFactPayload.fact.id);
+    assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).length, 1);
+    const conflictingReplay = await fetch(factPath.replace(/^/, origin), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ ...factBody, value: 'Different mutation under the same key' }),
+    });
+    assert.equal(conflictingReplay.status, 409);
+    assert.equal((await conflictingReplay.json()).code, 'fact_idempotency_conflict');
+    assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).length, 1);
     const detailAfterFact = await (await fetch(detailPath.replace(/^/, origin), { headers: { Cookie: adminCookie } })).json();
     assert.equal(detailAfterFact.effectiveFacts.seller_name.value, 'Verified Seller');
     assert.equal(detailAfterFact.history.operatorFacts[0].note, 'Called seller.');
     const staleFact = await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
-      body: JSON.stringify({ value: 'Stale Seller', verified: true, expectedRevision: viewerDetailPayload.opportunity.factEditRevision }),
+      body: JSON.stringify({ value: 'Stale Seller', verified: true,
+        idempotencyKey: '40000000-0000-4000-8000-000000000004',
+        expectedRevision: viewerDetailPayload.opportunity.factEditRevision }),
     });
     assert.equal(staleFact.status, 409);
     assert.equal((await staleFact.json()).code, 'fact_edit_conflict');
     assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).length, 1);
+    const malformedIdempotency = await fetch(factPath.replace(/^/, origin), {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ ...factBody, idempotencyKey: 'not-a-uuid' }),
+    });
+    assert.equal(malformedIdempotency.status, 400);
+    assert.match((await malformedIdempotency.json()).error, /idempotency key/i);
     const malformedVerification = await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
-      body: JSON.stringify({ value: 'x', verified: 'yes' }),
+      body: JSON.stringify({ value: 'x', verified: 'yes',
+        idempotencyKey: '50000000-0000-4000-8000-000000000005' }),
     });
     assert.equal(malformedVerification.status, 400);
     const missingRevision = await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
-      body: JSON.stringify({ value: 'No authority', verified: true }),
+      body: JSON.stringify({ value: 'No authority', verified: true,
+        idempotencyKey: '60000000-0000-4000-8000-000000000006' }),
     });
     assert.equal(missingRevision.status, 400);
     assert.match((await missingRevision.json()).error, /expected revision is invalid/i);
     assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).length, 1);
     const malformedField = await fetch(`${origin}/api/admin/deal-hunter/opportunities/${encodeURIComponent(opportunityId)}/facts/not_allowed`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ value: 'x', verified: false }),
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ value: 'x', verified: false,
+        idempotencyKey: '70000000-0000-4000-8000-000000000007' }),
     });
     assert.equal(malformedField.status, 400);
     const before = await storage.getDealHunterOpportunityScore(opportunityId);

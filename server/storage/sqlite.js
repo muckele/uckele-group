@@ -873,7 +873,19 @@ function normalizeDealHunterScoreEvidenceRow(row) {
 }
 
 function normalizeDealHunterOpportunityFactRow(row) {
-  return row ? { ...row, verified: Boolean(row.verified) } : null;
+  if (!row) return null;
+  return {
+    id: row.id,
+    opportunity_id: row.opportunity_id,
+    field: row.field,
+    value: row.value,
+    source: row.source,
+    verified: Boolean(row.verified),
+    actor: row.actor,
+    note: row.note,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
 }
 
 function normalizeDealHunterOpportunitySourceObservationRow(row) {
@@ -4174,6 +4186,8 @@ export function createSqliteStorage(config, options = {}) {
       -- place; neither projection stores raw source payloads.
       CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_facts (
         id TEXT PRIMARY KEY,
+        idempotency_key_digest TEXT,
+        request_digest TEXT,
         opportunity_id TEXT NOT NULL,
         field TEXT NOT NULL,
         value TEXT NOT NULL,
@@ -4192,6 +4206,9 @@ export function createSqliteStorage(config, options = {}) {
           AND verified IN (0, 1)
           AND actor = trim(actor) AND length(actor) BETWEEN 1 AND 200
           AND (note IS NULL OR (note = trim(note) AND length(note) BETWEEN 1 AND 4000))
+          AND ((idempotency_key_digest IS NULL AND request_digest IS NULL)
+            OR (length(idempotency_key_digest) = 64 AND idempotency_key_digest NOT GLOB '*[^0-9a-f]*'
+              AND length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'))
           AND created_at = trim(created_at) AND length(created_at) BETWEEN 1 AND 80 AND julianday(created_at) IS NOT NULL
           AND updated_at = trim(updated_at) AND length(updated_at) BETWEEN 1 AND 80 AND julianday(updated_at) IS NOT NULL
         ),
@@ -4210,6 +4227,9 @@ export function createSqliteStorage(config, options = {}) {
           AND NEW.verified IN (0, 1)
           AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
           AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+          AND ((NEW.idempotency_key_digest IS NULL AND NEW.request_digest IS NULL)
+            OR (length(NEW.idempotency_key_digest) = 64 AND NEW.idempotency_key_digest NOT GLOB '*[^0-9a-f]*'
+              AND length(NEW.request_digest) = 64 AND NEW.request_digest NOT GLOB '*[^0-9a-f]*'))
           AND NEW.created_at = trim(NEW.created_at) AND length(NEW.created_at) BETWEEN 1 AND 80 AND julianday(NEW.created_at) IS NOT NULL
           AND NEW.updated_at = trim(NEW.updated_at) AND length(NEW.updated_at) BETWEEN 1 AND 80 AND julianday(NEW.updated_at) IS NOT NULL
         ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
@@ -4227,6 +4247,9 @@ export function createSqliteStorage(config, options = {}) {
           AND NEW.verified IN (0, 1)
           AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
           AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+          AND ((NEW.idempotency_key_digest IS NULL AND NEW.request_digest IS NULL)
+            OR (length(NEW.idempotency_key_digest) = 64 AND NEW.idempotency_key_digest NOT GLOB '*[^0-9a-f]*'
+              AND length(NEW.request_digest) = 64 AND NEW.request_digest NOT GLOB '*[^0-9a-f]*'))
           AND NEW.created_at = trim(NEW.created_at) AND length(NEW.created_at) BETWEEN 1 AND 80 AND julianday(NEW.created_at) IS NOT NULL
           AND NEW.updated_at = trim(NEW.updated_at) AND length(NEW.updated_at) BETWEEN 1 AND 80 AND julianday(NEW.updated_at) IS NOT NULL
         ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
@@ -5630,6 +5653,23 @@ export function createSqliteStorage(config, options = {}) {
   ensureColumn(database, 'deal_hunter_opportunities', 'campaign_authority_revision',
     'INTEGER NOT NULL DEFAULT 1 CHECK(campaign_authority_revision > 0)');
   ensureColumn(database, 'deal_hunter_opportunities', 'last_material_change_at', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_facts', 'idempotency_key_digest',
+    "TEXT CHECK(idempotency_key_digest IS NULL OR (length(idempotency_key_digest) = 64 AND idempotency_key_digest NOT GLOB '*[^0-9a-f]*'))");
+  ensureColumn(database, 'deal_hunter_opportunity_facts', 'request_digest',
+    "TEXT CHECK(request_digest IS NULL OR (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'))");
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_opportunity_facts_idempotency_boundary_insert
+    BEFORE INSERT ON deal_hunter_opportunity_facts
+    WHEN (NEW.idempotency_key_digest IS NULL) <> (NEW.request_digest IS NULL)
+    BEGIN SELECT RAISE(ABORT, 'invalid operator opportunity fact idempotency'); END;
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_opportunity_facts_idempotency_boundary_update
+    BEFORE UPDATE OF idempotency_key_digest, request_digest ON deal_hunter_opportunity_facts
+    WHEN (NEW.idempotency_key_digest IS NULL) <> (NEW.request_digest IS NULL)
+    BEGIN SELECT RAISE(ABORT, 'invalid operator opportunity fact idempotency'); END;
+  `);
+  database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_opportunity_facts_idempotency
+    ON deal_hunter_opportunity_facts(idempotency_key_digest)
+    WHERE idempotency_key_digest IS NOT NULL`);
   database.exec(`
     CREATE TABLE IF NOT EXISTS deal_hunter_crm_ownership_revisions (
       opportunity_id TEXT NOT NULL REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE,
@@ -12761,6 +12801,8 @@ export function createSqliteStorage(config, options = {}) {
       expectedCampaignAuthorityRevision,
       expectedPrimarySubmissionId = null,
       expectedSubmissionFactSnapshot = null,
+      idempotencyKeyDigest,
+      requestDigest,
     } = {}) {
       const record = normalizeOperatorOpportunityFactRecord(fact);
       const expectedRevision = Number(expectedCampaignAuthorityRevision);
@@ -12780,7 +12822,19 @@ export function createSqliteStorage(config, options = {}) {
         ))) {
         throw new Error('Opportunity fact expected submission revision is invalid.');
       }
+      if (![idempotencyKeyDigest, requestDigest].every((digest) =>
+        typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest))) {
+        throw new Error('Opportunity fact idempotency authority is invalid.');
+      }
       const transaction = database.transaction(() => {
+        const prior = database.prepare(`SELECT * FROM deal_hunter_opportunity_facts
+          WHERE idempotency_key_digest = ? LIMIT 1`).get(idempotencyKeyDigest);
+        if (prior) {
+          if (prior.request_digest !== requestDigest) {
+            throw new Error('Opportunity fact idempotency key conflicts with a different mutation.');
+          }
+          return normalizeDealHunterOpportunityFactRow(prior);
+        }
         const current = database.prepare(`SELECT opportunity_id, status, campaign_authority_revision, primary_submission_id FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1`)
           .get(record.opportunity_id);
         if (!current || current.status !== 'active') return null;
@@ -12798,8 +12852,13 @@ export function createSqliteStorage(config, options = {}) {
             throw new Error('The opportunity changed since this edit was opened. Reload the latest detail before saving again.');
           }
         }
-        database.prepare(`INSERT INTO deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at)
-          VALUES (@id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at)`).run({ ...record, verified: record.verified ? 1 : 0 });
+        database.prepare(`INSERT INTO deal_hunter_opportunity_facts
+          (id, idempotency_key_digest, request_digest, opportunity_id, field, value,
+           source, verified, actor, note, created_at, updated_at)
+          VALUES (@id, @idempotency_key_digest, @request_digest, @opportunity_id,
+            @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at)`)
+          .run({ ...record, idempotency_key_digest: idempotencyKeyDigest,
+            request_digest: requestDigest, verified: record.verified ? 1 : 0 });
         return normalizeDealHunterOpportunityFactRow(database.prepare(`SELECT * FROM deal_hunter_opportunity_facts WHERE id = ?`).get(record.id));
       });
       return transaction.immediate();

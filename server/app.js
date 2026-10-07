@@ -2010,6 +2010,11 @@ export function createApp({
         response.status(400).json({ success: false, error: 'Opportunity fact verification state must be boolean.' });
         return;
       }
+      if (typeof request.body?.idempotencyKey !== 'string'
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.body.idempotencyKey)) {
+        response.status(400).json({ success: false, error: 'A valid client idempotency key is required.' });
+        return;
+      }
       const expectedRevision = request.body?.expectedRevision;
       const revisionKeys = expectedRevision && typeof expectedRevision === 'object' && !Array.isArray(expectedRevision)
         ? Object.keys(expectedRevision).sort().join(',') : '';
@@ -2040,6 +2045,7 @@ export function createApp({
           value: request.body?.value,
           verified: request.body.verified,
           note: request.body?.note ?? null,
+          idempotencyKey: request.body.idempotencyKey,
           expectedRevision: request.body.expectedRevision,
           actor: session.username || 'admin',
           storage: getStorage(),
@@ -2048,8 +2054,14 @@ export function createApp({
       } catch (error) {
         const message = String(error?.message || 'Opportunity fact could not be saved.');
         const conflict = /changed since this edit was opened/i.test(message);
-        const status = conflict || /no longer current|current canonical opportunity/i.test(message) ? 409 : /was not found/i.test(message) ? 404 : 400;
-        response.status(status).json({ success: false, ...(conflict ? { code: 'fact_edit_conflict' } : {}), error: message });
+        const idempotencyConflict = /idempotency key conflicts/i.test(message);
+        const status = conflict || idempotencyConflict
+          || /no longer current|current canonical opportunity/i.test(message) ? 409
+          : /was not found/i.test(message) ? 404 : 400;
+        response.status(status).json({ success: false,
+          ...(conflict ? { code: 'fact_edit_conflict' }
+            : idempotencyConflict ? { code: 'fact_idempotency_conflict' } : {}),
+          error: message });
       }
     }),
   );
