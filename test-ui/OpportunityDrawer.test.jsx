@@ -222,7 +222,8 @@ describe('Opportunity drawer', () => {
     expect(within(dialog).getByText('88%')).toBeVisible();
     expect(within(dialog).getByText('Reviewed · Current')).toBeVisible();
     expect(within(dialog).getByText(/CRM: Active · CIM: Not Requested/)).toBeVisible();
-    expect(within(dialog).getByRole('region', { name: 'Pursue next action' })).toHaveTextContent('Prepare and review the broker materials request');
+    expect(within(dialog).getByRole('region', { name: 'Pursue next action' })).toHaveTextContent('Review the bounded campaign authorization');
+    expect(within(dialog).getByRole('region', { name: 'Pursue next action' })).toHaveTextContent('Approve the verified recipient and campaign policy once');
     expect(within(dialog).getByRole('region', { name: 'Pursue next action' })).toHaveTextContent('does not send or create work');
     expect(within(dialog).getAllByText(/Observed Aug 29, 2026/)).toHaveLength(3);
     expect(within(dialog).getByText(/2 missing evidence · 1 contradiction/)).toBeVisible();
