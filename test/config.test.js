@@ -169,6 +169,24 @@ test('daily digest enablement is independent of every CIM follow-up and Stage 2 
   assert.equal(result.ok, true, result.errors.join('\n'));
 });
 
+test('Fly release configuration preserves fail-closed CIM activation flags', () => {
+  const flyConfig = fs.readFileSync(new URL('../fly.toml', import.meta.url), 'utf8');
+  const expectedFlags = new Map([
+    ['DEAL_HUNTER_CIM_OUTREACH_PAUSED', 'true'],
+    ['DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED', 'false'],
+    ['DEAL_HUNTER_CIM_AUTOMATION_PAUSED', 'true'],
+    ['DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED', 'false'],
+  ]);
+
+  for (const [name, expectedValue] of expectedFlags) {
+    const declarations = [
+      ...flyConfig.matchAll(new RegExp(`^\\s*${name}\\s*=\\s*"([^"]*)"\\s*$`, 'gm')),
+    ];
+    assert.equal(declarations.length, 1, `${name} must have exactly one Fly declaration`);
+    assert.equal(declarations[0][1], expectedValue, `${name} must remain fail-closed in Fly`);
+  }
+});
+
 test('production configuration rejects missing and shared security secrets', () => {
   const config = productionConfig();
   config.admin.sessionSecret = 'short';
