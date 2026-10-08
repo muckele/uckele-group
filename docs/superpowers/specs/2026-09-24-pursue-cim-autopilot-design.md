@@ -71,7 +71,7 @@ The target is a coherent owner workflow in which:
 - `Pursue`, `Watch`, and `Pass` semantics while a campaign exists.
 - New campaign, logical-touch, immutable-transmission, conversation, and terminal-authority concepts.
 - Exactly-once logical slot behavior under clicks, jobs, restarts, crashes, and overlapping processes.
-- Initial request and follow-up cadence through the 21-calendar-day campaign boundary.
+- Initial request and follow-up cadence through the 28-calendar-day campaign boundary.
 - Opportunity-local IANA timezone authority and no-fallback behavior.
 - Same-broker batching without identity merging.
 - CRM linkage, inbound reply association, materials association, owner-visible state, observability, audit, migration coexistence, rollout gates, rollback, and test strategy.
@@ -90,7 +90,7 @@ The target is a coherent owner workflow in which:
 
 ### 3.3 Product boundary
 
-The campaign begins with a new post-cutover `Pursue` decision or a separately authorized historical canary enrollment. It ends on reply, verified materials, advanced diligence, Watch, Pass, explicit stop, CRM archive, suppression, unsafe delivery, provider ambiguity requiring investigation, or expiry 21 local calendar days after initial provider acceptance. Later diligence, document analysis, underwriting, lender work, and LOI workflow remain downstream acquisition capabilities.
+The campaign begins with a new post-cutover `Pursue` decision or a separately authorized historical canary enrollment. It ends on any broker reply, verified materials, advanced diligence, Watch, Pass, explicit stop, CRM archive, suppression, unsafe delivery, provider ambiguity requiring investigation, or expiry 28 local calendar days after initial provider acceptance. An NDA request, question, promise to send later, or out-of-office reply stops automatic follow-up for owner disposition; the campaign never auto-signs an NDA or discloses confidential buyer information. Later diligence, document analysis, underwriting, lender work, and LOI workflow remain downstream acquisition capabilities.
 
 ## 4. Baseline evidence and authority
 
@@ -470,7 +470,7 @@ Required authority:
 - accepted, failed, ambiguous, or cancelled timestamp;
 - bounded outcome and terminal reason.
 
-The deterministic touch identity is derived from campaign ID and slot key. Unique `(campaign_id, slot_key)` is the primary duplicate barrier. A weekday slot key contains the opportunity-local calendar date, not the scheduler run time.
+The deterministic touch identity is derived from campaign ID and slot key. Unique `(campaign_id, slot_key)` is the primary duplicate barrier. A repeating slot key contains the opportunity-local calendar date, not the scheduler run time. The durable `weekday-follow-up` kind remains for schema compatibility, but cadence v2 uses a `calendar:YYYY-MM-DD` slot and does not imply weekday-only eligibility.
 
 Touch states are:
 
@@ -529,31 +529,33 @@ The sender records the revisions it validated. The final provider-pending transi
 
 New campaigns use a new immutable policy marker such as `deal-hunter-cim-autopilot-v1`. Legacy automatic and operator-approved markers remain distinct and must not be accepted as this policy.
 
-The new cadence is:
+The versioned `deal-hunter-cim-cadence-v2` cadence is:
 
 1. initial request at the first eligible local sending instant after campaign readiness;
-2. follow-up 1 at initial provider acceptance plus 48 elapsed hours, rolled forward into an eligible local window;
-3. follow-up 2 at follow-up 1 provider acceptance plus 72 elapsed hours, rolled forward;
-4. follow-up 3 at follow-up 2 provider acceptance plus 96 elapsed hours, rolled forward;
-5. after follow-up 3, one follow-up on each subsequent eligible local weekday at the configured campaign send time; and
+2. follow-up 1 on the second business date after initial provider acceptance, at the configured campaign send time;
+3. follow-up 2 two local calendar dates after follow-up 1 provider acceptance, at the configured campaign send time;
+4. follow-up 3 two local calendar dates after follow-up 2 provider acceptance, at the configured campaign send time;
+5. after follow-up 3, one follow-up every two local calendar dates after the prior provider acceptance, at the configured campaign send time, including weekends; and
 6. no touch at or after campaign expiry.
 
 Only an accepted provider outcome anchors the next touch. Delivery, open, click, delayed, or scheduler time does not replace the acceptance anchor. Ambiguity schedules nothing.
 
 ### 11.2 Eligible local window
 
-The campaign window is Monday through Friday, 08:00 inclusive to 17:00 exclusive in the opportunity's authoritative local IANA timezone.
+The initial request and first-follow-up business-day calculation use Monday through Friday. Every later two-calendar-day touch may fall on a weekend. Every touch uses the configured campaign send time within 08:00 inclusive to 17:00 exclusive in the opportunity's authoritative local IANA timezone.
+
+The initial accepted outcome binds that configured send time into the versioned expiry derivation. Every later cadence projection reuses and revalidates the persisted value; a configuration change cannot silently move an existing campaign's scheduled wall time.
 
 - A due instant inside the window remains due at that instant.
 - A due instant before 08:00 rolls to 08:00 that local date.
 - A due instant at or after 17:00 rolls to 08:00 the next eligible weekday.
-- A weekend due instant rolls to 08:00 Monday, subject to configured holiday behavior if a later approved policy adds it. No holiday calendar is inferred in v1.
+- An initial request on a weekend rolls to 08:00 Monday. Follow-up 1 skips weekend dates while counting two business dates. Later follow-ups do not roll a weekend date to Monday. No holiday calendar is inferred.
 - The initial request follows the same window.
 - Scheduler delay does not create a second slot; it claims the already deterministic due slot.
 
 ### 11.3 Campaign expiry
 
-Expiry is 21 local calendar days after the initial provider acceptance. Compute it by projecting the acceptance instant into the campaign timezone, adding 21 calendar dates while preserving the local wall-clock time, and converting the result back to an instant under that IANA zone's offset rules. If a daylight-saving transition makes that wall-clock time nonexistent, use the earliest valid instant after the gap; if it is repeated, use the earlier occurrence. Persist both the result and the derivation metadata.
+Expiry is 28 local calendar days after the initial provider acceptance. Compute it by projecting the acceptance instant into the campaign timezone, adding 28 calendar dates while preserving the local wall-clock time, and converting the result back to an instant under that IANA zone's offset rules. Follow-up acceptance never resets this anchor. If a daylight-saving transition makes that wall-clock time nonexistent, use the earliest valid instant after the gap; if it is repeated, use the earlier occurrence. Persist both the result and the derivation metadata.
 
 At or after expiry:
 
@@ -561,6 +563,8 @@ At or after expiry:
 - untransmitted slots become `cancelled-before-provider` with reason `campaign_expired`;
 - the campaign becomes `expired`; and
 - later provider lifecycle events update history but do not reopen the campaign.
+
+Until the separately gated FL-04C expiry writer exists, the owner release report projects an elapsed active campaign as expired without mutating durable state. It offers owner review for a possible phone call and exposes no further email or stale stop action.
 
 ### 11.4 Timezone authority
 
@@ -957,7 +961,7 @@ The central CIM outreach pause remains active through schema deployment, synthet
 
 #### FL-04C — Follow-Ups and Same-Broker Batching
 
-- accepted-at cadence through 21 local calendar days;
+- accepted-at cadence through 28 local calendar days;
 - terminal-authority scheduler behavior;
 - broker conversations and batch transmissions;
 - recipient safety controls that defer/group rather than discard opportunities.
@@ -1132,13 +1136,13 @@ Tests use deterministic clocks and provider fakes for normal CI, real SQLite tra
 26. California opportunity uses `America/Los_Angeles`; New York uses `America/New_York`; Arizona uses `America/Phoenix` without DST drift.
 27. Missing or ambiguous timezone blocks initial and follow-up claims.
 28. Initial readiness before 08:00 rolls to 08:00 local; after 17:00 rolls to next weekday.
-29. Friday/weekend due times roll to Monday 08:00 local.
-30. Follow-up 1 derives from initial accepted-at plus 48 elapsed hours, then window roll.
-31. Follow-up 2 derives from follow-up 1 accepted-at plus 72 hours.
-32. Follow-up 3 derives from follow-up 2 accepted-at plus 96 hours.
-33. Post-follow-up-3 creates one deterministic slot per subsequent eligible local weekday.
+29. Initial Friday/weekend readiness rolls to Monday 08:00 local; later calendar follow-ups retain weekend dates.
+30. Follow-up 1 is scheduled for the second business date after initial acceptance at the configured local send time.
+31. Follow-up 2 is scheduled two local calendar dates after follow-up 1 acceptance.
+32. Follow-up 3 is scheduled two local calendar dates after follow-up 2 acceptance, including a weekend date when applicable.
+33. Post-follow-up-3 creates one deterministic slot two local calendar dates after each accepted touch.
 34. DST spring gap and fall repetition follow the specified resolution rules.
-35. No slot is claimed or sent at/after the 21-local-calendar-day expiry.
+35. No slot is claimed or sent at/after the 28-local-calendar-day expiry, and later acceptance does not reset it.
 36. Provider ambiguity creates no next slot.
 
 ### 22.4 Concurrency and exactly-once
@@ -1269,7 +1273,7 @@ FL-04C is acceptable for controlled mailbox when scenarios 26–67 and 68–74 p
 3. **Initial send timing:** first eligible opportunity-local weekday window after readiness.
 4. **Follow-up anchor:** prior provider acceptance, never scheduler or delivery time.
 5. **Timezone:** evidence-backed IANA zone per opportunity; no Pacific fallback.
-6. **Expiry:** 21 local calendar days after initial acceptance.
+6. **Expiry:** 28 local calendar days after initial acceptance, without reset by later touches.
 7. **Exactly once:** unique logical slots, immutable persisted transmissions, one consumed invocation authority at provider-pending, and zero provider invocations by recovery; ambiguity means reconcile only.
 8. **Same broker:** batch communication, separate opportunity/campaign identity.
 9. **Replies:** exact conversation/thread evidence first; shared reply stops all campaigns in that conversation pending classification.

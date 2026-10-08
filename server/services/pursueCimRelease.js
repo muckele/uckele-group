@@ -1,9 +1,13 @@
-import { getCimOutreachPauseStatus } from './cimOpportunityIdentity.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 
 const terminalCampaignStates = new Set([
   'responded', 'materials-received', 'stopped', 'expired',
 ]);
+
+async function defaultGetPauseStatus(args) {
+  const { getCimOutreachPauseStatus } = await import('./cimOpportunityIdentity.js');
+  return getCimOutreachPauseStatus(args);
+}
 
 function boundedText(value, maximum = 400) {
   return typeof value === 'string' ? value.trim().slice(0, maximum) : '';
@@ -28,7 +32,7 @@ function storedAddresses(value) {
     && address.length >= 3 && address.length <= 320).slice(0, 20);
 }
 
-function releaseStatus({ decision, enrollment, campaign, transmission }) {
+function releaseStatus({ decision, enrollment, campaign, transmission, projectedAt }) {
   if (!decision) return { code: 'not_pursued', reason: '', actionRequired: false };
   if (decision.action !== 'pursue') {
     return { code: decision.action === 'pass' ? 'pass_selected' : 'watch_selected',
@@ -55,6 +59,11 @@ function releaseStatus({ decision, enrollment, campaign, transmission }) {
   if (campaign?.state === 'action-required') {
     return { code: 'action_required', reason: boundedText(campaign.reason_code, 160),
       actionRequired: true };
+  }
+  const expiry = Date.parse(campaign?.local_expiry_at ?? '');
+  if (Number.isFinite(expiry) && expiry <= Date.parse(projectedAt)
+    && ['initial-pending', 'active-follow-up'].includes(campaign?.state)) {
+    return { code: 'expired', reason: 'campaign_window_elapsed', actionRequired: false };
   }
   if (transmission?.state === 'accepted') {
     return { code: 'provider_accepted',
@@ -131,7 +140,7 @@ function publicTransmission({ transmission, communication, cadenceContext }) {
 }
 
 export async function getPursueCimReleaseReport({ storage, opportunityId,
-  now = new Date().toISOString(), getPauseStatus = getCimOutreachPauseStatus } = {}) {
+  now = new Date().toISOString(), getPauseStatus = defaultGetPauseStatus } = {}) {
   if (!storage || typeof storage.readPursueCimProjection !== 'function'
     || typeof opportunityId !== 'string' || !opportunityId
     || opportunityId.trim() !== opportunityId || opportunityId.length > 200) {
@@ -177,10 +186,11 @@ export async function getPursueCimReleaseReport({ storage, opportunityId,
     || liveAuthorization.recipient_authority_digest !== campaign?.recipient_fingerprint)) {
     throw new Error('Pursue CIM release report authorization binding mismatch');
   }
-  const status = releaseStatus({ decision, enrollment, campaign, transmission });
+  const status = releaseStatus({ decision, enrollment, campaign, transmission, projectedAt });
   const activation = authority?.activation || null;
   const timezone = authority?.timezone || null;
-  const canStop = Boolean(campaign && !terminalCampaignStates.has(campaign.state));
+  const canStop = Boolean(campaign && status.code !== 'expired'
+    && !terminalCampaignStates.has(campaign.state));
   const releasedTransmission = publicTransmission({ transmission, communication, cadenceContext });
   const authorizationStatus = !liveAuthorization ? '' : liveAuthorization.withdrawn_at
     ? 'withdrawn' : liveAuthorization.consumed_at ? 'consumed'
@@ -281,7 +291,7 @@ export async function getPursueCimReleaseReport({ storage, opportunityId,
 
 export async function stopPursueCimCampaign({ storage, opportunityId, campaignId,
   expectedRowVersion, expectedTerminalRevision, idempotencyKey, reason = '', actor,
-  now = new Date().toISOString(), getPauseStatus = getCimOutreachPauseStatus } = {}) {
+  now = new Date().toISOString(), getPauseStatus = defaultGetPauseStatus } = {}) {
   const invalid = !storage || typeof storage.appendCimTerminalEvent !== 'function'
     || typeof opportunityId !== 'string' || !opportunityId || opportunityId.length > 200
     || opportunityId.trim() !== opportunityId

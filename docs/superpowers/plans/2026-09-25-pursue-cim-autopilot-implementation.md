@@ -157,7 +157,7 @@ The request digest covers action, opportunity, expected freshness pair, selected
 - `opportunityTimezone.js` validates IANA names by constructing `Intl.DateTimeFormat`; explicit verified IANA evidence wins. A versioned checked-in postal/city/state resolver may derive a zone only from sufficiently specific evidence and records its dataset version/digest. State-only multi-zone results are ambiguous. Until a resolver dataset is selected and reviewed, derived resolution is disabled and only explicit verified IANA facts are eligible.
 - Add a protected admin command `POST /api/admin/deal-hunter/triage/:opportunityId/timezone` backed by `appendOpportunityTimezoneRevision`. It accepts a validated IANA zone, bounded evidence type/ID and note, actor from the session, expected prior timezone revision, and client idempotency key; it never edits a prior revision. A derived revision is written only by the versioned resolver with its exact input/dataset digest. A correction after claim increments the revision, appends audit evidence, terminalizes/cancels prepared pre-provider work, and makes the final gate reject the stale revision.
 - Tests cover California/Los Angeles, New York/New York, Phoenix/Arizona without DST drift, at least one multi-zone-state postal/city split, missing/ambiguous evidence, and correction after claim.
-- Policy v1 is weekdays, 08:00 inclusive to 17:00 exclusive local time. Initial readiness rolls forward. Follow-up anchors are prior provider acceptance plus 48/72/96 elapsed hours, then window roll. Accepted finalization always derives exactly one dormant next-slot identity through the later-weekday/21-local-calendar-day policy; no follow-up slot may be claimed, prepared, or sent before FL-04C activation.
+- Campaign policy v1 now binds cadence policy `deal-hunter-cim-cadence-v2`. Initial readiness rolls into the weekday 08:00–17:00 local window. Follow-up 1 is the second business date after initial acceptance; each later accepted touch anchors the next slot two local calendar dates later, including weekends, at the configured send time. The initial acceptance persists that configured wall time in the expiry derivation so later configuration changes cannot move the campaign. Expiry remains anchored to initial acceptance at 28 local calendar days and never resets. Accepted finalization derives exactly one dormant next-slot identity; no follow-up slot may be claimed, prepared, or sent before FL-04C activation. The release report projects elapsed active campaigns as expired for owner phone-call review; a durable FL-04C expiry writer remains separately gated and unimplemented.
 - For nonexistent spring-forward local time choose the earliest valid instant after the gap; for repeated fall-back local time choose the earlier instant. Persist local input, zone, offset choice, policy version, and resulting instant.
 - Provider ambiguity creates no next slot. A claimed slot at or after expiry is terminalized, not sent.
 
@@ -586,13 +586,13 @@ Every spec scenario has an owning layer, focused evidence, and package. `PG` mea
 | 26 | CA/NY/AZ IANA behavior | Pure clock tests, including Phoenix DST | P3 |
 | 27 | Missing/ambiguous timezone blocks claim | Policy + claim/final-gate tests | P3/P6 |
 | 28 | Initial window roll | Pure clock table tests | P3 |
-| 29 | Weekend to Monday | Pure clock table tests | P3 |
-| 30 | Follow-up 1 accepted+48h | Pure policy + dormant accepted finalization | P3/P6D |
-| 31 | Follow-up 2 accepted+72h | Pure policy + dormant synthetic accepted chain | P3/P6D |
-| 32 | Follow-up 3 accepted+96h | Pure policy + dormant synthetic accepted chain | P3/P6D |
-| 33 | Later weekday deterministic slots | Pure policy + dormant slot storage | P3/P6D |
+| 29 | Initial weekend to Monday; later weekend retained | Pure clock table tests | P3 |
+| 30 | Follow-up 1 on second business date | Pure policy + dormant accepted finalization | P3/P6D |
+| 31 | Follow-up 2 after two local calendar dates | Pure policy + dormant synthetic accepted chain | P3/P6D |
+| 32 | Follow-up 3 after two local calendar dates, including weekend | Pure policy + dormant synthetic accepted chain | P3/P6D |
+| 33 | Later two-calendar-day deterministic slots | Pure policy + dormant slot storage | P3/P6D |
 | 34 | DST gap/repetition | Pure instant/local derivation fixtures | P3 |
-| 35 | 21-local-day expiry | Policy + dormant materialization/claim boundary | P3/P6D |
+| 35 | 28-local-day expiry anchored to initial acceptance | Policy + dormant materialization/claim boundary | P3/P6D |
 | 36 | Ambiguity creates no next slot | Finalization/policy assertion | P3/P6D |
 | 37 | SQLite campaign race | Two worker processes, one generation | P4B/P5 |
 | 38 | PostgreSQL slot race | Concurrent transactions, normalized winner | P5 |

@@ -1,7 +1,10 @@
 import { validateIanaTimezone } from './opportunityTimezone.js';
 
 export const CIM_CAMPAIGN_POLICY_VERSION = 'deal-hunter-cim-autopilot-v1';
+export const CIM_CADENCE_POLICY_VERSION = 'deal-hunter-cim-cadence-v2';
 const HOUR_MS = 3_600_000;
+const CAMPAIGN_EXPIRY_DAYS = 28;
+const FOLLOW_UP_INTERVAL_DAYS = 2;
 const formatters = new Map();
 
 function formatter(zone) {
@@ -86,8 +89,40 @@ function nextDay(wall) {
   return { year: value.getUTCFullYear(), month: value.getUTCMonth() + 1, day: value.getUTCDate() };
 }
 
+function addCalendarDays(wall, count) {
+  const value = new Date(Date.UTC(wall.year, wall.month - 1, wall.day + count));
+  return { year: value.getUTCFullYear(), month: value.getUTCMonth() + 1,
+    day: value.getUTCDate() };
+}
+
 function weekday(wall) {
   return new Date(Date.UTC(wall.year, wall.month - 1, wall.day)).getUTCDay();
+}
+
+function campaignSendTime(value) {
+  if (!/^\d\d:\d\d$/.test(value)) throw new Error('Invalid campaign send time.');
+  const [hour, minute] = value.split(':').map(Number);
+  if (hour < 8 || hour >= 17 || minute > 59) {
+    throw new Error('Send time is outside eligible window.');
+  }
+  return { hour, minute };
+}
+
+function scheduledFollowUpInstant(accepted, timezone, sendTime, { businessDays }) {
+  const clock = campaignSendTime(sendTime);
+  let date = { ...parts(accepted, timezone) };
+  if (businessDays) {
+    let remaining = FOLLOW_UP_INTERVAL_DAYS;
+    while (remaining > 0) {
+      date = nextDay(date);
+      if (weekday(date) > 0 && weekday(date) < 6) remaining -= 1;
+    }
+  } else {
+    date = addCalendarDays(date, FOLLOW_UP_INTERVAL_DAYS);
+  }
+  const resolved = resolveLocalInstant({ year: date.year, month: date.month, day: date.day,
+    ...clock, second: 0 }, timezone);
+  return { instant: instant(resolved.instant), disambiguation: resolved.disambiguation };
 }
 
 export function rollToEligibleWindow(rawDueAt, timezone) {
@@ -104,11 +139,12 @@ export function rollToEligibleWindow(rawDueAt, timezone) {
   return { dueAt: resolved.instant, dueLocal: isoLocal(wall), disambiguation: resolved.disambiguation };
 }
 
-export function calculateCampaignExpiry(initialAcceptedAt, timezone) {
+export function calculateCampaignExpiry(initialAcceptedAt, timezone, sendTime = '08:00') {
+  campaignSendTime(sendTime);
   const accepted = instant(initialAcceptedAt);
   const localAccepted = parts(accepted, timezone);
   const target = new Date(Date.UTC(localAccepted.year, localAccepted.month - 1,
-    localAccepted.day + 21, localAccepted.hour, localAccepted.minute,
+    localAccepted.day + CAMPAIGN_EXPIRY_DAYS, localAccepted.hour, localAccepted.minute,
     localAccepted.second, localAccepted.millisecond));
   const localExpiry = { year: target.getUTCFullYear(), month: target.getUTCMonth() + 1,
     day: target.getUTCDate(), hour: target.getUTCHours(), minute: target.getUTCMinutes(),
@@ -117,6 +153,8 @@ export function calculateCampaignExpiry(initialAcceptedAt, timezone) {
   return { sourceAcceptedAt: accepted.toISOString(), timezone, localAccepted: isoLocal(localAccepted),
     localExpiry: isoLocal(localExpiry), disambiguation: resolved.disambiguation,
     expiresAt: resolved.instant, policyVersion: CIM_CAMPAIGN_POLICY_VERSION,
+    cadencePolicyVersion: CIM_CADENCE_POLICY_VERSION,
+    sendTime,
     resolverVersion: 'intl-iana-v1' };
 }
 
@@ -127,23 +165,27 @@ export function calculateNextCimSlot({ policyVersion, timezone, kind, readyAt,
   if (kind !== 'initial' && !expiryAt) throw new Error('Campaign expiry is required for follow-ups.');
   const expiry = expiryAt ? instant(expiryAt).getTime() : Infinity;
   let raw;
+  let disambiguation = 'exact';
   if (kind === 'initial') raw = instant(readyAt);
   else {
     if (priorOutcome !== 'accepted' || !priorAcceptedAt) return null;
     const accepted = instant(priorAcceptedAt);
-    const hours = { 'follow-up-1': 48, 'follow-up-2': 72, 'follow-up-3': 96 }[kind];
-    if (hours) raw = new Date(accepted.getTime() + hours * HOUR_MS);
-    else if (kind === 'weekday-follow-up') {
-      if (!/^\d\d:\d\d$/.test(sendTime)) throw new Error('Invalid campaign send time.');
-      const [hour, minute] = sendTime.split(':').map(Number);
-      if (hour < 8 || hour >= 17 || minute > 59) throw new Error('Send time is outside eligible window.');
-      let date = nextDay(parts(accepted, timezone));
-      while (weekday(date) === 0 || weekday(date) === 6) date = nextDay(date);
-      raw = instant(resolveLocalInstant({ ...date, hour, minute }, timezone).instant);
+    if (kind === 'follow-up-1') {
+      ({ instant: raw, disambiguation } = scheduledFollowUpInstant(accepted, timezone,
+        sendTime, { businessDays: true }));
+    } else if (['follow-up-2', 'follow-up-3', 'weekday-follow-up'].includes(kind)) {
+      // `weekday-follow-up` is retained as the durable kind for compatibility. Under the
+      // v2 cadence its logical identity is calendar-based and weekend dates are eligible.
+      ({ instant: raw, disambiguation } = scheduledFollowUpInstant(accepted, timezone,
+        sendTime, { businessDays: false }));
     } else throw new Error('Unknown CIM logical slot kind.');
   }
-  const rolled = rollToEligibleWindow(raw.toISOString(), timezone);
-  if (new Date(rolled.dueAt).getTime() >= expiry) return null;
-  return { kind, slotKey: kind === 'weekday-follow-up' ? `weekday:${rolled.dueLocal.slice(0, 10)}` : kind,
-    rawDueAt: raw.toISOString(), ...rolled, timezone, policyVersion };
+  const due = kind === 'initial' ? rollToEligibleWindow(raw.toISOString(), timezone)
+    : { dueAt: raw.toISOString(), dueLocal: isoLocal(parts(raw, timezone)),
+      disambiguation };
+  if (new Date(due.dueAt).getTime() >= expiry) return null;
+  return { kind, slotKey: kind === 'weekday-follow-up'
+    ? `calendar:${due.dueLocal.slice(0, 10)}` : kind,
+    rawDueAt: raw.toISOString(), ...due, timezone, policyVersion,
+    cadencePolicyVersion: CIM_CADENCE_POLICY_VERSION };
 }

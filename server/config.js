@@ -713,6 +713,10 @@ export function validateConfig(config = getConfig()) {
   if (stage2WindowMinutes.every((value) => value !== null) && stage2WindowMinutes[0] >= stage2WindowMinutes[1]) {
     errors.push('DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START must be earlier than DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_END.');
   }
+  if (stage2WindowMinutes[0] !== null
+    && (stage2WindowMinutes[0] < 8 * 60 || stage2WindowMinutes[0] >= 17 * 60)) {
+    errors.push('DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START must be within 08:00 inclusive and 17:00 exclusive.');
+  }
   requirePositiveNumber(config.dealHunter.lookbackDays, 'DEAL_HUNTER_LOOKBACK_DAYS');
   requirePositiveNumber(config.dealHunter.maxSourceRecords, 'DEAL_HUNTER_MAX_SOURCE_RECORDS', { integer: true });
   requirePositiveNumber(config.dealHunter.sheetCsvMaxPayloadBytes, 'DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES', { integer: true });

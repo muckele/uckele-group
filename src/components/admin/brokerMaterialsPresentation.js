@@ -90,6 +90,10 @@ export function pursueNextActionPresentation({ brokerMaterials = {}, cimRelease 
       return { kind: 'Next action', title: 'Review received broker materials',
         detail: 'Materials were reported received; confirm retrieval, scanning, and owner review before relying on them.' };
     }
+    if (cimRelease.status?.code === 'expired') {
+      return { kind: 'Next action', title: 'Review the unanswered opportunity',
+        detail: 'The bounded four-week email campaign expired without a reply or CIM. Decide whether a phone call is appropriate; no further email is scheduled.' };
+    }
     return { kind: 'Waiting reason',
       title: 'Review the durable CIM campaign status',
       detail: 'The campaign owns this opportunity. Use its persisted status and stop controls; do not start a duplicate manual request.' };
@@ -117,8 +121,8 @@ export function pursueNextActionPresentation({ brokerMaterials = {}, cimRelease 
   }
   const sendBlocker = brokerMaterials.sendBlockers?.[0];
   const sendBlockerDetail = sendBlocker?.message || sendBlocker?.code || 'Current send authority is unavailable';
-  return { kind: 'Next action', title: 'Prepare and review the broker materials request',
+  return { kind: 'Next action', title: 'Review the bounded campaign authorization',
     detail: sendBlocker
       ? `Sending remains unavailable: ${sendBlockerDetail}${/[.!?]$/.test(sendBlockerDetail) ? '' : '.'}`
-      : 'Review the recipient and complete message before any separate final approval.' };
+      : 'Approve the verified recipient and campaign policy once. Every touch still requires current safety authority; live sending remains separately gated.' };
 }
