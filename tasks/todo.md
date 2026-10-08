@@ -20,4 +20,4 @@
   - Follow-up evaluation passed 75 deterministic fixtures and 24 adapter-fault
     fixtures. UI tests passed 277/277. Full lint, focused lint, production build,
     and `git diff --check` passed.
-- [ ] Commit, push, open stacked draft PR, and verify exact-head CI.
+- [x] Commit, push, open stacked draft PR 74 on PR 73, and verify exact-head CI.
