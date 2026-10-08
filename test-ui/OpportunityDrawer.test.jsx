@@ -222,6 +222,8 @@ describe('Opportunity drawer', () => {
     expect(within(dialog).getByText('88%')).toBeVisible();
     expect(within(dialog).getByText('Reviewed · Current')).toBeVisible();
     expect(within(dialog).getByText(/CRM: Active · CIM: Not Requested/)).toBeVisible();
+    expect(within(dialog).getByRole('region', { name: 'Pursue next action' })).toHaveTextContent('Prepare and review the broker materials request');
+    expect(within(dialog).getByRole('region', { name: 'Pursue next action' })).toHaveTextContent('does not send or create work');
     expect(within(dialog).getAllByText(/Observed Aug 29, 2026/)).toHaveLength(3);
     expect(within(dialog).getByText(/2 missing evidence · 1 contradiction/)).toBeVisible();
     expect(within(dialog).getByText('Profit is in range.')).toBeVisible();
@@ -376,6 +378,8 @@ describe('Opportunity drawer', () => {
     expect(within(card).getByText(/Payload 444444444444/)).toBeVisible();
     expect(within(card).getByText(/Current · expires 2026-10-01T15:17:00.000Z/)).toBeVisible();
     expect(within(card).getByText(/Campaign expiry is established after initial provider acceptance/)).toBeVisible();
+    expect(screen.getByRole('region', { name: 'Pursue next action' }))
+      .toHaveTextContent('Review the durable CIM campaign status');
     fireEvent.click(within(card).getByRole('button', { name: 'Stop CIM campaign' }));
     expect(onCimReleaseStop).toHaveBeenCalledWith(expect.objectContaining({
       campaignId: 'campaign-p8a', expectedRowVersion: 4, expectedTerminalRevision: 0,
@@ -403,6 +407,8 @@ describe('Opportunity drawer', () => {
 
     const card = screen.getByRole('region', { name: 'Pursue CIM canary' });
     expect(within(card).getByRole('status')).toHaveTextContent('Loading durable canary state');
+    expect(screen.getByRole('region', { name: 'Pursue next action' }))
+      .toHaveTextContent('Wait for durable CIM status');
     expect(screen.queryByRole('region', { name: 'Broker Materials' })).not.toBeInTheDocument();
   });
 
@@ -449,6 +455,8 @@ describe('Opportunity drawer', () => {
 
     expect(screen.getByRole('region', { name: 'Attachment intake status' })).toBeVisible();
     expect(screen.getByText('Attachment status: Retrieval pending')).toBeVisible();
+    expect(screen.getByRole('region', { name: 'Pursue next action' }))
+      .toHaveTextContent('Wait for attachment retrieval');
     expect(screen.queryByRole('region', { name: 'Broker Materials' })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Open linked CRM record' })).toHaveAttribute('href', '/admin/crm/crm-1');
   });
