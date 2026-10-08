@@ -1,4 +1,4 @@
-import { getCimProviderReconciliationConfig } from '../config.js';
+import { getCimProviderReconciliationConfig, getConfig } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { createCimProviderBoundaryAuthorization } from './cimProviderBoundary.js';
 import { deriveAcceptedCimCadence } from './pursueCimCadence.js';
@@ -69,12 +69,18 @@ function denied() {
   };
 }
 
-async function acceptedCadence(storage, transmissionId, observedAt) {
+function configuredCadenceSendTime(configOverride) {
+  const configured = configOverride?.dealHunter?.cimAutomation?.sendWindowStart;
+  return configured ?? getConfig().dealHunter?.cimAutomation?.sendWindowStart ?? '08:00';
+}
+
+async function acceptedCadence(storage, transmissionId, observedAt, configOverride) {
   if (typeof storage?.readCimCadenceContext !== 'function') {
     throw new Error('Durable CIM cadence context is unavailable');
   }
   const context = await storage.readCimCadenceContext({ transmissionId });
-  return deriveAcceptedCimCadence(context, observedAt);
+  return deriveAcceptedCimCadence(context, observedAt,
+    { sendTime: configuredCadenceSendTime(configOverride) });
 }
 
 // This is the only new-transmission orchestration entry. It accepts the
@@ -209,7 +215,7 @@ export async function finalizeAuthorizedCimTransmission({
     actor,
     now: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
     cadence: outcome.category === 'accepted'
-      ? await acceptedCadence(storage, transmission.id, observedAt) : null,
+      ? await acceptedCadence(storage, transmission.id, observedAt, configOverride) : null,
   };
   await testHooks.beforeFinalization?.({ command, providerResult, outcome });
   const durableResult = await storage.finalizeCimTransmission(command);
@@ -397,6 +403,7 @@ export async function reconcileCimProviderTransmission({
   providerProfile = '',
   actor,
   now = new Date(),
+  configOverride,
 } = {}) {
   if (!transmission?.id || !/^[0-9a-f]{64}$/.test(transmission.payload_digest ?? '')
     || !Number.isSafeInteger(transmission.row_version)
@@ -450,7 +457,8 @@ export async function reconcileCimProviderTransmission({
     actor,
     now: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
     cadence: outcome === 'accepted'
-      ? await acceptedCadence(storage, transmission.id, exactEvidence.observedAt) : null,
+      ? await acceptedCadence(storage, transmission.id, exactEvidence.observedAt,
+        configOverride) : null,
   });
   return { resolved: outcome !== 'ambiguous' && !durableResult.conflict,
     reconciliationOnly: outcome === 'ambiguous', providerCalls: 0,

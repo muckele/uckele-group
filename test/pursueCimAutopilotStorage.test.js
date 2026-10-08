@@ -3193,7 +3193,7 @@ test('P6D scenario 43 accepted finalization anchors and creates one dormant next
     FROM deal_hunter_cim_campaigns WHERE id = ?`).get(authority.campaignId);
   assert.equal(campaign.state, 'active-follow-up');
   assert.equal(campaign.initial_accepted_at, '2026-09-25T19:00:07.000Z');
-  assert.equal(campaign.local_expiry_at, '2026-10-16T19:00:07.000Z');
+  assert.equal(campaign.local_expiry_at, '2026-10-23T19:00:07.000Z');
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 2);
   database.prepare('UPDATE deal_hunter_cim_campaigns SET local_expiry_at = ? WHERE id = ?')
     .run(first.nextTouch.due_at, authority.campaignId);
@@ -3201,11 +3201,11 @@ test('P6D scenario 43 accepted finalization anchors and creates one dormant next
     expectedRowVersion: first.nextTouch.row_version,
     expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
     claimTokenDigest: digest('6'), claimOwner: 'expiry-proof',
-    claimExpiresAt: '2026-09-28T13:00:00.000Z', now: first.nextTouch.due_at })).terminal, true);
+    claimExpiresAt: '2026-09-29T13:00:00.000Z', now: first.nextTouch.due_at })).terminal, true);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'transmission-finalized'").get().count, 1);
 });
 
-test('P6D SQLite persists follow-up-1/2/3 and weekday progression without activation', async (t) => {
+test('P6D SQLite persists the accepted two-day calendar progression without activation', async (t) => {
   const { storage, database, authority, authorization, pending, boundaryNonceDigest } =
     await createProviderPendingFixture(t, 'durable-chain');
   assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
@@ -3222,8 +3222,8 @@ test('P6D SQLite persists follow-up-1/2/3 and weekday progression without activa
     cadence: await acceptedCadence(storage, pending.id, initialObservedAt) });
   const expectedKinds = ['follow-up-1', 'follow-up-2', 'follow-up-3',
     'weekday-follow-up'];
-  const observedAt = [initial.nextTouch.due_at, '2026-10-01T15:00:07.000Z',
-    '2026-10-05T15:00:07.000Z', '2026-10-16T18:59:00.000Z'];
+  const observedAt = [initial.nextTouch.due_at, '2026-10-01T12:00:07.000Z',
+    '2026-10-03T12:00:07.000Z', '2026-10-22T12:00:00.000Z'];
   let current = initial.nextTouch;
   for (const [index, expectedKind] of expectedKinds.entries()) {
     assert.equal(current.kind, expectedKind);
@@ -3240,14 +3240,14 @@ test('P6D SQLite persists follow-up-1/2/3 and weekday progression without activa
     assert.equal(outcome.applied, true);
     current = outcome.nextTouch;
   }
-  assert.equal(current, null, 'the next weekday slot cannot cross the local expiry');
+  assert.equal(current, null, 'the next calendar slot cannot cross the local expiry');
   assert.deepEqual(database.prepare(`SELECT kind FROM deal_hunter_cim_campaign_touches
     WHERE campaign_id=? ORDER BY ordinal`).all(authority.campaignId).map(({ kind }) => kind),
   ['initial', 'follow-up-1', 'follow-up-2', 'follow-up-3', 'weekday-follow-up']);
   assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
     WHERE campaign_id=? AND event_type='touch-created'`).get(authority.campaignId).count, 4);
   assert.equal(database.prepare(`SELECT local_expiry_at FROM deal_hunter_cim_campaigns
-    WHERE id=?`).get(authority.campaignId).local_expiry_at, '2026-10-16T19:00:07.000Z');
+    WHERE id=?`).get(authority.campaignId).local_expiry_at, '2026-10-23T19:00:07.000Z');
 });
 
 test('P6D exact reconciliation resolves ambiguity and creates one dormant next slot', async (t) => {

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   calculateCampaignExpiry,
   calculateNextCimSlot,
+  CIM_CADENCE_POLICY_VERSION,
   CIM_CAMPAIGN_POLICY_VERSION,
 } from './cimCampaignPolicy.js';
 
@@ -51,13 +52,13 @@ function assertCurrentTouch(touch) {
     || (expectedOrdinal !== undefined && revision(touch.ordinal, 'touch ordinal') !== expectedOrdinal)
     || (touch.kind !== 'weekday-follow-up' && touch.logical_slot !== touch.kind)
     || (touch.kind === 'weekday-follow-up'
-      && (!/^weekday:\d{4}-\d{2}-\d{2}$/.test(touch.logical_slot)
+      && (!/^calendar:\d{4}-\d{2}-\d{2}$/.test(touch.logical_slot)
         || revision(touch.ordinal, 'touch ordinal') < 4))) {
     throw new Error('Invalid current CIM cadence touch');
   }
 }
 
-export function deriveAcceptedCimCadence(context, observedAt) {
+export function deriveAcceptedCimCadence(context, observedAt, { sendTime = '08:00' } = {}) {
   const acceptedAt = instant(observedAt, 'provider-observed acceptance instant');
   const transmission = context?.transmission;
   const activeMembers = (context?.members ?? []).filter((member) =>
@@ -97,11 +98,14 @@ export function deriveAcceptedCimCadence(context, observedAt) {
   if (touch.kind === 'initial') {
     initialAcceptedAt = campaign.initial_accepted_at
       ? instant(campaign.initial_accepted_at, 'initial accepted instant') : acceptedAt;
+    if (initialAcceptedAt !== acceptedAt) {
+      throw new Error('CIM cadence expiry authority changed');
+    }
     if (campaign.local_expiry_at) {
       localExpiryAt = instant(campaign.local_expiry_at, 'campaign expiry');
       derivation = expiryDerivation(campaign.expiry_derivation);
     } else {
-      derivation = calculateCampaignExpiry(initialAcceptedAt, timezone.iana_timezone);
+      derivation = calculateCampaignExpiry(initialAcceptedAt, timezone.iana_timezone, sendTime);
       localExpiryAt = derivation.expiresAt;
     }
   } else {
@@ -109,10 +113,17 @@ export function deriveAcceptedCimCadence(context, observedAt) {
     localExpiryAt = instant(campaign.local_expiry_at, 'campaign expiry');
     derivation = expiryDerivation(campaign.expiry_derivation);
   }
+  if (derivation.policyVersion !== campaign.policy_version
+    || derivation.cadencePolicyVersion !== CIM_CADENCE_POLICY_VERSION
+    || typeof derivation.sendTime !== 'string'
+    || instant(derivation.sourceAcceptedAt, 'expiry source acceptance instant') !== initialAcceptedAt
+    || instant(derivation.expiresAt, 'expiry derivation instant') !== localExpiryAt) {
+    throw new Error('CIM cadence expiry authority changed');
+  }
   const kind = nextKind(touch.kind);
   const slot = calculateNextCimSlot({ policyVersion: campaign.policy_version,
     timezone: timezone.iana_timezone, kind, priorAcceptedAt: acceptedAt,
-    priorOutcome: 'accepted', expiryAt: localExpiryAt });
+    priorOutcome: 'accepted', expiryAt: localExpiryAt, sendTime: derivation.sendTime });
   const nextTouch = slot ? {
     id: digest('cim-touch:v1', campaign.id, slot.slotKey, campaign.policy_version),
     logicalSlot: slot.slotKey,
@@ -122,7 +133,7 @@ export function deriveAcceptedCimCadence(context, observedAt) {
     dueAt: slot.dueAt,
     dueLocal: slot.dueLocal,
     timezoneRevision,
-    cadencePolicyVersion: campaign.policy_version,
+    cadencePolicyVersion: CIM_CADENCE_POLICY_VERSION,
   } : null;
   return {
     campaignId: campaign.id,

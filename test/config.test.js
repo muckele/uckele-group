@@ -507,3 +507,27 @@ test('CIM recipient caps and follow-up send windows fail closed when invalid', (
   assert.ok(reversed.errors.some((error) => error.includes('30_DAY_TOUCH_CAP')));
   assert.ok(reversed.errors.some((error) => error.includes('SEND_WINDOW_START must be earlier')));
 });
+
+test('P6D automation cadence send time stays inside its durable 08:00-17:00 authority', () => {
+  const config = productionConfig();
+  config.dealHunter.cimAutomation = { schedulerCheckIntervalMs: 900_000,
+    sendWindowStart: '08:00', sendWindowEnd: '17:00' };
+  config.dealHunter.cimAutomation.sendWindowStart = '07:59';
+  let result = validateConfig(config);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes(
+    'DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START must be within')));
+
+  config.dealHunter.cimAutomation.sendWindowStart = '17:00';
+  config.dealHunter.cimAutomation.sendWindowEnd = '18:00';
+  result = validateConfig(config);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes(
+    'DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START must be within')));
+
+  config.dealHunter.cimAutomation.sendWindowStart = '16:59';
+  config.dealHunter.cimAutomation.sendWindowEnd = '17:00';
+  result = validateConfig(config);
+  assert.equal(result.errors.some((error) => error.includes(
+    'DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START')), false, result.errors.join('\n'));
+});

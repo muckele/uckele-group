@@ -30,7 +30,7 @@ test('Pursue next action reflects current recipient, prerequisite, and pause aut
     kind: 'Waiting reason', title: 'Resolve the current prerequisite', detail: 'No current recipient.',
   });
   assert.deepEqual(action({ pursued: true, sendBlockers: [{ message: 'Outreach is paused.' }] }), {
-    kind: 'Next action', title: 'Prepare and review the broker materials request',
+    kind: 'Next action', title: 'Review the bounded campaign authorization',
     detail: 'Sending remains unavailable: Outreach is paused.',
   });
 });
@@ -67,6 +67,11 @@ test('Pursue next action presents durable request outcomes without encouraging d
   assert.equal(action({ pursued: true }, { cimRelease: { campaign,
     status: { code: 'materials_received', actionRequired: false } } }).title,
     'Review received broker materials');
+  assert.deepEqual(action({ pursued: true }, { cimRelease: { campaign,
+    status: { code: 'expired', actionRequired: false } } }), {
+    kind: 'Next action', title: 'Review the unanswered opportunity',
+    detail: 'The bounded four-week email campaign expired without a reply or CIM. Decide whether a phone call is appropriate; no further email is scheduled.',
+  });
   assert.equal(action({ pursued: true }, { cimRelease: { campaign,
     status: { code: 'provider_pending', actionRequired: true } } }).title,
     'Reconcile the pending provider outcome');
@@ -83,6 +88,13 @@ test('Pursue next action presents durable request outcomes without encouraging d
   } }, { cimRelease: { campaign,
     status: { code: 'provider_definitive_failure', actionRequired: true } } }).title,
     'Review the durable CIM campaign status');
+});
+
+test('Pursue next action describes one bounded approval without implying per-message review', () => {
+  assert.deepEqual(action({ pursued: true }), {
+    kind: 'Next action', title: 'Review the bounded campaign authorization',
+    detail: 'Approve the verified recipient and campaign policy once. Every touch still requires current safety authority; live sending remains separately gated.',
+  });
 });
 
 test('Pursue next action does not overstate attachment readiness', () => {
