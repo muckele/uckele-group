@@ -16,6 +16,7 @@ import {
 } from '../server/services/pursueCimProvider.js';
 import { authorizePreparedCimTransmission } from '../server/services/pursueCimFinalGate.js';
 import { deriveAcceptedCimCadence } from '../server/services/pursueCimCadence.js';
+import { cimFollowUpCapacityWindow } from '../server/services/pursueCimFollowUpCapacity.js';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
 import { processCrmEmailOutbox } from '../server/services/followUpEmail.js';
 import { recordEmailEventsFromWebhook } from '../server/services/emailEvents.js';
@@ -27,6 +28,7 @@ import { createPursueCimProviderFake } from './fixtures/pursueCimHarness.js';
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
+  'deal_hunter_cim_capacity_reservations',
   'deal_hunter_cim_campaign_touches',
   'deal_hunter_cim_campaigns',
   'deal_hunter_cim_capability_activations',
@@ -47,6 +49,7 @@ const singleIdTables = expectedTables.filter((table) => ![
 
 const tableDropOrder = [
   'deal_hunter_cim_audit_events',
+  'deal_hunter_cim_capacity_reservations',
   'deal_hunter_cim_live_provider_authorizations',
   'deal_hunter_cim_capability_activations',
   'deal_hunter_cim_safety_events',
@@ -412,6 +415,60 @@ async function seedSyntheticActivationChain(storage, through = 'fl04b-initial') 
     if (capability === through) break;
     parentId = id;
   }
+}
+
+function executionInstant(offsetMilliseconds = 0) {
+  return new Date(Date.now() + offsetMilliseconds).toISOString();
+}
+
+function primeFollowUpAuthority(database, suffix, recipientFingerprint = digest('e')) {
+  const authority = insertBaseAuthority(database, suffix, recipientFingerprint);
+  const submissionId = `submission${suffix}`;
+  seedCrmOwner(database, authority.opportunityId, submissionId);
+  const dueAt = executionInstant(-60_000);
+  const expiryAt = executionInstant(28 * 24 * 60 * 60 * 1000);
+  database.prepare(`UPDATE deal_hunter_cim_campaigns SET state='active-follow-up',
+    reason_code=NULL, initial_accepted_at=?, local_expiry_at=?, expiry_derivation=?
+    WHERE id=?`).run(executionInstant(-24 * 60 * 60 * 1000), expiryAt,
+    JSON.stringify({ retained: true }), authority.campaignId);
+  database.prepare(`UPDATE deal_hunter_cim_campaign_touches SET
+    logical_slot='follow-up-1', kind='follow-up-1', ordinal=1,
+    due_at=?, due_local='2026-10-08T09:00:00', state='scheduled',
+    claim_token_digest=NULL, claim_owner=NULL, claimed_at=NULL, claim_expires_at=NULL,
+    transmission_id=NULL, row_version=1 WHERE id=?`).run(dueAt, authority.touchId);
+  return { ...authority, submissionId, dueAt, expiryAt, recipientFingerprint };
+}
+
+async function configureFollowUpCapacity(storage, database, { dailyCap = 1,
+  recipientCap = 1 } = {}) {
+  await seedSyntheticActivationChain(storage, 'fl04c-followup');
+  database.prepare(`UPDATE deal_hunter_cim_capability_activations
+    SET daily_cap=?, recipient_cap=? WHERE id='synthetic-fl04c-followup'`)
+    .run(dailyCap, recipientCap);
+}
+
+async function claimFollowUp(storage, authority, token, { now = executionInstant(),
+  expiresAt = executionInstant(5 * 60 * 1000), owner = 'follow-up-worker' } = {}) {
+  return storage.claimDueCimTouch({ touchId: authority.touchId, expectedRowVersion: 1,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    claimTokenDigest: token, claimOwner: owner, claimExpiresAt: expiresAt, now });
+}
+
+function reservedPreparationCommand(authority, token, overrides = {}) {
+  return {
+    activationId: 'synthetic-fl04c-followup', claimOwner: 'follow-up-worker',
+    recipientFingerprint: authority.recipientFingerprint,
+    touchIds: [authority.touchId], claimTokenDigest: token,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    preparationGeneration: 1, payloadVersion: 'deal-hunter-cim-follow-up-1-v1',
+    fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+    ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+    subject: `Synthetic follow-up ${authority.touchId}`,
+    bodyText: `Synthetic follow-up body ${authority.touchId}`,
+    bodyHtmlSanitized: `<p>Synthetic follow-up body ${authority.touchId}</p>`,
+    tags: [`cim_touch_id=${authority.touchId}`], actor: 'follow-up-worker',
+    ...overrides,
+  };
 }
 
 function insertPreparedTransmission(database, authority, suffix = '') {
@@ -1302,6 +1359,257 @@ test('P1B due touch claim has one winner and rejects stale terminal authority', 
   assert.equal((await storage.claimDueCimTouch({ ...command, expectedRowVersion: 2,
     now: '2026-09-25T19:11:00.000Z' })).staleAuthority, true);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'touch-claimed'").get().count, 1);
+});
+
+test('FL04C capacity calendar uses Pacific midnight across DST boundaries', () => {
+  assert.deepEqual(cimFollowUpCapacityWindow('2026-11-01T07:30:00.000Z'), {
+    capacityDate: '2026-11-01', nextMidnight: '2026-11-02T08:00:00.000Z',
+    recipientWindowExpiresAt: '2026-11-02T07:30:00.000Z',
+  });
+  assert.deepEqual(cimFollowUpCapacityWindow('2026-03-08T08:30:00.000Z'), {
+    capacityDate: '2026-03-08', nextMidnight: '2026-03-09T07:00:00.000Z',
+    recipientWindowExpiresAt: '2026-03-09T08:30:00.000Z',
+  });
+});
+
+test('FL04C two SQLite workers atomically compete for the final daily slot', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-follow-up-daily-race');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const first = primeFollowUpAuthority(database, '-follow-up-race-a', digest('e'));
+  const second = primeFollowUpAuthority(database, '-follow-up-race-b', digest('f'));
+  await configureFollowUpCapacity(storage, database, { dailyCap: 1, recipientCap: 2 });
+  assert.equal((await claimFollowUp(storage, first, digest('1'))).claimed, true);
+  assert.equal((await claimFollowUp(storage, second, digest('2'))).claimed, true);
+  const outcomes = await Promise.all([
+    transitionFromWorker(sqlitePath, 'pre-provider-transition', {
+      method: 'prepareReservedCimFollowUp',
+      payload: reservedPreparationCommand(first, digest('1')),
+    }),
+    transitionFromWorker(sqlitePath, 'pre-provider-transition', {
+      method: 'prepareReservedCimFollowUp',
+      payload: reservedPreparationCommand(second, digest('2')),
+    }),
+  ]);
+  assert.equal(outcomes.filter(({ prepared }) => prepared).length, 1);
+  assert.deepEqual(outcomes.filter(({ capacityDeferred }) => capacityDeferred)
+    .map(({ blockedReason }) => blockedReason), ['daily_capacity']);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions').get().count, 1);
+  assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_capacity_reservations WHERE state='reserved'").get().count, 1);
+});
+
+test('FL04C recipient rolling window reserves the final recipient slot', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-follow-up-recipient-race');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const first = primeFollowUpAuthority(database, '-follow-up-recipient-a', digest('a'));
+  const second = primeFollowUpAuthority(database, '-follow-up-recipient-b', digest('b'));
+  await configureFollowUpCapacity(storage, database, { dailyCap: 2, recipientCap: 1 });
+  assert.equal((await claimFollowUp(storage, first, digest('a'))).claimed, true);
+  assert.equal((await claimFollowUp(storage, second, digest('b'))).claimed, true);
+  assert.equal((await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(first, digest('a')))).prepared, true);
+  const blocked = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(second, digest('b')));
+  assert.equal(blocked.capacityDeferred, true);
+  assert.equal(blocked.blockedReason, 'recipient_capacity');
+  assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_capacity_reservations WHERE state='reserved'").get().count, 1);
+});
+
+test('FL04C reservation is request-bound, idempotent, and rejects stale execution-time leases', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-follow-up-binding');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = primeFollowUpAuthority(database, '-follow-up-binding');
+  await configureFollowUpCapacity(storage, database, { dailyCap: 2, recipientCap: 2 });
+  assert.equal((await claimFollowUp(storage, authority, digest('3'))).claimed, true);
+  const command = reservedPreparationCommand(authority, digest('3'));
+  const prepared = await storage.prepareReservedCimFollowUp(command);
+  assert.equal(prepared.prepared, true);
+  const replay = await storage.prepareReservedCimFollowUp(command);
+  assert.equal(replay.existing, true);
+  assert.equal(replay.reservation.id, prepared.reservation.id);
+  const generationOnlyDrift = await storage.prepareReservedCimFollowUp({ ...command,
+    preparationGeneration: 2 });
+  assert.equal(generationOnlyDrift.existing, false);
+  assert.equal(generationOnlyDrift.payloadConflict, true);
+  assert.equal(generationOnlyDrift.blockedReason, 'payload_conflict');
+  assert.equal(generationOnlyDrift.transmission.id, prepared.transmission.id);
+  const changed = await storage.prepareReservedCimFollowUp({ ...command,
+    preparationGeneration: 2, bodyText: 'Changed follow-up body' });
+  assert.equal(changed.payloadConflict, true);
+  assert.equal(changed.transmission.id, prepared.transmission.id);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_capacity_reservations').get().count, 1);
+
+  const drift = primeFollowUpAuthority(database, '-follow-up-drift', digest('a'));
+  assert.equal((await claimFollowUp(storage, drift, digest('4'))).claimed, true);
+  const rejected = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(drift, digest('4'), { recipientFingerprint: digest('b') }));
+  assert.equal(rejected.blockedReason, 'recipient_authority_changed');
+
+  const stale = primeFollowUpAuthority(database, '-follow-up-stale', digest('c'));
+  const staleNow = '2026-10-01T00:00:00.000Z';
+  database.prepare('UPDATE deal_hunter_cim_campaign_touches SET due_at=? WHERE id=?')
+    .run('2026-09-30T23:59:00.000Z', stale.touchId);
+  assert.equal((await claimFollowUp(storage, stale, digest('5'), { now: staleNow,
+    expiresAt: '2026-10-01T00:05:00.000Z' })).claimed, true);
+  const expired = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(stale, digest('5')));
+  assert.equal(expired.blockedReason, 'claim_expired');
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions').get().count, 1);
+
+  const long = primeFollowUpAuthority(database, '-follow-up-long-lease', digest('d'));
+  assert.equal((await claimFollowUp(storage, long, digest('0'), {
+    now: executionInstant(), expiresAt: executionInstant(60 * 60 * 1000),
+  })).claimed, true);
+  assert.equal((await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(long, digest('0')))).blockedReason, 'claim_expiry_invalid');
+});
+
+test('FL04C cancellation releases capacity while provider-pending permanently consumes it', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-follow-up-lifecycle');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const first = primeFollowUpAuthority(database, '-follow-up-lifecycle-a', digest('a'));
+  const second = primeFollowUpAuthority(database, '-follow-up-lifecycle-b', digest('b'));
+  await configureFollowUpCapacity(storage, database, { dailyCap: 1, recipientCap: 2 });
+  assert.equal((await claimFollowUp(storage, first, digest('6'))).claimed, true);
+  const prepared = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(first, digest('6')));
+  database.prepare(`UPDATE deal_hunter_cim_transmissions SET state='cancelled-before-provider',
+    updated_at=?, row_version=row_version+1 WHERE id=?`).run(executionInstant(), prepared.transmission.id);
+  assert.equal(database.prepare(`SELECT state FROM deal_hunter_cim_capacity_reservations
+    WHERE id=?`).get(prepared.reservation.id).state, 'released');
+  assert.equal((await claimFollowUp(storage, second, digest('7'))).claimed, true);
+  const replacement = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(second, digest('7')));
+  assert.equal(replacement.prepared, true);
+  database.prepare(`UPDATE deal_hunter_cim_transmissions SET state='provider-pending',
+    updated_at=?, row_version=row_version+1 WHERE id=?`).run(executionInstant(), replacement.transmission.id);
+  database.prepare(`UPDATE deal_hunter_cim_transmissions SET state='ambiguous',
+    updated_at=?, row_version=row_version+1 WHERE id=?`).run(executionInstant(), replacement.transmission.id);
+  assert.equal(database.prepare(`SELECT state FROM deal_hunter_cim_capacity_reservations
+    WHERE id=?`).get(replacement.reservation.id).state, 'consumed');
+});
+
+test('FL04C restart renews only the same immutable uninvoked transmission', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-follow-up-renew');
+  let executionNow = '2026-10-08T16:00:00.000Z';
+  let storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } },
+    { pursueCimExecutionClock: () => executionNow });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = primeFollowUpAuthority(database, '-follow-up-renew');
+  await configureFollowUpCapacity(storage, database, { dailyCap: 2, recipientCap: 2 });
+  assert.equal((await claimFollowUp(storage, authority, digest('8'), {
+    now: executionNow, expiresAt: '2026-10-08T16:05:00.000Z',
+  })).claimed, true);
+  const prepared = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(authority, digest('8')));
+  assert.equal(prepared.prepared, true);
+  const payloadDigest = prepared.transmission.payload_digest;
+  storage.close();
+  executionNow = '2026-10-08T16:06:00.000Z';
+  storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } },
+    { pursueCimExecutionClock: () => executionNow });
+  const command = { transmissionId: prepared.transmission.id, touchId: authority.touchId,
+    activationId: 'synthetic-fl04c-followup', recipientFingerprint: authority.recipientFingerprint,
+    expectedRowVersion: 3, claimTokenDigest: digest('9'), claimOwner: 'follow-up-worker',
+    claimExpiresAt: '2026-10-08T16:11:00.000Z', actor: 'follow-up-worker' };
+  database.prepare(`UPDATE deal_hunter_cim_capacity_reservations SET state='expired',
+    expired_at=?,row_version=row_version+1 WHERE id=?`).run(executionNow, prepared.reservation.id);
+  const blockerTransmission = insertPreparedTransmission(database, authority, '-follow-up-renew');
+  const sourceTouch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+    WHERE id=?`).get(authority.touchId);
+  insertFixtureRow(database, 'deal_hunter_cim_campaign_touches', { ...sourceTouch,
+    id: 'touch-follow-up-renew-blocker', logical_slot: 'follow-up-renew-blocker',
+    ordinal: 2, state: 'scheduled', transmission_id: null, row_version: 1 });
+  insertFixtureRow(database, 'deal_hunter_cim_capacity_reservations', {
+    id: 'reservation-follow-up-renew-blocker', activation_id: 'synthetic-fl04c-followup',
+    transmission_id: blockerTransmission.transmissionId,
+    touch_id: 'touch-follow-up-renew-blocker',
+    campaign_id: authority.campaignId, conversation_id: authority.conversationId,
+    recipient_fingerprint: authority.recipientFingerprint,
+    recipient_address_digest: sha256('broker@example.test'), capacity_date: '2026-10-08',
+    claim_token_digest: digest('a'), state: 'reserved', reserved_at: executionNow,
+    expires_at: '2026-10-08T16:11:00.000Z',
+    recipient_window_expires_at: '2026-10-09T16:06:00.000Z', consumed_at: null,
+    released_at: null, release_reason: null, expired_at: null, row_version: 1,
+  });
+  const campaignBlocked = await storage.renewReservedCimFollowUp(command);
+  assert.equal(campaignBlocked.capacityDeferred, true);
+  assert.equal(campaignBlocked.blockedReason, 'campaign_capacity');
+  database.prepare(`UPDATE deal_hunter_cim_capacity_reservations SET state='released',
+    released_at=?,release_reason='fixture-release',row_version=row_version+1 WHERE id=?`)
+    .run(executionNow, 'reservation-follow-up-renew-blocker');
+  const renewed = await storage.renewReservedCimFollowUp(command);
+  assert.equal(renewed.renewed, true);
+  assert.equal(renewed.transmission.id, prepared.transmission.id);
+  assert.equal(renewed.transmission.payload_digest, payloadDigest);
+  assert.equal((await storage.renewReservedCimFollowUp(command)).existing, true);
+  assert.equal((await storage.renewReservedCimFollowUp({ ...command,
+    recipientFingerprint: digest('0') })).blockedReason, 'renewal_authority_changed');
+  assert.deepEqual(database.prepare(`SELECT state FROM deal_hunter_cim_capacity_reservations
+    WHERE transmission_id=? AND id<>? ORDER BY reserved_at, id`)
+    .all(prepared.transmission.id, 'reservation-follow-up-renew-blocker')
+    .map(({ state }) => state), ['expired', 'reserved']);
+});
+
+test('FL04C provider-pending requires an unexpired claim-bound reservation at database time', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-follow-up-provider-guard');
+  const executionNow = '2026-10-01T00:00:00.000Z';
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } },
+    { pursueCimExecutionClock: () => executionNow });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = primeFollowUpAuthority(database, '-follow-up-provider-guard');
+  database.prepare('UPDATE deal_hunter_cim_campaign_touches SET due_at=? WHERE id=?')
+    .run('2026-09-30T23:59:00.000Z', authority.touchId);
+  await configureFollowUpCapacity(storage, database, { dailyCap: 1, recipientCap: 1 });
+  assert.equal((await claimFollowUp(storage, authority, digest('f'), { now: executionNow,
+    expiresAt: '2026-10-01T00:05:00.000Z' })).claimed, true);
+  const prepared = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(authority, digest('f')));
+  assert.equal(prepared.prepared, true);
+  assert.throws(() => database.prepare(`UPDATE deal_hunter_cim_transmissions
+    SET state='provider-pending',updated_at=?,row_version=row_version+1 WHERE id=?`)
+    .run(executionInstant(), prepared.transmission.id), /capacity authority unavailable/);
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_transmissions WHERE id=?')
+    .get(prepared.transmission.id).state, 'prepared');
+});
+
+test('FL04C provider-pending revalidates the complete activation chain at database time', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-follow-up-provider-activation-chain');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = primeFollowUpAuthority(database, '-follow-up-provider-activation-chain');
+  await configureFollowUpCapacity(storage, database, { dailyCap: 1, recipientCap: 1 });
+  assert.equal((await claimFollowUp(storage, authority, digest('d'))).claimed, true);
+  const prepared = await storage.prepareReservedCimFollowUp(
+    reservedPreparationCommand(authority, digest('d')));
+  assert.equal(prepared.prepared, true);
+  await storage.withdrawCimCapabilityActivation({ id: 'synthetic-fl04b-enrollment',
+    actor: 'fixture-owner', reason: 'synthetic prerequisite withdrawal',
+    now: executionInstant() });
+  assert.throws(() => database.prepare(`UPDATE deal_hunter_cim_transmissions
+    SET state='provider-pending',updated_at=?,row_version=row_version+1 WHERE id=?`)
+    .run(executionInstant(), prepared.transmission.id), /capacity authority unavailable/);
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_transmissions WHERE id=?')
+    .get(prepared.transmission.id).state, 'prepared');
+  assert.equal(database.prepare(`SELECT state FROM deal_hunter_cim_capacity_reservations
+    WHERE id=?`).get(prepared.reservation.id).state, 'reserved');
 });
 
 test('P5 due selector returns only bounded current generation-one initial touches', async (t) => {

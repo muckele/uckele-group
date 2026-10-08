@@ -376,6 +376,13 @@ const relationshipInventoryEntries = [
     reason: inertPursueCimAuthorityBlockingReason,
   }),
   ...relationshipEntries({
+    table: 'deal_hunter_cim_capacity_reservations',
+    columns: ['activation_id', 'campaign_id', 'conversation_id', 'touch_id', 'transmission_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
     table: 'deal_hunter_cim_transmission_touches',
     columns: ['campaign_id', 'opportunity_id', 'touch_id', 'transmission_id'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,

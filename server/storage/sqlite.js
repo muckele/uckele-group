@@ -1620,6 +1620,7 @@ const inertPursueCimAuthorityIdentity = Object.freeze({
   deal_hunter_cim_campaigns: ['id'],
   deal_hunter_cim_campaign_touches: ['id'],
   deal_hunter_cim_transmissions: ['id'],
+  deal_hunter_cim_capacity_reservations: ['id'],
   deal_hunter_cim_transmission_touches: ['transmission_id', 'touch_id'],
   deal_hunter_cim_terminal_events: ['id'],
   deal_hunter_cim_safety_events: ['id'],
@@ -4693,6 +4694,38 @@ export function createSqliteStorage(config, options = {}) {
         FOREIGN KEY(outbox_id) REFERENCES crm_email_outbox(id) ON DELETE RESTRICT
       );
 
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_capacity_reservations (
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        activation_id TEXT NOT NULL,
+        transmission_id TEXT NOT NULL,
+        touch_id TEXT NOT NULL,
+        campaign_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        recipient_fingerprint TEXT NOT NULL CHECK(length(recipient_fingerprint) = 64),
+        recipient_address_digest TEXT NOT NULL CHECK(length(recipient_address_digest) = 64),
+        capacity_date TEXT NOT NULL CHECK(capacity_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+        claim_token_digest TEXT NOT NULL CHECK(length(claim_token_digest) = 64),
+        state TEXT NOT NULL CHECK(state IN ('reserved', 'consumed', 'released', 'expired')),
+        reserved_at TEXT NOT NULL CHECK(julianday(reserved_at) IS NOT NULL),
+        expires_at TEXT NOT NULL CHECK(julianday(expires_at) IS NOT NULL),
+        recipient_window_expires_at TEXT NOT NULL CHECK(julianday(recipient_window_expires_at) IS NOT NULL),
+        consumed_at TEXT CHECK(consumed_at IS NULL OR julianday(consumed_at) IS NOT NULL),
+        released_at TEXT CHECK(released_at IS NULL OR julianday(released_at) IS NOT NULL),
+        release_reason TEXT CHECK(release_reason IS NULL OR length(release_reason) BETWEEN 1 AND 160),
+        expired_at TEXT CHECK(expired_at IS NULL OR julianday(expired_at) IS NOT NULL),
+        row_version INTEGER NOT NULL DEFAULT 1 CHECK(row_version >= 1),
+        CHECK(expires_at > reserved_at),
+        CHECK((state = 'reserved' AND consumed_at IS NULL AND released_at IS NULL AND expired_at IS NULL)
+          OR (state = 'consumed' AND consumed_at IS NOT NULL AND released_at IS NULL AND expired_at IS NULL)
+          OR (state = 'released' AND consumed_at IS NULL AND released_at IS NOT NULL AND expired_at IS NULL)
+          OR (state = 'expired' AND consumed_at IS NULL AND released_at IS NULL AND expired_at IS NOT NULL)),
+        FOREIGN KEY(activation_id) REFERENCES deal_hunter_cim_capability_activations(id) ON DELETE RESTRICT,
+        FOREIGN KEY(transmission_id) REFERENCES deal_hunter_cim_transmissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY(touch_id) REFERENCES deal_hunter_cim_campaign_touches(id) ON DELETE RESTRICT,
+        FOREIGN KEY(campaign_id) REFERENCES deal_hunter_cim_campaigns(id) ON DELETE RESTRICT,
+        FOREIGN KEY(conversation_id) REFERENCES deal_hunter_broker_conversations(id) ON DELETE RESTRICT
+      );
+
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_transmission_touches (
         transmission_id TEXT NOT NULL,
         touch_id TEXT NOT NULL,
@@ -4874,6 +4907,14 @@ export function createSqliteStorage(config, options = {}) {
         WHERE provider IS NOT NULL AND provider_message_id IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_transmission_touches_active_touch
         ON deal_hunter_cim_transmission_touches(touch_id) WHERE cancelled_at IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_capacity_active_touch
+        ON deal_hunter_cim_capacity_reservations(touch_id) WHERE state = 'reserved';
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_capacity_active_campaign
+        ON deal_hunter_cim_capacity_reservations(campaign_id) WHERE state = 'reserved';
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_capacity_daily
+        ON deal_hunter_cim_capacity_reservations(capacity_date, state, expires_at);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_capacity_recipient
+        ON deal_hunter_cim_capacity_reservations(recipient_address_digest, state, recipient_window_expires_at);
       CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_terminal_events_scope
         ON deal_hunter_cim_terminal_events(scope, scope_id, revision DESC);
       CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_safety_events_run_status
@@ -4885,6 +4926,93 @@ export function createSqliteStorage(config, options = {}) {
       CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_live_authorizations_current
         ON deal_hunter_cim_live_provider_authorizations(transmission_id, writer_path)
         WHERE consumed_at IS NULL AND withdrawn_at IS NULL;
+
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_lifecycle
+      BEFORE UPDATE ON deal_hunter_cim_capacity_reservations
+      WHEN NEW.activation_id <> OLD.activation_id OR NEW.transmission_id <> OLD.transmission_id
+        OR NEW.touch_id <> OLD.touch_id OR NEW.campaign_id <> OLD.campaign_id
+        OR NEW.conversation_id <> OLD.conversation_id
+        OR NEW.recipient_fingerprint <> OLD.recipient_fingerprint
+        OR NEW.recipient_address_digest <> OLD.recipient_address_digest
+        OR NEW.capacity_date <> OLD.capacity_date OR NEW.claim_token_digest <> OLD.claim_token_digest
+        OR NEW.reserved_at <> OLD.reserved_at OR NEW.expires_at <> OLD.expires_at
+        OR (NEW.recipient_window_expires_at <> OLD.recipient_window_expires_at
+          AND (NEW.state <> 'consumed' OR NEW.recipient_window_expires_at < OLD.recipient_window_expires_at))
+        OR OLD.state <> 'reserved' OR NEW.state NOT IN ('consumed', 'released', 'expired')
+      BEGIN SELECT RAISE(ABORT, 'capacity reservation is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_no_delete
+      BEFORE DELETE ON deal_hunter_cim_capacity_reservations
+      BEGIN SELECT RAISE(ABORT, 'capacity reservation evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_consume
+      BEFORE UPDATE OF state ON deal_hunter_cim_transmissions
+      WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'provider-pending'
+        AND EXISTS (
+          SELECT 1 FROM deal_hunter_cim_transmission_touches m
+          JOIN deal_hunter_cim_campaign_touches t ON t.id=m.touch_id
+          WHERE m.transmission_id=NEW.id AND m.cancelled_at IS NULL AND t.kind <> 'initial'
+        )
+      BEGIN
+        SELECT CASE WHEN (
+          SELECT COUNT(*) FROM deal_hunter_cim_capacity_reservations r
+          JOIN deal_hunter_cim_campaign_touches t ON t.id=r.touch_id
+          JOIN deal_hunter_cim_campaigns c ON c.id=r.campaign_id
+          JOIN deal_hunter_broker_conversations v ON v.id=r.conversation_id
+          JOIN deal_hunter_cim_capability_activations a ON a.id=r.activation_id
+          JOIN deal_hunter_cim_capability_activations initial
+            ON initial.id=a.prerequisite_activation_id
+          JOIN deal_hunter_cim_capability_activations enrollment
+            ON enrollment.id=initial.prerequisite_activation_id
+          JOIN deal_hunter_cim_capability_activations safety
+            ON safety.id=enrollment.prerequisite_activation_id
+          WHERE r.transmission_id=NEW.id AND r.state='reserved'
+            AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND t.transmission_id=NEW.id AND t.state='claimed'
+            AND t.claim_token_digest=r.claim_token_digest
+            AND t.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND c.id=t.campaign_id AND c.state='active-follow-up'
+            AND c.local_expiry_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND c.recipient_fingerprint=r.recipient_fingerprint
+            AND v.id=NEW.conversation_id AND v.state='open'
+            AND v.recipient_fingerprint=r.recipient_fingerprint
+            AND v.recipient_address=json_extract(NEW.to_addresses,'$[0]')
+            AND a.capability='fl04c-followup' AND a.status='current' AND a.mode='active'
+            AND (a.expires_at IS NULL OR a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND a.prerequisite_evidence_id IS NOT NULL
+            AND a.prerequisite_evidence_hash IS NOT NULL
+            AND initial.capability='fl04b-initial' AND initial.status='current'
+            AND initial.mode NOT IN ('off','shadow')
+            AND (initial.expires_at IS NULL
+              OR initial.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND initial.prerequisite_evidence_id IS NOT NULL
+            AND initial.prerequisite_evidence_hash IS NOT NULL
+            AND enrollment.capability='fl04b-enrollment' AND enrollment.status='current'
+            AND enrollment.mode NOT IN ('off','shadow')
+            AND (enrollment.expires_at IS NULL
+              OR enrollment.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND enrollment.prerequisite_evidence_id IS NOT NULL
+            AND enrollment.prerequisite_evidence_hash IS NOT NULL
+            AND safety.capability='fl04a-safety' AND safety.status='current'
+            AND safety.mode NOT IN ('off','shadow')
+            AND (safety.expires_at IS NULL
+              OR safety.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ) <> 1 THEN RAISE(ABORT, 'follow-up capacity authority unavailable') END;
+        UPDATE deal_hunter_cim_capacity_reservations SET state = 'consumed',
+          consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+          recipient_window_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day'),
+          row_version = row_version + 1
+        WHERE transmission_id = NEW.id AND state = 'reserved'
+          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now');
+      END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_release
+      AFTER UPDATE OF state ON deal_hunter_cim_transmissions
+      WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'cancelled-before-provider'
+      BEGIN
+        UPDATE deal_hunter_cim_capacity_reservations SET state = 'released',
+          released_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+          release_reason = 'cancelled-before-provider',
+          row_version = row_version + 1
+        WHERE transmission_id = NEW.id AND state = 'reserved';
+      END;
 
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_owner_decision_events_no_update
       BEFORE UPDATE ON deal_hunter_owner_decision_events
@@ -7688,6 +7816,7 @@ export function createSqliteStorage(config, options = {}) {
       const authority = dealHunterCrmMatchAuthoritySnapshot(database);
       return authority.complete ? authority.revision : null;
     },
+    executionClock: options.pursueCimExecutionClock,
   });
   const convergeSubmissionTerminal = (submission, evidenceId = '') => {
     if (!submission?.id) return;

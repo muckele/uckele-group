@@ -4,6 +4,7 @@ import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
 import { deriveAcceptedCimCadence } from '../services/pursueCimCadence.js';
+import { cimFollowUpCapacityWindow } from '../services/pursueCimFollowUpCapacity.js';
 
 const cimWriterCapabilities = new Map([
   ['pursue-cim-initial', 'fl04b-initial'],
@@ -285,7 +286,14 @@ function deterministicUuid(...parts) {
   return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20, 32)}`;
 }
 
-export function createPursueCimSqliteTransitions(database, { applyPass, readCrmMatchAuthorityFingerprint } = {}) {
+export function createPursueCimSqliteTransitions(database, {
+  applyPass, readCrmMatchAuthorityFingerprint, executionClock,
+} = {}) {
+  const executionInstant = () => {
+    const instant = new Date(executionClock ? executionClock() : Date.now());
+    if (!Number.isFinite(instant.getTime())) throw new Error('Invalid CIM execution clock');
+    return instant.toISOString();
+  };
   const transitions = {
     async readPursuitEnrollmentAuthority({ opportunityId, now }) {
       const id = requiredText(opportunityId, 'opportunityId', 200);
@@ -1665,7 +1673,284 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         `).get(id));
       }).immediate();
     },
-    async prepareCimTransmission(command) {
+    prepareReservedCimFollowUp(command) {
+      const activationId = requiredText(command.activationId, 'activationId');
+      const claimOwner = requiredText(command.claimOwner, 'claimOwner', 200);
+      const recipientFingerprint = requiredText(command.recipientFingerprint,
+        'recipientFingerprint', 64);
+      if (!/^[0-9a-f]{64}$/.test(recipientFingerprint)
+        || !Array.isArray(command.touchIds) || command.touchIds.length !== 1) {
+        throw new Error('Invalid follow-up reservation binding');
+      }
+      const touchId = requiredText(command.touchIds[0], 'touchId');
+      const claimTokenDigest = requiredText(command.claimTokenDigest, 'claimTokenDigest', 64);
+      if (!/^[0-9a-f]{64}$/.test(claimTokenDigest)) throw new Error('Invalid claim token digest');
+      const outcome = (flags = {}, transmission = null, reservation = null) => ({
+        prepared: false, existing: false, capacityDeferred: false,
+        payloadConflict: false, terminal: false, blockedReason: null,
+        ...flags, transmission, reservation,
+      });
+      return database.transaction(() => {
+        const now = executionInstant();
+        database.prepare(`UPDATE deal_hunter_cim_capacity_reservations
+          SET state='expired', expired_at=?, row_version=row_version+1
+          WHERE state='reserved' AND expires_at <= ?`).run(now, now);
+        const touch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+          WHERE id=?`).get(touchId);
+        const campaign = touch && database.prepare(`SELECT * FROM deal_hunter_cim_campaigns
+          WHERE id=?`).get(touch.campaign_id);
+        const conversation = campaign && database.prepare(`SELECT *
+          FROM deal_hunter_broker_conversations WHERE id=?`).get(campaign.conversation_id);
+        const activation = currentActivationChain(database, 'fl04c-followup', now);
+        const blocked = (blockedReason) => outcome({ terminal: true, blockedReason });
+        if (!touch || !campaign || !conversation || activation?.id !== activationId
+          || activation.status !== 'current' || activation.mode !== 'active') {
+          return blocked('capability_inactive');
+        }
+        if (touch.kind === 'initial' || touch.campaign_id !== campaign.id
+          || touch.opportunity_id !== campaign.opportunity_id
+          || campaign.state !== 'active-follow-up' || conversation.state !== 'open'
+          || campaign.conversation_id !== conversation.id
+          || campaign.recipient_fingerprint !== recipientFingerprint
+          || conversation.recipient_fingerprint !== recipientFingerprint
+          || campaign.terminal_revision !== command.expectedCampaignTerminalRevision
+          || conversation.terminal_revision !== command.expectedConversationTerminalRevision
+          || (campaign.local_expiry_at && campaign.local_expiry_at <= now)) {
+          return blocked('recipient_authority_changed');
+        }
+        if (conversation.recipient_address !== command.toAddresses?.[0]
+          || touch.state !== 'claimed' || touch.claim_token_digest !== claimTokenDigest
+          || touch.claim_owner !== claimOwner || !touch.claim_expires_at
+          || touch.claim_expires_at <= now) return blocked('claim_expired');
+        if (Date.parse(touch.claim_expires_at) > Date.parse(now) + 5 * 60 * 1000) {
+          return blocked('claim_expiry_invalid');
+        }
+        if (database.prepare(`SELECT 1 FROM email_suppressions
+          WHERE normalized_email=lower(?) AND lifted_at IS NULL LIMIT 1`)
+          .get(conversation.recipient_address)
+          || database.prepare(`SELECT 1 FROM email_events WHERE lower(recipient_email)=lower(?)
+            AND event_type IN ('complained','complaint','bounced','hard_bounce',
+              'unsubscribe','unsubscribed','opt_out') LIMIT 1`)
+            .get(conversation.recipient_address)) return blocked('recipient_suppressed');
+        if (database.prepare(`SELECT 1 FROM crm_communications
+          WHERE direction='inbound' AND (thread_key=? OR submission_id=?) LIMIT 1`)
+          .get(conversation.rfc_thread_key, campaign.crm_submission_id)) return blocked('reply_received');
+        const active = database.prepare(`SELECT r.id AS reservation_id,
+            tr.preparation_generation
+          FROM deal_hunter_cim_capacity_reservations r
+          JOIN deal_hunter_cim_transmissions tr ON tr.id=r.transmission_id
+          WHERE r.touch_id=? AND r.state='reserved' LIMIT 1`).get(touchId);
+        if (active) {
+          if (command.preparationGeneration !== active.preparation_generation) {
+            return outcome({ payloadConflict: true, blockedReason: 'payload_conflict' },
+              database.prepare(`SELECT tr.* FROM deal_hunter_cim_capacity_reservations r
+                JOIN deal_hunter_cim_transmissions tr ON tr.id=r.transmission_id
+                WHERE r.id=?`).get(active.reservation_id),
+              database.prepare(`SELECT * FROM deal_hunter_cim_capacity_reservations
+                WHERE id=?`).get(active.reservation_id));
+          }
+          const prepared = transitions.prepareCimTransmissionSync({ ...command, now,
+            preparationGeneration: command.preparationGeneration });
+          return outcome({ existing: prepared.existing,
+            payloadConflict: prepared.payloadConflict,
+            terminal: prepared.terminal,
+            blockedReason: prepared.terminal ? 'terminal_authority_changed'
+              : prepared.payloadConflict ? 'payload_conflict' : null },
+          prepared.transmission, database.prepare(`SELECT *
+            FROM deal_hunter_cim_capacity_reservations WHERE id=?`).get(active.reservation_id));
+        }
+        const priorTransmission = database.prepare(`SELECT tr.*
+          FROM deal_hunter_cim_transmission_touches m
+          JOIN deal_hunter_cim_transmissions tr ON tr.id=m.transmission_id
+          WHERE m.touch_id=? AND m.cancelled_at IS NULL LIMIT 1`).get(touchId);
+        if (priorTransmission) return outcome({ terminal: true,
+          blockedReason: 'reservation_renewal_required' }, priorTransmission);
+        if (command.preparationGeneration !== 1) return outcome({ payloadConflict: true,
+          blockedReason: 'preparation_generation_invalid' });
+        const window = cimFollowUpCapacityWindow(now);
+        const addressDigest = sha256(conversation.recipient_address.trim().toLowerCase());
+        const dailyCount = database.prepare(`SELECT COUNT(*) AS count
+          FROM deal_hunter_cim_capacity_reservations WHERE capacity_date=? AND
+          (state='consumed' OR (state='reserved' AND expires_at>?))`)
+          .get(window.capacityDate, now).count;
+        if (!Number.isSafeInteger(activation.daily_cap) || activation.daily_cap < 1
+          || dailyCount >= activation.daily_cap) {
+          return outcome({ capacityDeferred: true, blockedReason: 'daily_capacity' });
+        }
+        const recipientCount = database.prepare(`SELECT COUNT(*) AS count
+          FROM deal_hunter_cim_capacity_reservations WHERE recipient_address_digest=?
+          AND recipient_window_expires_at>? AND state IN ('reserved','consumed')`)
+          .get(addressDigest, now).count;
+        if (!Number.isSafeInteger(activation.recipient_cap) || activation.recipient_cap < 1
+          || recipientCount >= activation.recipient_cap) {
+          return outcome({ capacityDeferred: true, blockedReason: 'recipient_capacity' });
+        }
+        const campaignReservation = database.prepare(`SELECT 1
+          FROM deal_hunter_cim_capacity_reservations
+          WHERE campaign_id=? AND state='reserved' LIMIT 1`).get(campaign.id);
+        if (campaignReservation) return outcome({ capacityDeferred: true,
+          blockedReason: 'campaign_capacity' });
+        const prepared = transitions.prepareCimTransmissionSync({ ...command, now });
+        if (!prepared.prepared) return outcome({ existing: prepared.existing,
+          payloadConflict: prepared.payloadConflict, terminal: prepared.terminal,
+          blockedReason: prepared.terminal ? 'terminal_authority_changed' : null },
+        prepared.transmission);
+        const expiresAt = new Date(Math.min(Date.parse(touch.claim_expires_at),
+          Date.parse(window.nextMidnight))).toISOString();
+        if (expiresAt <= now) throw new Error('Invalid capacity reservation lifetime');
+        const reservationId = digest('cim-follow-up-capacity:v1', prepared.transmission.id,
+          claimTokenDigest, window.capacityDate);
+        database.prepare(`INSERT INTO deal_hunter_cim_capacity_reservations (
+          id, activation_id, transmission_id, touch_id, campaign_id, conversation_id,
+          recipient_fingerprint, recipient_address_digest, capacity_date,
+          claim_token_digest, state, reserved_at, expires_at,
+          recipient_window_expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)`)
+          .run(reservationId, activation.id, prepared.transmission.id, touch.id,
+            campaign.id, conversation.id, recipientFingerprint, addressDigest,
+            window.capacityDate, claimTokenDigest, now, expiresAt,
+            window.recipientWindowExpiresAt);
+        const reservation = database.prepare(`SELECT *
+          FROM deal_hunter_cim_capacity_reservations WHERE id=?`).get(reservationId);
+        appendAudit(database, { eventType: 'follow-up-capacity-reserved',
+          authorityId: reservationId, opportunityId: touch.opportunity_id,
+          campaignId: campaign.id, conversationId: conversation.id, touchId,
+          transmissionId: prepared.transmission.id, activationId: activation.id,
+          nextState: 'reserved', actor: command.actor, occurredAt: now });
+        return outcome({ prepared: true }, prepared.transmission, reservation);
+      }).immediate();
+    },
+    renewReservedCimFollowUp(command) {
+      const transmissionId = requiredText(command.transmissionId, 'transmissionId');
+      const touchId = requiredText(command.touchId, 'touchId');
+      const activationId = requiredText(command.activationId, 'activationId');
+      const recipientFingerprint = requiredText(command.recipientFingerprint,
+        'recipientFingerprint', 64);
+      const claimTokenDigest = requiredText(command.claimTokenDigest, 'claimTokenDigest', 64);
+      const claimOwner = requiredText(command.claimOwner, 'claimOwner', 200);
+      const claimExpiresAt = canonicalInstant(command.claimExpiresAt);
+      const expectedRowVersion = requiredRevision(command.expectedRowVersion, 'expectedRowVersion');
+      if (![recipientFingerprint, claimTokenDigest].every((value) => /^[0-9a-f]{64}$/.test(value))) {
+        throw new Error('Invalid follow-up renewal binding');
+      }
+      const outcome = (flags = {}, transmission = null, reservation = null) => ({
+        renewed: false, existing: false, capacityDeferred: false, terminal: false,
+        blockedReason: null, ...flags, transmission, reservation,
+      });
+      return database.transaction(() => {
+        const now = executionInstant();
+        database.prepare(`UPDATE deal_hunter_cim_capacity_reservations
+          SET state='expired', expired_at=?, row_version=row_version+1
+          WHERE state='reserved' AND expires_at <= ?`).run(now, now);
+        const transmission = database.prepare(`SELECT * FROM deal_hunter_cim_transmissions
+          WHERE id=?`).get(transmissionId);
+        const touch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+          WHERE id=?`).get(touchId);
+        const campaign = touch && database.prepare(`SELECT * FROM deal_hunter_cim_campaigns
+          WHERE id=?`).get(touch.campaign_id);
+        const conversation = campaign && database.prepare(`SELECT *
+          FROM deal_hunter_broker_conversations WHERE id=?`).get(campaign.conversation_id);
+        const activation = currentActivationChain(database, 'fl04c-followup', now);
+        const window = cimFollowUpCapacityWindow(now);
+        const reservationId = digest('cim-follow-up-capacity:v1', transmissionId,
+          claimTokenDigest, window.capacityDate);
+        const addressDigest = conversation
+          ? sha256(conversation.recipient_address.trim().toLowerCase()) : '';
+        const replay = database.prepare(`SELECT * FROM deal_hunter_cim_capacity_reservations
+          WHERE id=?`).get(reservationId);
+        if (replay) {
+          if (!transmission || transmission.state !== 'prepared'
+            || transmission.invocation_authority_count !== 0 || !touch || !campaign || !conversation
+            || touch.transmission_id !== transmission.id || touch.state !== 'claimed'
+            || touch.claim_token_digest !== claimTokenDigest || touch.claim_owner !== claimOwner
+            || touch.claim_expires_at !== claimExpiresAt || touch.claim_expires_at <= now
+            || campaign.state !== 'active-follow-up' || conversation.state !== 'open'
+            || activation?.id !== activationId
+            || campaign.recipient_fingerprint !== recipientFingerprint
+            || conversation.recipient_fingerprint !== recipientFingerprint
+            || (campaign.local_expiry_at && campaign.local_expiry_at <= now)
+            || replay.state !== 'reserved' || replay.activation_id !== activationId
+            || replay.transmission_id !== transmission.id || replay.touch_id !== touch.id
+            || replay.campaign_id !== campaign.id || replay.conversation_id !== conversation.id
+            || replay.recipient_fingerprint !== recipientFingerprint
+            || replay.recipient_address_digest !== addressDigest
+            || replay.claim_token_digest !== claimTokenDigest || replay.expires_at <= now) {
+            return outcome({ terminal: true, blockedReason: 'renewal_authority_changed' },
+              transmission, replay);
+          }
+          return outcome({ existing: true }, transmission, replay);
+        }
+        if (!transmission || transmission.state !== 'prepared'
+          || transmission.invocation_authority_count !== 0 || !touch || !campaign || !conversation
+          || touch.transmission_id !== transmission.id || touch.row_version !== expectedRowVersion
+          || touch.state !== 'claimed' || touch.claim_expires_at > now
+          || campaign.state !== 'active-follow-up'
+          || conversation.state !== 'open' || activation?.id !== activationId
+          || campaign.recipient_fingerprint !== recipientFingerprint
+          || conversation.recipient_fingerprint !== recipientFingerprint
+          || (campaign.local_expiry_at && campaign.local_expiry_at <= now)
+          || claimExpiresAt <= now || Date.parse(claimExpiresAt) > Date.parse(now) + 5 * 60 * 1000) {
+          return outcome({ terminal: true, blockedReason: 'renewal_authority_changed' }, transmission);
+        }
+        const prior = database.prepare(`SELECT * FROM deal_hunter_cim_capacity_reservations
+          WHERE transmission_id=? ORDER BY reserved_at DESC, id DESC LIMIT 1`).get(transmission.id);
+        if (!prior || prior.state !== 'expired'
+          || prior.activation_id !== activationId || prior.touch_id !== touch.id
+          || prior.campaign_id !== campaign.id || prior.conversation_id !== conversation.id
+          || prior.recipient_fingerprint !== recipientFingerprint
+          || prior.recipient_address_digest !== addressDigest) {
+          return outcome({ terminal: true, blockedReason: 'renewal_not_permitted' }, transmission);
+        }
+        if (!Number.isSafeInteger(activation.daily_cap) || activation.daily_cap < 1
+          || !Number.isSafeInteger(activation.recipient_cap) || activation.recipient_cap < 1) {
+          return outcome({ terminal: true, blockedReason: 'renewal_authority_changed' }, transmission);
+        }
+        const dailyCount = database.prepare(`SELECT COUNT(*) AS count
+          FROM deal_hunter_cim_capacity_reservations WHERE capacity_date=? AND
+          (state='consumed' OR (state='reserved' AND expires_at>?))`)
+          .get(window.capacityDate, now).count;
+        if (dailyCount >= activation.daily_cap) return outcome({ capacityDeferred: true,
+          blockedReason: 'daily_capacity' }, transmission);
+        const recipientCount = database.prepare(`SELECT COUNT(*) AS count
+          FROM deal_hunter_cim_capacity_reservations WHERE recipient_address_digest=?
+          AND recipient_window_expires_at>? AND state IN ('reserved','consumed')`)
+          .get(addressDigest, now).count;
+        if (recipientCount >= activation.recipient_cap) return outcome({ capacityDeferred: true,
+          blockedReason: 'recipient_capacity' }, transmission);
+        const campaignReservation = database.prepare(`SELECT 1
+          FROM deal_hunter_cim_capacity_reservations
+          WHERE campaign_id=? AND state='reserved' LIMIT 1`).get(campaign.id);
+        if (campaignReservation) return outcome({ capacityDeferred: true,
+          blockedReason: 'campaign_capacity' }, transmission);
+        const expiresAt = new Date(Math.min(Date.parse(claimExpiresAt),
+          Date.parse(window.nextMidnight))).toISOString();
+        const updated = database.prepare(`UPDATE deal_hunter_cim_campaign_touches SET
+          claim_token_digest=?, claim_owner=?, claimed_at=?, claim_expires_at=?,
+          row_version=row_version+1, updated_at=? WHERE id=? AND row_version=?
+          AND transmission_id=? AND state='claimed'`)
+          .run(claimTokenDigest, claimOwner, now, claimExpiresAt, now, touch.id,
+            expectedRowVersion, transmission.id);
+        if (updated.changes !== 1) throw new Error('Follow-up renewal lost touch authority');
+        database.prepare(`INSERT INTO deal_hunter_cim_capacity_reservations (
+          id, activation_id, transmission_id, touch_id, campaign_id, conversation_id,
+          recipient_fingerprint, recipient_address_digest, capacity_date,
+          claim_token_digest, state, reserved_at, expires_at, recipient_window_expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)`)
+          .run(reservationId, activation.id, transmission.id, touch.id, campaign.id,
+            conversation.id, recipientFingerprint, addressDigest, window.capacityDate,
+            claimTokenDigest, now, expiresAt, window.recipientWindowExpiresAt);
+        const reservation = database.prepare(`SELECT *
+          FROM deal_hunter_cim_capacity_reservations WHERE id=?`).get(reservationId);
+        appendAudit(database, { eventType: 'follow-up-capacity-renewed',
+          authorityId: reservationId, opportunityId: touch.opportunity_id,
+          campaignId: campaign.id, conversationId: conversation.id, touchId,
+          transmissionId: transmission.id, activationId: activation.id,
+          priorState: 'expired', nextState: 'reserved', actor: command.actor,
+          occurredAt: now });
+        return outcome({ renewed: true }, transmission, reservation);
+      }).immediate();
+    },
+    prepareCimTransmissionSync(command) {
       if (!Array.isArray(command.touchIds) || command.touchIds.length < 1
         || command.touchIds.length > 50 || new Set(command.touchIds).size !== command.touchIds.length) {
         throw new Error('Invalid transmission membership');
@@ -1886,6 +2171,9 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
         `).get(transmissionId));
       }).immediate();
+    },
+    async prepareCimTransmission(command) {
+      return transitions.prepareCimTransmissionSync(command);
     },
     async readCimOutreachCounters() {
       const counts = {};
@@ -3405,5 +3693,6 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       }).immediate();
     },
   };
+  Object.defineProperty(transitions, 'prepareCimTransmissionSync', { enumerable: false });
   return transitions;
 }
