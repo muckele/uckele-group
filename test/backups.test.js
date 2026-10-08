@@ -18,7 +18,10 @@ import {
 function testConfig(root) {
   return {
     storage: { provider: 'sqlite', sqlitePath: path.join(root, 'source.sqlite') },
-    secureDocuments: { storageDir: path.join(root, 'secure-documents') },
+    secureDocuments: {
+      storageDir: path.join(root, 'secure-documents'),
+      quarantineDir: path.join(root, 'cim-attachment-quarantine'),
+    },
     protection: { rateLimitRetentionMs: 0 },
     backup: {
       enabled: true,

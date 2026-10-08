@@ -461,6 +461,16 @@ function normalizeUploadRequestRow(row) {
     : null;
 }
 
+function normalizeCimAttachmentIntakeRow(row) {
+  return row
+    ? {
+        ...row,
+        size_bytes: Number(row.size_bytes || 0),
+        scan_attempt_count: Number(row.scan_attempt_count || 0),
+      }
+    : null;
+}
+
 function normalizeEmailEventRow(row) {
   return row
     ? {
@@ -1937,6 +1947,12 @@ export function inspectCanonicalMergeDependentState(database, approval) {
     { column: 'submission_id', values: submissionIds },
     metadataFilter,
   ]);
+  const cimAttachmentIntakes = selectCanonicalMergeRows(database, 'secure_attachment_ingestions', [
+    { column: 'communication_id', values: communicationIds },
+    { column: 'approved_submission_id', values: submissionIds },
+    { column: 'vault_request_id', values: secureUploadRequests.map((row) => row.id) },
+    { column: 'vault_document_id', values: secureDocuments.map((row) => row.id) },
+  ]);
   const prospectDiscoveries = selectCanonicalMergeRows(database, 'prospect_discoveries', [
     { column: 'submission_id', values: submissionIds },
   ]);
@@ -1947,6 +1963,7 @@ export function inspectCanonicalMergeDependentState(database, approval) {
     metadataFilter,
   ]).filter((row) => row.id !== manifestId);
   const linkedCrmState = [
+    ...cimAttachmentIntakes.map((row) => `secure_attachment_ingestions:${row.id}`),
     ...secureUploadRequests.map((row) => `secure_upload_requests:${row.id}`),
     ...secureDocuments.map((row) => `secure_documents:${row.id}`),
     ...secureCleanupJobs.map((row) => `secure_document_cleanup_jobs:${row.id}`),
@@ -2146,6 +2163,9 @@ const canonicalOpportunityMergeRequiredSchema = Object.freeze({
   contact_submissions: ['id', 'deal_hunter_opportunity_id', 'listing_url', 'metadata'],
   secure_upload_requests: ['id', 'submission_id'],
   secure_documents: ['id', 'request_id', 'submission_id'],
+  secure_attachment_ingestions: [
+    'id', 'communication_id', 'approved_submission_id', 'vault_request_id', 'vault_document_id',
+  ],
   email_events: ['id', 'message_id', 'submission_id', 'communication_id', 'opportunity_id', 'metadata'],
   crm_activity_events: ['id', 'submission_id', 'opportunity_id', 'metadata'],
   crm_communications: [
@@ -3775,6 +3795,52 @@ export function createSqliteStorage(config, options = {}) {
       note TEXT,
       nda_accepted_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS secure_attachment_ingestions (
+      id TEXT PRIMARY KEY,
+      communication_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      provider_message_id TEXT NOT NULL,
+      provider_attachment_id TEXT NOT NULL,
+      original_file_name TEXT NOT NULL,
+      declared_mime_type TEXT NOT NULL,
+      detected_mime_type TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+      sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+      quarantine_path TEXT NOT NULL,
+      duplicate_of_id TEXT REFERENCES secure_attachment_ingestions(id) ON DELETE RESTRICT,
+      lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN (
+        'quarantining', 'scan-pending', 'scan-unavailable', 'unsafe',
+        'awaiting-owner-approval', 'publishing', 'published'
+      )),
+      scan_status TEXT NOT NULL CHECK (scan_status IN ('pending', 'clean', 'unsafe', 'unavailable')),
+      scan_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (scan_attempt_count >= 0 AND scan_attempt_count <= 3),
+      scanner_name TEXT,
+      scanner_version TEXT,
+      scan_last_error TEXT,
+      next_scan_at TEXT,
+      hold_reason TEXT,
+      owner_approved_at TEXT,
+      owner_approved_by TEXT,
+      approved_submission_id TEXT REFERENCES contact_submissions(id) ON DELETE RESTRICT,
+      approved_document_type TEXT,
+      vault_request_id TEXT,
+      vault_document_id TEXT,
+      vault_relative_path TEXT,
+      published_at TEXT,
+      retention_status TEXT NOT NULL DEFAULT 'hold' CHECK (retention_status = 'hold'),
+      retention_review_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (provider, provider_message_id, provider_attachment_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_secure_attachment_ingestions_sha256
+      ON secure_attachment_ingestions (sha256, created_at);
+    CREATE INDEX IF NOT EXISTS idx_secure_attachment_ingestions_communication
+      ON secure_attachment_ingestions (communication_id, created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_secure_attachment_ingestions_vault_document
+      ON secure_attachment_ingestions (vault_document_id) WHERE vault_document_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS email_events (
       id TEXT PRIMARY KEY,
@@ -8938,6 +9004,123 @@ export function createSqliteStorage(config, options = {}) {
         convergeUploadTerminal(normalizeUploadRequestRow(database.prepare(
           'SELECT * FROM secure_upload_requests WHERE id = ?').get(requestRecord.id)));
         return requestRecord;
+      }).immediate();
+    },
+
+    async getCimAttachmentIntakeByProviderAttachment(provider, messageId, attachmentId) {
+      return normalizeCimAttachmentIntakeRow(database.prepare(`
+        SELECT * FROM secure_attachment_ingestions
+        WHERE provider = ? AND provider_message_id = ? AND provider_attachment_id = ?
+        LIMIT 1
+      `).get(provider, messageId, attachmentId));
+    },
+
+    async getCimAttachmentIntake(id) {
+      return normalizeCimAttachmentIntakeRow(
+        database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ? LIMIT 1').get(id),
+      );
+    },
+
+    async getCimAttachmentIntakeBySha256(sha256) {
+      return normalizeCimAttachmentIntakeRow(database.prepare(`
+        SELECT * FROM secure_attachment_ingestions
+        WHERE sha256 = ? AND quarantine_path <> ''
+        ORDER BY created_at ASC, id ASC LIMIT 1
+      `).get(sha256));
+    },
+
+    async listCimAttachmentIntakes({ communicationId = '', limit = 1000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 10000));
+      const rows = communicationId
+        ? database.prepare(`SELECT * FROM secure_attachment_ingestions
+            WHERE communication_id = ? ORDER BY created_at DESC LIMIT ?`).all(communicationId, safeLimit)
+        : database.prepare('SELECT * FROM secure_attachment_ingestions ORDER BY created_at DESC LIMIT ?').all(safeLimit);
+      return rows.map(normalizeCimAttachmentIntakeRow);
+    },
+
+    async insertCimAttachmentIntake(record) {
+      return database.transaction(() => {
+        const existing = database.prepare(`SELECT * FROM secure_attachment_ingestions
+          WHERE provider = ? AND provider_message_id = ? AND provider_attachment_id = ? LIMIT 1`)
+          .get(record.provider, record.provider_message_id, record.provider_attachment_id);
+        if (existing) return normalizeCimAttachmentIntakeRow(existing);
+        const keys = [
+          'id', 'communication_id', 'provider', 'provider_message_id', 'provider_attachment_id',
+          'original_file_name', 'declared_mime_type', 'detected_mime_type', 'size_bytes', 'sha256',
+          'quarantine_path', 'duplicate_of_id', 'lifecycle_status', 'scan_status', 'scan_attempt_count',
+          'scanner_name', 'scanner_version', 'scan_last_error', 'next_scan_at', 'hold_reason', 'owner_approved_at',
+          'owner_approved_by', 'approved_submission_id', 'approved_document_type', 'vault_request_id',
+          'vault_document_id', 'vault_relative_path', 'published_at', 'retention_status',
+          'retention_review_at', 'created_at', 'updated_at',
+        ];
+        database.prepare(`INSERT INTO secure_attachment_ingestions (${keys.join(', ')})
+          VALUES (${keys.map((key) => `@${key}`).join(', ')})`).run(record);
+        return normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(record.id),
+        );
+      }).immediate();
+    },
+
+    async updateCimAttachmentIntake(id, values = {}, options = {}) {
+      const allowed = new Set([
+        'updated_at', 'lifecycle_status', 'scan_status', 'scan_attempt_count', 'scanner_name',
+        'scanner_version', 'scan_last_error', 'next_scan_at', 'hold_reason', 'duplicate_of_id', 'owner_approved_at',
+        'owner_approved_by', 'approved_submission_id', 'approved_document_type',
+        'vault_request_id', 'vault_document_id', 'vault_relative_path', 'published_at',
+        'retention_status', 'retention_review_at',
+      ]);
+      const updates = Object.entries(values).filter(([key]) => allowed.has(key));
+      if (updates.length === 0) return this.getCimAttachmentIntake(id);
+      return database.transaction(() => {
+        const payload = Object.fromEntries(updates);
+        payload.id = id;
+        payload.expected_status = options.expectedStatus || '';
+        const clause = options.expectedStatus ? ' AND lifecycle_status = @expected_status' : '';
+        const result = database.prepare(`UPDATE secure_attachment_ingestions SET
+          ${updates.map(([key]) => `${key} = @${key}`).join(', ')} WHERE id = @id${clause}`).run(payload);
+        if (result.changes === 0) return null;
+        return normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(id),
+        );
+      }).immediate();
+    },
+
+    async publishCimAttachmentToVault({ intakeId, expectedStatus, request, document, publishedAt }) {
+      return database.transaction(() => {
+        const intake = normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+        );
+        if (!intake || intake.lifecycle_status !== expectedStatus) return null;
+        if (intake.scan_status !== 'clean'
+          || intake.approved_submission_id !== request.submission_id
+          || intake.vault_request_id !== request.id
+          || intake.vault_document_id !== document.id
+          || intake.approved_document_type !== document.document_type
+          || document.request_id !== request.id
+          || document.submission_id !== request.submission_id
+          || document.original_name !== intake.original_file_name
+          || document.mime_type !== intake.detected_mime_type
+          || Number(document.size_bytes) !== Number(intake.size_bytes)
+          || document.uploaded_by_email !== intake.owner_approved_by) {
+          throw new Error('Attachment publication authority changed before commit.');
+        }
+        const communication = database.prepare(
+          'SELECT submission_id, direction FROM crm_communications WHERE id = ? LIMIT 1',
+        ).get(intake.communication_id);
+        if (!communication || communication.direction !== 'inbound'
+          || communication.submission_id !== request.submission_id) {
+          throw new Error('Attachment communication assignment changed before commit.');
+        }
+        assertCrmSubmissionWritableInTransaction(request.submission_id);
+        insertSecureUploadRequestStatement.run(serializeUploadRequest(request));
+        insertSecureDocumentStatement.run(document);
+        const result = database.prepare(`UPDATE secure_attachment_ingestions
+          SET lifecycle_status = 'published', published_at = ?, hold_reason = NULL, updated_at = ?
+          WHERE id = ? AND lifecycle_status = ?`).run(publishedAt, publishedAt, intakeId, expectedStatus);
+        if (result.changes !== 1) throw new Error('Attachment publication lifecycle changed before commit.');
+        return normalizeCimAttachmentIntakeRow(
+          database.prepare('SELECT * FROM secure_attachment_ingestions WHERE id = ?').get(intakeId),
+        );
       }).immediate();
     },
 

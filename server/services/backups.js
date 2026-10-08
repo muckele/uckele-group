@@ -97,6 +97,43 @@ function validateBackupManifest(manifest) {
     }
   }
 
+  if (manifest.quarantinedAttachments !== undefined) {
+    if (!isObject(manifest.quarantinedAttachments)) {
+      errors.push('Quarantined-attachment section must be an object.');
+    } else if (!Array.isArray(manifest.quarantinedAttachments.files)
+      || !isNonNegativeInteger(manifest.quarantinedAttachments.count)
+      || !isNonNegativeInteger(manifest.quarantinedAttachments.totalBytes)) {
+      errors.push('Quarantined-attachment section has invalid counts or files.');
+    } else {
+      let totalBytes = 0;
+      const intakeIds = new Set();
+      const relativePaths = new Set();
+      for (const [index, object] of manifest.quarantinedAttachments.files.entries()) {
+        const label = `Quarantined attachment at index ${index}`;
+        if (!isObject(object) || !Array.isArray(object.intakeIds) || object.intakeIds.length < 1) {
+          errors.push(`${label} must include intakeIds.`);
+          continue;
+        }
+        if (!isNonEmptyString(object.relativePath)) errors.push(`${label} relativePath is required.`);
+        if (!isNonNegativeInteger(object.sizeBytes)) errors.push(`${label} sizeBytes must be a non-negative integer.`);
+        if (!isSha256(object.sha256)) errors.push(`${label} sha256 must be a SHA-256 checksum.`);
+        if (relativePaths.has(object.relativePath)) errors.push(`${label} relativePath is duplicated.`);
+        relativePaths.add(object.relativePath);
+        totalBytes += Number(object.sizeBytes || 0);
+        for (const intakeId of object.intakeIds) {
+          if (!isNonEmptyString(intakeId) || intakeIds.has(intakeId)) errors.push(`${label} intakeIds are invalid or duplicated.`);
+          intakeIds.add(intakeId);
+        }
+      }
+      if (manifest.quarantinedAttachments.files.length !== manifest.quarantinedAttachments.count) {
+        errors.push('Quarantined-attachment object count does not match the manifest.');
+      }
+      if (totalBytes !== manifest.quarantinedAttachments.totalBytes) {
+        errors.push('Quarantined-attachment total size does not match the manifest.');
+      }
+    }
+  }
+
   if (!isObject(manifest.retention)
       || !Number.isInteger(manifest.retention.days) || manifest.retention.days < 1
       || !Number.isInteger(manifest.retention.count) || manifest.retention.count < 1) {
@@ -356,6 +393,83 @@ function readSecureDocumentRowsFromDatabase(database) {
   `).all();
 }
 
+function readQuarantinedAttachmentRowsFromDatabase(database) {
+  const table = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'secure_attachment_ingestions'").get();
+  if (!table) return [];
+  return database.prepare(`
+    SELECT id, quarantine_path, sha256, size_bytes
+    FROM secure_attachment_ingestions
+    WHERE quarantine_path <> ''
+    ORDER BY created_at ASC, id ASC
+  `).all();
+}
+
+function resolveOwnedBackupSource(root, relativePath) {
+  const resolvedRoot = path.resolve(String(root || ''));
+  const resolvedPath = path.resolve(resolvedRoot, String(relativePath || ''));
+  if (!resolvedRoot || resolvedPath === resolvedRoot || !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) return '';
+  return resolvedPath;
+}
+
+async function resolveOwnedRegularFile(root, relativePath, label) {
+  const resolvedRoot = path.resolve(String(root || ''));
+  const rootStat = await fs.lstat(resolvedRoot);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`${label} root must be a real directory, not a symbolic link.`);
+  }
+  const resolvedPath = resolveOwnedBackupSource(resolvedRoot, relativePath);
+  if (!resolvedPath) throw new Error(`${label} resolves outside its owned root.`);
+  const stat = await fs.lstat(resolvedPath);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${label} must be a regular file, not a symbolic link.`);
+  }
+  const [realRoot, realPath] = await Promise.all([fs.realpath(resolvedRoot), fs.realpath(resolvedPath)]);
+  if (realPath === realRoot || !realPath.startsWith(`${realRoot}${path.sep}`)) {
+    throw new Error(`${label} resolves outside its owned root.`);
+  }
+  return { filePath: resolvedPath, stat };
+}
+
+async function copyQuarantinedAttachments({ databasePath, quarantineDirectory, destination }) {
+  const { database } = await openImmutableBackupDatabase(databasePath);
+  let rows;
+  try {
+    rows = readQuarantinedAttachmentRowsFromDatabase(database);
+  } finally {
+    database.close();
+  }
+  const grouped = new Map();
+  for (const row of rows) {
+    const key = String(row.quarantine_path);
+    const current = grouped.get(key) || { ...row, intakeIds: [] };
+    if (current.sha256 !== row.sha256 || Number(current.size_bytes) !== Number(row.size_bytes)) {
+      throw new Error('Quarantine lifecycle rows disagree about a shared object.');
+    }
+    current.intakeIds.push(row.id);
+    grouped.set(key, current);
+  }
+  const objects = [];
+  for (const row of grouped.values()) {
+    const { filePath: sourcePath } = await resolveOwnedRegularFile(
+      quarantineDirectory,
+      row.quarantine_path,
+      `Quarantined attachment ${row.intakeIds[0]}`,
+    );
+    const relativePath = path.join('quarantine', `${row.sha256}-${safeSegment(path.basename(row.quarantine_path), 'attachment')}`);
+    const copiedPath = path.join(destination, relativePath);
+    await fs.mkdir(path.dirname(copiedPath), { recursive: true, mode: 0o700 });
+    await fs.copyFile(sourcePath, copiedPath);
+    await fs.chmod(copiedPath, 0o600);
+    const stat = await fs.stat(copiedPath);
+    const checksum = await sha256File(copiedPath);
+    if (stat.size !== Number(row.size_bytes) || checksum !== row.sha256) {
+      throw new Error(`Quarantined attachment ${row.intakeIds[0]} failed backup integrity validation.`);
+    }
+    objects.push({ intakeIds: row.intakeIds, sizeBytes: stat.size, sha256: checksum, relativePath });
+  }
+  return objects;
+}
+
 function compareManifestDocumentsToDatabase(manifestDocuments, databaseRows) {
   const errors = [];
   const rowsById = new Map(databaseRows.map((row) => [String(row.id), row]));
@@ -518,6 +632,11 @@ export async function createBackupBundle({ storage = getStorage(), config = getC
       documentsDirectory: config.secureDocuments.storageDir,
       destination: workingPath,
     });
+    const quarantinedAttachments = await copyQuarantinedAttachments({
+      databasePath,
+      quarantineDirectory: config.secureDocuments.quarantineDir,
+      destination: workingPath,
+    });
     const manifest = {
       version: backupVersion,
       id,
@@ -533,6 +652,13 @@ export async function createBackupBundle({ storage = getStorage(), config = getC
         totalBytes: documents.reduce((sum, document) => sum + document.sizeBytes, 0),
         files: documents,
       },
+      ...(quarantinedAttachments.length > 0 ? {
+        quarantinedAttachments: {
+          count: quarantinedAttachments.length,
+          totalBytes: quarantinedAttachments.reduce((sum, object) => sum + object.sizeBytes, 0),
+          files: quarantinedAttachments,
+        },
+      } : {}),
       retention: {
         days: config.backup.retentionDays,
         count: config.backup.retentionCount,
@@ -607,6 +733,25 @@ export async function verifyBackupBundle(bundlePath) {
         const documentRows = readSecureDocumentRowsFromDatabase(database);
         if (documentRows.length !== manifest.secureDocuments.count) errors.push('Secure-document row count does not match the manifest.');
         errors.push(...compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows));
+        const intakeRows = readQuarantinedAttachmentRowsFromDatabase(database);
+        if (intakeRows.length > 0 && !manifest.quarantinedAttachments) {
+          errors.push('Quarantined-attachment manifest section is required for database lifecycle rows.');
+        }
+        if (manifest.quarantinedAttachments) {
+          const expectedIds = new Set(manifest.quarantinedAttachments.files.flatMap((object) => object.intakeIds));
+          const actualIds = new Set(intakeRows.map((row) => row.id));
+          if (expectedIds.size !== actualIds.size || [...expectedIds].some((id) => !actualIds.has(id))) {
+            errors.push('Quarantined-attachment lifecycle rows do not match the manifest.');
+          }
+          const objectsByIntakeId = new Map(manifest.quarantinedAttachments.files
+            .flatMap((object) => object.intakeIds.map((id) => [id, object])));
+          for (const row of intakeRows) {
+            const object = objectsByIntakeId.get(row.id);
+            if (!object || object.sha256 !== row.sha256 || Number(object.sizeBytes) !== Number(row.size_bytes)) {
+              errors.push(`Quarantined attachment ${row.id} does not match its database lifecycle row.`);
+            }
+          }
+        }
       } finally {
         database.close();
       }
@@ -630,6 +775,20 @@ export async function verifyBackupBundle(bundlePath) {
       if (await sha256File(filePath) !== document.sha256) errors.push(`Document ${document.id} checksum does not match.`);
     } catch (error) {
       errors.push(`Document ${document.id} could not be verified: ${error.message}`);
+    }
+  }
+
+  for (const object of manifest.quarantinedAttachments?.files || []) {
+    try {
+      const { filePath, stat } = await resolveOwnedRegularFile(
+        resolvedBundle,
+        object.relativePath,
+        `Quarantined attachment ${object.intakeIds[0]}`,
+      );
+      if (stat.size !== object.sizeBytes) errors.push(`Quarantined attachment ${object.intakeIds[0]} size does not match.`);
+      if (await sha256File(filePath) !== object.sha256) errors.push(`Quarantined attachment ${object.intakeIds[0]} checksum does not match.`);
+    } catch (error) {
+      errors.push(`Quarantined attachment ${object.intakeIds[0]} could not be verified: ${error.message}`);
     }
   }
 
@@ -731,7 +890,9 @@ export async function getBackupStatus(config = getConfig()) {
     createdAt: latest.manifest.createdAt,
     verifiedAt: latest.manifest.verification?.verifiedAt || '',
     documentCount: latest.manifest.secureDocuments?.count || 0,
-    totalBytes: (latest.manifest.database?.sizeBytes || 0) + (latest.manifest.secureDocuments?.totalBytes || 0),
+    totalBytes: (latest.manifest.database?.sizeBytes || 0)
+      + (latest.manifest.secureDocuments?.totalBytes || 0)
+      + (latest.manifest.quarantinedAttachments?.totalBytes || 0),
   };
   const ageMs = Date.now() - Date.parse(latest.manifest.createdAt || '');
   const stale = !Number.isFinite(ageMs) || ageMs > 36 * 60 * 60 * 1000;
@@ -779,6 +940,7 @@ async function replaceDirectory(source, destination, overwrite) {
 export async function restoreBackupBundle(bundlePath, {
   databasePath,
   documentsDirectory,
+  quarantineDirectory,
   overwrite = false,
 } = {}) {
   const verification = await verifyBackupBundle(bundlePath);
@@ -786,13 +948,33 @@ export async function restoreBackupBundle(bundlePath, {
 
   const targetDatabase = path.resolve(databasePath);
   const targetDocuments = path.resolve(documentsDirectory);
+  const targetQuarantine = quarantineDirectory ? path.resolve(quarantineDirectory) : '';
+  if (verification.manifest.quarantinedAttachments && !targetQuarantine) {
+    throw new Error('Restore requires quarantineDirectory for a bundle containing quarantined attachments.');
+  }
+  const quarantineRelativeToDocuments = targetQuarantine ? path.relative(targetDocuments, targetQuarantine) : '';
+  const quarantineNestedInDocuments = Boolean(targetQuarantine
+    && quarantineRelativeToDocuments
+    && !path.isAbsolute(quarantineRelativeToDocuments)
+    && quarantineRelativeToDocuments !== '..'
+    && !quarantineRelativeToDocuments.startsWith(`..${path.sep}`));
+  if (targetQuarantine && targetQuarantine === targetDocuments) {
+    throw new Error('Restore quarantine directory must be distinct from the secure-document directory.');
+  }
   const stageRoot = `${targetDatabase}.restore-${randomUUID()}`;
   const stagedDatabase = path.join(stageRoot, databaseFileName);
   const stagedDocuments = path.join(stageRoot, 'secure-documents');
+  const stagedQuarantine = quarantineNestedInDocuments
+    ? path.join(stagedDocuments, quarantineRelativeToDocuments)
+    : path.join(stageRoot, 'cim-attachment-quarantine');
   let databaseSafetyPath = '';
   let documentsSafetyPath = '';
+  let quarantineSafetyPath = '';
   try {
     await fs.mkdir(stagedDocuments, { recursive: true, mode: 0o700 });
+    if (verification.manifest.quarantinedAttachments) {
+      await fs.mkdir(stagedQuarantine, { recursive: true, mode: 0o700 });
+    }
     await fs.copyFile(path.join(verification.path, verification.manifest.database.relativePath), stagedDatabase);
 
     for (const document of verification.manifest.secureDocuments.files) {
@@ -802,9 +984,22 @@ export async function restoreBackupBundle(bundlePath, {
       await fs.chmod(destination, 0o600);
     }
 
+    for (const object of verification.manifest.quarantinedAttachments?.files || []) {
+      const destination = path.join(stagedQuarantine, path.basename(object.relativePath).replace(/^[0-9a-f]{64}-/, ''));
+      const { filePath: sourcePath } = await resolveOwnedRegularFile(
+        verification.path,
+        object.relativePath,
+        `Quarantined attachment ${object.intakeIds[0]}`,
+      );
+      await fs.copyFile(sourcePath, destination);
+      await fs.chmod(destination, 0o600);
+      object.restoredName = path.basename(destination);
+    }
+
     const restoredDatabase = openBackupDatabase(stagedDatabase, { readonly: false });
     try {
       const updatePath = restoredDatabase.prepare('UPDATE secure_documents SET storage_path = ? WHERE id = ?');
+      const updateQuarantinePath = restoredDatabase.prepare('UPDATE secure_attachment_ingestions SET quarantine_path = ? WHERE id = ?');
       const transaction = restoredDatabase.transaction(() => {
         for (const document of verification.manifest.secureDocuments.files) {
           const result = updatePath.run(
@@ -815,6 +1010,12 @@ export async function restoreBackupBundle(bundlePath, {
             throw new Error(`Restore could not map secure document ${document.id} to exactly one database row.`);
           }
         }
+        for (const object of verification.manifest.quarantinedAttachments?.files || []) {
+          for (const intakeId of object.intakeIds) {
+            const result = updateQuarantinePath.run(object.restoredName, intakeId);
+            if (result.changes !== 1) throw new Error(`Restore could not map quarantined attachment ${intakeId} to exactly one database row.`);
+          }
+        }
       });
       transaction();
     } finally {
@@ -823,6 +1024,9 @@ export async function restoreBackupBundle(bundlePath, {
 
     await fs.mkdir(path.dirname(targetDatabase), { recursive: true, mode: 0o700 });
     await fs.mkdir(path.dirname(targetDocuments), { recursive: true, mode: 0o700 });
+    if (targetQuarantine && !quarantineNestedInDocuments) {
+      await fs.mkdir(path.dirname(targetQuarantine), { recursive: true, mode: 0o700 });
+    }
     try {
       await fs.access(targetDatabase);
       if (!overwrite) throw new Error(`Restore destination already exists: ${targetDatabase}`);
@@ -833,10 +1037,15 @@ export async function restoreBackupBundle(bundlePath, {
     }
 
     let documentsInstalled = false;
+    let quarantineInstalled = false;
     let databaseInstalled = false;
     try {
       documentsSafetyPath = await replaceDirectory(stagedDocuments, targetDocuments, overwrite);
       documentsInstalled = true;
+      if (verification.manifest.quarantinedAttachments && !quarantineNestedInDocuments) {
+        quarantineSafetyPath = await replaceDirectory(stagedQuarantine, targetQuarantine, overwrite);
+        quarantineInstalled = true;
+      }
       await fs.rename(stagedDatabase, targetDatabase);
       databaseInstalled = true;
       await fs.chmod(targetDatabase, 0o600);
@@ -845,6 +1054,8 @@ export async function restoreBackupBundle(bundlePath, {
       if (databaseSafetyPath) await fs.rename(databaseSafetyPath, targetDatabase).catch(() => {});
       if (documentsInstalled) await fs.rm(targetDocuments, { recursive: true, force: true }).catch(() => {});
       if (documentsSafetyPath) await fs.rename(documentsSafetyPath, targetDocuments).catch(() => {});
+      if (quarantineInstalled) await fs.rm(targetQuarantine, { recursive: true, force: true }).catch(() => {});
+      if (quarantineSafetyPath) await fs.rename(quarantineSafetyPath, targetQuarantine).catch(() => {});
       throw error;
     }
 
@@ -854,7 +1065,10 @@ export async function restoreBackupBundle(bundlePath, {
       documentsDirectory: targetDocuments,
       databaseSafetyPath,
       documentsSafetyPath,
+      quarantineDirectory: targetQuarantine || null,
+      quarantineSafetyPath,
       restoredDocuments: verification.manifest.secureDocuments.count,
+      restoredQuarantinedAttachments: verification.manifest.quarantinedAttachments?.count || 0,
     };
   } finally {
     await fs.rm(stageRoot, { recursive: true, force: true });

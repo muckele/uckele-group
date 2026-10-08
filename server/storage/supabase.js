@@ -337,6 +337,16 @@ function normalizeUploadRequestRow(row) {
     : null;
 }
 
+function normalizeCimAttachmentIntakeRow(row) {
+  return row
+    ? {
+        ...row,
+        size_bytes: Number(row.size_bytes || 0),
+        scan_attempt_count: Number(row.scan_attempt_count || 0),
+      }
+    : null;
+}
+
 function normalizeEmailEventRow(row) {
   return row
     ? {
@@ -2233,6 +2243,68 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
 
       return normalizeUploadRequestRow(data);
+    },
+
+    async getCimAttachmentIntakeByProviderAttachment(provider, messageId, attachmentId) {
+      const { data, error } = await client.from('secure_attachment_ingestions').select('*')
+        .eq('provider', provider).eq('provider_message_id', messageId)
+        .eq('provider_attachment_id', attachmentId).maybeSingle();
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
+    async getCimAttachmentIntake(id) {
+      const { data, error } = await client.from('secure_attachment_ingestions').select('*')
+        .eq('id', id).maybeSingle();
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
+    async getCimAttachmentIntakeBySha256(sha256) {
+      const { data, error } = await client.from('secure_attachment_ingestions').select('*')
+        .eq('sha256', sha256).neq('quarantine_path', '').order('created_at', { ascending: true })
+        .order('id', { ascending: true }).limit(1).maybeSingle();
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
+    async listCimAttachmentIntakes({ communicationId = '', limit = 1000 } = {}) {
+      let query = client.from('secure_attachment_ingestions').select('*')
+        .order('created_at', { ascending: false }).limit(Math.max(1, Math.min(Number(limit) || 1000, 10000)));
+      if (communicationId) query = query.eq('communication_id', communicationId);
+      const { data, error } = await query;
+      if (error) throw error;
+      return (data || []).map(normalizeCimAttachmentIntakeRow);
+    },
+
+    async insertCimAttachmentIntake(record) {
+      const inserted = await client.from('secure_attachment_ingestions').upsert(record, {
+        onConflict: 'provider,provider_message_id,provider_attachment_id',
+        ignoreDuplicates: true,
+      }).select().maybeSingle();
+      if (inserted.error) throw inserted.error;
+      if (inserted.data) return normalizeCimAttachmentIntakeRow(inserted.data);
+      return this.getCimAttachmentIntakeByProviderAttachment(
+        record.provider,
+        record.provider_message_id,
+        record.provider_attachment_id,
+      );
+    },
+
+    async updateCimAttachmentIntake(id, values = {}, options = {}) {
+      let query = client.from('secure_attachment_ingestions').update(values).eq('id', id);
+      if (options.expectedStatus) query = query.eq('lifecycle_status', options.expectedStatus);
+      const { data, error } = await query.select().maybeSingle();
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
+    },
+
+    async publishCimAttachmentToVault(command) {
+      const { data, error } = await client.rpc('publish_cim_attachment_to_vault_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizeCimAttachmentIntakeRow(data);
     },
 
     async updateSecureUploadRequest(id, values) {

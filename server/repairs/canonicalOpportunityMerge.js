@@ -766,6 +766,20 @@ const relationshipInventoryEntries = [
     reason: redundantRelationshipReason,
   }),
   ...relationshipEntries({
+    table: 'secure_attachment_ingestions',
+    columns: ['communication_id', 'approved_submission_id', 'vault_request_id', 'vault_document_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.linkedCrmState',
+    reason: blockingRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'secure_attachment_ingestions',
+    columns: ['duplicate_of_id', 'provider_message_id', 'provider_attachment_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    scannerPath: 'dependentState.records.linkedCrmState',
+    reason: redundantRelationshipReason,
+  }),
+  ...relationshipEntries({
     table: 'secure_documents',
     columns: ['request_id', 'submission_id'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
