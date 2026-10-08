@@ -1509,6 +1509,8 @@ test('FL04C restart renews only the same immutable uninvoked transmission', asyn
   const database = new Database(sqlitePath);
   t.after(() => database.close());
   const authority = primeFollowUpAuthority(database, '-follow-up-renew');
+  database.prepare('UPDATE deal_hunter_cim_campaign_touches SET due_at=? WHERE id=?')
+    .run('2026-10-08T15:59:00.000Z', authority.touchId);
   await configureFollowUpCapacity(storage, database, { dailyCap: 2, recipientCap: 2 });
   assert.equal((await claimFollowUp(storage, authority, digest('8'), {
     now: executionNow, expiresAt: '2026-10-08T16:05:00.000Z',
