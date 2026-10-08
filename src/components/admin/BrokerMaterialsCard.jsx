@@ -1,5 +1,6 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import BrokerMaterialsFollowUps from './BrokerMaterialsFollowUps.jsx';
+import { brokerMaterialsLifecyclePresentation } from './brokerMaterialsPresentation.js';
 
 const primaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-moss bg-moss px-4 py-2 text-sm font-semibold text-white transition hover:bg-pine disabled:cursor-not-allowed disabled:opacity-50';
 const secondaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
@@ -7,32 +8,6 @@ const secondaryButton = 'inline-flex min-h-10 items-center justify-center rounde
 function formatDateTime(value) {
   if (!value || !Number.isFinite(Date.parse(value))) return 'Not supplied';
   return new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
-}
-
-function lifecyclePresentation(request) {
-  if (request?.respondedAt || request?.status === 'responded' || request?.requestState === 'responded') {
-    return { badge: 'Replied', sentence: 'The broker replied to this request.', action: 'View Broker Reply' };
-  }
-  if (request?.status === 'ambiguous' || request?.requestState === 'provider_ambiguous' || request?.deliveryState === 'ambiguous') {
-    return { badge: 'Ambiguous', sentence: 'Delivery could not be confirmed. Do not send another request.', action: 'Review Ambiguous Result' };
-  }
-  if (request?.status === 'delivery_issue' || request?.status === 'failed' || request?.requestState === 'failed' || ['bounced', 'failed', 'rejected', 'suppressed', 'complained'].includes(request?.deliveryState)) {
-    return {
-      badge: 'Delivery Issue', sentence: request.errorSummary || 'The request has a delivery issue.',
-      action: 'Review Delivery Issue',
-    };
-  }
-  if (request?.status === 'logged' || request?.requestState === 'logged') {
-    return { badge: 'Sent', sentence: 'The broker materials request is logged.', action: 'View Logged Request' };
-  }
-  if (request?.status === 'delivered' || request?.deliveryState === 'delivered') {
-    return { badge: 'Sent', sentence: `Delivered to ${request.recipient?.email || request.recipient?.displayName || 'the broker'}.`, action: 'View Request Status' };
-  }
-  if (request?.status === 'sent' || ['accepted', 'delivered'].includes(request?.deliveryState) || request?.providerAcceptedAt) {
-    const timestamp = formatDateTime(request.providerAcceptedAt || request.requestedAt || request.updatedAt);
-    return { badge: 'Sent', sentence: `Sent to ${request.recipient?.email || request.recipient?.displayName || 'the broker'} · ${timestamp}.`, action: 'View Sent Request' };
-  }
-  return { badge: 'Sending / Pending', sentence: 'A broker materials request is pending.', action: 'View Request Status' };
 }
 
 function blockerPresentation(brokerMaterials) {
@@ -123,7 +98,7 @@ export default function BrokerMaterialsCard({
   const preparation = existingRequest ? null : providedPreparation;
   const recipientSelection = existingRequest ? null : providedRecipientSelection;
   const blocker = blockerPresentation(brokerMaterials);
-  const lifecycle = existingRequest ? lifecyclePresentation(existingRequest) : null;
+  const lifecycle = existingRequest ? brokerMaterialsLifecyclePresentation(existingRequest) : null;
   const review = preparation?.review;
   const message = review?.message;
   const recipient = review?.recipient;
