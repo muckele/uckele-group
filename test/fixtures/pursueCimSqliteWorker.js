@@ -33,6 +33,7 @@ process.on('message', async ({ sqlitePath, mode, command }) => {
       } else {
         const { method, payload } = command;
         if (!['claimDueCimTouch', 'prepareCimTransmission',
+          'prepareReservedCimFollowUp', 'renewReservedCimFollowUp',
           'issueCimLiveProviderAuthorization', 'authorizeCimProviderPending'].includes(method)) {
           throw new Error('Unsupported pre-provider test transition');
         }
@@ -43,6 +44,9 @@ process.on('message', async ({ sqlitePath, mode, command }) => {
           conflict: result.conflict ?? false,
           terminal: result.terminal ?? false,
           existing: result.existing ?? false,
+          renewed: result.renewed ?? false,
+          capacityDeferred: result.capacityDeferred ?? false,
+          blockedReason: result.blockedReason ?? null,
           payloadConflict: result.payloadConflict ?? false,
           prepared: result.prepared ?? false, issued: result.issued ?? false,
           authorized: result.authorized ?? false } });

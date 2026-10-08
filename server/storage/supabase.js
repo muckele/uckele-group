@@ -1556,6 +1556,47 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         { requiredRows: { transmission: ['prepared', 'existing'] } });
     },
 
+    async prepareReservedCimFollowUp(command) {
+      const { data, error } = await client.rpc('pursue_cim_prepare_reserved_followup_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      const allowedReasons = new Set([null, 'daily_capacity', 'recipient_capacity',
+        'campaign_capacity', 'claim_expired', 'recipient_authority_changed',
+        'recipient_suppressed', 'reply_received', 'terminal_authority_changed',
+        'capability_inactive', 'claim_expiry_invalid', 'reservation_renewal_required',
+        'preparation_generation_invalid', 'payload_conflict']);
+      if (!allowedReasons.has(data?.blockedReason ?? null)) {
+        throw new Error('Malformed Pursue CIM follow-up reservation result');
+      }
+      return normalizePursueCimRpcResult(data,
+        ['prepared', 'existing', 'capacityDeferred', 'payloadConflict', 'terminal'],
+        ['transmission', 'reservation'], {
+          requiredRows: { transmission: ['prepared', 'existing'],
+            reservation: ['prepared', 'existing'] },
+          extraFields: ['blockedReason'],
+        });
+    },
+
+    async renewReservedCimFollowUp(command) {
+      const { data, error } = await client.rpc('pursue_cim_renew_reserved_followup_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      const allowedReasons = new Set([null, 'daily_capacity', 'recipient_capacity',
+        'campaign_capacity', 'renewal_authority_changed', 'renewal_not_permitted']);
+      if (!allowedReasons.has(data?.blockedReason ?? null)) {
+        throw new Error('Malformed Pursue CIM follow-up renewal result');
+      }
+      return normalizePursueCimRpcResult(data,
+        ['renewed', 'existing', 'capacityDeferred', 'terminal'],
+        ['transmission', 'reservation'], {
+          requiredRows: { transmission: ['renewed', 'existing'],
+            reservation: ['renewed', 'existing'] },
+          extraFields: ['blockedReason'],
+        });
+    },
+
     async issueCimLiveProviderAuthorization(command) {
       const { data, error } = await client.rpc('pursue_cim_issue_live_authorization_v1', {
         p_command: command,

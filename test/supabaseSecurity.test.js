@@ -115,6 +115,10 @@ const pursueCimP4bMigrationUrl = new URL(
   '../supabase/migrations/20261001130000_pursue_cim_p4b_authority.sql',
   import.meta.url,
 );
+const pursueCimFollowUpCapacityMigrationUrl = new URL(
+  '../supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -474,7 +478,10 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const pursueCimAutopilotMigration = fs.readFileSync(pursueCimAutopilotMigrationUrl, 'utf8');
   const crmAuthorityMigration = fs.readFileSync(crmAuthorityMigrationUrl, 'utf8');
   const pursueCimP4bMigration = fs.readFileSync(pursueCimP4bMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}`;
+  const pursueCimFollowUpCapacityMigration = fs.readFileSync(
+    pursueCimFollowUpCapacityMigrationUrl, 'utf8',
+  );
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${pursueCimFollowUpCapacityMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -492,6 +499,19 @@ test('Supabase migration and fresh schema isolate every current app table to the
     pursueCimAutopilotMigration,
     /create\s+policy/i,
     'Pursue CIM Autopilot authorities must not add public RLS policies',
+  );
+  assert.doesNotMatch(
+    pursueCimFollowUpCapacityMigration,
+    /create\s+policy/i,
+    'Pursue CIM follow-up capacity must not add public RLS policies',
+  );
+  assert.match(
+    pursueCimFollowUpCapacityMigration,
+    /revoke all on table public\.deal_hunter_cim_capacity_reservations\s+from public, anon, authenticated, service_role;/i,
+  );
+  assert.match(
+    pursueCimFollowUpCapacityMigration,
+    /grant select, insert, update on table public\.deal_hunter_cim_capacity_reservations to service_role;/i,
   );
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');

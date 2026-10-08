@@ -45,12 +45,23 @@ const p10bAuthorityMigrationPath = path.join(root,
   'supabase/migrations/20261010120000_pursue_cim_controlled_mailbox_authority.sql');
 const p6dV2MigrationPath = path.join(root,
   'supabase/migrations/20261010130000_pursue_cim_cadence_v2.sql');
+const passedArchiveMigrationPath = path.join(root,
+  'supabase/migrations/20261012120000_deal_hunter_passed_archive.sql');
+const manualFollowUpMigrationPath = path.join(root,
+  'supabase/migrations/20261013120000_deal_hunter_manual_follow_up_current_owner.sql');
+const operatorFactGuardMigrationPath = path.join(root,
+  'supabase/migrations/20261014120000_operator_fact_stale_save_guard.sql');
+const operatorFactIdempotencyMigrationPath = path.join(root,
+  'supabase/migrations/20261014130000_operator_fact_idempotency.sql');
+const fl04cCapacityMigrationPath = path.join(root,
+  'supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
   'deal_hunter_cim_campaign_touches',
   'deal_hunter_cim_campaigns',
   'deal_hunter_cim_capability_activations',
+  'deal_hunter_cim_capacity_reservations',
   'deal_hunter_cim_live_provider_authorizations',
   'deal_hunter_cim_safety_events',
   'deal_hunter_cim_terminal_events',
@@ -80,6 +91,9 @@ const expectedP1cFunctions = [
   'pursue_cim_bump_global_authority_revision_v1',
   'pursue_cim_cancel_prepared_transmission_v1',
   'pursue_cim_canonical_json_v1',
+  'pursue_cim_capacity_guard_v1',
+  'pursue_cim_capacity_retain_v1',
+  'pursue_cim_capacity_transmission_v1',
   'pursue_cim_claim_due_touch_v1',
   'pursue_cim_consume_safety_events_v1',
   'pursue_cim_converge_terminal_authority_v1',
@@ -95,6 +109,7 @@ const expectedP1cFunctions = [
   'pursue_cim_json_stringify_v1',
   'pursue_cim_list_due_initial_touches_v1',
   'pursue_cim_materialize_campaign_v1',
+  'pursue_cim_prepare_reserved_followup_v1',
   'pursue_cim_prepare_transmission_v1',
   'pursue_cim_read_cadence_context_v1',
   'pursue_cim_read_final_gate_context_v1',
@@ -107,6 +122,7 @@ const expectedP1cFunctions = [
   'pursue_cim_record_capability_activation_v1',
   'pursue_cim_record_owner_decision_v1',
   'pursue_cim_refresh_inbound_binding_v1',
+  'pursue_cim_renew_reserved_followup_v1',
   'pursue_cim_required_instant_v1',
   'pursue_cim_required_revision_v1',
   'pursue_cim_required_text_v1',
@@ -426,6 +442,87 @@ test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
   assert.match(p3Migration, /v_opportunity_status <> 'active'/);
 });
 
+test('FL04C PostgreSQL capacity migration is additive, atomic, retained, and exact in fresh schema', () => {
+  const migration = fs.readFileSync(fl04cCapacityMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8').trim();
+  assert.equal(schema.endsWith(migration), true);
+  assert.match(migration, /create table if not exists public\.deal_hunter_cim_capacity_reservations/);
+  assert.doesNotMatch(migration, /drop table|truncate table/i);
+  assert.match(migration, /clock_timestamp\(\)/);
+  assert.match(migration, /at time zone 'America\/Los_Angeles'/);
+  assert.doesNotMatch(migration, /jsonb_build_object\('now',v_now::text/,
+    'the DB execution clock must be forwarded in the canonical instant format');
+  assert.doesNotMatch(migration, /pg_catalog\.(?:least|greatest)\(/,
+    'PostgreSQL special forms cannot be schema-qualified');
+  const reserve = migration.slice(migration.indexOf(
+    'create or replace function public.pursue_cim_prepare_reserved_followup_v1'));
+  assert.ok(reserve.indexOf("'cim-capacity-daily:'")
+    < reserve.indexOf("'cim-capacity-recipient:'"));
+  assert.match(reserve, /pursue_cim_prepare_transmission_v1/);
+  assert.match(migration, /state='consumed'/);
+  assert.match(migration, /state='released'/);
+  assert.match(migration, /state='expired'/);
+  assert.match(migration, /before update of state on public\.deal_hunter_cim_transmissions/);
+  assert.match(migration, /follow-up capacity authority unavailable/);
+  assert.match(migration,
+    /a\.id=public\.pursue_cim_current_activation_v1\('fl04c-followup',v_now\)/);
+  assert.match(migration, /v_touch\.opportunity_id <> v_campaign\.opportunity_id/);
+  assert.match(migration,
+    /pursue_cim_required_revision_v1\(p_command,'preparationGeneration'\)[\s\S]*<> v_current\.preparation_generation/);
+  assert.match(migration, /claim_expires_at > v_now\+interval '5 minutes'/);
+  assert.match(migration, /from public\.email_events/);
+  assert.match(migration, /reservation_renewal_required/);
+  assert.equal([...migration.matchAll(/'blockedReason','campaign_capacity'/g)].length, 2,
+    'prepare and renewal must both normalize the active-campaign uniqueness fence');
+  assert.match(migration,
+    /select \* into v_prior[\s\S]*or v_prior\.id is null or v_prior\.state <> 'expired'/);
+  assert.match(migration, /get diagnostics v_changed = row_count/);
+  assert.match(migration, /capacity reservation evidence is retained/);
+  assert.match(migration, /grant execute on function public\.pursue_cim_prepare_reserved_followup_v1\(jsonb\) to service_role/);
+  assert.match(migration, /grant execute on function public\.pursue_cim_renew_reserved_followup_v1\(jsonb\) to service_role/);
+});
+
+test('FL04C Supabase adapter normalizes reservation and renewal RPCs', async () => {
+  const calls = [];
+  const storage = createSupabaseStorage({ storage: {} }, { client: {
+    async rpc(name, args) {
+      calls.push({ name, args });
+      if (name === 'pursue_cim_prepare_reserved_followup_v1') return { data: {
+        prepared: true, existing: false, capacityDeferred: false,
+        payloadConflict: false, terminal: false, blockedReason: null,
+        transmission: { id: 'transmission-1', row_version: '3' },
+        reservation: { id: 'reservation-1', row_version: '1', state: 'reserved',
+          reserved_at: '2026-10-08T16:00:00Z' },
+      }, error: null };
+      if (args.p_command.campaignCapacityFixture) return { data: {
+        renewed: false, existing: false, capacityDeferred: true,
+        terminal: false, blockedReason: 'campaign_capacity',
+        transmission: { id: 'transmission-1', row_version: '3' }, reservation: null,
+      }, error: null };
+      return { data: { renewed: true, existing: false, capacityDeferred: false,
+        terminal: false, blockedReason: null,
+        transmission: { id: 'transmission-1', row_version: '3' },
+        reservation: { id: 'reservation-2', row_version: '1', state: 'reserved',
+          reserved_at: '2026-10-08T16:06:00Z' } }, error: null };
+    },
+  } });
+  const prepared = await storage.prepareReservedCimFollowUp({ touchIds: ['touch-1'] });
+  const renewed = await storage.renewReservedCimFollowUp({ transmissionId: 'transmission-1' });
+  const campaignBlocked = await storage.renewReservedCimFollowUp({
+    transmissionId: 'transmission-1', campaignCapacityFixture: true,
+  });
+  assert.equal(prepared.reservation.row_version, 1);
+  assert.equal(renewed.reservation.reserved_at, '2026-10-08T16:06:00.000Z');
+  assert.deepEqual({ capacityDeferred: campaignBlocked.capacityDeferred,
+    blockedReason: campaignBlocked.blockedReason },
+  { capacityDeferred: true, blockedReason: 'campaign_capacity' });
+  assert.deepEqual(calls.map(({ name }) => name), [
+    'pursue_cim_prepare_reserved_followup_v1',
+    'pursue_cim_renew_reserved_followup_v1',
+    'pursue_cim_renew_reserved_followup_v1',
+  ]);
+});
+
 test('P1C Supabase adapter rejects contradictory transition authority', async () => {
   const cases = [
     ['transitionPursuitEnrollment', ['applied', 'staleRevision', 'conflict']],
@@ -436,6 +533,9 @@ test('P1C Supabase adapter rejects contradictory transition authority', async ()
     ['recordOwnerDecision', ['applied', 'replay', 'conflict']],
     ['materializePursuitCampaign', ['applied', 'existing', 'actionRequired']],
     ['prepareCimTransmission', ['prepared', 'existing', 'payloadConflict', 'terminal']],
+    ['prepareReservedCimFollowUp', ['prepared', 'existing', 'capacityDeferred',
+      'payloadConflict', 'terminal']],
+    ['renewReservedCimFollowUp', ['renewed', 'existing', 'capacityDeferred', 'terminal']],
     ['issueCimLiveProviderAuthorization', ['issued', 'replay', 'conflict']],
     ['enterCimProviderSeam', ['entered', 'alreadyEntered', 'unauthorized']],
     ['finalizeCimTransmission', ['applied', 'existing', 'conflict']],
@@ -467,6 +567,12 @@ test('P1C Supabase adapter rejects missing success rows and unexpected authority
       staleAuthority: false, terminal: false, conflict: false, touch: null }],
     ['prepareCimTransmission', { prepared: true, existing: false,
       payloadConflict: false, terminal: false, transmission: null }],
+    ['prepareReservedCimFollowUp', { prepared: true, existing: false,
+      capacityDeferred: false, payloadConflict: false, terminal: false,
+      blockedReason: null, transmission: null, reservation: null }],
+    ['renewReservedCimFollowUp', { renewed: true, existing: false,
+      capacityDeferred: false, terminal: false, blockedReason: null,
+      transmission: null, reservation: null }],
     ['issueCimLiveProviderAuthorization', { issued: true, replay: false,
       conflict: false, blockedReason: null, authorization: null }],
     ['finalizeCimTransmission', { applied: true, existing: false,
@@ -670,6 +776,11 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p9MigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p10bAuthorityMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dV2MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(passedArchiveMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(manualFollowUpMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactGuardMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactIdempotencyMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(fl04cCapacityMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -697,8 +808,11 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
         'serviceWrite', (select bool_and(
             has_table_privilege('service_role', format('public.%I', name), 'INSERT')
             and has_table_privilege('service_role', format('public.%I', name), 'UPDATE')
-            and has_table_privilege('service_role', format('public.%I', name), 'DELETE')
+            and (name = 'deal_hunter_cim_capacity_reservations'
+              or has_table_privilege('service_role', format('public.%I', name), 'DELETE'))
           ) from unnest(array[${expectedTables.map((name) => `'${name}'`).join(',')}]) as name),
+        'capacityDelete', has_table_privilege('service_role',
+          'public.deal_hunter_cim_capacity_reservations', 'DELETE'),
         'serviceTruncate', (select bool_or(
             has_table_privilege('service_role', format('public.%I', name), 'TRUNCATE')
           ) from unnest(array[${expectedTables.map((name) => `'${name}'`).join(',')}]) as name),
@@ -718,6 +832,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
     assert.equal(catalog.authenticated, false);
     assert.equal(catalog.service, true);
     assert.equal(catalog.serviceWrite, true);
+    assert.equal(catalog.capacityDelete, false);
     assert.equal(catalog.serviceTruncate, false);
     assert.equal(catalog.idsNotNull, true);
     assert.equal(catalog.activeIndex, true);
@@ -958,6 +1073,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p9MigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p10bAuthorityMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dV2MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(passedArchiveMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(manualFollowUpMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactGuardMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactIdempotencyMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(fl04cCapacityMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -1251,6 +1371,9 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       { public: false, anon: false, authenticated: false,
         service: !['pursue_cim_apply_accepted_cadence_v1',
           'pursue_cim_cancel_prepared_transmission_v1',
+          'pursue_cim_capacity_guard_v1',
+          'pursue_cim_capacity_retain_v1',
+          'pursue_cim_capacity_transmission_v1',
           'pursue_cim_emit_admitted_import_safety_v1',
           'pursue_cim_authorize_provider_pending_p5_v1',
           'pursue_cim_expected_initial_expiry_v1',
@@ -2867,6 +2990,132 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);`));
     let chain = committedCadenceRpc('pursue_cim_finalize_with_cadence_v1',
       acceptedFinalizationCommand);
+    const followUpActivation = {
+      id: 'activation-followup-capacity-test', capability: 'fl04c-followup', mode: 'active',
+      prerequisiteActivationId: 'activation-initial', prerequisiteEvidenceId: 'fl04c-test-evidence',
+      prerequisiteEvidenceHash: 'c'.repeat(64), policyHash: 'a'.repeat(64),
+      configHash: 'b'.repeat(64), actor: 'fixture', reason: 'disposable capacity parity',
+      confirmation: 'fixture-confirmation', providerProfile: 'synthetic-provider',
+      dailyCap: 10, recipientCap: 10,
+    };
+    const followUpClaim = {
+      touchId: chain.nextTouch.id, expectedRowVersion: chain.nextTouch.row_version,
+      expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+      claimTokenDigest: 'b'.repeat(64), claimOwner: 'fl04c-capacity-test',
+    };
+    const followUpPrepare = {
+      ...reference.prepareCommands[0], touchIds: [chain.nextTouch.id],
+      activationId: followUpActivation.id, claimTokenDigest: followUpClaim.claimTokenDigest,
+      claimOwner: followUpClaim.claimOwner, recipientFingerprint: parityRecipientFingerprint,
+    };
+    const blockerInsert = (id) => `insert into public.deal_hunter_cim_capacity_reservations
+      (id,activation_id,transmission_id,touch_id,campaign_id,conversation_id,
+       recipient_fingerprint,recipient_address_digest,capacity_date,claim_token_digest,
+       state,reserved_at,expires_at,recipient_window_expires_at)
+      select '${id}','${followUpActivation.id}',m.transmission_id,m.touch_id,t.campaign_id,
+        c.conversation_id,c.recipient_fingerprint,
+        pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+          pg_catalog.lower(pg_catalog.btrim(v.recipient_address)),'UTF8')),'hex'),
+        (pg_catalog.clock_timestamp() at time zone 'America/Los_Angeles')::date,
+        repeat('a',64),'reserved',pg_catalog.clock_timestamp()-interval '1 second',
+        pg_catalog.clock_timestamp()+interval '4 minutes',
+        pg_catalog.clock_timestamp()+interval '24 hours'
+      from public.deal_hunter_cim_transmission_touches m
+      join public.deal_hunter_cim_campaign_touches t on t.id=m.touch_id
+      join public.deal_hunter_cim_campaigns c on c.id=t.campaign_id
+      join public.deal_hunter_broker_conversations v on v.id=c.conversation_id
+      where m.transmission_id='${acceptedFinalizationCommand.transmissionId}' limit 1;`;
+    const prepareCampaignCapacity = psql(container, chainDatabase, `begin;
+      set role service_role;
+      select public.pursue_cim_record_capability_activation_v1(
+        '${JSON.stringify(followUpActivation)}'::jsonb
+          ||pg_catalog.jsonb_build_object('now',pg_catalog.to_char(
+            pg_catalog.clock_timestamp() at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+      select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify(followUpClaim)}'::jsonb||pg_catalog.jsonb_build_object(
+          'now',pg_catalog.to_char(pg_catalog.clock_timestamp() at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'claimExpiresAt',pg_catalog.to_char(
+            (pg_catalog.clock_timestamp()+interval '4 minutes') at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+      reset role;
+      ${blockerInsert('capacity-blocker-prepare')}
+      set role service_role;
+      select public.pursue_cim_prepare_reserved_followup_v1(
+        '${JSON.stringify(followUpPrepare).replaceAll("'", "''")}'::jsonb);
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse).at(-1);
+    assert.deepEqual({ capacityDeferred: prepareCampaignCapacity.capacityDeferred,
+      blockedReason: prepareCampaignCapacity.blockedReason },
+    { capacityDeferred: true, blockedReason: 'campaign_capacity' },
+    `${chainDatabase}: prepare must normalize the active-campaign capacity fence`);
+    const renewCommand = {
+      touchId: chain.nextTouch.id, activationId: followUpActivation.id,
+      recipientFingerprint: parityRecipientFingerprint, claimTokenDigest: 'd'.repeat(64),
+      claimOwner: 'fl04c-capacity-renew-test', actor: 'fixture',
+    };
+    const renewCapacityOutput = psql(container, chainDatabase, `begin;
+      set role service_role;
+      select public.pursue_cim_record_capability_activation_v1(
+        '${JSON.stringify(followUpActivation)}'::jsonb
+          ||pg_catalog.jsonb_build_object('now',pg_catalog.to_char(
+            pg_catalog.clock_timestamp() at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+      select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify(followUpClaim)}'::jsonb||pg_catalog.jsonb_build_object(
+          'now',pg_catalog.to_char(pg_catalog.clock_timestamp() at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'claimExpiresAt',pg_catalog.to_char(
+            (pg_catalog.clock_timestamp()+interval '4 minutes') at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+      select public.pursue_cim_prepare_reserved_followup_v1(
+        '${JSON.stringify(followUpPrepare).replaceAll("'", "''")}'::jsonb);
+      reset role;
+      update public.deal_hunter_cim_capacity_reservations set state='expired',
+        expired_at=pg_catalog.clock_timestamp(),row_version=row_version+1
+        where touch_id='${chain.nextTouch.id}' and state='reserved';
+      update public.deal_hunter_cim_campaign_touches
+        set claim_expires_at=pg_catalog.clock_timestamp()-interval '1 second',
+          row_version=row_version+1 where id='${chain.nextTouch.id}';
+      ${blockerInsert('capacity-blocker-renew')}
+      select pg_catalog.jsonb_build_object(
+        'transmissionState',tr.state,'invocations',tr.invocation_authority_count,
+        'touchState',t.state,'touchTransmission',t.transmission_id,
+        'touchClaimExpired',t.claim_expires_at<=pg_catalog.clock_timestamp(),
+        'touchOpportunityMatches',t.opportunity_id=c.opportunity_id,
+        'campaignState',c.state,'campaignUnexpired',c.local_expiry_at>pg_catalog.clock_timestamp(),
+        'conversationState',v.state,'fingerprintMatches',
+          c.recipient_fingerprint='${parityRecipientFingerprint}'
+            and v.recipient_fingerprint='${parityRecipientFingerprint}',
+        'priorState',r.state,'priorActivation',r.activation_id,
+        'priorTouch',r.touch_id,'priorCampaign',r.campaign_id,'priorConversation',r.conversation_id,
+        'currentActivation',public.pursue_cim_current_activation_v1(
+          'fl04c-followup',pg_catalog.clock_timestamp()))
+      from public.deal_hunter_cim_campaign_touches t
+      join public.deal_hunter_cim_campaigns c on c.id=t.campaign_id
+      join public.deal_hunter_broker_conversations v on v.id=c.conversation_id
+      join public.deal_hunter_cim_transmissions tr on tr.id=t.transmission_id
+      left join lateral (select * from public.deal_hunter_cim_capacity_reservations
+        where transmission_id=tr.id order by reserved_at desc,id desc limit 1) r on true
+      where t.id='${chain.nextTouch.id}';
+      select pg_catalog.set_config('fl04c.transmission_id',transmission_id,true),
+        pg_catalog.set_config('fl04c.touch_row_version',row_version::text,true)
+        from public.deal_hunter_cim_campaign_touches where id='${chain.nextTouch.id}';
+      set role service_role;
+      select public.pursue_cim_renew_reserved_followup_v1(
+        '${JSON.stringify(renewCommand)}'::jsonb||pg_catalog.jsonb_build_object(
+          'transmissionId',pg_catalog.current_setting('fl04c.transmission_id'),
+          'expectedRowVersion',pg_catalog.current_setting('fl04c.touch_row_version')::bigint,
+          'claimExpiresAt',pg_catalog.to_char(
+            (pg_catalog.clock_timestamp()+interval '4 minutes') at time zone 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    const renewPreconditions = renewCapacityOutput.at(-2);
+    const renewCampaignCapacity = renewCapacityOutput.at(-1);
+    assert.deepEqual({ capacityDeferred: renewCampaignCapacity.capacityDeferred,
+      blockedReason: renewCampaignCapacity.blockedReason },
+    { capacityDeferred: true, blockedReason: 'campaign_capacity' },
+    `${chainDatabase}: renewal must normalize the active-campaign capacity fence: ${JSON.stringify(renewPreconditions)}`);
     const chainKinds = ['follow-up-1', 'follow-up-2', 'follow-up-3',
       'weekday-follow-up'];
     const chainObservedAt = [chain.nextTouch.due_at, '2026-10-01T12:00:07.000Z',

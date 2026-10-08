@@ -260,8 +260,12 @@ function waitForWorkerMessage(worker, predicate, timeoutMs = 10_000) {
 async function runOverlappingSqlitePair({ sqlitePath, operation, input }) {
   const argumentsList = [sqlitePath, operation, JSON.stringify(input)];
   const workers = [
-    fork(sqliteWorkerUrl, argumentsList, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }),
-    fork(sqliteWorkerUrl, argumentsList, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }),
+    fork(sqliteWorkerUrl, argumentsList, {
+      execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    }),
+    fork(sqliteWorkerUrl, argumentsList, {
+      execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    }),
   ];
   const trace = [];
   const errors = [];
@@ -293,6 +297,11 @@ async function runOverlappingSqlitePair({ sqlitePath, operation, input }) {
       assert.equal(message.phase, 'result', message.error || errors.join('\n'));
     }
     return { results: messages.map(({ result }) => result), trace };
+  } catch (error) {
+    const workerErrors = errors.join('\n').trim();
+    throw new Error(workerErrors ? `${error.message}\n${workerErrors}` : error.message, {
+      cause: error,
+    });
   } finally {
     if (blocker?.inTransaction) blocker.exec('ROLLBACK');
     blocker?.close();
