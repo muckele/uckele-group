@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 
 export const P10B_GUEST_PROCESSES = [
@@ -53,11 +54,22 @@ export function p10bGuestPaths(window, databasePath = window.databasePath) {
     .map((name) => [name, `${prefix}-${name}.json`]));
 }
 
-export function writeP10bGuestRecord(file, value) {
+export function writeP10bGuestRecord(file, value, fileSystem = fs) {
   const bytes = JSON.stringify(value);
   if (Buffer.byteLength(bytes) > 65536) throw new Error('Guest evidence exceeds bound');
-  const fd = fs.openSync(file, 'wx', 0o600);
-  try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  const pending = `${file}.pending-${randomUUID()}`;
+  const fd = fileSystem.openSync(pending, 'wx', 0o600);
+  try {
+    try { fileSystem.writeFileSync(fd, bytes); fileSystem.fsyncSync(fd); }
+    finally { fileSystem.closeSync(fd); }
+    // Exclusive link publishes complete, synced bytes atomically. Readers
+    // cannot observe an empty/partial record; existing evidence is retained.
+    fileSystem.linkSync(pending, file);
+  } finally {
+    // Publication is the commit point. A private temporary-file removal
+    // failure cannot turn its immutable published facts into a stale receipt.
+    try { fileSystem.unlinkSync(pending); } catch { /* Retain private bytes if removal fails. */ }
+  }
 }
 
 export function readP10bGuestRecord(file) {

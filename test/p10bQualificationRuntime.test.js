@@ -230,9 +230,13 @@ test('host failures retain evidence, stop once and never release qualification',
   for (const variant of ['start-failure', 'malformed-provider', 'malformed-frame',
     'tampered-candidate', 'sqlite-close-failure', 'sqlite-acquire-failure', 'stop-failure', 'stop-timeout', 'uncertain-process']) await t.test(variant, async (t) => {
     const h = await hostFixture(t, variant);
+    const began = Date.now();
     const result = await h.run();
     assert.equal(result.success, false); assert.equal(result.lifecycleVerified, false);
     assert.equal(result.artifact, undefined); assert.equal(h.stops, variant === 'start-failure' ? 0 : 1);
+    if (variant === 'stop-timeout' || variant === 'stop-failure') {
+      assert.ok(Date.now() - began < 5000, 'Verified guest handoff must not renew the stopped-readback budget');
+    }
     assert.equal(JSON.stringify(result).includes('offline-sending-secret'), false);
     assert.ok(fs.existsSync(`${h.evidencePath}.result.json`));
     if (variant === 'sqlite-close-failure' || variant === 'sqlite-acquire-failure') {

@@ -93,14 +93,20 @@ function validateMachine(machine, packet, state) {
       .some((key) => Boolean(env[key]))) throw new Error('Machine state or isolated configuration changed');
 }
 
-function validateGuestClosure(outcome, packet) {
+function validateGuestHandoff(outcome, packet) {
   const { guestShutdown, ...retained } = outcome || {};
   if (guestShutdown?.version !== 'p10b-guest-shutdown-receipt-v1'
     || guestShutdown.windowDigest !== digest(p10bGuestWindow(packet))
-    || guestShutdown.stopAt !== packet.guest.stopAt || guestShutdown.cleanupUncertain !== false
+    || guestShutdown.stopAt !== packet.guest.stopAt || guestShutdown.handoffVerified !== true
+    || guestShutdown.outcomeDigest !== digest(retained)) throw new Error('Guest handoff is unverified');
+  return guestShutdown;
+}
+
+function validateGuestClosure(outcome, packet) {
+  const guestShutdown = validateGuestHandoff(outcome, packet);
+  if (guestShutdown.cleanupUncertain !== false
     || guestShutdown.authorityClosed !== true || guestShutdown.ingressClosed !== true
-    || guestShutdown.workerSqliteClosed !== true || guestShutdown.handoffVerified !== true || guestShutdown.failure !== false
-    || guestShutdown.outcomeDigest !== digest(retained)) throw new Error('Guest cleanup is unverified');
+    || guestShutdown.workerSqliteClosed !== true || guestShutdown.failure !== false) throw new Error('Guest cleanup is unverified');
 }
 
 function finalArtifact(candidate, packet, stop, now) {
@@ -159,6 +165,7 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
   let stopPromise;
   let candidate;
   let prepared;
+  let guestHandoffVerified = false;
   let failure;
   let stage = 'preflight';
   let startIssued = false;
@@ -206,7 +213,8 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
       // owner. An early host failure still waits through its frozen cutoff.
       operations.abort();
       // Execution expiry closes permission, never the responsibility to stop.
-      const stopDeadline = startIssued ? Math.max(Date.now() + stopTimeoutMs, deadline) : Date.now() + stopTimeoutMs;
+      const stopDeadline = startIssued && !guestHandoffVerified
+        ? Math.max(Date.now() + stopTimeoutMs, deadline) : Date.now() + stopTimeoutMs;
       const stopping = new AbortController();
       const timer = setTimeout(() => stopping.abort(), Math.max(1, stopDeadline - Date.now()));
       let verified = false;
@@ -328,9 +336,11 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
         worker.channel.send({ version: 'p10b-control-v1', kind: 'observation', id: frame.id, observed });
       } else if (frame.kind === 'terminal' && packet.operation === 'qualify' && !candidate) {
         candidate = frame.candidate;
+        validateGuestHandoff(candidate, packet); guestHandoffVerified = true;
       } else if (frame.kind === 'prepared' && packet.operation === 'prepare' && !prepared) {
         prepared = frame.receipt;
         validateGuestClosure(prepared, packet);
+        guestHandoffVerified = true;
         if (prepared?.version !== 'p10b-runtime-preparation-v1' || prepared.sourceHead !== packet.sourceHead
           || prepared.app !== target.app || prepared.machineId !== target.machineId
           || !hash.test(prepared.databaseIdentityHash || '') || prepared.providerCalls !== 0
@@ -350,7 +360,10 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
         cancel();
         try {
           const frame = await bounded(() => worker.channel.next(), Math.min(closureGraceMs, deadline - Date.now() - stopTimeoutMs));
-          if (frame?.kind === 'terminal') candidate = frame.candidate;
+          if (frame?.kind === 'terminal') {
+            candidate = frame.candidate;
+            validateGuestHandoff(candidate, packet); guestHandoffVerified = true;
+          }
         } catch { /* Closure unavailable: stop, retain and fail closed. */ }
       }
       stop = await stopOnce();

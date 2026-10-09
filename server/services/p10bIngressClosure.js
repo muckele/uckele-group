@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { assertQualificationHardOff } from './p10bQualificationContract.js';
 import { P10B_MACHINE_ID, p10bDatabaseIdentity, p10bPublicConfigurationDigest } from './p10bRuntime.js';
-import { parseP10bGuestWindow } from './p10bGuestShutdown.js';
+import { parseP10bGuestWindow, writeP10bGuestRecord } from './p10bGuestShutdown.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 
 function binding(config, runtime) {
@@ -24,7 +24,7 @@ export function installP10bIngressClosure({ config, runtime, server, closeStorag
   databasePath = config.storage.sqlitePath, processControl = process } = {}) {
   const expected = binding(config, runtime);
   const prefix = `${databasePath}.p10b-${expected.phase}-server`;
-  fs.writeFileSync(`${prefix}.json`, JSON.stringify({ ...expected, pid: processControl.pid }), { flag: 'wx', mode: 0o600 });
+  writeP10bGuestRecord(`${prefix}.json`, { ...expected, pid: processControl.pid });
   const hold = setInterval(() => {}, 0x7fffffff);
   let closure;
   const close = () => {
@@ -46,7 +46,7 @@ export function installP10bIngressClosure({ config, runtime, server, closeStorag
       try { receipt = { ...expected, closed, databaseIdentityHash: p10bDatabaseIdentity(databasePath),
         runtimeConfigurationDigest: p10bPublicConfigurationDigest(config) }; }
       catch { receipt = { ...expected, closed: false }; }
-      fs.writeFileSync(`${prefix}-closed.json`, JSON.stringify(receipt), { flag: 'wx', mode: 0o600 });
+      writeP10bGuestRecord(`${prefix}-closed.json`, receipt);
       return receipt;
     })();
     return closure;

@@ -221,3 +221,40 @@ test('guest refuses changed retained SQLite identity before opening or closing a
   try { assert.equal(db.prepare('SELECT status FROM deal_hunter_cim_capability_activations WHERE id=?')
     .get(f.prepared.initialActivationId).status, 'current'); } finally { db.close(); }
 });
+
+test('concurrent readers never see a partially written receipt and exclusive publication preserves evidence', async () => {
+  const databasePath = temporary(); const file = `${databasePath}.receipt.json`; const value = { complete: true, text: 'x'.repeat(2000) };
+  const script = `${databasePath}.reader.mjs`;
+  fs.writeFileSync(script, `import fs from 'node:fs';process.stdout.write('ready\\n');
+    const file=process.argv[2];const deadline=Date.now()+2000;
+    const poll=setInterval(()=>{if(fs.existsSync(file)){
+      try{process.stdout.write(JSON.stringify({value:JSON.parse(fs.readFileSync(file,'utf8'))})+'\\n');}
+      catch{process.stdout.write(JSON.stringify({partial:true})+'\\n');}
+      clearInterval(poll);
+    }else if(Date.now()>deadline){clearInterval(poll);process.exitCode=1;}},1);`);
+  const reader = spawn(process.execPath, [script, file], { stdio: ['ignore', 'pipe', 'ignore'], env: { PATH: process.env.PATH } });
+  try {
+    await once(reader.stdout, 'data'); const result = once(reader.stdout, 'data');
+    writeP10bGuestRecord(file, value, { ...fs, openSync: (...args) => {
+      const fd = fs.openSync(...args);
+      if (args[1] === 'wx') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      return fd;
+    } });
+    const [chunk] = await result; assert.deepEqual(JSON.parse(String(chunk)).value, value);
+    const original = fs.readFileSync(file, 'utf8');
+    assert.throws(() => writeP10bGuestRecord(file, { changed: true }), { code: 'EEXIST' });
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+    assert.equal(fs.readdirSync(path.dirname(file)).some((name) => name.includes('.pending-')), false);
+  } finally { reader.kill('SIGKILL'); }
+});
+
+test('sync failure cannot publish success and private cleanup failure cannot alter a committed receipt', () => {
+  const databasePath = temporary(); const failed = `${databasePath}.sync-failed.json`;
+  assert.throws(() => writeP10bGuestRecord(failed, { cleanupUncertain: false }, { ...fs,
+    fsyncSync: () => { throw new Error('offline fsync failure'); } }), /fsync failure/);
+  assert.equal(fs.existsSync(failed), false);
+  const committed = `${databasePath}.committed.json`; const value = { cleanupUncertain: false, complete: true };
+  writeP10bGuestRecord(committed, value, { ...fs, unlinkSync: () => { throw new Error('offline private removal failure'); } });
+  assert.deepEqual(readP10bGuestRecord(committed), value);
+  assert.equal(fs.readdirSync(path.dirname(committed)).filter((name) => name.includes('.pending-')).length, 1);
+});
