@@ -6,6 +6,9 @@ import { prepareP10bControlledMailbox, executeP10bFirstMailboxQualification } fr
 import { assertQualificationHardOff, qualificationDigest } from './p10bQualificationContract.js';
 import { isP10bQualificationRuntime, p10bDatabaseIdentity, p10bPublicConfigurationDigest, P10B_MACHINE_ID } from './p10bRuntime.js';
 import { requestP10bIngressClosure } from './p10bIngressClosure.js';
+import { assertP10bGuestReady, completeP10bGuestHandoff, parseP10bGuestWindow, p10bGuestWindow,
+  requestP10bGuestShutdown, writeP10bGuestRecord } from './p10bGuestShutdown.js';
+import { sha256, stableCanonicalJson } from '../utils/security.js';
 
 function metadata(databasePath) {
   const database = new Database(databasePath, { readonly: true, fileMustExist: true });
@@ -28,6 +31,8 @@ function assertRuntime(config, packet, runtime) {
     || runtime.sourceHead !== packet.sourceHead) {
     throw new Error('Worker runtime binding failed');
   }
+  if (stableCanonicalJson(parseP10bGuestWindow(config.dealHunter.cimProvider.qualificationGuestWindow, runtime))
+    !== stableCanonicalJson(p10bGuestWindow(packet))) throw new Error('Guest cutoff binding changed');
 }
 
 // Dependency injection is for offline boundary tests; the shipped CLI uses
@@ -38,15 +43,20 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
   validateRuntime = assertRuntime, createStorage = createSqliteStorage,
   prepare = prepareP10bControlledMailbox, execute = executeP10bFirstMailboxQualification,
   clock = () => new Date(), resolveDatabasePath = (value) => value,
-  closeIngress = requestP10bIngressClosure } = {}) {
+  closeIngress = requestP10bIngressClosure, guestReady = assertP10bGuestReady,
+  requestShutdown = requestP10bGuestShutdown, completeHandoff = completeP10bGuestHandoff,
+  processControl = process } = {}) {
   const controller = new AbortController();
   const pending = new Map();
-  let storage;
+  let storage; let sqliteClosed = true;
   let sequence = 0;
   let stopped = false;
   const first = await channel.next();
   if (first?.kind !== 'run') throw new Error('A single explicit runtime packet is required');
   const packet = first.packet;
+  let window; let databasePath; let handoff = false;
+  const cancel = () => controller.abort();
+  processControl.on('SIGUSR1', cancel);
   const send = (kind, values = {}) => channel.send({ version: 'p10b-control-v1', kind, ...values });
   const pump = (async () => {
     while (true) {
@@ -65,17 +75,26 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
     pending.clear();
   });
   const stopAndVerify = async () => {
-    if (!stopped) { stopped = true; send('stop'); }
-    // Actual Machine stop kills this process. Only the host can verify that
-    // stop and release the final artifact; this worker never fabricates it.
+    if (!stopped) {
+      stopped = true;
+      try { send('stop'); await channel.flush?.(); } catch { /* Retained guest candidate still precedes exit. */ }
+      if (window) completeHandoff(window, databasePath);
+    }
+    // The guest guard exits to stop this Machine; only an external readback
+    // can verify the stopped state and release the final artifact.
     return new Promise(() => {});
   };
   try {
-    if (packet?.version !== 'p10b-runtime-packet-v1' || !['prepare', 'qualify'].includes(packet.operation)) {
+    if (packet?.version !== 'p10b-runtime-packet-v2' || !['prepare', 'qualify'].includes(packet.operation)) {
       throw new Error('Invalid runtime packet');
     }
     validateRuntime(config, packet, runtime);
-    const databasePath = resolveDatabasePath(packet.databasePath);
+    window = p10bGuestWindow(packet);
+    databasePath = resolveDatabasePath(packet.databasePath);
+    await guestReady({ window, databasePath, clock: () => Date.parse(new Date(clock()).toISOString()) });
+    writeP10bGuestRecord(`${databasePath}.p10b-${window.phase}-worker-process.json`, {
+      windowDigest: sha256(stableCanonicalJson(window)), pid: processControl.pid });
+    sqliteClosed = false;
     storage = createStorage(config);
     const initial = metadata(databasePath);
     if (packet.operation === 'prepare') {
@@ -96,10 +115,12 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
         runtimeConfigurationDigest: p10bPublicConfigurationDigest(config),
         opportunityId: prepared.opportunityId, initialActivationId: prepared.initialActivationId,
         preparedAt: prepared.preparedAt, review: prepared.review, providerCalls: 0, productionReady: false };
-      storage.close(); storage = null;
+      storage.close(); sqliteClosed = true; storage = null;
       await closeIngress({ config, runtime, databasePath });
-      receipt.ingressClosed = true;
+      receipt.ingressClosed = true; receipt.sqliteClosed = true;
       fs.writeFileSync(`${databasePath}.p10b-preparation.json`, JSON.stringify(receipt), { flag: 'wx', mode: 0o600 });
+      receipt.guestShutdown = await requestShutdown({ window, databasePath, outcome: receipt });
+      handoff = true;
       send('prepared', { receipt });
       await stopAndVerify();
       return;
@@ -136,20 +157,29 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
       initialActivationId: packet.initialActivationId, manifest, reviewedDigest: packet.reviewedDigest,
       supervisorTarget: packet.target, clock, observe, stopAndVerify, signal: controller.signal,
       lifecyclePollMs: 1000, onBeforeStop: async (candidate) => {
-        storage.close(); storage = null;
+        storage.close(); sqliteClosed = true; storage = null;
         await closeIngress({ config, runtime, databasePath });
-        candidate.ingressClosed = true;
+        candidate.ingressClosed = true; candidate.sqliteClosed = true;
+        candidate.guestShutdown = await requestShutdown({ window, databasePath, outcome: candidate,
+          failure: Boolean(candidate.failureStage || candidate.cleanup?.errors?.length) });
+        handoff = true;
         send('terminal', { candidate });
       } });
   } catch {
     // The stop callback intentionally never returns on a real Machine. Close
     // this connection before invoking it, including failures before execution.
-    try { storage?.close(); } catch { /* Host fails closed and still owns stop. */ }
+    try { if (storage) { storage.close(); sqliteClosed = true; } }
+    catch { /* Failed acquisition or close retains cleanup uncertainty. */ }
     storage = null;
     try { await closeIngress({ config, runtime, databasePath: resolveDatabasePath(packet.databasePath) }); }
-    catch { /* Host stops without releasing success. */ }
+    catch { /* Guest cutoff still closes without releasing success. */ }
+    if (window && !handoff) {
+      try { await requestShutdown({ window, databasePath, failure: true,
+        outcome: { sqliteClosed, failureStage: 'worker-failed', productionReady: false } }); }
+      catch { /* Fixed guest cutoff owns termination even without acknowledgment. */ }
+    }
     // Never serialize exception messages or environment values over SSH.
-    try { send('worker-failed'); } catch { /* Host watchdog retains ownership. */ }
+    try { send('worker-failed'); } catch { /* Guest watchdog retains ownership. */ }
     await stopAndVerify();
-  } finally { storage?.close(); }
+  } finally { storage?.close(); processControl.removeListener('SIGUSR1', cancel); }
 }

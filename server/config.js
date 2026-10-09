@@ -76,6 +76,7 @@ export function resolveCimProviderProfile(environment = process.env) {
       provider: 'resend',
       qualificationRuntime: environment.P10B_QUALIFICATION_RUNTIME === 'true',
       qualificationPhase: environment.P10B_QUALIFICATION_PHASE || '',
+      qualificationGuestWindow: environment.P10B_GUEST_WINDOW || '',
       resendApiKey: environment.DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY || '',
       resendFromEmail: environment.DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL || '',
       resendReplyTo: environment.DEAL_HUNTER_CIM_MAILBOX_REPLY_TO || '',

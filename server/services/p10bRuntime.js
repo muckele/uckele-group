@@ -3,6 +3,7 @@ import { captureQualificationSignatureReceipt } from './p10bQualificationLifecyc
 import { stableCanonicalJson } from '../utils/security.js';
 import fs from 'node:fs';
 import { sha256 } from '../utils/security.js';
+import { parseP10bGuestWindow } from './p10bGuestShutdown.js';
 
 export const P10B_MACHINE_ID = '0803730bd1d7e8';
 
@@ -21,6 +22,8 @@ export function initializeP10bRuntimeFilesystem(config, { environment = process.
   assertQualificationHardOff(config);
   const databasePath = config.storage.sqlitePath;
   const phase = config.dealHunter.cimProvider.qualificationPhase;
+  const guestWindowDigest = config.dealHunter.cimProvider.qualificationGuestWindow
+    ? sha256(stableCanonicalJson(parseP10bGuestWindow(config.dealHunter.cimProvider.qualificationGuestWindow))) : null;
   if (config.storage.provider !== 'sqlite' || !['prepare', 'qualify'].includes(phase) || environment.FLY_APP_NAME !== 'uckele-group-p10b'
     || environment.FLY_MACHINE_ID !== P10B_MACHINE_ID || !/^[0-9a-f]{40}$/.test(sourceHead)
     || !/^\/data\/p10b-first-mailbox-[a-z0-9-]{1,80}\.sqlite$/.test(databasePath)) {
@@ -35,7 +38,7 @@ export function initializeP10bRuntimeFilesystem(config, { environment = process.
     }
     fileSystem.writeFileSync(markerPath, JSON.stringify({ version: 'p10b-fresh-start-v1', sourceHead,
       app: environment.FLY_APP_NAME, machineId: environment.FLY_MACHINE_ID,
-      startedAt: new Date(clock()).toISOString() }), { flag: 'wx', mode: 0o600 });
+      guestWindowDigest, startedAt: new Date(clock()).toISOString() }), { flag: 'wx', mode: 0o600 });
   } else {
     const preparation = JSON.parse(fileSystem.readFileSync(`${databasePath}.p10b-preparation.json`, 'utf8'));
     if (preparation.sourceHead !== sourceHead || preparation.app !== environment.FLY_APP_NAME
@@ -45,6 +48,7 @@ export function initializeP10bRuntimeFilesystem(config, { environment = process.
     }
     fileSystem.writeFileSync(`${databasePath}.p10b-qualify-start.json`, JSON.stringify({
       version: 'p10b-one-start-v1', sourceHead, databaseIdentityHash: preparation.databaseIdentityHash,
+      guestWindowDigest,
       startedAt: new Date(clock()).toISOString() }), { flag: 'wx', mode: 0o600 });
   }
 }
@@ -70,6 +74,7 @@ export function p10bPublicConfigurationDigest(config) {
   return sha256(stableCanonicalJson({ version: 'p10b-public-runtime-configuration-v1',
     isProduction: config.isProduction, qualificationRuntime: p.qualificationRuntime,
     qualificationPhase: p.qualificationPhase, providerProfile: p.profile,
+    guestWindowDigest: p.qualificationGuestWindow ? sha256(stableCanonicalJson(parseP10bGuestWindow(p.qualificationGuestWindow))) : null,
     from: p.resendFromEmail, replyBase: p.resendReplyTo, domain: p.resendInboundDomain,
     allowedRecipients: p.allowedRecipients, databasePath: config.storage.sqlitePath,
     sendingCredentialPresent: Boolean(p.resendApiKey), readCredentialPresent: Boolean(p.reconciliationApiKey),

@@ -16,6 +16,7 @@ import { runP10bQualificationHost, validateP10bRuntimePacket } from '../server/s
 import { initializeP10bRuntimeFilesystem, p10bDatabaseIdentity, p10bPublicConfigurationDigest,
   runServerStartupMaintenance, startServerSchedulers } from '../server/services/p10bRuntime.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
+import { P10B_GUEST_PROCESSES, p10bGuestWindow } from '../server/services/p10bGuestShutdown.js';
 
 const digest = (value) => sha256(stableCanonicalJson(value));
 const sourceHead = '1'.repeat(40);
@@ -40,7 +41,9 @@ async function hostFixture(t, variant = '') {
     runtimeConfigurationDigests: { qualify: p10bPublicConfigurationDigest(f.options.config) } };
   f.manifest.configurationEvidenceDigest = digest(configurationEvidence);
   f.options.reviewedDigest = qualificationDigest(f.manifest);
-  const packet = { version: 'p10b-runtime-packet-v1', operation: 'qualify',
+  const packet = { version: 'p10b-runtime-packet-v2', operation: 'qualify',
+    guest: { issuedAt: f.manifest.issuedAt, stopAt: new Date(Date.parse(f.manifest.issuedAt) + 10000).toISOString(),
+      closureGraceMs: 200, stopReserveMs: 200 },
     target: { app: f.manifest.runtime.app, machineId: f.manifest.runtime.machineId, imageDigest: f.manifest.runtime.imageDigest },
     sourceHead, databasePath: '/data/p10b-first-mailbox-offline.sqlite', actor: 'offline-owner',
     ownerPermissionDigest: f.manifest.ownerPermissionDigest, configurationEvidence,
@@ -64,13 +67,16 @@ async function hostFixture(t, variant = '') {
     DEAL_HUNTER_DAILY_EMAIL_ENABLED: 'false', FOLLOW_UP_EMAIL_ENABLED: 'false', FOLLOW_UP_AI_ENABLED: 'false',
     DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL: f.manifest.from, DEAL_HUNTER_CIM_MAILBOX_REPLY_TO: 'replies@p10b-e2e.uckelegroup.com',
     DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN: f.manifest.domain, DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS: f.manifest.recipient };
+  f.options.config.dealHunter.cimProvider.qualificationGuestWindow = stableCanonicalJson(p10bGuestWindow(packet));
+  env.P10B_GUEST_WINDOW = f.options.config.dealHunter.cimProvider.qualificationGuestWindow;
   const machine = { id: packet.target.machineId, state: 'stopped', region: 'ewr', image_ref: { digest: packet.target.imageDigest },
-    config: { env, guest: { cpu_kind: 'shared', cpus: 1, memory_mb: 512 }, restart: { policy: 'no' },
+    config: { env, processes: P10B_GUEST_PROCESSES, guest: { cpu_kind: 'shared', cpus: 1, memory_mb: 512 }, restart: { policy: 'no' },
       mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }], services: [{ autostart: false, internal_port: 8787 }] } };
   let starts = 0;
   let stops = 0;
   let reads = 0;
   let child;
+  let guardian;
   let exit;
   const ledger = path.join(f.directory, 'offline-posts.jsonl');
   const data = path.join(f.directory, 'offline-worker-data.json');
@@ -86,12 +92,22 @@ async function hostFixture(t, variant = '') {
     import { createSqliteStorage } from ${JSON.stringify(new URL('../server/storage/sqlite.js', import.meta.url).href)};
     import { executeP10bFirstMailboxQualification } from ${JSON.stringify(new URL('../server/services/pursueCimControlledMailboxHarness.js', import.meta.url).href)};
     import { ingestFakeLifecycle } from ${JSON.stringify(new URL('./helpers/p10bQualificationFixture.js', import.meta.url).href)};
+    import { createServer } from 'node:http';
+    import { installP10bIngressClosure, requestP10bIngressClosure } from ${JSON.stringify(new URL('../server/services/p10bIngressClosure.js', import.meta.url).href)};
     const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
     const channel = createP10bControlChannel({ input: process.stdin, output: process.stdout });
+    const server = createServer(); await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const runtime = { app: data.manifest.runtime.app, machineId: data.manifest.runtime.machineId, sourceHead: data.sourceHead };
+    const cached = createSqliteStorage({ ...data.config, storage: { sqlitePath: data.databasePath } });
+    installP10bIngressClosure({ config: data.config, runtime, server, databasePath: data.databasePath,
+      closeStorage: () => cached.close() });
     await serveP10bQualificationWorker({ channel, config: data.config,
       runtime: { app: data.manifest.runtime.app, machineId: data.manifest.runtime.machineId, sourceHead: data.sourceHead },
-      closeIngress: async () => {},
-      createStorage: (cfg) => createSqliteStorage({ ...cfg, storage: { sqlitePath: data.databasePath } }),
+      closeIngress: (opts) => requestP10bIngressClosure(opts),
+      createStorage: (cfg) => { const storage = createSqliteStorage({ ...cfg, storage: { sqlitePath: data.databasePath } });
+        if (data.variant === 'sqlite-acquire-failure') throw new Error('offline storage factory failure');
+        if (data.variant === 'sqlite-close-failure') storage.close = () => { throw new Error('offline SQLite close failure'); };
+        return storage; },
       resolveDatabasePath: () => data.databasePath, clock: () => data.manifest.issuedAt,
       execute: (options) => executeP10bFirstMailboxQualification({ ...options, lifecyclePollMs: 20, stopTimeoutMs: 200,
         fetcher: async (url, request) => {
@@ -109,6 +125,15 @@ async function hostFixture(t, variant = '') {
       }),
     });
   `, { mode: 0o600 });
+  const guardScript = path.join(f.directory, 'offline-guardian.mjs');
+  fs.writeFileSync(guardScript, `
+    import fs from 'node:fs';
+    import { runP10bGuestGuardian } from ${JSON.stringify(new URL('../server/services/p10bGuestGuardian.js', import.meta.url).href)};
+    const data = JSON.parse(fs.readFileSync(process.argv[2]));
+    const window = JSON.parse(data.config.dealHunter.cimProvider.qualificationGuestWindow);
+    await runP10bGuestGuardian({ window, databasePath: data.databasePath,
+      clock: () => Date.parse(data.manifest.issuedAt) + Date.now() - data.wallStartedAt });
+  `);
   const adapter = {
     async getMachine() { reads += 1; return structuredClone(machine); },
     async getSecretMetadata() { return secrets; },
@@ -116,14 +141,16 @@ async function hostFixture(t, variant = '') {
       starts += 1;
       if (variant === 'start-failure') throw new Error('offline-sending-secret');
       machine.state = 'started';
+      guardian = spawn(process.execPath, [guardScript, data], { stdio: 'ignore' });
+      guardian.once('close', async () => {
+        stops += 1;
+        if (variant !== 'stop-timeout' && variant !== 'stop-failure') machine.state = 'stopped';
+        child?.kill('SIGTERM');
+      });
+      t.after(() => { if (guardian.exitCode === null && guardian.signalCode === null) guardian.kill('SIGKILL'); });
     },
     async stopMachine() {
-      stops += 1;
-      if (variant === 'stop-timeout') return new Promise(() => {});
-      if (variant === 'stop-failure') throw new Error('offline-sending-secret');
-      if (variant === 'slow-stop') await new Promise((resolve) => setTimeout(resolve, 30));
-      machine.state = 'stopped';
-      child?.kill('SIGTERM');
+      assert.fail('Host must never call Fly stop; the guest owns shutdown');
     },
     async openWorker() {
       if (variant === 'open-hung') return new Promise(() => {});
@@ -151,9 +178,29 @@ async function hostFixture(t, variant = '') {
   };
   return { f, packet, adapter, machine, ledger, admission, admissionDirectory, get starts() { return starts; }, get stops() { return stops; },
     get reads() { return reads; }, get child() { return child; }, evidencePath: path.join(f.directory, 'host'),
-    run: (options = {}) => runP10bQualificationHost({ packet, adapter,
-      evidencePath: path.join(f.directory, 'host'), clock: () => f.manifest.issuedAt,
-      stopTimeoutMs: 200, closureGraceMs: 200, admission, admissionDirectory, ...options }) };
+    run: (options = {}) => {
+      if (!starts) {
+        packet.guest.stopAt = new Date(Math.min(Date.parse(f.manifest.expiresAt),
+          Date.parse(f.manifest.issuedAt) + f.manifest.maximumRuntimeMs)).toISOString();
+        packet.guest.closureGraceMs = options.closureGraceMs || 200;
+        packet.guest.stopReserveMs = options.stopTimeoutMs || 200;
+        f.options.config.dealHunter.cimProvider.qualificationGuestWindow = stableCanonicalJson(p10bGuestWindow(packet));
+        env.P10B_GUEST_WINDOW = f.options.config.dealHunter.cimProvider.qualificationGuestWindow;
+        configurationEvidence.runtimeConfigurationDigests.qualify = p10bPublicConfigurationDigest(f.options.config);
+        f.manifest.configurationEvidenceDigest = digest(configurationEvidence);
+        packet.configurationEvidenceDigest = f.manifest.configurationEvidenceDigest;
+        packet.reviewedDigest = qualificationDigest(f.manifest);
+        const marker = JSON.parse(fs.readFileSync(`${databasePath}.p10b-qualify-start.json`));
+        marker.guestWindowDigest = digest(p10bGuestWindow(packet));
+        fs.writeFileSync(`${databasePath}.p10b-qualify-start.json`, JSON.stringify(marker));
+        const childData = JSON.parse(fs.readFileSync(data)); childData.config = f.options.config; childData.manifest = f.manifest;
+        childData.wallStartedAt = Date.now();
+        fs.writeFileSync(data, JSON.stringify(childData));
+      }
+      return runP10bQualificationHost({ packet, adapter,
+        evidencePath: path.join(f.directory, 'host'), clock: () => f.manifest.issuedAt,
+        stopTimeoutMs: 200, closureGraceMs: 200, admission, admissionDirectory, ...options });
+    } };
 }
 
 test('actual offline worker closes SQLite authority before process death and host artifact release', async (t) => {
@@ -181,21 +228,25 @@ test('actual offline worker closes SQLite authority before process death and hos
 
 test('host failures retain evidence, stop once and never release qualification', async (t) => {
   for (const variant of ['start-failure', 'malformed-provider', 'malformed-frame',
-    'tampered-candidate', 'stop-failure', 'stop-timeout', 'uncertain-process']) await t.test(variant, async (t) => {
+    'tampered-candidate', 'sqlite-close-failure', 'sqlite-acquire-failure', 'stop-failure', 'stop-timeout', 'uncertain-process']) await t.test(variant, async (t) => {
     const h = await hostFixture(t, variant);
     const result = await h.run();
     assert.equal(result.success, false); assert.equal(result.lifecycleVerified, false);
-    assert.equal(result.artifact, undefined); assert.equal(h.stops, 1);
+    assert.equal(result.artifact, undefined); assert.equal(h.stops, variant === 'start-failure' ? 0 : 1);
     assert.equal(JSON.stringify(result).includes('offline-sending-secret'), false);
     assert.ok(fs.existsSync(`${h.evidencePath}.result.json`));
+    if (variant === 'sqlite-close-failure' || variant === 'sqlite-acquire-failure') {
+      const retained = JSON.parse(fs.readFileSync(path.join(h.f.directory, 'fixture.sqlite.p10b-qualify-guardian-outcome.json')));
+      assert.equal(retained.outcome.sqliteClosed, false);
+    }
   });
 });
 
 test('deadline owns stop even when worker opening hangs and admission rejects concurrent owners', async (t) => {
   const h = await hostFixture(t, 'open-hung');
-  h.f.manifest.maximumRuntimeMs = 600;
+  h.f.manifest.maximumRuntimeMs = 1500;
   h.packet.reviewedDigest = qualificationDigest(h.f.manifest);
-  const first = h.run({ stopTimeoutMs: 100, closureGraceMs: 100 });
+  const first = h.run({ stopTimeoutMs: 300, closureGraceMs: 200 });
   await new Promise((resolve) => setTimeout(resolve, 20));
   await assert.rejects(h.run(), /already owns/);
   const result = await first;
@@ -218,7 +269,7 @@ test('packet identity, freshness, budget and hard-offs fail before outbound work
   }
   h.machine.config.env.DEAL_HUNTER_CIM_PROVIDER_ENABLED = 'true';
   const result = await h.run();
-  assert.equal(result.success, false); assert.equal(h.starts, 0); assert.equal(h.stops, 1);
+  assert.equal(result.success, false); assert.equal(h.starts, 0); assert.equal(h.stops, 0);
   assert.equal(fs.existsSync(h.ledger), false);
 });
 
@@ -332,7 +383,7 @@ test('fixed target and independent stop budget cover early clock failure and per
       clock = () => new Date(Date.parse(h.f.manifest.issuedAt) + 800);
     }
     const result = await h.run({ clock });
-    assert.equal(result.success, false); assert.equal(h.starts, 0); assert.equal(h.stops, 1);
+    assert.equal(result.success, false); assert.equal(h.starts, 0); assert.equal(h.stops, 0);
     assert.equal(result.stoppedVerified, true);
     assert.equal(JSON.stringify(result).includes('offline-sending-secret'), false);
   });
@@ -351,7 +402,7 @@ test('durable admission rejects another process state or evidence prefix before 
   assert.equal(replay.success, false); assert.equal(h.starts, 1); assert.equal(h.stops, 1);
 });
 
-test('host cancellation aborts a pending start before its sole stop and reaps a late SSH worker', async (t) => {
+test('host cancellation aborts a pending start and reaps a late SSH worker', async (t) => {
   for (const variant of ['late-start', 'late-worker']) await t.test(variant, async (t) => {
     const h = await hostFixture(t);
     h.f.manifest.maximumRuntimeMs = 700; h.packet.reviewedDigest = qualificationDigest(h.f.manifest);
@@ -365,26 +416,29 @@ test('host cancellation aborts a pending start before its sole stop and reaps a 
         async terminate() { lateReaped = true; return true; } };
     };
     const result = await h.run({ stopTimeoutMs: 100, closureGraceMs: 100 });
-    assert.equal(result.success, false); assert.equal(h.stops, 1);
+    assert.equal(result.success, false); assert.equal(h.stops, variant === 'late-start' ? 0 : 1);
     if (variant === 'late-start') assert.equal(aborted, true);
     else { await new Promise((resolve) => setTimeout(resolve, 150)); assert.equal(lateReaped, true); }
   });
 });
 
-test('terminal failure and cancelled no-reply child close authority before the host stop command', async (t) => {
+test('terminal failure and cancelled no-reply child close authority before guest exit', async (t) => {
   const h = await hostFixture(t, 'no-reply');
   h.f.manifest.maximumRuntimeMs = 1300; h.packet.reviewedDigest = qualificationDigest(h.f.manifest);
   // Update the child's immutable manifest after this test narrows the window.
   const dataPath = path.join(h.f.directory, 'offline-worker-data.json');
   const data = JSON.parse(fs.readFileSync(dataPath)); data.manifest = h.f.manifest;
   fs.writeFileSync(dataPath, JSON.stringify(data));
-  const originalStop = h.adapter.stopMachine;
-  h.adapter.stopMachine = async (...args) => {
+  const originalRead = h.adapter.getMachine;
+  h.adapter.getMachine = async (...args) => {
+    const observed = await originalRead(...args);
+    if (h.starts && observed.state === 'stopped') {
     const ctx = await h.f.storage.readCimFinalGateContext({ transmissionId: h.f.manifest.transmissionId,
       authorizationId: `p10b-q-${h.packet.reviewedDigest.slice(0, 48)}`, now: h.f.manifest.issuedAt });
     assert.equal(ctx.activation.status, 'withdrawn');
     assert.ok(ctx.authorization.consumed_at || ctx.authorization.withdrawn_at); assert.equal(ctx.safety.outreach_paused, 1);
-    return originalStop(...args);
+    }
+    return observed;
   };
   const result = await h.run();
   assert.equal(result.success, false); assert.equal(result.artifact, undefined); assert.equal(h.stops, 1);
@@ -486,7 +540,7 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN: cfg.dealHunter.cimProvider.resendInboundDomain,
     DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS: 'mathew@uckelegroup.com' };
   const machine = { id: machineId, state: 'stopped', region: 'ewr', image_ref: { digest: `sha256:${'a'.repeat(64)}` },
-    config: { env, guest: { cpu_kind: 'shared', cpus: 1, memory_mb: 512 }, restart: { policy: 'no' },
+    config: { env, processes: P10B_GUEST_PROCESSES, guest: { cpu_kind: 'shared', cpus: 1, memory_mb: 512 }, restart: { policy: 'no' },
       mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }], services: [{ autostart: false, internal_port: 8787 }] } };
   const statePath = path.join(directory, 'machine.json'); fs.writeFileSync(statePath, JSON.stringify(machine));
   const configPath = path.join(directory, 'config.json'); fs.writeFileSync(configPath, JSON.stringify(cfg));
@@ -494,6 +548,9 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
   const fakeFly = path.join(directory, 'fake-fly.mjs');
   fs.writeFileSync(fakeFly, `
     import fs from 'node:fs';
+    import { spawn } from 'node:child_process';
+    import { runP10bGuestGuardian } from ${JSON.stringify(new URL('../server/services/p10bGuestGuardian.js', import.meta.url).href)};
+    import { assertP10bGuestReady } from ${JSON.stringify(new URL('../server/services/p10bGuestShutdown.js', import.meta.url).href)};
     import { createP10bControlChannel } from ${JSON.stringify(new URL('../server/services/p10bControlChannel.js', import.meta.url).href)};
     import { serveP10bQualificationWorker } from ${JSON.stringify(new URL('../server/services/p10bQualificationWorker.js', import.meta.url).href)};
     import { createSqliteStorage } from ${JSON.stringify(new URL('../server/storage/sqlite.js', import.meta.url).href)};
@@ -503,12 +560,29 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     import { initializeP10bRuntimeFilesystem } from ${JSON.stringify(new URL('../server/services/p10bRuntime.js', import.meta.url).href)};
     import { ingestFakeLifecycle } from ${JSON.stringify(new URL('./helpers/p10bQualificationFixture.js', import.meta.url).href)};
     const args = process.argv.slice(2);
-    fs.appendFileSync(${JSON.stringify(commands)}, JSON.stringify(args)+'\\n');
+    if (args[0] !== 'offline-guest') fs.appendFileSync(${JSON.stringify(commands)}, JSON.stringify(args)+'\\n');
     const machine = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}));
     const cfg = JSON.parse(fs.readFileSync(${JSON.stringify(configPath)}));
-    if (args[0] === 'machines') process.stdout.write(JSON.stringify([machine]));
+    const window=JSON.parse(cfg.dealHunter.cimProvider.qualificationGuestWindow);
+    const runtimePath=${JSON.stringify(databasePath)}+'.offline-boot-'+window.phase+'.json';
+    if(args[0]==='offline-guest') {
+      const boot=JSON.parse(fs.readFileSync(runtimePath));
+      await runP10bGuestGuardian({window,databasePath:${JSON.stringify(databasePath)},
+        clock:()=>Date.parse(window.issuedAt)+Date.now()-boot.wallStartedAt,exit:()=>{
+          const latest=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}));latest.state='stopped';
+          fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(latest));
+          const serverPath=${JSON.stringify(databasePath)}+'.p10b-'+window.phase+'-server.json';
+          if(fs.existsSync(serverPath)){try{process.kill(JSON.parse(fs.readFileSync(serverPath)).pid,'SIGTERM');}catch{}}
+          process.exit(0);
+        }});
+    } else if (args[0] === 'machines') process.stdout.write(JSON.stringify([machine]));
     else if (args[0] === 'secrets') process.stdout.write(JSON.stringify([{name:'DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY',digest:'abc123'}]));
     else if (args[0] === 'machine' && args[1] === 'start') {
+      fs.writeFileSync(runtimePath,JSON.stringify({wallStartedAt:Date.now()}));
+      const guest=spawn(process.execPath,[${JSON.stringify(fakeFly)},'offline-guest'],{detached:true,stdio:'ignore'});
+      guest.unref();
+      fs.writeFileSync(runtimePath+'.pid',String(guest.pid));
+      await assertP10bGuestReady({window,databasePath:${JSON.stringify(databasePath)},clock:()=>Date.parse(window.issuedAt)});
       const map = (file) => String(file).startsWith(${JSON.stringify(logicalPath)})
         ? ${JSON.stringify(databasePath)}+String(file).slice(${logicalPath.length}) : file;
       const fileSystem = Object.fromEntries(['existsSync','writeFileSync','readFileSync','realpathSync','statSync','lstatSync']
@@ -516,8 +590,6 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
       initializeP10bRuntimeFilesystem(cfg,{sourceHead:${JSON.stringify(sourceHead)},fileSystem,
         environment:{FLY_APP_NAME:'uckele-group-p10b',FLY_MACHINE_ID:${JSON.stringify(machineId)}},clock:()=>${JSON.stringify(at)}});
       machine.state='started'; fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(machine));
-    } else if (args[0] === 'machine' && args[1] === 'stop') {
-      machine.state='stopped'; fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(machine));
     } else if (args[0] === 'ssh') {
       const channel=createP10bControlChannel({input:process.stdin,output:process.stdout});
       const server=createServer();await new Promise((resolve)=>server.listen(0,'127.0.0.1',resolve));
@@ -557,13 +629,23 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     reconciliationKeyPermission: 'full_access', sendingKeyId: 'outbound', reconciliationKeyId: 'read',
     webhookId: 'offline', webhookUrl: 'https://uckele-group-p10b.fly.dev/api/webhooks/resend', verifiedAt: at,
     flySecretMetadataDigest: digest(secrets), runtimeConfigurationDigests: {
-      prepare: p10bPublicConfigurationDigest(cfg), qualify: p10bPublicConfigurationDigest(qualifyCfg) } };
-  const packet = { version: 'p10b-runtime-packet-v1', operation: 'prepare', target: {
+      prepare: '4'.repeat(64), qualify: '5'.repeat(64) } };
+  const packet = { version: 'p10b-runtime-packet-v2', operation: 'prepare',
+    guest: { issuedAt: at, stopAt: new Date(Date.parse(at)+10000).toISOString(), closureGraceMs: 1000, stopReserveMs: 2000 }, target: {
     app: 'uckele-group-p10b', machineId, imageDigest: machine.image_ref.digest }, sourceHead,
     databasePath: logicalPath, actor: 'offline-owner', runId: 'offline-concrete-first-mailbox',
     permissionEvidenceId: 'offline-permission', ownerPermissionDigest: 'f'.repeat(64),
     configurationEvidence: evidence, configurationEvidenceDigest: digest(evidence),
     budget: { priceEvidenceDigest: 'c'.repeat(64), maximumUsdPerSecond: 0.000001, fixedIncrementalUsd: 0.001 } };
+  cfg.dealHunter.cimProvider.qualificationGuestWindow = stableCanonicalJson(p10bGuestWindow(packet));
+  machine.config.env.P10B_GUEST_WINDOW = cfg.dealHunter.cimProvider.qualificationGuestWindow;
+  evidence.runtimeConfigurationDigests.prepare = p10bPublicConfigurationDigest(cfg);
+  packet.configurationEvidenceDigest = digest(evidence);
+  fs.writeFileSync(statePath,JSON.stringify(machine));fs.writeFileSync(configPath,JSON.stringify(cfg));
+  t.after(()=>{for(const phase of ['prepare','qualify']){
+    const pidFile=databasePath+'.offline-boot-'+phase+'.json.pid';
+    if(fs.existsSync(pidFile)){try{process.kill(Number(fs.readFileSync(pidFile)),'SIGKILL');}catch{/* Offline guardian already exited. */}}
+  }});
   const admissionDirectory = path.join(directory, 'admission');
   const prepare = await runP10bQualificationHost({ packet, adapter, clock: () => at,
     evidencePath: path.join(directory, 'prepare'), admissionDirectory, stopTimeoutMs: 2000, closureGraceMs: 1000 });
@@ -581,16 +663,23 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     expiresAt: new Date(Date.parse(r.preparedAt) + 600000).toISOString(), maximumCalls: 1, retries: 0,
     maximumIncrementalUsd: 1, maximumRuntimeMs: 10000 };
   machine.config.env.P10B_QUALIFICATION_PHASE = 'qualify';
-  fs.writeFileSync(statePath, JSON.stringify(machine)); fs.writeFileSync(configPath, JSON.stringify(qualifyCfg));
   const qualification = { ...packet, operation: 'qualify', manifest, reviewedDigest: qualificationDigest(manifest),
     opportunityId: r.opportunityId, initialActivationId: r.initialActivationId };
   delete qualification.runId; delete qualification.permissionEvidenceId;
+  qualification.guest={issuedAt:manifest.issuedAt,stopAt:new Date(Date.parse(manifest.issuedAt)+manifest.maximumRuntimeMs).toISOString(),
+    closureGraceMs:1000,stopReserveMs:2000};
+  qualifyCfg.dealHunter.cimProvider.qualificationGuestWindow=stableCanonicalJson(p10bGuestWindow(qualification));
+  machine.config.env.P10B_GUEST_WINDOW=qualifyCfg.dealHunter.cimProvider.qualificationGuestWindow;
+  evidence.runtimeConfigurationDigests.qualify=p10bPublicConfigurationDigest(qualifyCfg);
+  qualification.configurationEvidenceDigest=digest(evidence);manifest.configurationEvidenceDigest=digest(evidence);
+  qualification.reviewedDigest=qualificationDigest(manifest);
+  fs.writeFileSync(statePath,JSON.stringify(machine));fs.writeFileSync(configPath,JSON.stringify(qualifyCfg));
   const result = await runP10bQualificationHost({ packet: qualification, adapter, clock: () => r.preparedAt,
     evidencePath: path.join(directory, 'qualify'), admissionDirectory, stopTimeoutMs: 2000, closureGraceMs: 1000 });
   assert.equal(result.success, true, JSON.stringify(result)); assert.equal(result.productionReady, false);
   const ledger = fs.readFileSync(commands, 'utf8').trim().split('\n').map(JSON.parse);
   assert.equal(ledger.filter((args) => args[0] === 'machine' && args[1] === 'start').length, 2);
-  assert.equal(ledger.filter((args) => args[0] === 'machine' && args[1] === 'stop').length, 2);
+  assert.equal(ledger.filter((args) => args[0] === 'machine' && args[1] === 'stop').length, 0);
   assert.equal(fs.readFileSync(posts, 'utf8').trim().split('\n').length, 1);
   assert.equal(JSON.parse(fs.readFileSync(statePath)).state, 'stopped');
   assert.ok(children.every((child) => child.exitCode !== null || child.signalCode !== null));
@@ -649,6 +738,7 @@ test('isolated HTTP ingress refuses public/admin mutations and preparation webho
 
 test('explicit host cancellation closes authority and start ambiguity retains durable admission', async (t) => {
   const h = await hostFixture(t, 'open-hung');
+  h.f.manifest.maximumRuntimeMs = 700;
   const controller = new AbortController();
   const result = h.run({ signal: controller.signal, closureGraceMs: 30 });
   setTimeout(() => controller.abort(), 40);
@@ -659,4 +749,21 @@ test('explicit host cancellation closes authority and start ambiguity retains du
   const uncertain = await ambiguous.run();
   assert.equal(uncertain.startUncertain, true); assert.equal(uncertain.stopUncertain, true);
   assert.ok(fs.existsSync(path.join(ambiguous.admissionDirectory, '0803730bd1d7e8.active.json')));
+});
+
+test('host refuses missing guardian, renewable shutdown configuration and init overrides before start', async (t) => {
+  for (const variant of ['processes', 'window', 'init', 'schedule', 'autostop']) await t.test(variant, async (t) => {
+    const h = await hostFixture(t);
+    if (variant === 'processes') h.machine.config.processes = [{ exec: ['node', 'server/index.js'] }];
+    if (variant === 'window') h.packet.guest.issuedAt = '2020-01-01T00:00:00.000Z';
+    if (variant === 'init') h.machine.config.init = { exec: ['sleep', 'infinity'] };
+    if (variant === 'schedule') h.machine.config.schedule = 'hourly';
+    if (variant === 'autostop') h.machine.config.services[0].autostop = 'stop';
+    if (variant === 'window') await assert.rejects(async () => h.run(), /Frozen/);
+    else {
+      const result = await h.run();
+      assert.equal(result.success, false); assert.equal(result.artifact, undefined);
+    }
+    assert.equal(h.starts, 0); assert.equal(h.stops, 0); assert.equal(fs.existsSync(h.ledger), false);
+  });
 });

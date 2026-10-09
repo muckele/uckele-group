@@ -4,6 +4,7 @@ import os from 'node:os';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { qualificationDigest, validateQualificationContract } from './p10bQualificationContract.js';
 import { P10B_MACHINE_ID } from './p10bRuntime.js';
+import { P10B_GUEST_PROCESSES, p10bGuestWindow } from './p10bGuestShutdown.js';
 
 const owners = new Set();
 const digest = (value) => sha256(stableCanonicalJson(value));
@@ -24,11 +25,11 @@ const expectedFlags = {
 export function validateP10bRuntimePacket(packet, now) {
   const allowed = new Set(['version', 'operation', 'target', 'sourceHead', 'databasePath', 'actor',
     'runId', 'permissionEvidenceId', 'ownerPermissionDigest', 'configurationEvidence',
-    'configurationEvidenceDigest', 'budget', 'manifest', 'reviewedDigest', 'opportunityId', 'initialActivationId']);
+    'configurationEvidenceDigest', 'budget', 'manifest', 'reviewedDigest', 'opportunityId', 'initialActivationId', 'guest']);
   const evidence = packet?.configurationEvidence;
   const date = Date.parse(now);
   if (!packet || Object.keys(packet).some((key) => !allowed.has(key))
-    || packet.version !== 'p10b-runtime-packet-v1' || !['prepare', 'qualify'].includes(packet.operation)
+    || packet.version !== 'p10b-runtime-packet-v2' || !['prepare', 'qualify'].includes(packet.operation)
     || packet.target?.app !== 'uckele-group-p10b' || packet.target?.machineId !== P10B_MACHINE_ID
     || !/^sha256:[0-9a-f]{64}$/.test(packet.target?.imageDigest || '')
     || !/^[0-9a-f]{40}$/.test(packet.sourceHead || '')
@@ -67,6 +68,8 @@ export function validateP10bRuntimePacket(packet, now) {
       throw new Error('Qualification packet binding is invalid');
     }
   }
+  const window = p10bGuestWindow(packet);
+  if (date < Date.parse(window.issuedAt) || date >= Date.parse(window.stopAt)) throw new Error('Guest window is not current');
 }
 
 function validateMachine(machine, packet, state) {
@@ -76,7 +79,12 @@ function validateMachine(machine, packet, state) {
     || machine.image_ref?.digest !== packet.target.imageDigest || machine.region !== 'ewr'
     || config?.guest?.cpu_kind !== 'shared' || config.guest.cpus !== 1 || config.guest.memory_mb !== 512
     || config.restart?.policy !== 'no' || !Array.isArray(config.services) || !config.services.length
-    || config.services.some((service) => service.autostart !== false || service.internal_port !== 8787)
+    || config.schedule || config.auto_destroy === true
+    || stableCanonicalJson(config.processes) !== stableCanonicalJson(P10B_GUEST_PROCESSES)
+    || ['exec', 'cmd', 'entrypoint'].some((key) => config.init?.[key]?.length)
+    || env.P10B_GUEST_WINDOW !== stableCanonicalJson(p10bGuestWindow(packet))
+    || config.services.some((service) => service.autostart !== false || service.internal_port !== 8787
+      || ![undefined, false, 'off'].includes(service.autostop))
     || !Array.isArray(config.mounts) || config.mounts.length !== 1
     || config.mounts[0].volume !== 'vol_vwnkpex1k3yx9dnv' || config.mounts[0].path !== '/data'
     || Object.entries(expectedFlags).some(([key, value]) => env?.[key] !== value)
@@ -85,7 +93,18 @@ function validateMachine(machine, packet, state) {
       .some((key) => Boolean(env[key]))) throw new Error('Machine state or isolated configuration changed');
 }
 
+function validateGuestClosure(outcome, packet) {
+  const { guestShutdown, ...retained } = outcome || {};
+  if (guestShutdown?.version !== 'p10b-guest-shutdown-receipt-v1'
+    || guestShutdown.windowDigest !== digest(p10bGuestWindow(packet))
+    || guestShutdown.stopAt !== packet.guest.stopAt || guestShutdown.cleanupUncertain !== false
+    || guestShutdown.authorityClosed !== true || guestShutdown.ingressClosed !== true
+    || guestShutdown.workerSqliteClosed !== true || guestShutdown.handoffVerified !== true || guestShutdown.failure !== false
+    || guestShutdown.outcomeDigest !== digest(retained)) throw new Error('Guest cleanup is unverified');
+}
+
 function finalArtifact(candidate, packet, stop, now) {
+  validateGuestClosure(candidate, packet);
   const proof = candidate?.proof;
   if (candidate?.version !== 'p10b-pre-stop-candidate-v1' || candidate.manifestDigest !== packet.reviewedDigest
     || candidate.lifecycleVerified !== false || candidate.productionReady !== false
@@ -113,7 +132,8 @@ function finalArtifact(candidate, packet, stop, now) {
   return { ...result, digest: digest(result) };
 }
 
-// All actual start/stop commands are owned here. The remote worker supplies
+// The host starts only the reviewed Machine and verifies its stopped state.
+// The independent guest guard owns shutdown. The remote worker supplies
 // local SQLite/receipt evidence over existing authenticated SSH; this host
 // never copies or mounts the live database, forwards credentials, or sends mail.
 export async function runP10bQualificationHost({ packet: inputPacket, adapter, evidencePath,
@@ -182,11 +202,11 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
   const stopOnce = () => {
     if (!stopPromise) stopPromise = (async () => {
       stage = 'stopping';
-      // Reap outstanding start/SSH/read commands before the only stop command.
-      // A cancelled local command can no longer finish after verified stop.
+      // Reap local commands; the independent guest remains the sole shutdown
+      // owner. An early host failure still waits through its frozen cutoff.
       operations.abort();
       // Execution expiry closes permission, never the responsibility to stop.
-      const stopDeadline = Date.now() + stopTimeoutMs;
+      const stopDeadline = startIssued ? Math.max(Date.now() + stopTimeoutMs, deadline) : Date.now() + stopTimeoutMs;
       const stopping = new AbortController();
       const timer = setTimeout(() => stopping.abort(), Math.max(1, stopDeadline - Date.now()));
       let verified = false;
@@ -196,13 +216,15 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
         if (typeof adapter.reap === 'function') {
           controlsReaped = await bounded(() => adapter.reap(), stopDeadline - Date.now()) === true;
         }
-        await bounded(() => adapter.stopMachine(target, { signal: stopping.signal }),
-          stopDeadline - Date.now(), stopping.signal);
-        const machine = await bounded(() => adapter.getMachine(target, { signal: stopping.signal }),
-          stopDeadline - Date.now(), stopping.signal);
-        verified = machine?.id === target.machineId && machine.state === 'stopped'
-          && machine.image_ref?.digest === target.imageDigest;
-      } catch { /* Retain uncertainty; no second stop command. */ }
+        do {
+          const machine = await bounded(() => adapter.getMachine(target, { signal: stopping.signal }),
+            Math.min(1000, stopDeadline - Date.now()), stopping.signal);
+          verified = machine?.id === target.machineId && machine.state === 'stopped'
+            && machine.image_ref?.digest === target.imageDigest;
+          if (!verified) await bounded(() => new Promise((resolve) => setTimeout(resolve, 20)),
+            stopDeadline - Date.now(), stopping.signal);
+        } while (!verified && Date.now() < stopDeadline);
+      } catch { /* Retain uncertainty; this host has no competing stop action. */ }
       finally { clearTimeout(timer); stopping.abort(); }
       if (worker) {
         try { reaped = await bounded(() => worker.terminate(), stopDeadline - Date.now()) === true; }
@@ -252,10 +274,9 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
     reserved = true;
     startedAt = new Date(clock()).toISOString();
     validateP10bRuntimePacket(packet, startedAt);
-    maximumMs = packet.operation === 'prepare' ? 300000 : Math.min(900000,
-      Date.parse(packet.manifest.issuedAt) + packet.manifest.maximumRuntimeMs - Date.parse(startedAt),
-      Date.parse(packet.manifest.expiresAt) - Date.parse(startedAt));
+    maximumMs = Date.parse(packet.guest.stopAt) - Date.parse(startedAt);
     if (!Number.isFinite(maximumMs) || maximumMs <= closureGraceMs + stopTimeoutMs
+      || packet.guest.closureGraceMs !== closureGraceMs || packet.guest.stopReserveMs !== stopTimeoutMs
       || packet.budget.fixedIncrementalUsd + maximumMs / 1000 * packet.budget.maximumUsdPerSecond > 0.90) {
       throw new Error('Runtime or conservative aggregate budget is not bounded');
     }
@@ -309,6 +330,7 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
         candidate = frame.candidate;
       } else if (frame.kind === 'prepared' && packet.operation === 'prepare' && !prepared) {
         prepared = frame.receipt;
+        validateGuestClosure(prepared, packet);
         if (prepared?.version !== 'p10b-runtime-preparation-v1' || prepared.sourceHead !== packet.sourceHead
           || prepared.app !== target.app || prepared.machineId !== target.machineId
           || !hash.test(prepared.databaseIdentityHash || '') || prepared.providerCalls !== 0

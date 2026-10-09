@@ -55,6 +55,10 @@ export function createP10bControlChannel({ input, output }) {
       if (line.length > 65536 || sentBytes > 4 * 1024 * 1024 || output.writableLength > 65536) throw new Error('Control frame exceeded bound');
       output.write(line);
     },
+    flush() {
+      if (ended) return Promise.reject(new Error('Control channel unavailable'));
+      return new Promise((resolve, reject) => output.write('', (error) => error ? reject(error) : resolve()));
+    },
     close() { finish(new Error('Control channel closed')); },
   };
 }

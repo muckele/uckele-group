@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import { assertQualificationHardOff } from './p10bQualificationContract.js';
 import { P10B_MACHINE_ID, p10bDatabaseIdentity, p10bPublicConfigurationDigest } from './p10bRuntime.js';
+import { parseP10bGuestWindow } from './p10bGuestShutdown.js';
+import { sha256, stableCanonicalJson } from '../utils/security.js';
 
 function binding(config, runtime) {
   assertQualificationHardOff(config);
@@ -10,12 +12,14 @@ function binding(config, runtime) {
     throw new Error('Isolated ingress closure binding failed');
   }
   return { app: runtime.app, machineId: runtime.machineId, sourceHead: runtime.sourceHead,
-    phase: config.dealHunter.cimProvider.qualificationPhase };
+    phase: config.dealHunter.cimProvider.qualificationPhase,
+    guestWindowDigest: config.dealHunter.cimProvider.qualificationGuestWindow
+      ? sha256(stableCanonicalJson(parseP10bGuestWindow(config.dealHunter.cimProvider.qualificationGuestWindow, runtime))) : null };
 }
 
 // Local signal and retained files coordinate the two existing processes. There
-// is no external endpoint or credential. PID1 stays alive after draining HTTP,
-// so only the external host stops the Machine and verifies its final state.
+// is no external endpoint or credential. The listener holds after draining;
+// the independent Fly-configured guest guard exits to stop the whole Machine.
 export function installP10bIngressClosure({ config, runtime, server, closeStorage,
   databasePath = config.storage.sqlitePath, processControl = process } = {}) {
   const expected = binding(config, runtime);

@@ -15,13 +15,21 @@ import { initializeP10bRuntimeFilesystem, isP10bQualificationRuntime,
 import { installP10bIngressClosure } from './services/p10bIngressClosure.js';
 import { closeCachedStorage } from './storage/index.js';
 import fs from 'node:fs';
+import { assertP10bGuestReady, parseP10bGuestWindow } from './services/p10bGuestShutdown.js';
 
 const config = getConfig();
 const host = process.env.HOST || '0.0.0.0';
 let schedulers = [];
 
 assertValidConfig(config);
-if (isP10bQualificationRuntime(config)) initializeP10bRuntimeFilesystem(config);
+if (isP10bQualificationRuntime(config)) {
+  const window = parseP10bGuestWindow(config.dealHunter.cimProvider.qualificationGuestWindow, {
+    app: process.env.FLY_APP_NAME, machineId: process.env.FLY_MACHINE_ID,
+    sourceHead: fs.readFileSync('/app/p10b-source-head.txt', 'utf8').trim(),
+  });
+  await assertP10bGuestReady({ window });
+  initializeP10bRuntimeFilesystem(config);
+}
 const app = createApp();
 const cleanupSummary = await runServerStartupMaintenance(config, {
   cleanupAuth: cleanupExpiredAuthRecords, cleanupDocuments: reconcileSecureDocumentCleanupJobs,

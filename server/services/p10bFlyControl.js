@@ -71,10 +71,6 @@ export function createP10bFlyControl({ executable = '/opt/homebrew/bin/fly', env
     async startMachine({ app, machineId }, options) {
       await command(['machine', 'start', machineId, '--app', app], options);
     },
-    async stopMachine({ app, machineId }, options) {
-      await command(['machine', 'stop', machineId, '--app', app, '--timeout', '10', '--wait-timeout', '20s'],
-        { ...options, timeoutMs: 22000 });
-    },
     async openWorker({ app, machineId }, { signal } = {}) {
       if (signal?.aborted) throw new Error('Isolated worker opening cancelled');
       const { child, exit } = launch(['ssh', 'console', '--app', app, '--machine', machineId,
