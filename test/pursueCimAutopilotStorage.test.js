@@ -421,15 +421,17 @@ function executionInstant(offsetMilliseconds = 0) {
   return new Date(Date.now() + offsetMilliseconds).toISOString();
 }
 
-function primeFollowUpAuthority(database, suffix, recipientFingerprint = digest('e')) {
+function primeFollowUpAuthority(database, suffix, recipientFingerprint = digest('e'),
+  fixtureInstant = executionInstant()) {
   const authority = insertBaseAuthority(database, suffix, recipientFingerprint);
   const submissionId = `submission${suffix}`;
   seedCrmOwner(database, authority.opportunityId, submissionId);
-  const dueAt = executionInstant(-60_000);
-  const expiryAt = executionInstant(28 * 24 * 60 * 60 * 1000);
+  const fixtureTime = Date.parse(fixtureInstant);
+  const dueAt = new Date(fixtureTime - 60_000).toISOString();
+  const expiryAt = new Date(fixtureTime + 28 * 24 * 60 * 60 * 1000).toISOString();
   database.prepare(`UPDATE deal_hunter_cim_campaigns SET state='active-follow-up',
     reason_code=NULL, initial_accepted_at=?, local_expiry_at=?, expiry_derivation=?
-    WHERE id=?`).run(executionInstant(-24 * 60 * 60 * 1000), expiryAt,
+    WHERE id=?`).run(new Date(fixtureTime - 24 * 60 * 60 * 1000).toISOString(), expiryAt,
     JSON.stringify({ retained: true }), authority.campaignId);
   database.prepare(`UPDATE deal_hunter_cim_campaign_touches SET
     logical_slot='follow-up-1', kind='follow-up-1', ordinal=1,
@@ -1508,7 +1510,7 @@ test('FL04C restart renews only the same immutable uninvoked transmission', asyn
   t.after(() => storage.close());
   const database = new Database(sqlitePath);
   t.after(() => database.close());
-  const authority = primeFollowUpAuthority(database, '-follow-up-renew');
+  const authority = primeFollowUpAuthority(database, '-follow-up-renew', digest('e'), executionNow);
   await configureFollowUpCapacity(storage, database, { dailyCap: 2, recipientCap: 2 });
   assert.equal((await claimFollowUp(storage, authority, digest('8'), {
     now: executionNow, expiresAt: '2026-10-08T16:05:00.000Z',
