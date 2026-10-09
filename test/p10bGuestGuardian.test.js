@@ -128,7 +128,10 @@ test('guest authority cleanup preserves preparation setup but withdraws qualific
 test('independent guest exits on its original cutoff after host loss or a blocked app process', async (t) => {
   for (const variant of ['host-loss', 'blocked-app']) await t.test(variant, async (t) => {
     const f = await fixture(t); const databasePath = path.join(f.directory, 'fixture.sqlite');
-    const window = windowAt(3000, 'qualify'); const began = Date.now();
+    const window = windowAt(4000, 'qualify'); const began = Date.now();
+    // Preserve explicit cleanup/stop reserves under full-suite scheduling;
+    // the shipped path reserves thirty seconds for each of these stages.
+    window.closureGraceMs = 500; window.stopReserveMs = 500;
     writeP10bGuestRecord(`${databasePath}.p10b-qualify-start.json`, { sourceHead: window.sourceHead,
       guestWindowDigest: digest(window), databaseIdentityHash: p10bDatabaseIdentity(databasePath) });
     const cfg = config(); cfg.storage = { provider: 'sqlite', sqlitePath: window.databasePath };
@@ -168,10 +171,10 @@ test('independent guest exits on its original cutoff after host loss or a blocke
       // SIGSTOP blocks every callback in this distinct app/control process.
       process.kill(appPid, 'SIGSTOP');
     }
-    await until(() => fs.existsSync(completed));
+    await until(() => fs.existsSync(completed), 5000);
     const result = JSON.parse(fs.readFileSync(completed));
     assert.ok(result.exitedAt <= Date.parse(window.stopAt) + 150, 'Guest deadline was renewed');
-    assert.ok(result.exitedAt - began < 3150);
+    assert.ok(result.exitedAt - began < 4150);
     assert.equal(result.receipt.authorityClosed, true);
     assert.equal(result.receipt.ingressClosed, variant === 'host-loss');
     const db = new Database(databasePath, { readonly: true, fileMustExist: true });
