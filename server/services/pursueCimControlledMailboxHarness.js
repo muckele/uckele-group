@@ -838,9 +838,9 @@ export async function executeP10bLimitedFreeSmoke(options = {}) {
 export async function executeP10bFirstMailboxQualification({ storage, config,
   opportunityId, initialActivationId, manifest: inputManifest, reviewedDigest,
   supervisorTarget, observe, stopAndVerify, clock = () => new Date(), actor,
-  fetcher, readFetcher, testHooks = {}, stopTimeoutMs = 30000, lifecyclePollMs = 250 } = {}) {
+  fetcher, readFetcher, testHooks = {}, onBeforeStop, signal, stopTimeoutMs = 30000, lifecyclePollMs = 250 } = {}) {
   const supervisor = createQualificationSupervisor({ target: supervisorTarget, stopAndVerify, clock,
-    maximumRuntimeMs: inputManifest?.maximumRuntimeMs, stopTimeoutMs });
+    maximumRuntimeMs: inputManifest?.maximumRuntimeMs, stopTimeoutMs, beforeStop: closeAuthorityAndHandoff });
   const at = () => new Date(clock()).toISOString();
   let manifest;
   let armedConfig;
@@ -852,6 +852,9 @@ export async function executeP10bFirstMailboxQualification({ storage, config,
   let stop;
   let failure;
   let failureStage = 'validation';
+  const cancel = () => { void supervisor.close(); };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
   const request = async (url, options, reader) => {
     supervisor.assertActive();
     const controller = new AbortController();
@@ -895,6 +898,42 @@ export async function executeP10bFirstMailboxQualification({ storage, config,
     } catch { throw new Error('Qualification provider outcome unknown'); }
     finally { clearTimeout(timer); }
   };
+  async function closeAuthorityAndHandoff() {
+    if (armedConfig && authorizationId) {
+      try {
+        // SQLite cleanup is synchronous internally. Bound unexpected injected
+        // stalls; a late result never restores execution permission.
+        let timer;
+        try {
+          cleanup = await Promise.race([
+            cleanupExecution({ storage, services: {}, authorizationId, initialActivationId,
+              actor, now: new Date().toISOString(), armedConfig }),
+            new Promise((resolve) => { timer = setTimeout(() => resolve({ errors: ['cleanup_timeout'] }), stopTimeoutMs); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      } catch { cleanup = { errors: ['cleanup_failed'] }; }
+    }
+    // Close SQLite authority while the Machine is still alive. A host-owned
+    // supervisor can retain this bounded candidate over the existing SSH
+    // channel before stopping the worker's Machine. It is not a final artifact.
+    if (typeof onBeforeStop === 'function') {
+      let timer;
+      try {
+        const proof = lifecycle ? { ...lifecycle, version: 'p10b-lifecycle-proof-candidate-v1',
+          lifecycleVerified: false, productionReady: false } : null;
+        if (proof) { delete proof.digest; proof.digest = sha256(stableCanonicalJson(proof)); }
+        await Promise.race([
+          Promise.resolve().then(() => onBeforeStop({ version: 'p10b-pre-stop-candidate-v1',
+            manifestDigest: reviewedDigest, providerCalls,
+            outcome: finalization?.outcome?.category || 'unknown',
+            failureStage: failure ? failureStage : null, cleanup, proof,
+            lifecycleVerified: false, productionReady: false })),
+          new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error('Candidate handoff timed out')), stopTimeoutMs); }),
+        ]);
+      } catch { failure ||= new Error('Qualification candidate handoff failed'); failureStage = 'candidate-handoff'; }
+      finally { clearTimeout(timer); }
+    }
+  }
   try {
     await supervisor.bounded(async () => {
       if (storage?.provider !== 'sqlite' || typeof observe !== 'function'
@@ -1013,23 +1052,7 @@ export async function executeP10bFirstMailboxQualification({ storage, config,
       }
     });
   } catch (error) { failure = error; }
-  finally {
-    stop = await supervisor.close();
-    if (armedConfig && authorizationId) {
-      try {
-        // SQLite cleanup is synchronous internally. Bound unexpected injected
-        // stalls; a late result never restores execution permission.
-        let timer;
-        try {
-          cleanup = await Promise.race([
-            cleanupExecution({ storage, services: {}, authorizationId, initialActivationId,
-              actor, now: new Date().toISOString(), armedConfig }),
-            new Promise((resolve) => { timer = setTimeout(() => resolve({ errors: ['cleanup_timeout'] }), stopTimeoutMs); }),
-          ]);
-        } finally { clearTimeout(timer); }
-      } catch { cleanup = { errors: ['cleanup_failed'] }; }
-    }
-  }
+  finally { stop = await supervisor.close(); signal?.removeEventListener('abort', cancel); }
   const evidence = { version: 'p10b-first-mailbox-qualification-result-v1',
     manifestDigest: reviewedDigest, ...stop, providerCalls,
     failureStage: failure ? failureStage : null,

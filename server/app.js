@@ -5,6 +5,7 @@ import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { getConfig } from './config.js';
 import { getStorage } from './storage/index.js';
+import { p10bIngressOnly } from './services/p10bRuntime.js';
 import {
   getAcquisitionCommandCenter,
   getSourceHealth,
@@ -560,6 +561,7 @@ export function createApp({
   let activeSecureUploads = 0;
 
   app.disable('x-powered-by');
+  app.use(p10bIngressOnly(config));
   app.use((request, response, next) => {
     const providedId = String(request.headers['x-request-id'] || '').trim();
     request.id = /^[A-Za-z0-9._-]{1,100}$/.test(providedId) ? providedId : randomUUID();

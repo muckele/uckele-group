@@ -4,6 +4,11 @@ import { createSupabaseStorage } from './supabase.js';
 
 let cachedStorage;
 
+export function closeCachedStorage() {
+  cachedStorage?.close?.();
+  cachedStorage = undefined;
+}
+
 export function getStorage() {
   if (cachedStorage) {
     return cachedStorage;

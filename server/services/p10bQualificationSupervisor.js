@@ -3,7 +3,7 @@ const owners = new Set();
 // The trusted supervisor target is supplied independently of the untrusted
 // manifest. Ownership transfers only after this constructor succeeds. A
 // rejected duplicate never stops the existing owner's Machine.
-export function createQualificationSupervisor({ target, stopAndVerify, clock,
+export function createQualificationSupervisor({ target, stopAndVerify, clock, beforeStop,
   maximumRuntimeMs = 900000, stopTimeoutMs = 30000 } = {}) {
   if (target?.app !== 'uckele-group-p10b' || !/^[0-9a-f]{14}$/.test(target?.machineId || '')
     || typeof stopAndVerify !== 'function' || typeof clock !== 'function'
@@ -34,6 +34,13 @@ export function createQualificationSupervisor({ target, stopAndVerify, clock,
     if (!stopPromise) stopPromise = (async () => {
       let timer;
       let receipt;
+      if (typeof beforeStop === 'function') {
+        try {
+          await Promise.race([Promise.resolve().then(beforeStop),
+            new Promise((resolve) => { timer = setTimeout(resolve, stopTimeoutMs); })]);
+        } catch { /* An uncertain closure never prevents the owner's stop attempt. */ }
+        finally { clearTimeout(timer); }
+      }
       try {
         receipt = await Promise.race([
           Promise.resolve().then(() => stopAndVerify(binding)),
@@ -53,6 +60,7 @@ export function createQualificationSupervisor({ target, stopAndVerify, clock,
   const bounded = async (task) => {
     assertActive();
     let timer;
+    let abort;
     try {
       const value = await Promise.race([
         Promise.resolve().then(() => { assertActive(); return task(); }),
@@ -60,10 +68,14 @@ export function createQualificationSupervisor({ target, stopAndVerify, clock,
           timer = setTimeout(() => { void close(); reject(new Error('P10B qualification deadline reached')); },
             Math.max(1, remaining()));
         }),
+        new Promise((resolve, reject) => {
+          abort = () => reject(new Error('P10B qualification was stopped'));
+          abortController.signal.addEventListener('abort', abort, { once: true });
+        }),
       ]);
       assertActive();
       return value;
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); abortController.signal.removeEventListener('abort', abort); }
   };
   return { target: binding, signal: abortController.signal, assertActive, remaining, bounded, close,
     bindDeadline(expiresAt) {

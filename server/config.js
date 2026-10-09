@@ -64,12 +64,18 @@ function emailDomain(value) {
 export function resolveCimProviderProfile(environment = process.env) {
   const enabled = environment.DEAL_HUNTER_CIM_PROVIDER_ENABLED === 'true';
   const profile = String(environment.DEAL_HUNTER_CIM_PROVIDER_PROFILE || '').trim();
+  if (environment.P10B_QUALIFICATION_RUNTIME === 'true' && profile !== CONTROLLED_CIM_MAILBOX_PROFILE) {
+    return { enabled, profile, mode: 'invalid-qualification-runtime', provider: '',
+      qualificationRuntime: true, qualificationPhase: environment.P10B_QUALIFICATION_PHASE || '' };
+  }
   if (profile === CONTROLLED_CIM_MAILBOX_PROFILE) {
     return {
       enabled,
       profile,
       mode: 'controlled-mailbox',
       provider: 'resend',
+      qualificationRuntime: environment.P10B_QUALIFICATION_RUNTIME === 'true',
+      qualificationPhase: environment.P10B_QUALIFICATION_PHASE || '',
       resendApiKey: environment.DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY || '',
       resendFromEmail: environment.DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL || '',
       resendReplyTo: environment.DEAL_HUNTER_CIM_MAILBOX_REPLY_TO || '',
