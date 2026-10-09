@@ -10,7 +10,9 @@ import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { recordEmailEventsFromWebhook } from '../server/services/emailEvents.js';
 import { retryPendingInboundIngestion } from '../server/services/communications.js';
 import { executeP10bFirstMailboxQualification } from '../server/services/pursueCimControlledMailboxHarness.js';
-import { qualificationDigest } from '../server/services/p10bQualificationContract.js';
+import { P10B_QUALIFICATION_VERSION, qualificationDigest } from '../server/services/p10bQualificationContract.js';
+import { P10B_CONFIGURATION_EVIDENCE_VERSION, P10B_PROVIDER_IDENTITY, P10B_RUNTIME_PACKET_VERSION,
+  p10bProviderIdentityDigest } from '../server/services/p10bProviderIdentity.js';
 import { createP10bControlChannel } from '../server/services/p10bControlChannel.js';
 import { runP10bQualificationHost, validateP10bRuntimePacket } from '../server/services/p10bQualificationHost.js';
 import { initializeP10bRuntimeFilesystem, p10bDatabaseIdentity, p10bPublicConfigurationDigest,
@@ -32,16 +34,14 @@ async function hostFixture(t, variant = '') {
   f.manifest.runtime.databaseIdentityHash = p10bDatabaseIdentity(databasePath);
   f.manifest.maximumRuntimeMs = 10000;
   const secrets = [{ name: 'DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY', digest: 'abc123' }];
-  const configurationEvidence = { teamId: f.manifest.runtime.teamId,
-    sendingDomain: f.manifest.domain, receivingDomain: f.manifest.domain,
-    sendingKeyPermission: 'sending_access', reconciliationKeyPermission: 'full_access',
-    sendingKeyId: 'offline-outbound-key', reconciliationKeyId: 'offline-read-key',
-    webhookId: 'offline-webhook', webhookUrl: 'https://uckele-group-p10b.fly.dev/api/webhooks/resend',
+  const configurationEvidence = { version: P10B_CONFIGURATION_EVIDENCE_VERSION,
+    providerIdentity: structuredClone(P10B_PROVIDER_IDENTITY),
+    providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY),
     verifiedAt: f.manifest.issuedAt, flySecretMetadataDigest: digest(secrets),
     runtimeConfigurationDigests: { qualify: p10bPublicConfigurationDigest(f.options.config) } };
   f.manifest.configurationEvidenceDigest = digest(configurationEvidence);
   f.options.reviewedDigest = qualificationDigest(f.manifest);
-  const packet = { version: 'p10b-runtime-packet-v2', operation: 'qualify',
+  const packet = { version: P10B_RUNTIME_PACKET_VERSION, operation: 'qualify',
     guest: { issuedAt: f.manifest.issuedAt, stopAt: new Date(Date.parse(f.manifest.issuedAt) + 10000).toISOString(),
       closureGraceMs: 200, stopReserveMs: 200 },
     target: { app: f.manifest.runtime.app, machineId: f.manifest.runtime.machineId, imageDigest: f.manifest.runtime.imageDigest },
@@ -53,9 +53,15 @@ async function hostFixture(t, variant = '') {
     opportunityId: f.prepared.opportunityId, initialActivationId: f.prepared.initialActivationId };
   fs.writeFileSync(`${databasePath}.p10b-preparation.json`, JSON.stringify({
     sourceHead, app: packet.target.app, machineId: packet.target.machineId,
+    providerIdentityDigest: configurationEvidence.providerIdentityDigest,
     databaseIdentityHash: f.manifest.runtime.databaseIdentityHash,
     opportunityId: packet.opportunityId, initialActivationId: packet.initialActivationId,
     review: f.prepared.review }), { flag: 'wx', mode: 0o600 });
+  if (variant === 'preparation-provider-drift') {
+    const retained = JSON.parse(fs.readFileSync(`${databasePath}.p10b-preparation.json`));
+    retained.providerIdentityDigest = 'd'.repeat(64);
+    fs.writeFileSync(`${databasePath}.p10b-preparation.json`, JSON.stringify(retained));
+  }
   fs.writeFileSync(`${databasePath}.p10b-qualify-start.json`, JSON.stringify({
     version: 'p10b-one-start-v1', sourceHead, databaseIdentityHash: f.manifest.runtime.databaseIdentityHash,
     startedAt: f.manifest.issuedAt }), { flag: 'wx', mode: 0o600 });
@@ -228,12 +234,13 @@ test('actual offline worker closes SQLite authority before process death and hos
 
 test('host failures retain evidence, stop once and never release qualification', async (t) => {
   for (const variant of ['start-failure', 'malformed-provider', 'malformed-frame',
-    'tampered-candidate', 'sqlite-close-failure', 'sqlite-acquire-failure', 'stop-failure', 'stop-timeout', 'uncertain-process']) await t.test(variant, async (t) => {
+    'tampered-candidate', 'preparation-provider-drift', 'sqlite-close-failure', 'sqlite-acquire-failure', 'stop-failure', 'stop-timeout', 'uncertain-process']) await t.test(variant, async (t) => {
     const h = await hostFixture(t, variant);
     const began = Date.now();
     const result = await h.run();
     assert.equal(result.success, false); assert.equal(result.lifecycleVerified, false);
     assert.equal(result.artifact, undefined); assert.equal(h.stops, variant === 'start-failure' ? 0 : 1);
+    if (variant === 'preparation-provider-drift') assert.equal(fs.existsSync(h.ledger), false);
     if (variant === 'stop-timeout' || variant === 'stop-failure') {
       assert.ok(Date.now() - began < 5000, 'Verified guest handoff must not renew the stopped-readback budget');
     }
@@ -265,7 +272,7 @@ test('packet identity, freshness, budget and hard-offs fail before outbound work
     (p) => { p.sourceHead = 'main'; },
     (p) => { p.databasePath = '/data/p10b-readiness.sqlite'; },
     (p) => { p.configurationEvidence.verifiedAt = '2020-01-01T00:00:00Z'; },
-    (p) => { p.configurationEvidence.sendingKeyPermission = 'full_access'; },
+    (p) => { p.configurationEvidence.providerIdentity.outboundKey.permission = 'full_access'; },
     (p) => { p.manifest.runtime.teamId = 'wrong-team'; },
   ]) {
     const changed = structuredClone(h.packet); mutate(changed);
@@ -628,13 +635,12 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
   t.after(async () => { await adapter.reap(); });
   const secrets = [{ name: 'DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY', digest: 'abc123' }];
   const qualifyCfg = structuredClone(cfg); qualifyCfg.dealHunter.cimProvider.qualificationPhase = 'qualify';
-  const evidence = { teamId: 'offline-team', sendingDomain: cfg.dealHunter.cimProvider.resendInboundDomain,
-    receivingDomain: cfg.dealHunter.cimProvider.resendInboundDomain, sendingKeyPermission: 'sending_access',
-    reconciliationKeyPermission: 'full_access', sendingKeyId: 'outbound', reconciliationKeyId: 'read',
-    webhookId: 'offline', webhookUrl: 'https://uckele-group-p10b.fly.dev/api/webhooks/resend', verifiedAt: at,
+  const evidence = { version: P10B_CONFIGURATION_EVIDENCE_VERSION,
+    providerIdentity: structuredClone(P10B_PROVIDER_IDENTITY),
+    providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY), verifiedAt: at,
     flySecretMetadataDigest: digest(secrets), runtimeConfigurationDigests: {
       prepare: '4'.repeat(64), qualify: '5'.repeat(64) } };
-  const packet = { version: 'p10b-runtime-packet-v2', operation: 'prepare',
+  const packet = { version: P10B_RUNTIME_PACKET_VERSION, operation: 'prepare',
     guest: { issuedAt: at, stopAt: new Date(Date.parse(at)+10000).toISOString(), closureGraceMs: 1000, stopReserveMs: 2000 }, target: {
     app: 'uckele-group-p10b', machineId, imageDigest: machine.image_ref.digest }, sourceHead,
     databasePath: logicalPath, actor: 'offline-owner', runId: 'offline-concrete-first-mailbox',
@@ -657,8 +663,9 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
   assert.equal(prepare.lifecycleVerified, false); assert.equal(fs.existsSync(posts), false);
   assert.equal(prepare.preparation.providerCalls, 0);
   const r = prepare.preparation;
-  const manifest = { version: 'p10b-first-mailbox-qualification-v1', runtime: { teamId: evidence.teamId,
-    ...packet.target, databaseIdentityHash: r.databaseIdentityHash }, domain: evidence.sendingDomain,
+  const manifest = { version: P10B_QUALIFICATION_VERSION, runtime: {
+    providerIdentity: structuredClone(evidence.providerIdentity), providerIdentityDigest: r.providerIdentityDigest,
+    ...packet.target, databaseIdentityHash: r.databaseIdentityHash }, domain: evidence.providerIdentity.domain.name,
     recipient: 'mathew@uckelegroup.com', from: cfg.dealHunter.cimProvider.resendFromEmail,
     replyTo: r.review.transmission.addressing.replyTo, ownerPermissionDigest: packet.ownerPermissionDigest,
     configurationEvidenceDigest: packet.configurationEvidenceDigest,

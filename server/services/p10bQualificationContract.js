@@ -1,10 +1,18 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { p10bProviderIdentityDigest, validateP10bProviderIdentity } from './p10bProviderIdentity.js';
 
 export const P10B_QUALIFICATION_WRITER = 'p10b-first-mailbox-qualification';
-export const P10B_QUALIFICATION_VERSION = 'p10b-first-mailbox-qualification-v1';
+export const P10B_QUALIFICATION_VERSION = 'p10b-first-mailbox-qualification-v2';
 const digestPattern = /^[0-9a-f]{64}$/;
-const runtimeKeys = ['teamId', 'app', 'machineId', 'imageDigest', 'databaseIdentityHash'];
+const runtimeKeys = ['providerIdentityDigest', 'app', 'machineId', 'imageDigest', 'databaseIdentityHash'];
+const runtimeFields = new Set([...runtimeKeys, 'providerIdentity']);
 const grants = new WeakMap();
+
+export function validateP10bProviderRuntime(runtime) {
+  return runtime && Object.keys(runtime).every((key) => runtimeFields.has(key))
+    && validateP10bProviderIdentity(runtime.providerIdentity)
+    && p10bProviderIdentityDigest(runtime.providerIdentity) === runtime.providerIdentityDigest;
+}
 
 export function qualificationDigest(manifest) {
   return sha256(stableCanonicalJson(manifest));
@@ -34,7 +42,7 @@ export function validateQualificationContract({ manifest, observed, now,
     || manifest.maximumRuntimeMs > end - start
     || current - start >= manifest.maximumRuntimeMs) return deny('qualification_limits');
   if (manifest.runtime?.app !== 'uckele-group-p10b'
-    || !/^[a-zA-Z0-9_-]{1,120}$/.test(manifest.runtime?.teamId || '')
+    || !validateP10bProviderRuntime(manifest.runtime)
     || !/^[0-9a-f]{14}$/.test(manifest.runtime?.machineId || '')
     || !/^sha256:[0-9a-f]{64}$/.test(manifest.runtime?.imageDigest || '')
     || !digestPattern.test(manifest.runtime?.databaseIdentityHash || '')
@@ -48,7 +56,8 @@ export function validateQualificationContract({ manifest, observed, now,
     || !digestPattern.test(manifest.payloadDigest || '')
     || typeof manifest.transmissionId !== 'string' || !manifest.transmissionId
     || manifest.transmissionId.length > 240) return deny('qualification_identity');
-  if (!observed || runtimeKeys.some((key) => observed.runtime?.[key] !== manifest.runtime[key])
+  if (!observed || !validateP10bProviderRuntime(observed.runtime)
+    || runtimeKeys.some((key) => observed.runtime?.[key] !== manifest.runtime[key])
     || observed.domain !== manifest.domain || observed.ownerPermissionDigest !== manifest.ownerPermissionDigest
     || observed.configurationEvidenceDigest !== manifest.configurationEvidenceDigest
     || observed.freshDatabase !== true || observed.stopSupervised !== true

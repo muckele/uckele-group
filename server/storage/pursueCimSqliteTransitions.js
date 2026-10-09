@@ -48,7 +48,7 @@ function qualificationInboundAuthority(database, command) {
     if (authorizations.length !== 1 || !authorization.consumed_at || authorization.withdrawn_at
       || authorization.provider_profile !== 'controlled-mailbox-v1'
       || authorization.maximum_calls !== 1 || authorization.issued_at > now || authorization.expires_at <= now
-      || !/^p10b-first-mailbox-qualification-v1:[0-9a-f]{64}$/.test(authorization.reason || '')
+      || !/^p10b-first-mailbox-qualification-v2:[0-9a-f]{64}$/.test(authorization.reason || '')
       || currentActivationChain(database, 'fl04b-initial', now)?.id !== authorization.activation_id
       || pause?.outreach_paused !== 1 || transmission?.state !== 'accepted'
       || transmission.provider !== 'resend' || transmission.invocation_authority_count !== 1

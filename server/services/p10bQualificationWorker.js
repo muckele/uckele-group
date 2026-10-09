@@ -4,6 +4,7 @@ import { getConfig } from '../config.js';
 import { createSqliteStorage } from '../storage/sqlite.js';
 import { prepareP10bControlledMailbox, executeP10bFirstMailboxQualification } from './pursueCimControlledMailboxHarness.js';
 import { assertQualificationHardOff, qualificationDigest } from './p10bQualificationContract.js';
+import { validateP10bRuntimePacket } from './p10bQualificationHost.js';
 import { isP10bQualificationRuntime, p10bDatabaseIdentity, p10bPublicConfigurationDigest, P10B_MACHINE_ID } from './p10bRuntime.js';
 import { requestP10bIngressClosure } from './p10bIngressClosure.js';
 import { assertP10bGuestReady, completeP10bGuestHandoff, parseP10bGuestWindow, p10bGuestWindow,
@@ -85,9 +86,8 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
     return new Promise(() => {});
   };
   try {
-    if (packet?.version !== 'p10b-runtime-packet-v2' || !['prepare', 'qualify'].includes(packet.operation)) {
-      throw new Error('Invalid runtime packet');
-    }
+    const { startedAt: _startedAt, ...hostPacket } = packet || {};
+    validateP10bRuntimePacket(hostPacket, new Date(clock()).toISOString());
     validateRuntime(config, packet, runtime);
     window = p10bGuestWindow(packet);
     databasePath = resolveDatabasePath(packet.databasePath);
@@ -113,6 +113,7 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
       const receipt = { version: 'p10b-runtime-preparation-v1', app: runtime.app, machineId: runtime.machineId,
         sourceHead: packet.sourceHead, databaseIdentityHash: identity.databaseIdentityHash,
         runtimeConfigurationDigest: p10bPublicConfigurationDigest(config),
+        providerIdentityDigest: packet.configurationEvidence.providerIdentityDigest,
         opportunityId: prepared.opportunityId, initialActivationId: prepared.initialActivationId,
         preparedAt: prepared.preparedAt, review: prepared.review, providerCalls: 0, productionReady: false };
       storage.close(); sqliteClosed = true; storage = null;
@@ -131,6 +132,8 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
     if (qualificationDigest(manifest) !== packet.reviewedDigest || initial.transmissions !== 1
       || initial.authorizations !== 0 || initial.databaseIdentityHash !== manifest.runtime.databaseIdentityHash
       || retained.databaseIdentityHash !== initial.databaseIdentityHash || retained.sourceHead !== packet.sourceHead
+      || retained.providerIdentityDigest !== packet.configurationEvidence.providerIdentityDigest
+      || retained.providerIdentityDigest !== manifest.runtime.providerIdentityDigest
       || retained.review.digest !== manifest.reviewDigest || retained.review.transmission.id !== manifest.transmissionId
       || retained.app !== runtime.app || retained.machineId !== runtime.machineId
       || retained.opportunityId !== packet.opportunityId || retained.initialActivationId !== packet.initialActivationId

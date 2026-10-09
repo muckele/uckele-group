@@ -2,9 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
-import { qualificationDigest, validateQualificationContract } from './p10bQualificationContract.js';
+import { P10B_QUALIFICATION_VERSION, qualificationDigest, validateP10bProviderRuntime,
+  validateQualificationContract } from './p10bQualificationContract.js';
 import { P10B_MACHINE_ID } from './p10bRuntime.js';
 import { P10B_GUEST_PROCESSES, p10bGuestWindow } from './p10bGuestShutdown.js';
+import { P10B_CONFIGURATION_EVIDENCE_VERSION, P10B_RUNTIME_PACKET_VERSION,
+  p10bProviderIdentityDigest, validateP10bProviderIdentity } from './p10bProviderIdentity.js';
 
 const owners = new Set();
 const digest = (value) => sha256(stableCanonicalJson(value));
@@ -27,9 +30,11 @@ export function validateP10bRuntimePacket(packet, now) {
     'runId', 'permissionEvidenceId', 'ownerPermissionDigest', 'configurationEvidence',
     'configurationEvidenceDigest', 'budget', 'manifest', 'reviewedDigest', 'opportunityId', 'initialActivationId', 'guest']);
   const evidence = packet?.configurationEvidence;
+  const evidenceFields = new Set(['version', 'providerIdentity', 'providerIdentityDigest',
+    'flySecretMetadataDigest', 'runtimeConfigurationDigests', 'verifiedAt']);
   const date = Date.parse(now);
   if (!packet || Object.keys(packet).some((key) => !allowed.has(key))
-    || packet.version !== 'p10b-runtime-packet-v2' || !['prepare', 'qualify'].includes(packet.operation)
+    || packet.version !== P10B_RUNTIME_PACKET_VERSION || !['prepare', 'qualify'].includes(packet.operation)
     || packet.target?.app !== 'uckele-group-p10b' || packet.target?.machineId !== P10B_MACHINE_ID
     || !/^sha256:[0-9a-f]{64}$/.test(packet.target?.imageDigest || '')
     || !/^[0-9a-f]{40}$/.test(packet.sourceHead || '')
@@ -37,14 +42,10 @@ export function validateP10bRuntimePacket(packet, now) {
     || typeof packet.actor !== 'string' || !/^[A-Za-z0-9_.@-]{1,120}$/.test(packet.actor)
     || !hash.test(packet.ownerPermissionDigest || '') || !evidence
     || digest(evidence) !== packet.configurationEvidenceDigest
-    || !/^[A-Za-z0-9_-]{1,120}$/.test(evidence.teamId || '')
-    || evidence.sendingDomain !== 'p10b-e2e.uckelegroup.com'
-    || evidence.receivingDomain !== evidence.sendingDomain
-    || evidence.sendingKeyPermission !== 'sending_access' || evidence.reconciliationKeyPermission !== 'full_access'
-    || ![evidence.sendingKeyId, evidence.reconciliationKeyId, evidence.webhookId]
-      .every((id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,240}$/.test(id))
-    || evidence.sendingKeyId === evidence.reconciliationKeyId
-    || evidence.webhookUrl !== 'https://uckele-group-p10b.fly.dev/api/webhooks/resend'
+    || Object.keys(evidence).some((key) => !evidenceFields.has(key))
+    || evidence.version !== P10B_CONFIGURATION_EVIDENCE_VERSION
+    || !validateP10bProviderIdentity(evidence.providerIdentity)
+    || p10bProviderIdentityDigest(evidence.providerIdentity) !== evidence.providerIdentityDigest
     || !hash.test(evidence.flySecretMetadataDigest || '')
     || !hash.test(evidence.runtimeConfigurationDigests?.[packet.operation] || '')
     || !Number.isFinite(date) || !Number.isFinite(Date.parse(evidence.verifiedAt))
@@ -60,9 +61,11 @@ export function validateP10bRuntimePacket(packet, now) {
       || packet.manifest) throw new Error('Preparation packet is invalid');
   } else {
     const m = packet.manifest;
-    if (qualificationDigest(m) !== packet.reviewedDigest || m.runtime.app !== packet.target.app
+    if (m?.version !== P10B_QUALIFICATION_VERSION || qualificationDigest(m) !== packet.reviewedDigest
+      || !validateP10bProviderRuntime(m.runtime) || m.runtime.app !== packet.target.app
       || m.runtime.machineId !== packet.target.machineId || m.runtime.imageDigest !== packet.target.imageDigest
-      || m.runtime.teamId !== evidence.teamId || m.ownerPermissionDigest !== packet.ownerPermissionDigest
+      || m.runtime.providerIdentityDigest !== evidence.providerIdentityDigest
+      || m.ownerPermissionDigest !== packet.ownerPermissionDigest
       || m.configurationEvidenceDigest !== packet.configurationEvidenceDigest
       || typeof packet.opportunityId !== 'string' || typeof packet.initialActivationId !== 'string') {
       throw new Error('Qualification packet binding is invalid');
@@ -345,6 +348,7 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
           || prepared.app !== target.app || prepared.machineId !== target.machineId
           || !hash.test(prepared.databaseIdentityHash || '') || prepared.providerCalls !== 0
           || prepared.productionReady !== false || prepared.ingressClosed !== true
+          || prepared.providerIdentityDigest !== packet.configurationEvidence.providerIdentityDigest
           || prepared.runtimeConfigurationDigest !== packet.configurationEvidence.runtimeConfigurationDigests.prepare) {
           throw new Error('Preparation receipt changed');
         }

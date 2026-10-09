@@ -6,6 +6,7 @@ import { createHmac } from 'node:crypto';
 import { createSqliteStorage } from '../../server/storage/sqlite.js';
 import { prepareP10bControlledMailbox } from '../../server/services/pursueCimControlledMailboxHarness.js';
 import { P10B_QUALIFICATION_VERSION, qualificationDigest } from '../../server/services/p10bQualificationContract.js';
+import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from '../../server/services/p10bProviderIdentity.js';
 import { recordEmailEventsFromWebhook } from '../../server/services/emailEvents.js';
 
 export function config() {
@@ -36,7 +37,9 @@ export async function fixture(t) {
     synthetic: { runId: 'offline-first-mailbox', recipient: 'mathew@uckelegroup.com',
       permissionEvidenceId: 'offline-permission', permissionEvidenceHash: 'f'.repeat(64) } });
   const manifest = { version: P10B_QUALIFICATION_VERSION,
-    runtime: { teamId: 'offline-team', app: 'uckele-group-p10b', machineId: (++fixtureNumber).toString(16).padStart(14, '0'),
+    runtime: { providerIdentity: structuredClone(P10B_PROVIDER_IDENTITY),
+      providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY),
+      app: 'uckele-group-p10b', machineId: (++fixtureNumber).toString(16).padStart(14, '0'),
       imageDigest: `sha256:${'a'.repeat(64)}`, databaseIdentityHash: 'b'.repeat(64) },
     domain: 'p10b-e2e.uckelegroup.com', recipient: 'mathew@uckelegroup.com',
     from: configuration.dealHunter.cimProvider.resendFromEmail,
