@@ -2,6 +2,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { getCimWebhookAuthority, getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { safeCompareText } from '../utils/security.js';
+import { captureQualificationSignatureReceipt } from './p10bQualificationLifecycle.js';
 import { commitCrmActivityMutation } from './activity.js';
 import {
   applyEmailLifecycleToCommunication,
@@ -198,7 +199,7 @@ function parseSvixSignatures(value) {
     .filter((item) => item.version === 'v1' && item.signature);
 }
 
-function verifySvixSignature(request, secret) {
+function verifySvixSignature(request, secret, now = Date.now()) {
   const svixId = headerValue(request.headers['svix-id']);
   const svixTimestamp = headerValue(request.headers['svix-timestamp']);
   const signatures = parseSvixSignatures(request.headers['svix-signature']);
@@ -208,7 +209,7 @@ function verifySvixSignature(request, secret) {
     return false;
   }
 
-  if (Math.abs(Date.now() / 1000 - timestampSeconds) > 60 * 5) {
+  if (Math.abs(new Date(now).getTime() / 1000 - timestampSeconds) > 60 * 5) {
     return false;
   }
 
@@ -219,7 +220,7 @@ function verifySvixSignature(request, secret) {
   return signatures.some((item) => safeCompareText(item.signature, digest));
 }
 
-function authorizeWebhook(request, configOverride) {
+function authorizeWebhook(request, configOverride, now) {
   const config = configOverride || getConfig();
   const authority = getCimWebhookAuthority(config);
   const expectedSecret = authority.secret;
@@ -234,7 +235,7 @@ function authorizeWebhook(request, configOverride) {
 
   if (request.headers['svix-id'] || request.headers['svix-signature'] || request.headers['svix-timestamp']) {
     return {
-      ok: verifySvixSignature(request, expectedSecret),
+      ok: verifySvixSignature(request, expectedSecret, now),
       error: 'Invalid email webhook signature.',
       ...authority,
     };
@@ -578,9 +579,10 @@ export async function recordEmailEventsFromWebhook(request, {
   fetcher,
   reconcileDailyDigestWebhook = reconcileDailyDealHunterWebhookEvent,
   configOverride,
+  now = new Date().toISOString(),
 } = {}) {
   const config = configOverride || getConfig();
-  const authorization = authorizeWebhook(request, config);
+  const authorization = authorizeWebhook(request, config, now);
 
   if (!authorization.ok) {
     return {
@@ -612,6 +614,10 @@ export async function recordEmailEventsFromWebhook(request, {
       ? payloads.length === 1 ? svixId : `${svixId}:${index + 1}`
       : '';
     const eventInput = buildEventInputFromWebhook(payload, { providerEventId, svixId });
+    if (authorization.providerProfile === 'controlled-mailbox-v1') {
+      eventInput.metadata.qualificationSignatureReceipt = payloads.length === 1
+        ? captureQualificationSignatureReceipt(request, config, now) : null;
+    }
     const authorityProviderEventId = normalizeText(
       eventInput.provider_event_id || eventInput.metadata?.providerEventId, 240);
     const authorityEvent = {
@@ -635,7 +641,7 @@ export async function recordEmailEventsFromWebhook(request, {
 
     if (!internalDailyDigest && storage.resolvePursueCimInboundEvidence) {
       try {
-        inbound = await applyVerifiedPursueCimInbound(authorityEvent, { storage,
+        inbound = await applyVerifiedPursueCimInbound(authorityEvent, { storage, now,
           profileBinding: authorization.requireSignedProviderEvent ? {
             providerProfile: authorization.providerProfile,
             replyDomain: config.dealHunter?.cimProvider?.resendInboundDomain || '',
@@ -693,7 +699,7 @@ export async function recordEmailEventsFromWebhook(request, {
     if (normalizeText(eventInput.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received') {
       let result;
       try {
-        result = await ingestResendReceivedEmail({ event, storage, fetcher,
+        result = await ingestResendReceivedEmail({ event, storage, fetcher, now,
           configOverride: config });
       } catch {
         return {

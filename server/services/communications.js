@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { getCimProviderDeliveryConfig, getConfig } from '../config.js';
+import { getCimProviderDeliveryConfig, getCimProviderReconciliationConfig, getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { commitCrmActivityMutation } from './activity.js';
@@ -710,6 +710,9 @@ async function readBoundedJson(response, maxBytes) {
 }
 
 async function fetchReceivedEmail(emailId, { config = getConfig(), fetcher = fetchWithTimeout } = {}) {
+  const controlled = config.dealHunter?.cimProvider?.mode === 'controlled-mailbox';
+  if (controlled) config = { ...config, delivery: { ...config.delivery,
+    resendApiKey: getCimProviderReconciliationConfig(config).apiKey } };
   if (!config.delivery.resendApiKey) throw new Error('Resend content retrieval is not configured.');
   const request = async (url, maxBytes) => {
     const response = await fetcher(url, {
@@ -722,7 +725,13 @@ async function fetchReceivedEmail(emailId, { config = getConfig(), fetcher = fet
     return readBoundedJson(response, maxBytes);
   };
   const email = await request(receivedEmailUrl(emailId), maxReceivedEmailResponseBytes);
+  if (controlled && email.attachments != null && !Array.isArray(email.attachments)) {
+    throw new Error('Malformed controlled attachment metadata');
+  }
   let attachments = Array.isArray(email.attachments) ? email.attachments : [];
+  if (controlled && attachments.length > 0) {
+    throw new Error('Controlled qualification does not retrieve attachments');
+  }
   if (attachments.length > 0) {
     try {
       const attachmentResult = await request(receivedEmailUrl(emailId, '/attachments'), maxReceivedAttachmentResponseBytes);
@@ -815,11 +824,10 @@ async function markCimResponded(storage, request, communication) {
   return mutation.record;
 }
 
-async function updateInboundContent(storage, communication, received) {
+async function updateInboundContent(storage, communication, received, now = new Date().toISOString()) {
   const email = received.email || {};
   const headers = normalizeHeaders(email.headers);
   const plainText = text(email.text || htmlToPlainText(email.html), maxBodyTextLength);
-  const now = new Date().toISOString();
   const messageId = normalizeMessageId(headers['message-id'] || headers.message_id);
   const inReplyTo = normalizeMessageId(headers['in-reply-to'] || headers.in_reply_to);
   const references = normalizeReferences(headers.references);
@@ -988,7 +996,7 @@ async function resolveAndAssignInboundCommunication({ storage, communication, re
 }
 
 export async function ingestResendReceivedEmail({ event, storage = getStorage(), fetcher,
-  configOverride } = {}) {
+  configOverride, now } = {}) {
   const metadata = objectValue(event?.metadata);
   const providerMessageId = compactText(metadata.resendEmailId || event?.message_id, 240);
   if (!providerMessageId) return { ok: false, accepted: false, error: 'Received email ID is missing.' };
@@ -1038,7 +1046,7 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
     assignment.submissionId = resolved.assignment.submissionId;
     assignment.request = resolved.assignment.request;
     assignment.method = resolved.assignment.method;
-    const updated = await updateInboundContent(storage, communication, received);
+    const updated = await updateInboundContent(storage, communication, received, now);
     await applyObviousInboundOptOut(storage, updated);
     await markCimResponded(storage, assignment.request, updated);
     return { ok: true, accepted: true, communication: updated };

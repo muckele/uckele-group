@@ -5,8 +5,11 @@ import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
 import { deriveAcceptedCimCadence } from '../services/pursueCimCadence.js';
 import { cimFollowUpCapacityWindow } from '../services/pursueCimFollowUpCapacity.js';
+import { P10B_QUALIFICATION_WRITER, qualificationReason,
+  validateQualificationContract } from '../services/p10bQualificationContract.js';
 
 const cimWriterCapabilities = new Map([
+  [P10B_QUALIFICATION_WRITER, 'fl04b-initial'],
   ['pursue-cim-initial', 'fl04b-initial'],
   ['pursue-cim-autopilot-initial', 'fl04b-initial'],
   ['pursue-cim-follow-up', 'fl04c-followup'],
@@ -14,6 +17,22 @@ const cimWriterCapabilities = new Map([
   ['pursue-cim-batch', 'fl04c-batch'],
   ['pursue-cim-autopilot-batch', 'fl04c-batch'],
 ]);
+
+function qualificationBound(database, qualification, { transmission, authorization, now }) {
+  if (!transmission || !qualification
+    || database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions').get().count !== 1
+    || database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_live_provider_authorizations
+      WHERE writer_path = ?`).get(P10B_QUALIFICATION_WRITER).count > 1) return false;
+  const communication = database.prepare('SELECT * FROM crm_communications WHERE id = ?')
+    .get(transmission.communication_id);
+  const activation = currentActivationChain(database, 'fl04b-initial', now);
+  const enrollment = activation ? database.prepare(`SELECT * FROM deal_hunter_cim_capability_activations
+    WHERE id = ?`).get(activation.prerequisite_activation_id) : null;
+  if (activation?.prerequisite_evidence_hash !== qualification.manifest?.ownerPermissionDigest
+    || enrollment?.prerequisite_evidence_hash !== qualification.manifest?.ownerPermissionDigest) return false;
+  return Boolean(communication && validateQualificationContract({ ...qualification,
+    transmission, communication, authorization, now }).valid);
+}
 const pursueCimContainmentFindingCodes = new Set([
   'duplicate_provider_identity', 'missing_durable_authority', 'multiple_active_campaigns',
   'duplicate_accepted_touch', 'active_identity_ambiguity', 'unexpected_legacy_invocation',
@@ -504,6 +523,13 @@ export function createPursueCimSqliteTransitions(database, {
         transmission: candidate.transmission, campaignIds, touchIds,
         candidateConversations: [] };
     },
+    async readCimQualificationTerminalEvidence({ conversationId, providerEventId } = {}) {
+      if (!conversationId || !providerEventId) return null;
+      return database.prepare(`SELECT * FROM deal_hunter_cim_terminal_events
+        WHERE scope = 'conversation' AND scope_id = ? AND evidence_id = ?
+          AND reason_code = 'reply_received' ORDER BY revision DESC LIMIT 1`)
+        .get(requiredText(conversationId, 'conversationId'), requiredText(providerEventId, 'providerEventId')) ?? null;
+    },
     async readCimCadenceContext({ transmissionId } = {}) {
       return cadenceContext(database, requiredText(transmissionId, 'transmissionId'));
     },
@@ -992,7 +1018,10 @@ export function createPursueCimSqliteTransitions(database, {
         return { membership, touch, campaign, decision, enrollment, opportunity,
           timezone, crmOwnership, crmSubmission };
       });
-      return { transmission, conversation, authorization, activation, safety,
+      const qualificationChainCurrent = authorization?.writer_path === P10B_QUALIFICATION_WRITER
+        && currentActivationChain(database, 'fl04b-initial', requiredInstant(command.now
+          ?? new Date().toISOString()))?.id === authorization.activation_id;
+      return { transmission, conversation, authorization, activation, safety, qualificationChainCurrent,
         globalAuthorityRevision, communication, outbox, members };
     },
     async enterCimProviderSeam(command) {
@@ -1065,7 +1094,11 @@ export function createPursueCimSqliteTransitions(database, {
         if (transmission.provider_seam_entered_at) {
           return { entered: false, alreadyEntered: true, unauthorized: false };
         }
-        if (!pause || pause.outreach_paused !== 0 || transmission.row_version !== expectedRowVersion) {
+        const qualification = writerPath === P10B_QUALIFICATION_WRITER;
+        if (!pause || pause.outreach_paused !== (qualification ? 1 : 0)
+          || (qualification && !qualificationBound(database, command.qualification,
+            { transmission, authorization, now }))
+          || transmission.row_version !== expectedRowVersion) {
           return { entered: false, alreadyEntered: false, unauthorized: true };
         }
         const changed = database.prepare(`
@@ -1195,7 +1228,10 @@ export function createPursueCimSqliteTransitions(database, {
           return blocked('lifecycle_conflict');
         }
         const readiness = authoritySnapshot.readiness;
-        if (!authorityDigestMatches(readiness) || readiness.ready !== true
+        const qualification = writerPath === P10B_QUALIFICATION_WRITER;
+        if (qualification ? readiness?.version !== 'p10b-qualification-permission-v1'
+          || !qualificationBound(database, readiness, { transmission, now })
+          : !authorityDigestMatches(readiness) || readiness.ready !== true
           || readiness.version !== 'cim-provider-readiness-v1'
           || readiness.providerProfile !== providerProfile
           || Date.parse(readiness.expiresAt) <= Date.parse(now)) {
@@ -1211,7 +1247,7 @@ export function createPursueCimSqliteTransitions(database, {
         const pause = database.prepare(`
           SELECT outreach_paused FROM deal_hunter_cim_safety_settings WHERE id = 'global'
         `).get();
-        if (!pause || pause.outreach_paused !== 0) return blocked('central_pause');
+        if (!pause || pause.outreach_paused !== (qualification ? 1 : 0)) return blocked('central_pause');
         const authorization = database.prepare(`
           SELECT * FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?
         `).get(authorizationId);
@@ -1224,6 +1260,8 @@ export function createPursueCimSqliteTransitions(database, {
           || Date.parse(authorization.expires_at) <= Date.parse(now)) {
           return blocked('live_authorization_invalid');
         }
+        if (qualification && !qualificationBound(database, readiness,
+          { transmission, authorization, now })) return blocked('live_authorization_invalid');
         if (authoritySnapshot.authorization?.id !== authorization.id
           || authoritySnapshot.authorization?.activation_id !== authorization.activation_id
           || authoritySnapshot.authorization?.payload_digest !== authorization.payload_digest
@@ -1622,7 +1660,9 @@ export function createPursueCimSqliteTransitions(database, {
             && existing.writer_path === writerPath && existing.transmission_id === transmissionId
             && existing.payload_digest === payloadDigest
             && existing.recipient_authority_digest === recipientAuthorityDigest
-            && existing.provider_profile === providerProfile && existing.expires_at === expiresAt;
+            && existing.provider_profile === providerProfile && existing.expires_at === expiresAt
+            && (writerPath !== P10B_QUALIFICATION_WRITER
+              || (existing.reason === reason && existing.actor === actor && existing.issued_at === now));
           return outcome({ replay, conflict: !replay }, existing);
         }
         const current = database.prepare(`
@@ -1642,6 +1682,14 @@ export function createPursueCimSqliteTransitions(database, {
         if (!transmission || transmission.state !== 'prepared'
           || transmission.payload_digest !== payloadDigest) {
           return outcome({ blockedReason: 'transmission_invalid' });
+        }
+        if (writerPath === P10B_QUALIFICATION_WRITER
+          && (capability !== 'fl04b-initial' || providerProfile !== 'controlled-mailbox-v1'
+            || reason !== qualificationReason(command.qualification?.manifest)
+            || command.qualification?.manifest?.issuedAt !== now
+            || command.qualification?.manifest?.expiresAt !== expiresAt
+            || !qualificationBound(database, command.qualification, { transmission, now }))) {
+          return outcome({ blockedReason: 'live_authorization_invalid' });
         }
         const members = database.prepare(`
           SELECT c.recipient_fingerprint, t.kind
