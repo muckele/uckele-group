@@ -87,6 +87,7 @@ async function fixture(t) {
       calls += 1;
       assert.equal(url, 'https://api.resend.com/emails');
       const body = JSON.parse(options.body);
+      assert.equal(body.from, manifest.from);
       assert.deepEqual(body.to, [manifest.recipient]);
       assert.equal(body.reply_to, manifest.replyTo);
       return new Response(JSON.stringify({ id: 'offline-provider-message' }), { status: 200 });
@@ -145,6 +146,59 @@ test('first mailbox qualification uses real SQLite once while all ordinary hard-
   assert.equal(projection.transmission.invocation_authority_count, 1);
   await assert.rejects(executeP10bFirstMailboxQualification(f.options));
   assert.equal(f.calls, 1);
+});
+
+test('documented display-name sender survives exact reconciliation without address-only normalization', async (t) => {
+  for (const [label, from, accepted] of [
+    ['documented display name', 'P10B Sender <sender@p10b-e2e.uckelegroup.com>', true],
+    ['bare mailbox', 'sender@p10b-e2e.uckelegroup.com', false],
+    ['different display name', 'Other Sender <sender@p10b-e2e.uckelegroup.com>', false],
+    ['different mailbox', 'P10B Sender <other@p10b-e2e.uckelegroup.com>', false],
+    ['different domain', 'P10B Sender <sender@other.example.test>', false],
+    ['multiple senders', 'P10B Sender <sender@p10b-e2e.uckelegroup.com>, other@example.test', false],
+  ]) await t.test(label, async (t) => {
+    const f = await fixture(t);
+    f.options.readFetcher = async () => new Response(JSON.stringify({ data: [{
+      id: 'offline-provider-message', created_at: f.manifest.issuedAt, from,
+      to: [f.manifest.recipient], cc: null, bcc: null, reply_to: [f.manifest.replyTo],
+      subject: f.prepared.review.transmission.copy.subject,
+    }] }), { status: 200 });
+    if (accepted) {
+      const result = await executeP10bFirstMailboxQualification(f.options);
+      assert.equal(result.evidence.lifecycleVerified, true);
+      assert.equal(result.evidence.productionReady, false);
+    } else await assert.rejects(executeP10bFirstMailboxQualification(f.options), (error) => {
+      assert.equal(error.p10bEvidence.failureStage, 'reconciliation-write');
+      assert.equal(error.p10bEvidence.lifecycleVerified, false);
+      assert.equal(error.p10bEvidence.reconciliationOnly, true);
+      assert.equal(error.p10bEvidence.stoppedVerified, true);
+      return true;
+    });
+    assert.equal(f.calls, 1);
+    assert.equal(f.stops, 1);
+    await assert.rejects(executeP10bFirstMailboxQualification(f.options));
+    assert.equal(f.calls, 1, 'representation drift never grants a resend');
+  });
+});
+
+test('validly signed delivery cannot replace the frozen sender representation', async (t) => {
+  const f = await fixture(t);
+  await executeP10bFirstMailboxQualification(f.options);
+  const snapshot = await readQualificationLifecycleSnapshot({ storage: f.storage, manifest: f.manifest });
+  for (const from of ['sender@p10b-e2e.uckelegroup.com',
+    'Other Sender <sender@p10b-e2e.uckelegroup.com>',
+    'P10B Sender <other@p10b-e2e.uckelegroup.com>']) await t.test(from, () => {
+    const changed = structuredClone(snapshot);
+    const receipt = changed.delivery.metadata.qualificationSignatureReceipt;
+    const payload = JSON.parse(receipt.rawBody);
+    payload.data.from = from;
+    const request = signedRequest(payload, f.options.config, receipt.verifiedAt, receipt.svixId);
+    receipt.rawBody = request.rawBody;
+    receipt.svixSignature = request.headers['svix-signature'];
+    assert.throws(() => verifyQualificationLifecycle({ manifest: f.manifest,
+      config: f.options.config, snapshot: changed, reconciliation: f.reconciliation,
+      now: f.manifest.issuedAt }), /delivery/);
+  });
 });
 
 test('qualification manifest rejects identity, configuration, budget, payload and permission drift', async (t) => {
