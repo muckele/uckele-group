@@ -111,13 +111,16 @@ async function hostFixture(t, variant = '') {
       closeStorage: () => cached.close() });
     await serveP10bQualificationWorker({ channel, config: data.config,
       runtime: { app: data.manifest.runtime.app, machineId: data.manifest.runtime.machineId, sourceHead: data.sourceHead },
-      closeIngress: (opts) => requestP10bIngressClosure(opts),
+      closeIngress: async (opts) => {
+        await requestP10bIngressClosure(opts);
+        if (data.variant === 'slow-cleanup') await new Promise(resolve => setTimeout(resolve, 300));
+      },
       createStorage: (cfg) => { const storage = createSqliteStorage({ ...cfg, storage: { sqlitePath: data.databasePath } });
         if (data.variant === 'sqlite-acquire-failure') throw new Error('offline storage factory failure');
         if (data.variant === 'sqlite-close-failure') storage.close = () => { throw new Error('offline SQLite close failure'); };
         return storage; },
       resolveDatabasePath: () => data.databasePath, clock: () => data.manifest.issuedAt,
-      execute: (options) => executeP10bFirstMailboxQualification({ ...options, lifecyclePollMs: 20, stopTimeoutMs: 200,
+      execute: (options) => executeP10bFirstMailboxQualification({ ...options, lifecyclePollMs: 20, stopTimeoutMs: data.supervisorStopTimeoutMs,
         fetcher: async (url, request) => {
           if (url !== 'https://api.resend.com/emails' || request.method !== 'POST') throw new Error('Unexpected offline request');
           fs.appendFileSync(data.ledger, JSON.stringify({ method: request.method, body: JSON.parse(request.body) }) + '\\n');
@@ -214,7 +217,7 @@ async function hostFixture(t, variant = '') {
         marker.guestWindowDigest = digest(p10bGuestWindow(packet));
         fs.writeFileSync(`${databasePath}.p10b-qualify-start.json`, JSON.stringify(marker));
         const childData = JSON.parse(fs.readFileSync(data)); childData.config = f.options.config; childData.manifest = f.manifest;
-        childData.wallStartedAt = Date.now();
+        childData.wallStartedAt = Date.now(); childData.supervisorStopTimeoutMs = options.stopTimeoutMs || 200;
         fs.writeFileSync(data, JSON.stringify(childData));
       }
       return runP10bQualificationHost({ packet, adapter,
@@ -225,7 +228,7 @@ async function hostFixture(t, variant = '') {
 
 test('actual offline worker closes SQLite authority before process death and host artifact release', async (t) => {
   const h = await hostFixture(t);
-  const result = await h.run();
+  const result = await h.run({ stopTimeoutMs: 1000, closureGraceMs: 1000 });
   const guardianFiles = Object.fromEntries(['request', 'ack', 'receipt'].map(name => {
     const file = `${path.join(h.f.directory, 'fixture.sqlite')}.p10b-qualify-guardian-${name}.json`;
     return [name, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file)) : null];
@@ -248,6 +251,19 @@ test('actual offline worker closes SQLite authority before process death and hos
   assert.ok(fs.existsSync(`${h.evidencePath}.result.json`));
   const replay = await h.run();
   assert.equal(replay.success, false); assert.equal(h.starts, 1); assert.equal(h.stops, 1);
+});
+
+
+test('delayed cleanup reproduces the compressed fixture budget and succeeds within a reserved bounded budget', async t => {
+  for (const milliseconds of [200, 1000]) await t.test(String(milliseconds), async t => {
+    const h = await hostFixture(t, 'slow-cleanup');
+    const result = await h.run({ stopTimeoutMs: milliseconds, closureGraceMs: milliseconds });
+    assert.equal(result.success, milliseconds === 1000, JSON.stringify(result));
+    assert.equal(result.lifecycleVerified, milliseconds === 1000);
+    assert.equal(result.productionReady, false); assert.equal(h.starts, 1); assert.equal(h.stops, 1);
+    assert.equal(fs.readFileSync(h.ledger, 'utf8').trim().split('\n').length, 1);
+    if (milliseconds === 200) { assert.equal(result.failureStage, 'worker'); assert.equal(result.artifact, undefined); }
+  });
 });
 
 test('host failures retain evidence, stop once and never release qualification', async (t) => {
