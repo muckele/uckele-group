@@ -86,6 +86,7 @@ async function hostFixture(t, variant = '') {
   let child;
   let guardian;
   let exit;
+  let workerStderr = '';
   const ledger = path.join(f.directory, 'offline-posts.jsonl');
   const data = path.join(f.directory, 'offline-worker-data.json');
   fs.writeFileSync(data, JSON.stringify({ config: f.options.config, sourceHead, databasePath,
@@ -180,7 +181,7 @@ async function hostFixture(t, variant = '') {
       child = spawn(process.execPath, [script, data], { stdio: ['pipe', 'pipe', 'pipe'] });
       exit = new Promise((resolve) => child.once('close', () => resolve(true)));
       let stderr = '';
-      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; workerStderr += chunk; });
       t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
       const channel = createP10bControlChannel({ input: child.stdout, output: child.stdin });
       const originalNext = channel.next;
@@ -200,7 +201,7 @@ async function hostFixture(t, variant = '') {
     },
   };
   return { f, packet, adapter, machine, ledger, admission, admissionDirectory, get starts() { return starts; }, get stops() { return stops; },
-    get reads() { return reads; }, get child() { return child; }, evidencePath: path.join(f.directory, 'host'),
+    get reads() { return reads; }, get child() { return child; }, get workerStderr() { return workerStderr; }, evidencePath: path.join(f.directory, 'host'),
     run: (options = {}) => {
       if (!starts) {
         packet.guest.stopAt = new Date(Math.min(Date.parse(f.manifest.expiresAt),
@@ -225,6 +226,112 @@ async function hostFixture(t, variant = '') {
         stopTimeoutMs: 200, closureGraceMs: 200, admission, admissionDirectory, ...options });
     } };
 }
+
+test('early worker failure keeps verifying through transient reads, slow reads and reap failure', async t => {
+  for (const variant of ['transient-read', 'slow-read', 'reap-failure']) await t.test(variant, async t => {
+    const h = await hostFixture(t);
+    h.f.manifest.maximumRuntimeMs = 3200;
+    h.adapter.openWorker = async () => { throw Error('offline-sending-secret'); };
+    const read = h.adapter.getMachine;
+    let activeSignal; let stoppingReads = 0;
+    h.adapter.getMachine = async (target, options) => {
+      activeSignal ||= options.signal;
+      if (options.signal !== activeSignal) {
+        stoppingReads++;
+        if (stoppingReads === 1 && variant === 'transient-read') throw Error('offline-sending-secret');
+        if (stoppingReads === 1 && variant === 'slow-read') await new Promise(resolve => setTimeout(resolve, 1100));
+      }
+      return read(target, options);
+    };
+    let reaps = 0;
+    h.adapter.reap = async () => {
+      if (++reaps === 1 && variant === 'reap-failure') throw Error('offline-sending-secret');
+      return true;
+    };
+    const result = await h.run({ closureGraceMs: 400, stopTimeoutMs: 400 });
+    assert.equal(result.failureStage, 'worker'); assert.equal(result.success, false);
+    assert.equal(result.stoppedVerified, true, JSON.stringify(result));
+    assert.equal(result.stopUncertain, variant === 'reap-failure');
+    assert.ok(stoppingReads > 0); assert.equal(h.starts, 1); assert.equal(h.stops, 1);
+    assert.equal(fs.existsSync(h.ledger), false); assert.equal(result.artifact, undefined);
+    assert.deepEqual(result.failureDetails, { version: 'p10b-runtime-failure-v1',
+      origin: 'host', stage: 'worker', reason: 'operation-failed' });
+    assert.equal(JSON.stringify(result).includes('offline-sending-secret'), false);
+  });
+});
+
+test('pre-admission storage failure retains a safe worker phase in the host receipt', async t => {
+  const h = await hostFixture(t, 'sqlite-acquire-failure');
+  h.f.manifest.maximumRuntimeMs = 3200;
+  const result = await h.run({ closureGraceMs: 400, stopTimeoutMs: 400 });
+  assert.equal(result.success, false); assert.equal(result.artifact, undefined);
+  assert.deepEqual(result.failureDetails, { version: 'p10b-runtime-failure-v1',
+    origin: 'worker', stage: 'storage-open', reason: 'operation-failed' }, h.workerStderr);
+  assert.equal(fs.existsSync(h.ledger), false);
+});
+
+test('persistent stopped-read failures exhaust the frozen cutoff without another start or artifact', async t => {
+  const h = await hostFixture(t); h.f.manifest.maximumRuntimeMs = 1600;
+  h.adapter.openWorker = async () => { throw Error('offline-sending-secret'); };
+  const read = h.adapter.getMachine; let activeSignal;
+  h.adapter.getMachine = async (target, options) => {
+    activeSignal ||= options.signal;
+    if (options.signal !== activeSignal) throw Error('offline-sending-secret');
+    return read(target, options);
+  };
+  h.adapter.reap = async () => true;
+  const began = Date.now(); const result = await h.run({ closureGraceMs: 300, stopTimeoutMs: 300 });
+  assert.equal(result.stoppedVerified, false); assert.equal(result.stopUncertain, true);
+  assert.ok(Date.now() - began >= 1500); assert.ok(Date.now() - began < 2300);
+  assert.ok(result.stopVerification.readFailures > 1); assert.ok(result.stopVerification.readAttempts < 30);
+  assert.equal(result.success, false); assert.equal(h.starts, 1); assert.equal(result.artifact, undefined);
+  assert.equal(fs.existsSync(h.ledger), false);
+  assert.ok(fs.existsSync(path.join(h.admissionDirectory, `${h.packet.target.machineId}.active.json`)));
+  assert.equal(JSON.stringify(result).includes('offline-sending-secret'), false);
+});
+
+test('a pending stopped-state read is aborted and reaped at the original cutoff', async t => {
+  const h = await hostFixture(t); h.f.manifest.maximumRuntimeMs = 1600;
+  h.adapter.openWorker = async () => { throw Error('offline-sending-secret'); };
+  const read = h.adapter.getMachine; let activeSignal; let inflight = 0; let aborted = 0; let reaps = 0;
+  h.adapter.getMachine = async (target, options) => {
+    activeSignal ||= options.signal;
+    if (options.signal === activeSignal) return read(target, options);
+    inflight++; assert.equal(inflight, 1); assert.ok(options.timeoutMs <= 1600);
+    return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => {
+      aborted++; inflight--; reject(Error('offline-sending-secret'));
+    }, { once: true }));
+  };
+  h.adapter.reap = async () => { reaps++; return inflight === 0; };
+  const result = await h.run({ closureGraceMs: 300, stopTimeoutMs: 300 });
+  assert.equal(result.success, false); assert.equal(result.stopUncertain, true);
+  assert.equal(result.stopVerification.readAttempts, 1); assert.equal(aborted, 1); assert.equal(inflight, 0);
+  assert.ok(reaps >= 1); assert.equal(h.starts, 1); assert.equal(fs.existsSync(h.ledger), false);
+});
+
+test('a malformed remote failure diagnostic stays failed without leaking arbitrary fields', async t => {
+  const h = await hostFixture(t); h.f.manifest.maximumRuntimeMs = 3200;
+  const open = h.adapter.openWorker;
+  h.adapter.openWorker = async (...args) => {
+    const worker = await open(...args); const next = worker.channel.next; let replaced = false;
+    worker.channel.next = async () => {
+      const frame = await next();
+      if (!replaced && frame?.kind === 'observe') {
+        replaced = true;
+        return { version: 'p10b-control-v1', kind: 'worker-failed', failureDetails: {
+          version: 'p10b-runtime-failure-v1', origin: '__proto__', stage: 'bootstrap',
+          reason: 'operation-failed', message: 'offline-sending-secret' } };
+      }
+      return frame;
+    };
+    return worker;
+  };
+  const result = await h.run({ closureGraceMs: 400, stopTimeoutMs: 400 });
+  assert.equal(result.success, false); assert.equal(result.artifact, undefined);
+  assert.equal(result.failureDetails.reason, 'invalid-diagnostic');
+  assert.equal(JSON.stringify(result).includes('offline-sending-secret'), false);
+  assert.equal(fs.existsSync(h.ledger), false); assert.equal(h.starts, 1); assert.equal(h.stops, 1);
+});
 
 test('actual offline worker closes SQLite authority before process death and host artifact release', async (t) => {
   const h = await hostFixture(t);

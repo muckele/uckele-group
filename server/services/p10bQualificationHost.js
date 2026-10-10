@@ -8,6 +8,7 @@ import { P10B_MACHINE_ID } from './p10bRuntime.js';
 import { P10B_GUEST_PROCESSES, p10bGuestWindow } from './p10bGuestShutdown.js';
 import { P10B_CONFIGURATION_EVIDENCE_VERSION, P10B_RUNTIME_PACKET_VERSION,
   p10bProviderIdentityDigest, validateP10bProviderIdentity } from './p10bProviderIdentity.js';
+import { p10bRuntimeFailure, p10bFailureError, validateP10bRuntimeFailure } from './p10bRuntimeFailure.js';
 
 const owners = new Set();
 const digest = (value) => sha256(stableCanonicalJson(value));
@@ -170,6 +171,7 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
   let prepared;
   let guestHandoffVerified = false;
   let failure;
+  let failureDetails;
   let stage = 'preflight';
   let startIssued = false;
   let startCompleted = false;
@@ -187,12 +189,12 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
     let abort;
     try {
       if (!Number.isFinite(milliseconds) || milliseconds <= 0 || signal?.aborted) {
-        throw new Error('Host operation expired');
+        throw p10bFailureError('host', stage, null, { reason: 'cancelled' });
       }
       return await Promise.race([Promise.resolve().then(task), new Promise((resolve, reject) => {
-        timer = setTimeout(() => reject(new Error('Host operation timed out')), milliseconds);
+        timer = setTimeout(() => reject(p10bFailureError('host', stage, null, { reason: 'timed-out' })), milliseconds);
         if (signal) {
-          abort = () => reject(new Error('Host operation cancelled'));
+          abort = () => reject(p10bFailureError('host', stage, null, { reason: 'cancelled' }));
           signal.addEventListener('abort', abort, { once: true });
         }
       })]);
@@ -223,19 +225,42 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
       let verified = false;
       let reaped = !worker;
       let controlsReaped = true;
+      let readAttempts = 0; let readFailures = 0; let lastFailure = null;
+      // Pace the entire frozen interval so 2048 reads cannot finish early.
+      const pollIntervalMs = Math.max(100, Math.ceil((stopDeadline - Date.now()) / 2047));
+      const reap = async () => {
+        if (typeof adapter.reap !== 'function') return true;
+        try { return await bounded(() => adapter.reap(), Math.min(1000, stopDeadline - Date.now())) === true; }
+        catch (error) { lastFailure = p10bRuntimeFailure('host', 'stopping', error); return false; }
+      };
       try {
-        if (typeof adapter.reap === 'function') {
-          controlsReaped = await bounded(() => adapter.reap(), stopDeadline - Date.now()) === true;
-        }
-        do {
-          const machine = await bounded(() => adapter.getMachine(target, { signal: stopping.signal }),
-            Math.min(1000, stopDeadline - Date.now()), stopping.signal);
-          verified = machine?.id === target.machineId && machine.state === 'stopped'
-            && machine.image_ref?.digest === target.imageDigest;
-          if (!verified) await bounded(() => new Promise((resolve) => setTimeout(resolve, 20)),
+        // Reap uncertainty must not suppress independent stopped-state reads.
+        controlsReaped = await reap();
+        while (!verified && !stopping.signal.aborted && Date.now() < stopDeadline && readAttempts < 2048) {
+          const reading = new AbortController();
+          const abortRead = () => reading.abort();
+          stopping.signal.addEventListener('abort', abortRead, { once: true });
+          let readFailed = false;
+          try {
+            readAttempts++;
+            const timeoutMs = Math.min(10000, stopDeadline - Date.now());
+            const machine = await bounded(() => adapter.getMachine(target, { signal: reading.signal, timeoutMs }),
+              timeoutMs, reading.signal);
+            verified = machine?.id === target.machineId && machine.state === 'stopped'
+              && machine.image_ref?.digest === target.imageDigest;
+          } catch (error) {
+            readFailed = true; readFailures++;
+            lastFailure = p10bRuntimeFailure('host', 'stopping', error);
+          } finally {
+            reading.abort(); stopping.signal.removeEventListener('abort', abortRead);
+          }
+          // A timed-out local command must be reaped before another read.
+          if (readFailed && !(await reap())) { controlsReaped = false; break; }
+          if (!verified && Date.now() < stopDeadline) await bounded(
+            () => new Promise(resolve => setTimeout(resolve, Math.min(pollIntervalMs, stopDeadline - Date.now()))),
             stopDeadline - Date.now(), stopping.signal);
-        } while (!verified && Date.now() < stopDeadline);
-      } catch { /* Retain uncertainty; this host has no competing stop action. */ }
+        }
+      } catch (error) { lastFailure = p10bRuntimeFailure('host', 'stopping', error); }
       finally { clearTimeout(timer); stopping.abort(); }
       if (worker) {
         try { reaped = await bounded(() => worker.terminate(), stopDeadline - Date.now()) === true; }
@@ -249,6 +274,8 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
         stoppedVerified: verified, processReaped: reaped && controlsReaped,
         stopUncertain: !verified || !reaped || !controlsReaped || (startIssued && !startCompleted),
         startUncertain: startIssued && !startCompleted,
+        stopVerification: { readAttempts, readFailures, lastFailure,
+          deadline: new Date(stopDeadline).toISOString(), finishedAt: new Date().toISOString() },
         observedAt: new Date().toISOString() };
       if (!receipt.stopUncertain) {
         try {
@@ -352,10 +379,14 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
           || prepared.runtimeConfigurationDigest !== packet.configurationEvidence.runtimeConfigurationDigests.prepare) {
           throw new Error('Preparation receipt changed');
         }
+      } else if (frame.kind === 'worker-failed') {
+        failureDetails = validateP10bRuntimeFailure(frame.failureDetails) && frame.failureDetails.origin === 'worker'
+          ? { ...frame.failureDetails } : p10bRuntimeFailure('host', 'worker', null, { reason: 'invalid-diagnostic' });
+        throw new Error('Worker reported failure');
       } else if (frame.kind === 'stop' && (candidate || prepared)) break;
       else throw new Error('Unexpected worker control output');
     }
-  } catch { failure ||= stage; }
+  } catch (error) { failure ||= stage; failureDetails ||= p10bRuntimeFailure('host', stage, error); }
   finally {
     signal?.removeEventListener('abort', onAbort);
     clearTimeout(cancelTimer); clearTimeout(stopTimer);
@@ -376,11 +407,12 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
   let artifact;
   if (!failure && !stop?.stopUncertain && packet.operation === 'qualify') {
     try { artifact = finalArtifact(candidate, packet, stop, new Date(clock()).toISOString()); }
-    catch { failure = 'terminal-verification'; }
+    catch (error) { failure = 'terminal-verification'; failureDetails = p10bRuntimeFailure('host', failure, error); }
   }
   const result = { version: 'p10b-host-result-v1', operation: packet.operation, packetDigest: digest(packet),
     sourceHead: packet.sourceHead, startedAt: startedAt || null, finishedAt: new Date().toISOString(),
     ...stop, failureStage: failure || null, productionReady: false,
+    ...(failureDetails ? { failureDetails } : {}),
     lifecycleVerified: Boolean(artifact), success: !failure && !stop?.stopUncertain
       && (packet.operation === 'prepare' ? Boolean(prepared) : Boolean(artifact)),
     conservativeIncrementalUsd: reserved && packet.budget ? cost() : null,

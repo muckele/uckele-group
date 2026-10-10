@@ -59,6 +59,6 @@ export function createP10bControlChannel({ input, output }) {
       if (ended) return Promise.reject(new Error('Control channel unavailable'));
       return new Promise((resolve, reject) => output.write('', (error) => error ? reject(error) : resolve()));
     },
-    close() { finish(new Error('Control channel closed')); },
+    close(error = new Error('Control channel closed')) { finish(error); },
   };
 }

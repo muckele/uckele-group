@@ -1,7 +1,38 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { once } from 'node:events';
 
 const digest = value => sha256(stableCanonicalJson(value));
 const machineId = '0803730bd1d7e8';
+
+// An operator wrapper must check both child termination and retained evidence.
+// Printing the child's exit code alone must never turn failed prep into exit 0.
+export function assertP10bPreparationTerminal({ code, signal, result } = {}) {
+  const preparation = result?.preparation; const shutdown = preparation?.guestShutdown;
+  if (code !== 0 || signal !== null || result?.version !== 'p10b-host-result-v1'
+    || result.operation !== 'prepare' || result.success !== true || result.failureStage !== null
+    || result.stoppedVerified !== true || result.processReaped !== true
+    || result.stopUncertain !== false || result.startUncertain !== false
+    || result.productionReady !== false || result.lifecycleVerified !== false
+    || preparation?.providerCalls !== 0 || preparation.productionReady !== false
+    || preparation.ingressClosed !== true || preparation.sqliteClosed !== true
+    || shutdown?.handoffVerified !== true || shutdown.cleanupUncertain !== false || shutdown.failure !== false
+    || shutdown.authorityClosed !== true || shutdown.ingressClosed !== true || shutdown.workerSqliteClosed !== true) {
+    throw Error('Preparation terminal failed; retain child and host evidence');
+  }
+  return true;
+}
+
+export async function awaitP10bPreparationChild({ child, readResult, onExit } = {}) {
+  let terminal;
+  try { const [code, signal] = await once(child, 'close'); terminal = { code, signal }; }
+  catch { throw Error('Preparation terminal failed; child could not complete'); }
+  await onExit(terminal);
+  let result;
+  try { result = await readResult(); }
+  catch { throw Error('Preparation terminal failed; host result unavailable'); }
+  assertP10bPreparationTerminal({ ...terminal, result });
+  return result;
+}
 
 // Boundary-injected extraction of the existing runtime-only update controls.
 // Importing this module performs no authentication, I/O or external operation.

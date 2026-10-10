@@ -66,3 +66,27 @@ The earlier attempt remains failed and closed. Fly init logged `Main child exite
 The1001 ms first-request gap was248 ms for the initial read,750 ms for a timer installed afterward, and approximately3 ms scheduling overhead. It exceeded the1000 ms gate by1 ms. The cadence now begins before the initial asynchronous read. Both request and response gaps must still be at most1000 ms; the correction cannot guarantee scheduling or rescue the old attempt.
 
 The operator update/rollback helpers are extracted into a boundary-injected module with no I/O at import. The local full-sequence fixture uses actual parent/guardian/controller OS processes, byte-fragmented pretty JSON transport, a synthetic Machine API including created-to-stopped readback, real local worker/SQLite/ingress preparation and exact stopped baseline restoration. Its short process windows test ordering and convergence; separate virtual-time tests retain the exact five-minute/sixty-minute gates. All external boundaries are stubs. Failed demonstration refuses preparation and still restores the known stopped baseline. The held operator proposal contains `SESSION_NOT_APPROVED`, so it cannot consume authentication or open a runtime session.
+
+## Offline diagnosis after the closed no-email preparation attempt
+
+The October 10 no-email attempt retained a successful independent guardian demonstration and a failed preparation. Its CLI returned code 1, before worker registration or preparation export. The host's early `stopUncertain` did not change shutdown ownership: the guardian continued to its frozen cutoff and independently stopped the Machine. Later stopped-state evidence does not promote that failed preparation or remove its cleanup uncertainty. The executed operator copy, all failed evidence and the active host reservation remain preserved.
+
+The saved image completes server startup, real worker execution, SQLite preparation, ingress closure and guardian handoff offline with synthetic configuration and networking disabled. Removing runtime configuration only from the worker reproduces pre-registration failure. This contrast does not establish the lost live exception; missing configuration, bootstrap failure and transport failure must be distinguished by future evidence.
+
+Two routine defects were established independently. Initial local reaping and all stopped-state polling shared one catch, so a single reap/read failure ended verification before the frozen cutoff. A 1-second host read bound also conflicted with the concrete command's 10-second bound. Reaping uncertainty now remains separate from stopped-state observations. Sequential reads share the original deadline, pass their actual remaining timeout to the adapter, abort/reap failed local reads before retrying and pace their 2048-read limit across the complete interval. Validated guest handoff retains the shorter stop reserve. There is no host stop command, extra start, renewed permission window or artifact release on uncertainty.
+
+Worker failures now retain a closed vocabulary of phases and reasons before cleanup can consume the window. Bootstrap loading/default configuration and concrete command exits/timeouts also produce bounded sanitized provenance. Exception messages, stacks, stderr and environment values are never exported. Invalid remote diagnostics fail closed; unsupported OS signals cannot throw from failure handling.
+
+The executed operator also printed child code 1 and returned code 0. A future reviewed wrapper must use the shared completion path, which retains the child exit, waits for stdio closure and requires the actual successful preparation/cleanup/stopped receipt:
+
+```js
+await awaitP10bPreparationChild({
+  child,
+  onExit: terminal => retainChildExit(terminal),
+  readResult: () => readRetainedHostResult(),
+});
+```
+
+The held corrected operator copy uses this path. Actual local child/operator tests cover failed child exits and failed retained results. The full preparation/restoration fixture continues to use real local SQLite, server/worker/guardian processes and stubbed external boundaries.
+
+No new live window is opened by these corrections. The smallest next proof is a separately authorized zero-provider preparation using an image bound to the final reviewed source, a fresh packet/database/evidence path, exact stopped configuration and current public configuration/provider/price metadata. The preserved uncertain host reservation requires a separately reviewed recovery decision before any new admission; no automatic deletion or rearming is added. Any one-email qualification still needs separate owner approval. `productionReady=false` and global automation paused remain mandatory.
