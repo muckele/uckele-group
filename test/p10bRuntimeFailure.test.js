@@ -119,8 +119,11 @@ test('exact worker executable emits a safe bootstrap failure and exits nonzero',
     { cwd: directory, env: { PATH: process.env.PATH }, stdio: ['pipe', 'pipe', 'pipe'] });
   let stdout = ''; let stderr = '';
   child.stdout.on('data', chunk => { stdout += chunk; }); child.stderr.on('data', chunk => { stderr += chunk; });
-  const ended = once(child, 'close'); child.stdin.end();
-  const [code, signal] = await ended;
+  const ended = once(child, 'close');
+  let expired = false;
+  const timer = setTimeout(() => { expired = true; child.kill('SIGKILL'); }, 3000);
+  const [code, signal] = await ended; clearTimeout(timer);
+  assert.equal(expired, false, 'Bootstrap failure must exit even while SSH stdin remains open');
   assert.equal(code, 1); assert.equal(signal, null);
   const frame = JSON.parse(stdout.trim());
   assert.equal(frame.kind, 'worker-failed'); assert.equal(frame.failureDetails.stage, 'bootstrap');
