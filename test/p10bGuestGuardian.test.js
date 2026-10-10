@@ -31,6 +31,9 @@ async function until(predicate, milliseconds = 3000) {
 
 function closureHarness(window, databasePath) {
   const paths = p10bGuestPaths(window, databasePath); const windowDigest = digest(window);
+  // Pure guardian unit tests use the live test runner as their fixture parent.
+  writeP10bGuestRecord(paths.parentStart, { version: 'p10b-guardian-parent-start-v1', windowDigest,
+    pid: process.ppid, startedAt: window.issuedAt });
   writeP10bGuestRecord(`${databasePath}.p10b-${window.phase}-server.json`, {
     app: window.app, machineId: window.machineId, sourceHead: window.sourceHead,
     guestWindowDigest: windowDigest, pid: 900002 });
@@ -145,6 +148,13 @@ test('independent guest exits on its original cutoff after host loss or a blocke
       const d=JSON.parse(fs.readFileSync(process.argv[2]));
       await runP10bGuestGuardian({window:d.window,databasePath:d.databasePath,exit:(receipt)=>{
         fs.writeFileSync(d.completed,JSON.stringify({receipt,exitedAt:Date.now()}));process.exit(0);}});`);
+    const parentScript = `${databasePath}.offline-parent.mjs`;
+    fs.writeFileSync(parentScript, `import fs from 'node:fs';import {spawn} from 'node:child_process';
+      import {runP10bGuardianParent} from ${JSON.stringify(new URL('../server/services/p10bGuardianParent.js', import.meta.url).href)};
+      const d=JSON.parse(fs.readFileSync(process.argv[2]));
+      await runP10bGuardianParent({window:d.window,databasePath:d.databasePath,
+        launch:({environment})=>spawn(process.execPath,[${JSON.stringify(guardScript)},process.argv[2]],
+          {env:environment,stdio:'ignore'})});`);
     const appScript = `${databasePath}.offline-app.mjs`;
     fs.writeFileSync(appScript, `import fs from 'node:fs';import {createServer} from 'node:http';
       import {createSqliteStorage} from ${JSON.stringify(new URL('../server/storage/sqlite.js', import.meta.url).href)};
@@ -160,7 +170,7 @@ test('independent guest exits on its original cutoff after host loss or a blocke
       app.unref();
       const guard=spawn(process.execPath,process.argv.slice(2),{detached:true,stdio:'ignore',env:{PATH:process.env.PATH}});
       guard.unref();process.stdout.write(JSON.stringify({guardPid:guard.pid,appPid:app.pid})+'\\n');setInterval(()=>{},1000);`);
-    const host = spawn(process.execPath, [hostScript, guardScript, data], { stdio: ['ignore', 'pipe', 'ignore'], env: { PATH: process.env.PATH } });
+    const host = spawn(process.execPath, [hostScript, parentScript, data], { stdio: ['ignore', 'pipe', 'ignore'], env: { PATH: process.env.PATH } });
     const [chunk] = await once(host.stdout, 'data'); const { guardPid, appPid } = JSON.parse(String(chunk).trim());
     t.after(() => { host.kill('SIGKILL'); for (const pid of [guardPid, appPid]) {
       try { process.kill(pid, 'SIGKILL'); } catch { /* Already stopped. */ } } });
@@ -260,4 +270,23 @@ test('sync failure cannot publish success and private cleanup failure cannot alt
   writeP10bGuestRecord(committed, value, { ...fs, unlinkSync: () => { throw new Error('offline private removal failure'); } });
   assert.deepEqual(readP10bGuestRecord(committed), value);
   assert.equal(fs.readdirSync(path.dirname(committed)).filter((name) => name.includes('.pending-')).length, 1);
+});
+
+test('startup admission requires the matching living guardian parent and no exit record', async t => {
+  for (const variant of ['healthy', 'missing', 'wrong-window', 'dead', 'same-pid', 'exited', 'future-start']) {
+    await t.test(variant, async () => {
+      const window = windowAt(); const databasePath = temporary(); const paths = p10bGuestPaths(window, databasePath);
+      writeP10bGuestRecord(paths.start, { windowDigest: digest(window), pid: 900004, startedAt: window.issuedAt });
+      writeP10bGuestRecord(paths.ready, { windowDigest: digest(window), pid: 900004 });
+      if (variant !== 'missing') writeP10bGuestRecord(paths.parentStart, {
+        version: 'p10b-guardian-parent-start-v1', windowDigest: variant === 'wrong-window' ? '0'.repeat(64) : digest(window),
+        pid: variant === 'same-pid' ? 900004 : 900003,
+        startedAt: variant === 'future-start' ? new Date(Date.parse(window.issuedAt) + 1).toISOString() : window.issuedAt });
+      if (variant === 'exited') writeP10bGuestRecord(paths.processExit, { retained: true });
+      const signals = []; const operation = assertP10bGuestReady({ window, databasePath, timeoutMs: 30,
+        signalProcess(pid, signal) { signals.push([pid, signal]); if (variant === 'dead' && pid === 900003) throw Error('No parent'); } });
+      if (variant === 'healthy') { assert.equal((await operation).pid, 900004); assert.deepEqual(signals, [[900003, 0], [900004, 0]]); }
+      else await assert.rejects(operation);
+    });
+  }
 });

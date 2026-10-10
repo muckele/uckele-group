@@ -4,7 +4,7 @@ import { sha256, stableCanonicalJson } from '../utils/security.js';
 
 export const P10B_GUEST_PROCESSES = [
   { exec: ['node', 'server/index.js'] },
-  { exec: ['node', 'scripts/run-p10b-guest-guardian.js'], ignore_app_secrets: true },
+  { exec: ['node', 'scripts/run-p10b-guest-guardian-parent.js'], ignore_app_secrets: true },
 ];
 const digest = (value) => sha256(stableCanonicalJson(value));
 const canonicalDate = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value))
@@ -50,8 +50,24 @@ export function parseP10bGuestWindow(value, runtime) {
 
 export function p10bGuestPaths(window, databasePath = window.databasePath) {
   const prefix = `${databasePath}.p10b-${window.phase}-guardian`;
-  return Object.fromEntries(['start', 'ready', 'request', 'ack', 'receipt', 'outcome', 'handoff', 'export', 'cancel']
-    .map((name) => [name, `${prefix}-${name}.json`]));
+  return { ...Object.fromEntries(['start', 'ready', 'request', 'ack', 'receipt', 'outcome', 'handoff', 'export', 'cancel']
+    .map((name) => [name, `${prefix}-${name}.json`])),
+  parentStart: `${prefix}-parent-start.json`, processExit: `${prefix}-process-exit.json` };
+}
+
+// Freshness inventory for future no-send runs. The active guardian's three
+// startup records already exist at the first SSH observation and are verified
+// separately; every other marker and both phases on the unused path must be absent.
+export function p10bGuestFreshPathInventory(databasePaths, { activeDatabasePath, activePhase } = {}) {
+  return databasePaths.flatMap(databasePath => [databasePath, `${databasePath}-wal`, `${databasePath}-shm`,
+    ...['start', 'preparation', 'qualify-start', 'qualify-worker'].map(name => `${databasePath}.p10b-${name}.json`),
+    ...['prepare', 'qualify'].flatMap(phase => [
+      ...Object.entries(p10bGuestPaths({ phase }, databasePath))
+        .filter(([name]) => !(databasePath === activeDatabasePath && phase === activePhase
+          && ['start', 'ready', 'parentStart'].includes(name))).map(([, file]) => file),
+      ...['worker-process', 'server', 'server-closed'].map(name => `${databasePath}.p10b-${phase}-${name}.json`),
+    ]),
+  ]);
 }
 
 export function writeP10bGuestRecord(file, value, fileSystem = fs) {
@@ -85,11 +101,20 @@ export async function assertP10bGuestReady({ window, databasePath, timeoutMs = 2
   do {
     if (clock() >= Date.parse(window.stopAt) - window.stopReserveMs - window.closureGraceMs
       || fs.existsSync(paths.request) || fs.existsSync(paths.receipt)) throw new Error('Guest window is closing');
-    if (fs.existsSync(paths.ready)) {
+    if (fs.existsSync(paths.ready) && fs.existsSync(paths.parentStart)) {
       const ready = readP10bGuestRecord(paths.ready);
-      if (ready.windowDigest !== digest(window) || !Number.isSafeInteger(ready.pid) || ready.pid < 2) {
+      const parent = readP10bGuestRecord(paths.parentStart);
+      const start = readP10bGuestRecord(paths.start);
+      if (ready.windowDigest !== digest(window) || !Number.isSafeInteger(ready.pid) || ready.pid < 2
+        || parent.windowDigest !== digest(window) || parent.version !== 'p10b-guardian-parent-start-v1'
+        || !Number.isSafeInteger(parent.pid) || parent.pid < 2 || parent.pid === ready.pid
+        || start.pid !== ready.pid || start.windowDigest !== digest(window)
+        || !canonicalDate(parent.startedAt) || !canonicalDate(start.startedAt)
+        || Date.parse(parent.startedAt) < Date.parse(window.issuedAt)
+        || Date.parse(parent.startedAt) > Date.parse(start.startedAt) || fs.existsSync(paths.processExit)) {
         throw new Error('Guardian readiness changed');
       }
+      signalProcess(parent.pid, 0);
       signalProcess(ready.pid, 0);
       return ready;
     }

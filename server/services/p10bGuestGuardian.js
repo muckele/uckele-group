@@ -46,9 +46,10 @@ export function closeP10bGuestAuthority(window, databasePath, now) {
   } finally { db.close(); }
 }
 
-// A distinct Fly-configured process owns this timer. It never calls Fly or a
-// provider. Its normal exit is the sole guest shutdown action; the host only
-// observes stopped state. A stalled guest kernel/init remains outside scope.
+// The guardian child owns this timer. It never calls Fly or a provider. Its
+// normal exit is reaped by the secret-free configured parent, whose exit lets
+// Fly init stop the Machine; the host only observes stopped state. A stalled
+// parent/filesystem/guest kernel/init remains outside the operational scope.
 export async function runP10bGuestGuardian({ window, databasePath = window.databasePath,
   clock = () => Date.now(), monotonic = () => performance.now(), pid = process.pid,
   signalProcess = process.kill, closeAuthority = closeP10bGuestAuthority,

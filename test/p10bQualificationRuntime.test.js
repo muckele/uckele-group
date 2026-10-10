@@ -5,6 +5,8 @@ import os from 'node:os';
 import test from 'node:test';
 import { spawn } from 'node:child_process';
 import { PassThrough } from 'node:stream';
+import { demonstrateOfflineGuardianLoss, offlineDemoWindow } from './helpers/p10bRuntimeOnlyFixture.js';
+import { createP10bRuntimeOnlyControl } from '../server/services/p10bRuntimeOnlyControl.js';
 import { fixture, config, signedRequest } from './helpers/p10bQualificationFixture.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { recordEmailEventsFromWebhook } from '../server/services/emailEvents.js';
@@ -77,7 +79,7 @@ async function hostFixture(t, variant = '') {
   env.P10B_GUEST_WINDOW = f.options.config.dealHunter.cimProvider.qualificationGuestWindow;
   const machine = { id: packet.target.machineId, state: 'stopped', region: 'ewr', image_ref: { digest: packet.target.imageDigest },
     config: { env, processes: P10B_GUEST_PROCESSES, guest: { cpu_kind: 'shared', cpus: 1, memory_mb: 512 }, restart: { policy: 'no' },
-      mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }], services: [{ autostart: false, internal_port: 8787 }] } };
+      mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }], services: [{ autostart: false, autostop: false, internal_port: 8787 }] } };
   let starts = 0;
   let stops = 0;
   let reads = 0;
@@ -140,6 +142,18 @@ async function hostFixture(t, variant = '') {
     await runP10bGuestGuardian({ window, databasePath: data.databasePath,
       clock: () => Date.parse(data.manifest.issuedAt) + Date.now() - data.wallStartedAt });
   `);
+  const parentScript = path.join(f.directory, 'offline-guardian-parent.mjs');
+  fs.writeFileSync(parentScript, `
+    import fs from 'node:fs';
+    import { spawn } from 'node:child_process';
+    import { runP10bGuardianParent } from ${JSON.stringify(new URL('../server/services/p10bGuardianParent.js', import.meta.url).href)};
+    const data = JSON.parse(fs.readFileSync(process.argv[2]));
+    const window = JSON.parse(data.config.dealHunter.cimProvider.qualificationGuestWindow);
+    await runP10bGuardianParent({ window, databasePath: data.databasePath,
+      clock: () => Date.parse(data.manifest.issuedAt) + Date.now() - data.wallStartedAt,
+      launch: ({ environment }) => spawn(process.execPath, [${JSON.stringify(guardScript)}, process.argv[2]],
+        { env: environment, stdio: 'ignore' }) });
+  `);
   const adapter = {
     async getMachine() { reads += 1; return structuredClone(machine); },
     async getSecretMetadata() { return secrets; },
@@ -147,7 +161,7 @@ async function hostFixture(t, variant = '') {
       starts += 1;
       if (variant === 'start-failure') throw new Error('offline-sending-secret');
       machine.state = 'started';
-      guardian = spawn(process.execPath, [guardScript, data], { stdio: 'ignore' });
+      guardian = spawn(process.execPath, [parentScript, data], { stdio: 'ignore' });
       guardian.once('close', async () => {
         stops += 1;
         if (variant !== 'stop-timeout' && variant !== 'stop-failure') machine.state = 'stopped';
@@ -212,7 +226,11 @@ async function hostFixture(t, variant = '') {
 test('actual offline worker closes SQLite authority before process death and host artifact release', async (t) => {
   const h = await hostFixture(t);
   const result = await h.run();
-  assert.equal(result.success, true, JSON.stringify(result));
+  const guardianFiles = Object.fromEntries(['request', 'ack', 'receipt'].map(name => {
+    const file = `${path.join(h.f.directory, 'fixture.sqlite')}.p10b-qualify-guardian-${name}.json`;
+    return [name, fs.existsSync(file) ? JSON.parse(fs.readFileSync(file)) : null];
+  }));
+  assert.equal(result.success, true, JSON.stringify({ result, guardianFiles, posted: fs.existsSync(h.ledger) }));
   assert.equal(result.lifecycleVerified, true);
   assert.equal(result.productionReady, false);
   assert.equal(result.processReaped, true);
@@ -531,7 +549,7 @@ test('unrelated, attached and response-mismatched inbound never release proof or
   }
 });
 
-test('concrete CLI adapter proves no-send preparation then qualified child flow with entirely fake Fly/email boundaries', async (t) => {
+test('concrete parent-based no-send demo and preparation restore stopped baseline before separately stubbed qualification', async (t) => {
   const { createP10bFlyControl } = await import('../server/services/p10bFlyControl.js');
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p10b-concrete-'));
   const databasePath = path.join(directory, 'prepared.sqlite');
@@ -552,7 +570,44 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS: 'mathew@uckelegroup.com' };
   const machine = { id: machineId, state: 'stopped', region: 'ewr', image_ref: { digest: `sha256:${'a'.repeat(64)}` },
     config: { env, processes: P10B_GUEST_PROCESSES, guest: { cpu_kind: 'shared', cpus: 1, memory_mb: 512 }, restart: { policy: 'no' },
-      mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }], services: [{ autostart: false, internal_port: 8787 }] } };
+      mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }], services: [{ autostart: false, autostop: false, internal_port: 8787 }] } };
+  const baselineConfig = structuredClone(machine.config);
+  baselineConfig.image = `registry.fly.io/uckele-group@sha256:${'b'.repeat(64)}`;
+  baselineConfig.processes = [{exec:['node','server/index.js']}];
+  const demoConfig = structuredClone(machine.config);
+  demoConfig.image = `registry.fly.io/uckele-group-p10b@${machine.image_ref.digest}`;
+  const prepareConfig = structuredClone(demoConfig);
+  const demoWindow=offlineDemoWindow(machine,sourceHead);
+  demoConfig.env.P10B_GUEST_WINDOW=stableCanonicalJson(demoWindow);
+  demoConfig.processes=[{exec:['node','-e','setInterval(()=>{},2147483647)'],ignore_app_secrets:true},
+    {exec:['node','scripts/run-p10b-guest-guardian-parent.js'],ignore_app_secrets:true}];
+  const evidenceRecords = new Map();
+  const control = createP10bRuntimeOnlyControl({ session: {
+    app: 'uckele-group-p10b', machineId, startedAt: new Date().toISOString(),
+    sessionDeadline: new Date(Date.now()+3600000).toISOString(), maximumStarts:2,maximumStartWindowMs:300000,
+    maximumIncrementalUsd:1,maximumStoppedConfigUpdates:3,productionReady:false,globalAutomationPaused:true,
+    ownerPermissionDigest:'f'.repeat(64), candidateImageDigest:machine.image_ref.digest,
+    baselineImageDigest:`sha256:${'b'.repeat(64)}` }, evidence:{
+      has:name=>evidenceRecords.has(name),read:name=>evidenceRecords.get(name),
+      write(name,value){assert.equal(evidenceRecords.has(name),false);evidenceRecords.set(name,structuredClone(value));} } });
+  let machineVersion = 0; let transitionReads = 0; let apiUpdates = 0;
+  machine.config = structuredClone(baselineConfig); machine.image_ref.digest = `sha256:${'b'.repeat(64)}`;
+  machine.instance_id = 'baseline-0';
+  const api = async (method='GET',body) => {
+    if(method==='POST'){
+      assert.equal(machine.state,'stopped');assert.equal(body.skip_launch,true);
+      assert.equal(body.current_version,machine.instance_id);apiUpdates++;
+      machine.config=structuredClone(body.config);machine.image_ref.digest=body.config.image.split('@')[1];
+      machine.instance_id='candidate-'+(++machineVersion);transitionReads=1;
+      return {...structuredClone(machine),state:'created'};
+    }
+    const result=structuredClone(machine);if(transitionReads-- >0)result.state='created';return result;
+  };
+  await control.guardedUpdate(api,baselineConfig,demoConfig,'demo');
+  const demonstration = await demonstrateOfflineGuardianLoss(t,{directory,machine,
+    databasePath:path.join(directory,'watchdog.sqlite'),sourceHead,window:demoWindow});
+  assert.equal(demonstration.proof.success,true,JSON.stringify(demonstration.proof));
+  evidenceRecords.set('p10b-runtime-only-demo-proof.json',demonstration.proof);
   const statePath = path.join(directory, 'machine.json'); fs.writeFileSync(statePath, JSON.stringify(machine));
   const configPath = path.join(directory, 'config.json'); fs.writeFileSync(configPath, JSON.stringify(cfg));
   const commands = path.join(directory, 'commands.jsonl'); const posts = path.join(directory, 'posts.jsonl');
@@ -561,6 +616,7 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     import fs from 'node:fs';
     import { spawn } from 'node:child_process';
     import { runP10bGuestGuardian } from ${JSON.stringify(new URL('../server/services/p10bGuestGuardian.js', import.meta.url).href)};
+    import { runP10bGuardianParent } from ${JSON.stringify(new URL('../server/services/p10bGuardianParent.js', import.meta.url).href)};
     import { assertP10bGuestReady } from ${JSON.stringify(new URL('../server/services/p10bGuestShutdown.js', import.meta.url).href)};
     import { createP10bControlChannel } from ${JSON.stringify(new URL('../server/services/p10bControlChannel.js', import.meta.url).href)};
     import { serveP10bQualificationWorker } from ${JSON.stringify(new URL('../server/services/p10bQualificationWorker.js', import.meta.url).href)};
@@ -571,20 +627,26 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     import { initializeP10bRuntimeFilesystem } from ${JSON.stringify(new URL('../server/services/p10bRuntime.js', import.meta.url).href)};
     import { ingestFakeLifecycle } from ${JSON.stringify(new URL('./helpers/p10bQualificationFixture.js', import.meta.url).href)};
     const args = process.argv.slice(2);
-    if (args[0] !== 'offline-guest') fs.appendFileSync(${JSON.stringify(commands)}, JSON.stringify(args)+'\\n');
+    if (!['offline-guest', 'offline-guardian'].includes(args[0])) fs.appendFileSync(${JSON.stringify(commands)}, JSON.stringify(args)+'\\n');
     const machine = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}));
     const cfg = JSON.parse(fs.readFileSync(${JSON.stringify(configPath)}));
     const window=JSON.parse(cfg.dealHunter.cimProvider.qualificationGuestWindow);
     const runtimePath=${JSON.stringify(databasePath)}+'.offline-boot-'+window.phase+'.json';
-    if(args[0]==='offline-guest') {
+    if(args[0]==='offline-guardian') {
       const boot=JSON.parse(fs.readFileSync(runtimePath));
       await runP10bGuestGuardian({window,databasePath:${JSON.stringify(databasePath)},
-        clock:()=>Date.parse(window.issuedAt)+Date.now()-boot.wallStartedAt,exit:()=>{
+        clock:()=>Date.parse(window.issuedAt)+Date.now()-boot.wallStartedAt});
+    } else if(args[0]==='offline-guest') {
+      const boot=JSON.parse(fs.readFileSync(runtimePath));
+      await runP10bGuardianParent({window,databasePath:${JSON.stringify(databasePath)},
+        launch:({environment})=>spawn(process.execPath,[${JSON.stringify(fakeFly)},'offline-guardian'],
+          {env:environment,stdio:'ignore'}),
+        clock:()=>Date.parse(window.issuedAt)+Date.now()-boot.wallStartedAt,exit:(code)=>{
           const latest=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}));latest.state='stopped';
           fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(latest));
           const serverPath=${JSON.stringify(databasePath)}+'.p10b-'+window.phase+'-server.json';
           if(fs.existsSync(serverPath)){try{process.kill(JSON.parse(fs.readFileSync(serverPath)).pid,'SIGTERM');}catch{}}
-          process.exit(0);
+          process.exit(code);
         }});
     } else if (args[0] === 'machines') process.stdout.write(JSON.stringify([machine]));
     else if (args[0] === 'secrets') process.stdout.write(JSON.stringify([{name:'DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY',digest:'abc123'}]));
@@ -648,9 +710,10 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
     configurationEvidence: evidence, configurationEvidenceDigest: digest(evidence),
     budget: { priceEvidenceDigest: 'c'.repeat(64), maximumUsdPerSecond: 0.000001, fixedIncrementalUsd: 0.001 } };
   cfg.dealHunter.cimProvider.qualificationGuestWindow = stableCanonicalJson(p10bGuestWindow(packet));
-  machine.config.env.P10B_GUEST_WINDOW = cfg.dealHunter.cimProvider.qualificationGuestWindow;
+  prepareConfig.env.P10B_GUEST_WINDOW = cfg.dealHunter.cimProvider.qualificationGuestWindow;
   evidence.runtimeConfigurationDigests.prepare = p10bPublicConfigurationDigest(cfg);
   packet.configurationEvidenceDigest = digest(evidence);
+  await control.guardedUpdate(api,demoConfig,prepareConfig,'prepare');
   fs.writeFileSync(statePath,JSON.stringify(machine));fs.writeFileSync(configPath,JSON.stringify(cfg));
   t.after(()=>{for(const phase of ['prepare','qualify']){
     const pidFile=databasePath+'.offline-boot-'+phase+'.json.pid';
@@ -662,6 +725,14 @@ test('concrete CLI adapter proves no-send preparation then qualified child flow 
   assert.equal(prepare.success, true, JSON.stringify(prepare));
   assert.equal(prepare.lifecycleVerified, false); assert.equal(fs.existsSync(posts), false);
   assert.equal(prepare.preparation.providerCalls, 0);
+  const noSendRestored = await control.restoreBaseline(api,baselineConfig,[demoConfig,prepareConfig]);
+  assert.equal(noSendRestored.fullConfigRestored,true);assert.equal(machine.state,'stopped');
+  assert.deepEqual(machine.config,baselineConfig);assert.equal(machine.image_ref.digest,`sha256:${'b'.repeat(64)}`);
+  assert.equal(apiUpdates,3);assert.equal(fs.existsSync(posts),false);
+  await assert.rejects(control.guardedUpdate(api,baselineConfig,demoConfig,'demo'),/replay/);
+  // The following qualification is a separate offline protocol fixture with
+  // injected email responses, not authority granted by the no-send sequence.
+  machine.config=structuredClone(prepareConfig);machine.image_ref.digest=`sha256:${'a'.repeat(64)}`;
   const r = prepare.preparation;
   const manifest = { version: P10B_QUALIFICATION_VERSION, runtime: {
     providerIdentity: structuredClone(evidence.providerIdentity), providerIdentityDigest: r.providerIdentityDigest,

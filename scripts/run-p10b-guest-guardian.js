@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { parseP10bGuestWindow } from '../server/services/p10bGuestShutdown.js';
 import { runP10bGuestGuardian } from '../server/services/p10bGuestGuardian.js';
 
-// Fly config starts this process at boot with ignore_app_secrets=true. It
+// The secret-free Fly-configured parent starts this guardian at boot. It
 // reads only public runtime binding and the image's nonsecret source marker.
 try {
   if (process.argv.length !== 2) throw new Error('No arguments admitted');
