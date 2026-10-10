@@ -1,0 +1,77 @@
+{
+  "env": {
+    "DEAL_HUNTER_CIM_AUTOMATION_PAUSED": "true",
+    "DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED": "false",
+    "DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED": "false",
+    "DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS": "mathew@uckelegroup.com",
+    "DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL": "P10B Sender <sender@p10b-e2e.uckelegroup.com>",
+    "DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN": "p10b-e2e.uckelegroup.com",
+    "DEAL_HUNTER_CIM_MAILBOX_REPLY_TO": "replies@p10b-e2e.uckelegroup.com",
+    "DEAL_HUNTER_CIM_OUTREACH_PAUSED": "true",
+    "DEAL_HUNTER_CIM_PROVIDER_ENABLED": "false",
+    "DEAL_HUNTER_CIM_PROVIDER_PROFILE": "controlled-mailbox-v1",
+    "DEAL_HUNTER_DAILY_EMAIL_ENABLED": "false",
+    "DELIVERY_PROVIDER": "console",
+    "FOLLOW_UP_AI_ENABLED": "false",
+    "FOLLOW_UP_EMAIL_ENABLED": "false",
+    "NODE_ENV": "p10b",
+    "PORT": "8787",
+    "SQLITE_PATH": "/data/p10b-controlled.sqlite",
+    "STORAGE_PROVIDER": "sqlite",
+    "ADMIN_ALLOW_PASSWORD_AUTH": "true",
+    "ADMIN_AUTH_MODE": "hybrid",
+    "ANALYTICS_ENABLED": "true",
+    "BACKUP_ENABLED": "true",
+    "OUTBOUND_HTTP_TIMEOUT_MS": "10000",
+    "PUBLIC_SITE_URL": "https://p10b-e2e.uckelegroup.com/",
+    "SECURE_DOCUMENTS_STORAGE_DIR": "/data/secure-documents"
+  },
+  "init": {},
+  "guest": {
+    "cpu_kind": "shared",
+    "cpus": 1,
+    "memory_mb": 512
+  },
+  "metadata": {
+    "purpose": "p10b-controlled-mailbox-no-send",
+    "release": "v134"
+  },
+  "mounts": [
+    {
+      "encrypted": true,
+      "path": "/data",
+      "size_gb": 1,
+      "volume": "vol_vwnkpex1k3yx9dnv",
+      "name": "uckele_group_p10b_data"
+    }
+  ],
+  "services": [
+    {
+      "protocol": "tcp",
+      "internal_port": 8787,
+      "autostop": false,
+      "autostart": false,
+      "ports": [
+        {
+          "port": 80,
+          "handlers": [
+            "http"
+          ]
+        },
+        {
+          "port": 443,
+          "handlers": [
+            "http",
+            "tls"
+          ]
+        }
+      ],
+      "force_instance_key": null
+    }
+  ],
+  "image": "registry.fly.io/uckele-group:deployment-01M4E3SP6F492FH9RZ2F9M8EQ7@sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629",
+  "restart": {
+    "policy": "no"
+  },
+  "dns": {}
+}

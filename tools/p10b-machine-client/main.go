@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,15 +162,66 @@ func publicConfig(raw []byte) bool {
 	if e, ok := c["env"]; ok && json.Unmarshal(e, &env) != nil {
 		return false
 	}
-	names := strings.Fields("NODE_ENV P10B_QUALIFICATION_RUNTIME STORAGE_PROVIDER PORT HOST TZ APP_BASE_URL PUBLIC_BASE_URL LOG_LEVEL SQLITE_PATH P10B_QUALIFICATION_PHASE P10B_GUEST_WINDOW DEAL_HUNTER_CIM_PROVIDER_PROFILE DEAL_HUNTER_CIM_PROVIDER_ENABLED DEAL_HUNTER_CIM_OUTREACH_PAUSED DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED DEAL_HUNTER_CIM_AUTOMATION_PAUSED DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED DEAL_HUNTER_DAILY_EMAIL_ENABLED FOLLOW_UP_EMAIL_ENABLED FOLLOW_UP_AI_ENABLED DELIVERY_PROVIDER DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL DEAL_HUNTER_CIM_MAILBOX_REPLY_TO DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS")
+	names := strings.Fields("NODE_ENV P10B_QUALIFICATION_RUNTIME STORAGE_PROVIDER PORT HOST TZ APP_BASE_URL PUBLIC_BASE_URL LOG_LEVEL SQLITE_PATH P10B_QUALIFICATION_PHASE P10B_GUEST_WINDOW DEAL_HUNTER_CIM_PROVIDER_PROFILE DEAL_HUNTER_CIM_PROVIDER_ENABLED DEAL_HUNTER_CIM_OUTREACH_PAUSED DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED DEAL_HUNTER_CIM_AUTOMATION_PAUSED DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED DEAL_HUNTER_DAILY_EMAIL_ENABLED FOLLOW_UP_EMAIL_ENABLED FOLLOW_UP_AI_ENABLED DELIVERY_PROVIDER DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL DEAL_HUNTER_CIM_MAILBOX_REPLY_TO DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS ADMIN_ALLOW_PASSWORD_AUTH ADMIN_AUTH_MODE ANALYTICS_ENABLED BACKUP_ENABLED OUTBOUND_HTTP_TIMEOUT_MS PUBLIC_SITE_URL SECURE_DOCUMENTS_STORAGE_DIR")
 	allowed := map[string]bool{}
 	for _, n := range names {
 		allowed[n] = true
 	}
 	for k, v := range env {
-		if !allowed[k] || len(v) > 4096 || regexp.MustCompile(`(?i)https?://[^/]*@|postgres(?:ql)?:|Bearer\s`).MatchString(v) {
+		if !allowed[k] || len(v) > 4096 || regexp.MustCompile(`[\x00-\x1f\x7f]`).MatchString(v) || regexp.MustCompile(`(?i)https?://[^/]*@|postgres(?:ql)?:|Bearer\s`).MatchString(v) || !publicSetting(k, v) {
 			return false
 		}
+	}
+	return true
+}
+
+// Public configuration remains data, not runtime permission. Match the host's
+// typed policy without normalizing values needed for exact baseline restoration.
+func publicSetting(name, value string) bool {
+	switch name {
+	case "ADMIN_ALLOW_PASSWORD_AUTH", "ANALYTICS_ENABLED", "BACKUP_ENABLED":
+		return value == "true" || value == "false"
+	case "ADMIN_AUTH_MODE":
+		return value == "password" || value == "magic-link" || value == "hybrid"
+	case "OUTBOUND_HTTP_TIMEOUT_MS":
+		n, err := strconv.Atoi(value)
+		return err == nil && regexp.MustCompile(`^[1-9][0-9]{0,4}$`).MatchString(value) && n <= 10000
+	case "PUBLIC_SITE_URL":
+		m := regexp.MustCompile(`^https?://([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)(?::([1-9][0-9]{0,4}))?/?$`).FindStringSubmatch(value)
+		if m == nil || len(m[1]) > 253 {
+			return false
+		}
+		parts := strings.Split(m[1], ".")
+		last := parts[len(parts)-1]
+		if last[0] >= '0' && last[0] <= '9' {
+			if len(parts) != 4 {
+				return false
+			}
+			for _, p := range parts {
+				n, err := strconv.Atoi(p)
+				if err != nil || !regexp.MustCompile(`^(?:0|[1-9][0-9]{0,2})$`).MatchString(p) || n > 255 {
+					return false
+				}
+			}
+		}
+		if m[2] != "" {
+			n, err := strconv.Atoi(m[2])
+			return err == nil && n <= 65535
+		}
+		return true
+	case "SECURE_DOCUMENTS_STORAGE_DIR":
+		if value == "/app/data/secure-documents" {
+			return true
+		}
+		if !regexp.MustCompile(`^/data/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$`).MatchString(value) {
+			return false
+		}
+		for _, p := range strings.Split(strings.TrimPrefix(value, "/data/"), "/") {
+			if p == "." || p == ".." {
+				return false
+			}
+		}
+		return true
 	}
 	return true
 }
@@ -503,7 +555,7 @@ func frozenBaseline(raw json.RawMessage, image string) bool {
 			Entrypoint []string `json:"entrypoint"`
 		} `json:"init"`
 	}
-	if json.Unmarshal(raw, &c) != nil || !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(image) || !strings.HasSuffix(c.Image, "@"+image) || c.Guest.Kind != "shared" || c.Guest.Cpus != 1 || c.Guest.Memory != 512 || c.Restart.Policy != "no" || len(c.Mounts) != 1 || c.Mounts[0].Volume != "vol_vwnkpex1k3yx9dnv" || c.Mounts[0].Path != "/data" || len(c.Services) != 1 || c.Services[0].Autostart || c.Services[0].Autostop || c.Services[0].Port != 8787 || c.Destroy || len(c.Files) != 0 || c.Schedule != "" || len(c.Init.Exec)+len(c.Init.Cmd)+len(c.Init.Entrypoint) != 0 {
+	if json.Unmarshal(raw, &c) != nil || !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(image) || !regexp.MustCompile(`^[^@\s]+@sha256:[a-f0-9]{64}$`).MatchString(c.Image) || !strings.HasSuffix(c.Image, "@"+image) || c.Guest.Kind != "shared" || c.Guest.Cpus != 1 || c.Guest.Memory != 512 || c.Restart.Policy != "no" || len(c.Mounts) != 1 || c.Mounts[0].Volume != "vol_vwnkpex1k3yx9dnv" || c.Mounts[0].Path != "/data" || len(c.Services) != 1 || c.Services[0].Autostart || c.Services[0].Autostop || c.Services[0].Port != 8787 || c.Destroy || len(c.Files) != 0 || c.Schedule != "" || len(c.Init.Exec)+len(c.Init.Cmd)+len(c.Init.Entrypoint) != 0 {
 		return false
 	}
 	return true

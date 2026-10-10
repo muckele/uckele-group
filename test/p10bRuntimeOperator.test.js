@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import fs from 'node:fs';
 import { config as workerConfig } from './helpers/p10bQualificationFixture.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from '../server/services/p10bProviderIdentity.js';
@@ -9,14 +10,15 @@ const diagnostics = await import('../server/services/p10bWorkerDiagnostics.js').
 const digest = value => sha256(stableCanonicalJson(value));
 const now = Date.parse('2026-10-12T12:00:00.000Z');
 const image = `sha256:${'a'.repeat(64)}`;
+// Retained baseline key/config shape; the seven newly admitted values are
+// synthetic. No fixture lookup reads Fly metadata or credentials.
+const observedBaseline = JSON.parse(fs.readFileSync(new URL('./fixtures/p10bObservedBaselineShape.json', import.meta.url), 'utf8'));
+const publicEnvironmentCases = JSON.parse(fs.readFileSync(new URL('./fixtures/p10bPublicEnvironmentCases.json', import.meta.url), 'utf8'));
 function session() {
-  const config = { image: `registry.fly.io/uckele-group@sha256:${'b'.repeat(64)}`, env: {},
-    restart: { policy: 'no' }, guest: { cpu_kind: 'shared', cpus: 1, memory_mb: 512 },
-    mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }],
-    services: [{ autostart: false, autostop: false, internal_port: 8787 }] };
+  const config = structuredClone(observedBaseline);
   return { version: 'p10b-no-email-session-v1', app: 'uckele-group-p10b', machineId: '0803730bd1d7e8',
     sourceHead: '1'.repeat(40), nonce: 'c'.repeat(24), candidateImageDigest: image,
-    baselineImageDigest: `sha256:${'b'.repeat(64)}`, baselineConfig: config,
+    baselineImageDigest: config.image.split('@')[1], baselineConfig: config,
     ownerPermissionDigest: 'd'.repeat(64), permissionEvidenceId: 'owner:offline-stub',
     nativeClientSha256: '9'.repeat(64),
     startedAt: new Date(now).toISOString(), sessionDeadline: new Date(now + 3600000).toISOString(),
@@ -30,6 +32,98 @@ function session() {
       flySecretMetadataDigest: 'e'.repeat(64), verifiedAt: new Date(now).toISOString() },
     budget: { priceEvidenceDigest: 'f'.repeat(64), maximumUsdPerSecond: 0.000002, fixedIncrementalUsd: 0.8 } };
 }
+
+test('observed 25-key baseline shape passes typed policy; forbidden namespaces and malformed values deny before boundaries', async () => {
+  assert.equal(Object.keys(session().baselineConfig.env).length, 25);
+  assert.equal(operator.validateP10bNoEmailSession(session(), now), true);
+  for (const c of publicEnvironmentCases) {
+    const s = session(); s.baselineConfig.env[c.name] = c.value;
+    if (c.admitted) {
+      assert.equal(operator.validateP10bNoEmailSession(s, now), true, c.name);
+      if (c.name === 'PUBLIC_SITE_URL') assert.doesNotThrow(() => new URL(c.value), 'admitted origin must pass the server URL parser');
+    }
+    else {
+      assert.throws(() => operator.validateP10bNoEmailSession(s, now), /public configuration/, c.name);
+      let calls = 0;
+      await assert.rejects(operator.runP10bNoEmailOperator({ session: s, approval: {}, evidence: memoryEvidence(),
+        createBoundaries: () => { calls++; throw Error(); }, clock: () => now }));
+      assert.equal(calls, 0);
+    }
+  }
+});
+
+test('observed public settings survive both candidates and are bound to approval, phase and full restoration digests', () => {
+  const s = session(); const before = digest(s.baselineConfig);
+  const approval = { version: 'p10b-no-email-approval-v1', approved: true, sessionDigest: digest(s),
+    ownerPermissionDigest: s.ownerPermissionDigest, sourceHead: s.sourceHead, expiresAt: s.sessionDeadline,
+    recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 };
+  operator.assertP10bNoEmailApproval(s, approval, now);
+  const names = ['ADMIN_ALLOW_PASSWORD_AUTH', 'ADMIN_AUTH_MODE', 'ANALYTICS_ENABLED', 'BACKUP_ENABLED',
+    'OUTBOUND_HTTP_TIMEOUT_MS', 'PUBLIC_SITE_URL', 'SECURE_DOCUMENTS_STORAGE_DIR'];
+  for (const label of ['demo', 'prepare']) {
+    const p = operator.createP10bRuntimePhase(s, label, now);
+    for (const k of names) {
+      assert.equal(p.config.env[k], s.baselineConfig.env[k]);
+      const altered = structuredClone(p); delete altered.config.env[k];
+      assert.throws(() => operator.assertP10bFrozenPhase(s, altered));
+      const changedSession = structuredClone(s); changedSession.baselineConfig.env[k] = k === 'ADMIN_AUTH_MODE' ? 'password'
+        : k === 'PUBLIC_SITE_URL' ? 'https://other.test' : k === 'SECURE_DOCUMENTS_STORAGE_DIR' ? '/data/other'
+          : k === 'OUTBOUND_HTTP_TIMEOUT_MS' ? '1000' : 'false';
+      assert.notEqual(digest(changedSession.baselineConfig), before);
+      assert.throws(() => operator.assertP10bNoEmailApproval(changedSession, approval, now));
+    }
+  }
+  assert.equal(digest(s.baselineConfig), before);
+});
+
+test('preserved auth, analytics and backup switches cannot open preparation routes or startup/scheduler work', async () => {
+  const { p10bIngressOnly, runServerStartupMaintenance, startServerSchedulers } = await import('../server/services/p10bRuntime.js');
+  const config = workerConfig(); config.dealHunter.cimProvider.qualificationRuntime = true;
+  config.dealHunter.cimProvider.qualificationPhase = 'prepare';
+  config.admin = { authMode: 'hybrid', allowPasswordAuth: true }; config.analytics = { enabled: true }; config.backup = { enabled: true };
+  let calls = 0;
+  assert.deepEqual(await runServerStartupMaintenance(config, { cleanupAuth: () => { calls++; }, cleanupDocuments: () => { calls++; } }),
+    { reviewed: 0, isolated: true });
+  assert.deepEqual(startServerSchedulers(config, [() => { calls++; }]), []);
+  for (const route of ['/api/admin/login', '/api/analytics', '/api/secure-documents']) {
+    let status; p10bIngressOnly(config)({ method: 'POST', path: route },
+      { status: code => { status = code; return { json() {} }; } }, () => { calls++; });
+    assert.equal(status, 404);
+  }
+  assert.equal(calls, 0);
+});
+
+test('full public baseline preflight rejects stale, partial, changed-image/name/digest/source evidence without authentication', async () => {
+  const { runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
+  const s = session(); const envelope = { version: 'p10b-public-baseline-preflight-v1', app: s.app, machineId: s.machineId,
+    volumeId: 'vol_vwnkpex1k3yx9dnv', sourceHead: s.sourceHead, instanceId: 'observed-instance', state: 'stopped',
+    observedAt: new Date(now).toISOString(), observedEnvironmentNames: Object.keys(s.baselineConfig.env),
+    fullConfigurationRetained: true, baselineConfig: s.baselineConfig, baselineImageDigest: s.baselineImageDigest,
+    baselineConfigDigest: digest(s.baselineConfig) };
+  let calls = 0; const run = e => runP10bNoEmailSessionCli(['--validate-baseline', 'public.json'], { read: () => e,
+    clock: () => now, checkSource: h => { assert.equal(h, s.sourceHead); },
+    openNative: () => { calls++; throw Error(); }, createBoundaries: () => { calls++; throw Error(); } });
+  const result = await run(envelope); assert.equal(result.status, 'PUBLIC_BASELINE_VALIDATED');
+  assert.equal(result.baselineConfigDigest, digest(s.baselineConfig)); assert.equal(result.environmentNameCount, 25);
+  assert.equal(JSON.stringify(result).includes('secure-documents'), false);
+  for (const mutate of [e => { e.fullConfigurationRetained = false; }, e => { delete e.baselineConfig.env.BACKUP_ENABLED; },
+    e => { e.observedEnvironmentNames.pop(); }, e => { e.observedEnvironmentNames.push(e.observedEnvironmentNames[0]); },
+    e => { e.baselineConfig.env.ADMIN_AUTH_MODE = 'password'; }, e => { e.baselineConfigDigest = '0'.repeat(64); },
+    e => { e.baselineConfig.services[0].autostop = 'off'; e.baselineConfigDigest = digest(e.baselineConfig); },
+    e => { e.baselineConfig.image += '@extra'; e.baselineConfigDigest = digest(e.baselineConfig); },
+    e => { e.baselineConfig.image = `@${e.baselineImageDigest}`; e.baselineConfigDigest = digest(e.baselineConfig); },
+    ...[c => { c.auto_destroy = 'false'; }, c => { c.schedule = false; }, c => { c.init.exec = false; },
+      c => { c.init = false; }, c => { c.init = []; }, c => { c.env.TZ = 'é'.repeat(3000); },
+      c => { c.mounts = { 0: c.mounts[0], length: 1 }; }].map(mutate => e => { mutate(e.baselineConfig); e.baselineConfigDigest = digest(e.baselineConfig); }),
+    e => { e.baselineImageDigest = image; }, e => { e.observedAt = new Date(now - 1800001).toISOString(); },
+    e => { e.observedAt = new Date(now + 1).toISOString(); }, e => { e.instanceId = ''; }, e => { e.sourceHead = ''; },
+    e => { e.state = 'started'; }, e => { e.machineId = 'other'; }, e => { e.secret = 'synthetic-private-canary'; }]) {
+    const e = structuredClone(envelope); mutate(e); await assert.rejects(run(e));
+  }
+  await assert.rejects(runP10bNoEmailSessionCli(['--validate-baseline', 'public.json'], { read: () => envelope,
+    clock: () => now, checkSource: () => { throw Error('changed checkout'); }, openNative: () => { calls++; } }));
+  assert.equal(calls, 0);
+});
 function memoryEvidence() {
   const files = new Map(); return { files, has: name => files.has(name), read: name => structuredClone(files.get(name)),
     write(name, value) { assert.equal(files.has(name), false); files.set(name, structuredClone(value)); } };

@@ -14,9 +14,52 @@ export const P10B_RUNTIME_FLAGS = Object.freeze({ NODE_ENV: 'p10b', P10B_QUALIFI
   DEAL_HUNTER_CIM_MAILBOX_REPLY_TO: 'replies@p10b-e2e.uckelegroup.com',
   DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN: 'p10b-e2e.uckelegroup.com', DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS: 'mathew@uckelegroup.com' });
 export const P10B_PUBLIC_ENV_NAMES = Object.freeze([...Object.keys(P10B_RUNTIME_FLAGS), 'PORT', 'HOST', 'TZ',
-  'APP_BASE_URL', 'PUBLIC_BASE_URL', 'LOG_LEVEL', 'SQLITE_PATH', 'P10B_QUALIFICATION_PHASE', 'P10B_GUEST_WINDOW']);
+  'APP_BASE_URL', 'PUBLIC_BASE_URL', 'LOG_LEVEL', 'SQLITE_PATH', 'P10B_QUALIFICATION_PHASE', 'P10B_GUEST_WINDOW',
+  'ADMIN_ALLOW_PASSWORD_AUTH', 'ADMIN_AUTH_MODE', 'ANALYTICS_ENABLED', 'BACKUP_ENABLED',
+  'OUTBOUND_HTTP_TIMEOUT_MS', 'PUBLIC_SITE_URL', 'SECURE_DOCUMENTS_STORAGE_DIR']);
 const onlyKeys = (value, allowed) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).every(k => allowed.includes(k));
+
+// These are public settings, not permission to run auth routes, schedulers or
+// providers. Preserve their exact bytes for rollback; admit no secret namespace.
+export function isP10bPublicEnvironmentValue(name, value) {
+  if (!P10B_PUBLIC_ENV_NAMES.includes(name) || typeof value !== 'string' || Buffer.byteLength(value) > 4096
+    || [...value].some(c => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)
+    || /(?:https?:\/\/[^/]*@|postgres(?:ql)?:|Bearer\s)/i.test(value)) return false;
+  if (['ADMIN_ALLOW_PASSWORD_AUTH', 'ANALYTICS_ENABLED', 'BACKUP_ENABLED'].includes(name)) return ['true', 'false'].includes(value);
+  if (name === 'ADMIN_AUTH_MODE') return ['password', 'magic-link', 'hybrid'].includes(value);
+  if (name === 'OUTBOUND_HTTP_TIMEOUT_MS') return /^[1-9][0-9]{0,4}$/.test(value) && Number(value) <= 10000;
+  if (name === 'PUBLIC_SITE_URL') {
+    const origin = /^https?:\/\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)(?::([1-9][0-9]{0,4}))?\/?$/.exec(value);
+    if (!origin || origin[1].length > 253 || (origin[2] && Number(origin[2]) > 65535)) return false;
+    const parts = origin[1].split('.');
+    // Reject numeric/hex-like DNS endings that WHATWG treats as malformed IPs.
+    return !/^[0-9]/.test(parts.at(-1)) || (parts.length === 4
+      && parts.every(p => /^(?:0|[1-9][0-9]{0,2})$/.test(p) && Number(p) <= 255));
+  }
+  if (name === 'SECURE_DOCUMENTS_STORAGE_DIR') return value === '/app/data/secure-documents'
+    || (/^\/data\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/.test(value)
+      && value.slice(6).split('/').every(part => !['.', '..'].includes(part)));
+  return true;
+}
+
+export function validateP10bBaselineConfig(c, imageDigest) {
+  if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest || '') || typeof c?.image !== 'string'
+    || !/^[^@\s]+@sha256:[a-f0-9]{64}$/.test(c.image) || !c.image.endsWith(`@${imageDigest}`)
+    || !onlyKeys(c, ['image', 'env', 'restart', 'guest', 'mounts', 'services', 'init', 'processes', 'auto_destroy', 'schedule', 'checks', 'dns', 'metadata', 'metrics', 'stop_config'])
+    || !onlyKeys(c.env, P10B_PUBLIC_ENV_NAMES)
+    || c.guest?.cpu_kind !== 'shared' || c.guest.cpus !== 1 || c.guest.memory_mb !== 512 || c.restart?.policy !== 'no'
+    || !Array.isArray(c.mounts) || c.mounts.length !== 1 || c.mounts[0].volume !== 'vol_vwnkpex1k3yx9dnv' || c.mounts[0].path !== '/data'
+    || !Array.isArray(c.services) || c.services.length !== 1 || c.services.some(v => v.autostart !== false || v.autostop !== false || v.internal_port !== 8787)
+    || ![undefined, null, ''].includes(c.schedule) || ![undefined, null, false].includes(c.auto_destroy)
+    || (c.init != null && (typeof c.init !== 'object' || Array.isArray(c.init)))
+    || ['exec', 'cmd', 'entrypoint'].some(k => c.init?.[k] != null && (!Array.isArray(c.init[k]) || c.init[k].length !== 0))
+    || Buffer.byteLength(stableCanonicalJson(c)) > 32768
+    || Object.entries(c.env).some(([k, v]) => !isP10bPublicEnvironmentValue(k, v))) {
+    throw Error('Frozen baseline capacity or public configuration invalid');
+  }
+  return true;
+}
 
 export function validateP10bNoEmailSession(s, now) {
   if (!onlyKeys(s, ['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'nonce', 'candidateImageDigest', 'baselineImageDigest',
@@ -56,17 +99,7 @@ export function validateP10bNoEmailSession(s, now) {
     || !Number.isFinite(s.budget.maximumUsdPerSecond) || s.budget.maximumUsdPerSecond < 0
     || !Number.isFinite(s.budget.fixedIncrementalUsd) || s.budget.fixedIncrementalUsd < 0
     || s.budget.fixedIncrementalUsd + 600 * s.budget.maximumUsdPerSecond >= 1) throw Error('Frozen no-email session invalid');
-  const c = s.baselineConfig;
-  if (!onlyKeys(c, ['image', 'env', 'restart', 'guest', 'mounts', 'services', 'init', 'processes', 'auto_destroy', 'schedule', 'checks', 'dns', 'metadata', 'metrics', 'stop_config'])
-    || c.guest?.cpu_kind !== 'shared' || c.guest.cpus !== 1 || c.guest.memory_mb !== 512 || c.restart?.policy !== 'no'
-    || c.mounts?.length !== 1 || c.mounts[0].volume !== 'vol_vwnkpex1k3yx9dnv' || c.mounts[0].path !== '/data'
-    || c.services?.length !== 1 || c.services.some(v => v.autostart !== false || ![false, 'off'].includes(v.autostop) || v.internal_port !== 8787)
-    || c.schedule || c.auto_destroy === true || c.files?.length || ['exec', 'cmd', 'entrypoint'].some(k => c.init?.[k]?.length)
-    || Buffer.byteLength(stableCanonicalJson(c)) > 32768
-    || Object.entries(c.env || {}).some(([k, v]) => !P10B_PUBLIC_ENV_NAMES.includes(k) || typeof v !== 'string'
-      || v.length > 4096 || /(?:https?:\/\/[^/]*@|postgres(?:ql)?:|Bearer\s)/i.test(v))) {
-    throw Error('Frozen baseline capacity or public configuration invalid');
-  }
+  validateP10bBaselineConfig(s.baselineConfig, s.baselineImageDigest);
   return true;
 }
 

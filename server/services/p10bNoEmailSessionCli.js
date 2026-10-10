@@ -2,7 +2,8 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readP10bPublicJson, createP10bOperatorEvidence, createP10bRecoveryFilesystem, inspectP10bRecovery } from './p10bOperatorFiles.js';
-import { assertP10bNoEmailApproval, runP10bNoEmailOperator } from './p10bRuntimeOnlyOperator.js';
+import { assertP10bNoEmailApproval, runP10bNoEmailOperator, validateP10bBaselineConfig } from './p10bRuntimeOnlyOperator.js';
+import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { recoverP10bAdmissionReservation } from './p10bAdmissionRecovery.js';
 import { openP10bNativeMachineClient } from './p10bNativeMachineClient.js';
 import { createP10bNoEmailBoundaries } from './p10bNoEmailBoundaries.js';
@@ -21,6 +22,29 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
   openNative = openP10bNativeMachineClient, processes = createP10bOperatorProcesses(),
   createBoundaries = createP10bNoEmailBoundaries, clock = () => Date.now(),
   checkSource = assertP10bReviewedCheckout } = {}) {
+  if (args.length === 2 && args[0] === '--validate-baseline') {
+    const e = read(args[1]);
+    if (e?.version !== 'p10b-public-baseline-preflight-v1' || e.app !== 'uckele-group-p10b'
+      || e.machineId !== '0803730bd1d7e8' || e.volumeId !== 'vol_vwnkpex1k3yx9dnv'
+      || !/^[a-f0-9]{40}$/.test(e.sourceHead || '') || !/^[A-Za-z0-9-]{1,80}$/.test(e.instanceId || '')
+      || Object.keys(e).some(k => !['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'instanceId', 'state',
+        'observedAt', 'observedEnvironmentNames', 'fullConfigurationRetained', 'baselineConfig', 'baselineImageDigest', 'baselineConfigDigest'].includes(k))
+      || e.state !== 'stopped' || e.fullConfigurationRetained !== true
+      || !Number.isFinite(Date.parse(e.observedAt)) || Date.parse(e.observedAt) > clock()
+      || clock() - Date.parse(e.observedAt) > 1800000
+      || !Array.isArray(e.observedEnvironmentNames) || e.observedEnvironmentNames.some(k => typeof k !== 'string')
+      || new Set(e.observedEnvironmentNames).size !== e.observedEnvironmentNames.length
+      || stableCanonicalJson([...e.observedEnvironmentNames].sort()) !== stableCanonicalJson(Object.keys(e.baselineConfig?.env || {}).sort())) {
+      throw Error('Complete fresh stopped public baseline required');
+    }
+    validateP10bBaselineConfig(e.baselineConfig, e.baselineImageDigest);
+    if (e.baselineConfigDigest !== sha256(stableCanonicalJson(e.baselineConfig))) throw Error('Full public baseline digest mismatch');
+    checkSource(e.sourceHead);
+    return { status: 'PUBLIC_BASELINE_VALIDATED', baselineImageDigest: e.baselineImageDigest,
+      baselineConfigDigest: sha256(stableCanonicalJson(e.baselineConfig)), observedAt: e.observedAt,
+      sourceHead: e.sourceHead, instanceId: e.instanceId,
+      environmentNameCount: e.observedEnvironmentNames.length, productionReady: false };
+  }
   if (args.length === 2 && args[0] === '--validate-template') {
     const bundle = read(args[1]);
     if (bundle.version !== 'p10b-no-email-bundle-v1' || bundle.status !== 'SESSION_NOT_APPROVED'

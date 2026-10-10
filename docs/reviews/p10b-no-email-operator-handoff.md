@@ -15,6 +15,65 @@ node scripts/run-p10b-no-email-session.js --validate-template templates/p10b-no-
 This validation reads the held public template, returns its missing prerequisites,
 and cannot construct authentication or filesystem recovery boundaries.
 
+## Required complete baseline preflight before replacement image work
+
+Template validation proves the held contract only. The original offline operator
+fixture used an empty environment, and the build package relied on historical
+baseline identity/capacity without validating the current complete configuration
+through the host and native schemas. Seven existing public key names were therefore
+missed until after the one-build/one-push allowance was consumed. That allowance is
+closed. Do not use the earlier partial projection as a complete baseline.
+
+Before any separately approved replacement image build, collect a fresh stopped
+public baseline under that approval. Inspect its environment **names first**;
+reject unknown names before selecting values. Retain every admitted public value
+without normalization or omission, and compute the full canonical config digest.
+No secret values, credential-store data or value-derived secret digests belong in
+the file. Validate the clean reviewed checkout and the actual complete shape:
+
+```sh
+node scripts/run-p10b-no-email-session.js --validate-baseline /fresh/public-baseline.json
+```
+
+The envelope has version `p10b-public-baseline-preflight-v1`, fixed `app`,
+`machineId`, `volumeId`, final `sourceHead`, observed `instanceId`, `state=stopped`,
+`observedAt`, independently captured `observedEnvironmentNames`,
+`fullConfigurationRetained=true`, full `baselineConfig`, `baselineImageDigest`
+and `baselineConfigDigest=sha256(stableCanonicalJson(baselineConfig))`.
+The command rejects evidence older than 30 minutes, future observations, missing
+or duplicate names, dropped values, changed config/image digests and a changed or
+dirty source checkout. Its public receipt contains the full digest, source/image,
+instance, time and name count; it prints no environment values and opens no
+authentication, registry, recovery, SQLite or Machine boundary. Keep the envelope
+and receipt sealed with the replacement build intent. Recheck all bindings and
+freshness immediately before any build/spend; failure consumes no build or push.
+Native admission independently applies the same typed policy before loading
+authentication. Both validators consume shared public-value regression vectors;
+the full operator flow now uses the observed 25-key shape with explicitly
+synthetic values for the seven formerly omitted names. Future unknown keys remain
+closed and require their own offline semantic review.
+
+| Name | Public meaning and narrow admitted values |
+| --- | --- |
+| `ADMIN_ALLOW_PASSWORD_AUTH` | Auth feature switch: exact `true` or `false`; never a password. |
+| `ADMIN_AUTH_MODE` | Auth behavior: only `password`, `magic-link`, `hybrid`; never auth material. |
+| `ANALYTICS_ENABLED` | Local analytics switch: exact `true` or `false`. |
+| `BACKUP_ENABLED` | Local scheduler switch: exact `true` or `false`. |
+| `OUTBOUND_HTTP_TIMEOUT_MS` | Public request deadline: canonical decimal integer 1..10000 ms; rejects aliases, exponents and unbounded timeouts. |
+| `PUBLIC_SITE_URL` | HTTP(S) origin with a bounded DNS hostname whose final label starts with a letter, or canonical four-octet IPv4, optional port 1..65535 and optional root `/`; no userinfo, other path, query or fragment. |
+| `SECURE_DOCUMENTS_STORAGE_DIR` | Canonical non-root `/data` descendant with safe literal segments, or exact container default `/app/data/secure-documents`; no traversal, encoded or ambiguous segments. |
+
+All seven settings are preserved byte-for-byte through both candidates and exact
+baseline restoration. Accepted settings do not grant runtime permission:
+`password`/`hybrid` can enable password auth despite a false feature switch, so
+preparation safety relies on the existing ingress guard rejecting admin,
+analytics and document routes, and startup/scheduler guards suppressing ordinary
+cleanup/backup work. The frozen candidate flags separately enforce no-email
+provider/automation hard-offs. Credential namespaces, `NODE_OPTIONS`, `LD_PRELOAD`,
+unknown keys and credential-shaped/control-containing values remain denied.
+Name-only evidence does not prove the seven real values pass this policy; a fresh
+complete admitted baseline is still required before replacement image work.
+
 After separate owner approval and image preparation, the exact clean reviewed
 checkout and an existing private fresh evidence directory support one handoff:
 
