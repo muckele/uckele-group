@@ -98,6 +98,7 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
     if (label === 'prepare' && (!evidence.has('p10b-runtime-only-demo-proof.json')
       || evidence.read('p10b-runtime-only-demo-proof.json')?.success !== true)) throw Error('Guardian timing proof required');
     const current = await client(); assertStopped(current, expectedConfig);
+    assertTime(label === 'rollback' ? 30000 : 360000);
     if (nextConfig.restart?.policy !== 'no' || nextConfig.guest?.memory_mb !== 512 || nextConfig.guest?.cpus !== 1
       || nextConfig.guest?.cpu_kind !== 'shared' || nextConfig.mounts?.length !== 1
       || nextConfig.mounts[0].volume !== 'vol_vwnkpex1k3yx9dnv' || nextConfig.mounts[0].path !== '/data'
@@ -107,6 +108,7 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
     }
     evidence.write(`p10b-runtime-only-update-${label}-intent.json`, { at: new Date(clock()).toISOString(),
       currentVersion: current.instance_id, configDigest: digest(nextConfig), skip_launch: true });
+    assertTime(label === 'rollback' ? 30000 : 360000);
     const updated = await client('POST', { config: nextConfig, skip_launch: true, current_version: current.instance_id });
     evidence.write(`p10b-runtime-only-update-${label}-response.json`, updated);
     const readbacks = [];
@@ -120,6 +122,7 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
   async function restoreBaseline(client, baselineConfig, knownConfigs) {
     assertTime(30000);
     const current = await client();
+    assertTime(30000);
     if (current.state !== 'stopped') throw Error('Cannot restore without certain stopped state');
     const alreadyBaseline = stableCanonicalJson(current.config) === stableCanonicalJson(baselineConfig)
       && current.image_ref?.digest === session.baselineImageDigest;
@@ -131,6 +134,7 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
     else assertStopped(current, baselineConfig);
     const restored = { at: new Date(clock()).toISOString(), state: 'stopped', baselineImageDigest: session.baselineImageDigest,
       fullConfigRestored: true, alreadyBaseline, productionReady: false, globalAutomationPaused: true };
+    assertTime();
     evidence.write('p10b-runtime-only-restored.json', restored);
     return restored;
   }

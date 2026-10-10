@@ -11,6 +11,7 @@ import { assertP10bGuestReady, completeP10bGuestHandoff, parseP10bGuestWindow, p
   requestP10bGuestShutdown, writeP10bGuestRecord } from './p10bGuestShutdown.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { p10bRuntimeFailure } from './p10bRuntimeFailure.js';
+import { captureP10bWorkerDiagnostics } from './p10bWorkerDiagnostics.js';
 
 function metadata(databasePath) {
   const database = new Database(databasePath, { readonly: true, fileMustExist: true });
@@ -91,6 +92,8 @@ export async function serveP10bQualificationWorker({ channel, config = getConfig
     const { startedAt: _startedAt, ...hostPacket } = packet || {};
     validateP10bRuntimePacket(hostPacket, new Date(clock()).toISOString());
     stage = 'runtime-binding';
+    send('worker-public-diagnostic', { diagnostic: captureP10bWorkerDiagnostics({ config, packet, runtime,
+      credentialKeyNames: Object.keys(process.env) }) });
     validateRuntime(config, packet, runtime);
     window = p10bGuestWindow(packet);
     databasePath = resolveDatabasePath(packet.databasePath);

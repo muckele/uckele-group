@@ -8,6 +8,7 @@ import { P10B_MACHINE_ID } from './p10bRuntime.js';
 import { P10B_GUEST_PROCESSES, p10bGuestWindow } from './p10bGuestShutdown.js';
 import { P10B_CONFIGURATION_EVIDENCE_VERSION, P10B_RUNTIME_PACKET_VERSION,
   p10bProviderIdentityDigest, validateP10bProviderIdentity } from './p10bProviderIdentity.js';
+import { validateP10bWorkerDiagnostics } from './p10bWorkerDiagnostics.js';
 import { p10bRuntimeFailure, p10bFailureError, validateP10bRuntimeFailure } from './p10bRuntimeFailure.js';
 
 const owners = new Set();
@@ -172,6 +173,7 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
   let guestHandoffVerified = false;
   let failure;
   let failureDetails;
+  let workerDiagnostic;
   let stage = 'preflight';
   let startIssued = false;
   let startCompleted = false;
@@ -379,6 +381,9 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
           || prepared.runtimeConfigurationDigest !== packet.configurationEvidence.runtimeConfigurationDigests.prepare) {
           throw new Error('Preparation receipt changed');
         }
+      } else if (frame.kind === 'worker-public-diagnostic' && !workerDiagnostic) {
+        if (!validateP10bWorkerDiagnostics(frame.diagnostic, packet)) throw Error('Invalid public worker diagnostic');
+        workerDiagnostic = structuredClone(frame.diagnostic);
       } else if (frame.kind === 'worker-failed') {
         failureDetails = validateP10bRuntimeFailure(frame.failureDetails) && frame.failureDetails.origin === 'worker'
           ? { ...frame.failureDetails } : p10bRuntimeFailure('host', 'worker', null, { reason: 'invalid-diagnostic' });
@@ -412,7 +417,7 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
   const result = { version: 'p10b-host-result-v1', operation: packet.operation, packetDigest: digest(packet),
     sourceHead: packet.sourceHead, startedAt: startedAt || null, finishedAt: new Date().toISOString(),
     ...stop, failureStage: failure || null, productionReady: false,
-    ...(failureDetails ? { failureDetails } : {}),
+    ...(failureDetails ? { failureDetails } : {}), ...(workerDiagnostic ? { workerDiagnostic } : {}),
     lifecycleVerified: Boolean(artifact), success: !failure && !stop?.stopUncertain
       && (packet.operation === 'prepare' ? Boolean(prepared) : Boolean(artifact)),
     conservativeIncrementalUsd: reserved && packet.budget ? cost() : null,
