@@ -1,0 +1,70 @@
+{
+  "version": "p10b-no-email-bundle-v1",
+  "status": "SESSION_NOT_APPROVED",
+  "session": {
+    "version": "p10b-no-email-session-v1",
+    "app": "uckele-group-p10b",
+    "machineId": "0803730bd1d7e8",
+    "volumeId": "vol_vwnkpex1k3yx9dnv",
+    "sourceHead": null,
+    "nonce": null,
+    "candidateImageDigest": null,
+    "nativeClientSha256": null,
+    "baselineImageDigest": "sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629",
+    "baselineConfig": null,
+    "ownerPermissionDigest": null,
+    "permissionEvidenceId": null,
+    "startedAt": null,
+    "sessionDeadline": null,
+    "maximumStarts": 2,
+    "maximumStartWindowMs": 300000,
+    "maximumStoppedConfigUpdates": 3,
+    "maximumIncrementalUsd": 1,
+    "maximumLocalBuilds": 1,
+    "maximumImagePushes": 1,
+    "productionReady": false,
+    "globalAutomationPaused": true,
+    "authenticationEvidence": {
+      "version": "p10b-normal-authentication-coverage-v1",
+      "ownerAttested": false,
+      "expiresAt": null
+    },
+    "configurationEvidence": null,
+    "budget": null,
+    "recovery": {
+      "directory": null,
+      "activePath": null,
+      "archivePath": null,
+      "attemptPath": null,
+      "intentPath": null,
+      "terminalPath": null,
+      "expectedSha256": "d8db5f5624548885285327591e2b6259588d9d7333a0e85cda40960047a73043",
+      "packetDigest": "df7051b7cd424d9d70e924591130149f3932208414055511f201d8db5bcc12e8",
+      "evidencePath": "/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-runtime-attempt-4-f15f7d596089/runtime-harness/p10b-runtime-only-preparation",
+      "reservedAt": "2026-10-10T07:12:20.821Z"
+    }
+  },
+  "approval": {
+    "version": "p10b-no-email-approval-v1",
+    "approved": false,
+    "sessionDigest": null,
+    "ownerPermissionDigest": null,
+    "sourceHead": null,
+    "expiresAt": null,
+    "recoveryApproved": false,
+    "exclusiveAdmissionWriters": false,
+    "providerCalls": 0,
+    "emails": 0
+  },
+  "imageEvidence": {
+    "version": "p10b-image-prerequisite-v1",
+    "sourceHead": null,
+    "imageDigest": null,
+    "immutableImage": null,
+    "buildCount": null,
+    "pushCount": null,
+    "registryManifestVerified": false,
+    "manifestEvidenceDigest": null,
+    "verifiedAt": null
+  }
+}

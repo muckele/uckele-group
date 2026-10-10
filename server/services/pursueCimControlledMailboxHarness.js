@@ -6,6 +6,11 @@ import {
   validateCimProviderProfileBinding,
 } from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { fetchWithTimeout } from '../utils/http.js';
+import { createQualificationSupervisor } from './p10bQualificationSupervisor.js';
+import { readQualificationLifecycleSnapshot, verifyQualificationLifecycle } from './p10bQualificationLifecycle.js';
+import { P10B_QUALIFICATION_WRITER, qualificationReason,
+  validateQualificationContract, assertQualificationHardOff } from './p10bQualificationContract.js';
 import { setCimOutreachPaused } from './cimOpportunityIdentity.js';
 import { readCimCurrentAuthority } from './cimCampaignSafety.js';
 import { buildOpportunitySourceObservationSnapshot } from './dealHunterOpportunityFacts.js';
@@ -21,7 +26,8 @@ import {
   normalizeCimProviderReadiness,
 } from './pursueCimFinalGate.js';
 import { runDueCimInitialPreparations } from './pursueCimInitialPreparation.js';
-import { finalizeAuthorizedCimTransmission } from './pursueCimProvider.js';
+import { finalizeAuthorizedCimTransmission, createCimResendReconciliationLookup,
+  immutableTransmissionBinding, reconcileCimProviderTransmission } from './pursueCimProvider.js';
 import { getPursueCimReleaseReport } from './pursueCimRelease.js';
 import { assertP10bControlledMailboxTemplate } from './pursueCimControlledMailboxTemplate.js';
 
@@ -824,6 +830,243 @@ export async function executeP10bControlledMailbox(options = {}) {
 export async function executeP10bLimitedFreeSmoke(options = {}) {
   return executeP10b({ ...options, providerProfile: LIMITED_PROFILE,
     expectedConfirmation: P10B_LIMITED_SMOKE_CONFIRMATION });
+}
+
+// Deliberately no CLI/startup registration. The supervisor supplies fresh
+// local runtime/budget observations and owns stopping the isolated Machine.
+// This permission is not a provider readiness receipt.
+export async function executeP10bFirstMailboxQualification({ storage, config,
+  opportunityId, initialActivationId, manifest: inputManifest, reviewedDigest,
+  supervisorTarget, observe, stopAndVerify, clock = () => new Date(), actor,
+  fetcher, readFetcher, testHooks = {}, onBeforeStop, signal, stopTimeoutMs = 30000, lifecyclePollMs = 250 } = {}) {
+  const supervisor = createQualificationSupervisor({ target: supervisorTarget, stopAndVerify, clock,
+    maximumRuntimeMs: inputManifest?.maximumRuntimeMs, stopTimeoutMs, beforeStop: closeAuthorityAndHandoff });
+  const at = () => new Date(clock()).toISOString();
+  let manifest;
+  let armedConfig;
+  let authorizationId;
+  let providerCalls = 0;
+  let finalization;
+  let lifecycle;
+  let cleanup = { errors: [] };
+  let stop;
+  let failure;
+  let failureStage = 'validation';
+  const cancel = () => { void supervisor.close(); };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
+  const request = async (url, options, reader) => {
+    supervisor.assertActive();
+    const controller = new AbortController();
+    const timeoutMs = Math.max(1, Math.min(supervisor.remaining(), Number(options.timeoutMs) || 10000));
+    let timer;
+    try {
+      return await supervisor.bounded(() => Promise.race([
+        (async () => {
+          const response = await (reader || fetchWithTimeout)(url, { ...options, timeoutMs,
+            signal: AbortSignal.any([controller.signal, supervisor.signal]) });
+          const chunks = [];
+          let length = 0;
+          if (response.body) {
+            const bodyReader = response.body.getReader();
+            try {
+              for (;;) {
+                const { done, value } = await bodyReader.read();
+                if (done) break;
+                length += value.byteLength;
+                if (length > 65536 || supervisor.signal.aborted) {
+                  void bodyReader.cancel().catch(() => {});
+                  throw new Error('Qualification response bounds exceeded');
+                }
+                chunks.push(value);
+              }
+            } finally { bodyReader.releaseLock(); }
+          } else {
+            const bytes = Buffer.from(JSON.stringify(await response.json()));
+            if (bytes.length > 65536) throw new Error('Qualification response bounds exceeded');
+            chunks.push(bytes);
+            length = bytes.length;
+          }
+          return new Response(Buffer.concat(chunks, length), {
+            status: response.status, headers: response.headers });
+        })(),
+        new Promise((resolve, reject) => { timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error('Qualification provider timeout'));
+        }, timeoutMs); }),
+      ]));
+    } catch { throw new Error('Qualification provider outcome unknown'); }
+    finally { clearTimeout(timer); }
+  };
+  async function closeAuthorityAndHandoff() {
+    if (armedConfig && authorizationId) {
+      try {
+        // SQLite cleanup is synchronous internally. Bound unexpected injected
+        // stalls; a late result never restores execution permission.
+        let timer;
+        try {
+          cleanup = await Promise.race([
+            cleanupExecution({ storage, services: {}, authorizationId, initialActivationId,
+              actor, now: new Date().toISOString(), armedConfig }),
+            new Promise((resolve) => { timer = setTimeout(() => resolve({ errors: ['cleanup_timeout'] }), stopTimeoutMs); }),
+          ]);
+        } finally { clearTimeout(timer); }
+      } catch { cleanup = { errors: ['cleanup_failed'] }; }
+    }
+    // Close SQLite authority while the Machine is still alive. A host-owned
+    // supervisor can retain this bounded candidate over the existing SSH
+    // channel before stopping the worker's Machine. It is not a final artifact.
+    if (typeof onBeforeStop === 'function') {
+      let timer;
+      try {
+        const proof = lifecycle ? { ...lifecycle, version: 'p10b-lifecycle-proof-candidate-v1',
+          lifecycleVerified: false, productionReady: false } : null;
+        if (proof) { delete proof.digest; proof.digest = sha256(stableCanonicalJson(proof)); }
+        await Promise.race([
+          Promise.resolve().then(() => onBeforeStop({ version: 'p10b-pre-stop-candidate-v1',
+            manifestDigest: reviewedDigest, providerCalls,
+            outcome: finalization?.outcome?.category || 'unknown',
+            failureStage: failure ? failureStage : null, cleanup, proof,
+            lifecycleVerified: false, productionReady: false })),
+          new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error('Candidate handoff timed out')), stopTimeoutMs); }),
+        ]);
+      } catch { failure ||= new Error('Qualification candidate handoff failed'); failureStage = 'candidate-handoff'; }
+      finally { clearTimeout(timer); }
+    }
+  }
+  try {
+    await supervisor.bounded(async () => {
+      if (storage?.provider !== 'sqlite' || typeof observe !== 'function'
+        || !Number.isSafeInteger(lifecyclePollMs) || lifecyclePollMs < 1 || lifecyclePollMs > 1000) {
+        throw new Error('P10B qualification requires SQLite and an explicit supervisor');
+      }
+      boundedText(actor, 'actor', 200);
+      assertQualificationHardOff(config);
+      manifest = structuredClone(inputManifest);
+      armedConfig = structuredClone(config);
+      if (manifest.runtime?.app !== supervisor.target.app
+        || manifest.runtime?.machineId !== supervisor.target.machineId) {
+        throw new Error('P10B qualification supervisor target mismatch');
+      }
+      supervisor.bindDeadline(manifest.expiresAt);
+      const qualification = { manifest, reviewedDigest, clock,
+        assertActive: supervisor.assertActive,
+        observe: () => supervisor.bounded(observe) };
+      const observed = await qualification.observe();
+      const check = validateQualificationContract({ ...qualification, observed, now: at() });
+      if (!check.valid) throw new Error(`P10B qualification denied: ${check.reason}`);
+      authorizationId = `p10b-q-${reviewedDigest.slice(0, 48)}`;
+      const now = at();
+      const report = await getPursueCimReleaseReport({ storage, opportunityId, now });
+      supervisor.assertActive();
+      if (report?.pause?.paused !== true || report?.liveAuthorization
+        || report?.transmission?.state !== 'prepared') throw new Error('P10B qualification is not fresh prepared work');
+      const review = buildP10bReviewArtifact(report, { providerProfile: CONTROLLED_PROFILE, initialActivationId });
+      validateReviewBinding(review, armedConfig, { execution: true });
+      if (review.digest !== manifest.reviewDigest || review.transmission.id !== manifest.transmissionId
+        || review.transmission.payloadDigest !== manifest.payloadDigest) throw new Error('P10B qualification review binding changed');
+      const issued = await storage.issueCimLiveProviderAuthorization({ id: authorizationId,
+        activationId: initialActivationId, capability: 'fl04b-initial',
+        writerPath: P10B_QUALIFICATION_WRITER, transmissionId: manifest.transmissionId,
+        payloadDigest: manifest.payloadDigest, recipientAuthorityDigest: review.recipientAuthority.fingerprint,
+        providerProfile: CONTROLLED_PROFILE, actor, reason: qualificationReason(manifest),
+        now: manifest.issuedAt, expiresAt: manifest.expiresAt,
+        qualification: { manifest, reviewedDigest, observed } });
+      supervisor.assertActive();
+      if (issued?.issued !== true) throw new Error('P10B qualification permission was not issued');
+      const gate = await authorizePreparedCimTransmission({ storage,
+        transmissionId: manifest.transmissionId, authorizationId, writerPath: P10B_QUALIFICATION_WRITER,
+        providerProfile: CONTROLLED_PROFILE, actor, now: at(), configOverride: armedConfig,
+        readCurrentAuthority: readP10bSyntheticCurrentAuthority, qualification });
+      supervisor.assertActive();
+      if (gate?.authorized !== true) throw new Error('P10B qualification final gate denied execution');
+      failureStage = 'outbound';
+      const singleFetch = async (url, options) => {
+        supervisor.assertActive();
+        assertQualificationHardOff(armedConfig);
+        const observedNow = await qualification.observe();
+        if (!validateQualificationContract({ ...qualification, observed: observedNow, now: at() }).valid
+          || providerCalls !== 0 || url !== 'https://api.resend.com/emails' || options.method !== 'POST') {
+          throw new Error('P10B qualification provider boundary denied');
+        }
+        const durable = await storage.readCimFinalGateContext({ transmissionId: manifest.transmissionId, authorizationId, now: at() });
+        if (!validateQualificationContract({ ...qualification, observed: observedNow, now: at(), ...durable }).valid
+          || durable?.transmission?.state !== 'provider-pending'
+          || durable.transmission.invocation_authority_count !== 1
+          || !durable.transmission.provider_seam_entered_at || !durable.authorization?.consumed_at
+          || durable.qualificationChainCurrent !== true || Number(durable.safety?.outreach_paused) !== 1) {
+          throw new Error('P10B qualification durable provider permission changed');
+        }
+        supervisor.assertActive();
+        providerCalls += 1;
+        return request(url, options, fetcher);
+      };
+      finalization = await finalizeAuthorizedCimTransmission({ storage, finalGateResult: gate,
+        authorizationId, writerPath: P10B_QUALIFICATION_WRITER, providerProfile: CONTROLLED_PROFILE,
+        actor, now: new Date(clock()), configOverride: armedConfig, fetcher: singleFetch, testHooks });
+      supervisor.assertActive();
+      // Ambiguity is consumed; it does not become retry or qualification proof.
+      if (finalization?.outcome?.category !== 'accepted') return;
+      failureStage = 'reconciliation-read';
+      const context = await storage.readCimFinalGateContext({ transmissionId: manifest.transmissionId, authorizationId });
+      const lookup = createCimResendReconciliationLookup({ configOverride: armedConfig, clock,
+        fetcher: async (url, options) => {
+          const observedNow = await qualification.observe();
+          if (!validateQualificationContract({ ...qualification, observed: observedNow, now: at() }).valid
+            || url !== 'https://api.resend.com/emails?limit=100' || options.method !== 'GET') {
+            throw new Error('Qualification read boundary denied');
+          }
+          return request(url, options, readFetcher);
+        } });
+      const binding = immutableTransmissionBinding(context.transmission, CONTROLLED_PROFILE);
+      const reconciliation = await lookup({ transmission: context.transmission, binding, providerProfile: CONTROLLED_PROFILE });
+      supervisor.assertActive();
+      failureStage = 'reconciliation-write';
+      const reconciled = await reconcileCimProviderTransmission({ storage, transmission: context.transmission,
+        providerProfile: CONTROLLED_PROFILE, readProviderEvidence: async () => reconciliation,
+        actor, now: new Date(clock()), configOverride: armedConfig });
+      if (!reconciled.resolved || reconciled.outcome !== 'accepted') throw new Error('Qualification reconciliation is not exact');
+      failureStage = 'lifecycle-capture';
+      await testHooks.beforeLifecycleObservation?.({ manifest, reconciliation });
+      for (;;) {
+        supervisor.assertActive();
+        assertQualificationHardOff(armedConfig);
+        const currentObservation = await qualification.observe();
+        if (!validateQualificationContract({ ...qualification, observed: currentObservation, now: at() }).valid) {
+          throw new Error('Qualification execution binding drifted during lifecycle observation');
+        }
+        const lifecycleAuthority = await storage.readCimFinalGateContext({ transmissionId: manifest.transmissionId,
+          authorizationId, now: at() });
+        if (lifecycleAuthority?.qualificationChainCurrent !== true
+          || Number(lifecycleAuthority.safety?.outreach_paused) !== 1) {
+          throw new Error('Qualification lifecycle permission was revoked');
+        }
+        const snapshot = await readQualificationLifecycleSnapshot({ storage, manifest });
+        supervisor.assertActive();
+        if (snapshot) {
+          failureStage = 'lifecycle-verification';
+          lifecycle = verifyQualificationLifecycle({ manifest, config: armedConfig, snapshot, reconciliation, now: at() });
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(lifecyclePollMs, supervisor.remaining())));
+      }
+    });
+  } catch (error) { failure = error; }
+  finally { stop = await supervisor.close(); signal?.removeEventListener('abort', cancel); }
+  const evidence = { version: 'p10b-first-mailbox-qualification-result-v1',
+    manifestDigest: reviewedDigest, ...stop, providerCalls,
+    failureStage: failure ? failureStage : null,
+    outcome: finalization?.outcome?.category || 'unknown', cleanup,
+    lifecycleVerified: Boolean(lifecycle && !failure && stop.stoppedVerified && cleanup.errors.length === 0),
+    productionReady: false, reconciliationOnly: Boolean(failure || !stop.stoppedVerified
+      || cleanup.errors.length || finalization?.outcome?.category !== 'accepted') };
+  if (failure || !stop.stoppedVerified || cleanup.errors.length) {
+    const error = new Error(!stop.stoppedVerified ? 'P10B qualification stop is unverified'
+      : cleanup.errors.length ? 'P10B qualification permission closure is unverified' : 'P10B qualification execution failed');
+    error.p10bEvidence = evidence;
+    throw error;
+  }
+  return { evidence, ...(evidence.lifecycleVerified ? { lifecycle } : {}) };
 }
 
 export function buildP10bLimitedSmokePostRunAttestation({

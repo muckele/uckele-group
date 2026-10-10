@@ -4,7 +4,8 @@ import {
   validateCimProviderProfileBinding,
 } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
-import { classifyCimProtectedWork, enterCimProviderBoundary } from './cimProviderBoundary.js';
+import { classifyCimProtectedWork, enterCimProviderBoundary,
+  isQualificationBoundaryAuthorization } from './cimProviderBoundary.js';
 import { canonicalDailyDealHunterMailbox } from './dailyDealHunterDigest.js';
 import { recordEmailEvent } from './emailEvents.js';
 
@@ -549,7 +550,8 @@ async function sendMessage(message, {
   const cimClassification = await classifyCimProtectedWork(message, { storage });
 
   if (cimClassification.protected) {
-    if (config.dealHunter?.cimProvider?.enabled !== true) {
+    if (config.dealHunter?.cimProvider?.enabled !== true
+      && !isQualificationBoundaryAuthorization(cimProviderAuthorization)) {
       return {
         status: 'failed',
         error: 'CIM provider invocation is disabled by the environment hard-off.',
@@ -611,7 +613,7 @@ async function sendMessage(message, {
       };
     }
     const boundary = await enterCimProviderBoundary({
-      message, storage, authorization: cimProviderAuthorization, now,
+      message, storage, authorization: cimProviderAuthorization, now, config,
     });
     if (!boundary.allowed) {
       return {

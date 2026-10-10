@@ -1,5 +1,7 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
+import { P10B_QUALIFICATION_WRITER, readQualificationGrant,
+  validateQualificationContract, assertQualificationHardOff } from './p10bQualificationContract.js';
 
 export { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 
@@ -12,7 +14,9 @@ const cimMessageKinds = new Set([
 ]);
 
 const authorizedBoundaryObjects = new WeakSet();
+const qualificationBoundaryObjects = new WeakMap();
 const writerCapabilities = new Map([
+  [P10B_QUALIFICATION_WRITER, 'fl04b-initial'],
   ['pursue-cim-initial', 'fl04b-initial'],
   ['pursue-cim-autopilot-initial', 'fl04b-initial'],
   ['pursue-cim-follow-up', 'fl04c-followup'],
@@ -63,7 +67,16 @@ export function createCimProviderBoundaryAuthorization({
     throw new TypeError('The CIM provider boundary identity is incomplete.');
   }
   authorizedBoundaryObjects.add(authorization);
+  if (writerPath === P10B_QUALIFICATION_WRITER) {
+    const qualification = readQualificationGrant(finalGateResult);
+    if (!qualification) throw new TypeError('Same-process qualification gate required');
+    qualificationBoundaryObjects.set(authorization, qualification);
+  }
   return authorization;
+}
+
+export function isQualificationBoundaryAuthorization(authorization) {
+  return authorizedBoundaryObjects.has(authorization) && qualificationBoundaryObjects.has(authorization);
 }
 
 function denied(errorCategory, reconciliationOnly = false) {
@@ -91,7 +104,7 @@ async function deniedWithObservation({ storage, authorization, errorCategory,
 }
 
 export async function enterCimProviderBoundary({
-  message, storage, authorization, now = new Date(),
+  message, storage, authorization, now = new Date(), config,
 } = {}) {
   if (!authorizedBoundaryObjects.has(authorization)) {
     return denied('cim-provider-authorization-required');
@@ -99,6 +112,17 @@ export async function enterCimProviderBoundary({
   if (typeof storage?.readCimFinalGateContext !== 'function'
     || typeof storage?.enterCimProviderSeam !== 'function') {
     return denied('cim-provider-seam-unauthorized');
+  }
+  const qualification = qualificationBoundaryObjects.get(authorization);
+  let observed;
+  if (qualification) {
+    try {
+      assertQualificationHardOff(config);
+      qualification.assertActive();
+      now = qualification.clock();
+      observed = await qualification.observe();
+      qualification.assertActive();
+    } catch { return denied('cim-provider-seam-unauthorized', true); }
   }
   const nowIso = now instanceof Date ? now.toISOString() : new Date(now).toISOString();
   const reject = (errorCategory, reconciliationOnly = false) => deniedWithObservation({
@@ -122,6 +146,8 @@ export async function enterCimProviderBoundary({
   const communication = durable?.communication;
   const outbox = durable?.outbox;
   const members = Array.isArray(durable?.members) ? durable.members : [];
+  if (qualification && !validateQualificationContract({ ...qualification, observed,
+    now: nowIso, ...durable }).valid) return reject('cim-provider-seam-unauthorized', true);
   const expectedWork = capabilityWork.get(authorization.capability);
   if (!transmission || !liveAuthorization || !activation || !communication || !outbox
     || !expectedWork
@@ -206,6 +232,8 @@ export async function enterCimProviderBoundary({
       expectedRowVersion: authorization.expectedRowVersion,
       actor: authorization.actor,
       now: nowIso,
+      qualification: qualification ? { manifest: qualification.manifest,
+        reviewedDigest: qualification.reviewedDigest, observed } : undefined,
     });
   } catch {
     return reject('cim-provider-seam-unauthorized', true);
