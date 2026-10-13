@@ -1,4 +1,5 @@
 import hashlib
+import errno
 import importlib.util
 import json
 import os
@@ -9,7 +10,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import warnings
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SOURCE = Path(__file__).resolve().parent.parent / 'scripts/run-p10b-owner-handoff.py'
 def fixture_digest(value):
@@ -201,6 +202,31 @@ class OwnerEntryTests(unittest.TestCase):
         with patch.object(handoff.getpass, 'getpass', fallback):
             with self.assertRaises(handoff.getpass.GetPassWarning):
                 handoff.hidden_token()
+
+    def test_exited_leader_permission_denial_requires_positive_group_absence(self):
+        child = Mock(pid=23456)
+        child.wait.return_value = 0
+        with patch.object(handoff.os, 'killpg', side_effect=[PermissionError(errno.EPERM, 'offline signal denied'), ProcessLookupError()]) as signal_group:
+            self.assertEqual(handoff.settle_owned_group(child), 0)
+        child.wait.assert_called_once_with(timeout=0)
+        self.assertEqual([call.args for call in signal_group.call_args_list], [(23456, handoff.signal.SIGTERM), (23456, 0)])
+        for state in ('active', 'group-present', 'probe-denied', 'other-signal-error'):
+            with self.subTest(state=state):
+                child = Mock(pid=23456)
+                child.wait.return_value = 0
+                if state == 'active':
+                    child.wait.side_effect = subprocess.TimeoutExpired('owned-child', 0)
+                initial = OSError() if state == 'other-signal-error' else PermissionError(errno.EPERM, 'offline signal denied')
+                probe = PermissionError() if state == 'probe-denied' else None
+                with patch.object(handoff.os, 'killpg', side_effect=[initial, probe]) as signal_group:
+                    with self.assertRaises(handoff.Hold):
+                        handoff.settle_owned_group(child)
+                self.assertLessEqual(signal_group.call_count, 2)
+                self.assertTrue(all(call.args[1] in (handoff.signal.SIGTERM, 0) for call in signal_group.call_args_list))
+
+    def test_actual_fast_exited_command_can_close_without_descendants(self):
+        self.assertEqual(handoff.run_command([shutil.which('node'), '-e', 'process.stdout.write("{}")'],
+                                            {'PATH': '/usr/bin:/bin', 'HOME': str(self.root)}, 5), {})
 
     def test_actual_command_group_closes_even_after_leader_exit(self):
         for inherited_pipes, ignore_term in ((True, False), (False, False), (True, True), (False, True)):

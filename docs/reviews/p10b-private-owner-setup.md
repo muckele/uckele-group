@@ -7,11 +7,11 @@ until separately approved private setup and exact final session approval.
 ## Concrete owner package
 
 After the exact reviewed host commit and its CI succeed, the sealed package lives
-at `/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package`.
+at `/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package-v2`.
 Run its checksum-pinned wrapper from a private unrecorded owner terminal:
 
 ```sh
-/usr/local/bin/python3 -B /Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package/owner-handoff.py --check-only
+/usr/local/bin/python3 -B /Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package-v2/owner-handoff.py --check-only
 ```
 
 Use the same command with `--run` only after separate owner setup authority.
@@ -102,7 +102,11 @@ is permitted only for exact baseline restoration. No host stop/retry or new star
 is introduced. Guest shutdown owns permission/ingress/SQLite/artifact closure.
 
 Success requires runtime closure plus authenticated-client and private-directory
-cleanup proof. The outer launcher also verifies its owned process group. Timeout,
+cleanup proof. The outer launcher also verifies its owned process group.
+Darwin's signal permission error for an
+exited unreaped leader is resolved only by its exact child wait and an independent
+group probe returning ESRCH; active children, present groups and denied probes
+hold without further signaling. Timeout,
 refusal, replay or uncertainty preserves evidence and denies success. After closed
 clients, the owner must manually revoke only this new matching public token ID
 under the setup/runtime approval. No automated revocation is implemented. An

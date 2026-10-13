@@ -2,6 +2,7 @@
 """Private owner entry. Imports/check-only never accept credentials or use SDKs."""
 import argparse
 import datetime as dt
+import errno
 import getpass
 import hashlib
 import json
@@ -112,7 +113,21 @@ def settle_owned_group(child):
         os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    except OSError:
+    except OSError as error:
+        # Darwin returns EPERM for an exited, unreaped group leader. Resolve
+        # only that case: exact child exit AND positive absence of its group.
+        # Do not signal again after a permission failure or treat it as absence.
+        if error.errno == errno.EPERM:
+            try:
+                code = child.wait(timeout=0)
+            except (subprocess.TimeoutExpired, OSError):
+                raise Hold('Owned subprocess group termination unverified')
+            try:
+                os.killpg(child.pid, 0)
+            except ProcessLookupError:
+                return code
+            except OSError:
+                raise Hold('Owned subprocess group closure unverified')
         raise Hold('Owned subprocess group termination unverified')
     try:
         code = child.wait(timeout=2)
