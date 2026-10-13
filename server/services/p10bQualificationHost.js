@@ -209,7 +209,9 @@ export async function runP10bQualificationHost({ packet: inputPacket, adapter, e
   };
   const readSecrets = async () => {
     if (++reads > 2048) throw new Error('Host read limit reached');
-    const value = await bounded(() => adapter.getSecretMetadata(target, { signal: operations.signal }),
+    const value = await bounded(() => packet.operation === 'prepare'
+      ? adapter.getSecretNames(target, { signal: operations.signal })
+      : adapter.getSecretMetadata(target, { signal: operations.signal }),
       Math.min(10000, deadline - Date.now()), operations.signal);
     if (digest(value) !== packet.configurationEvidence.flySecretMetadataDigest) throw new Error('Staged secret metadata changed');
   };

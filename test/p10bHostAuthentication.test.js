@@ -19,6 +19,7 @@ function fixture() {
     volumeId: 'vol_vwnkpex1k3yx9dnv', sourceHead: 'c4944a46ac362cdcd002e077d5533b4b0843b1d0', hostSourceHead: '2'.repeat(40),
     candidateImageDigest: 'sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc',
     nativeClientSha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088',
+    namesClientPath: '/offline/names-client', namesClientSha256: 'a'.repeat(64),
     baselineImageDigest: baselineConfig.image.split('@')[1], baselineConfig, nonce: 'c'.repeat(24),
     ownerPermissionDigest: 'd'.repeat(64), permissionEvidenceId: 'owner:offline-stub',
     startedAt: new Date(now).toISOString(), sessionDeadline: new Date(now + 3600000).toISOString(),

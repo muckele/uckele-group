@@ -65,7 +65,8 @@ export function validateP10bNoEmailSession(s, now) {
   if (!onlyKeys(s, ['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'hostSourceHead', 'nonce', 'candidateImageDigest', 'baselineImageDigest',
     'baselineConfig', 'ownerPermissionDigest', 'permissionEvidenceId', 'startedAt', 'sessionDeadline', 'maximumStarts',
     'maximumStartWindowMs', 'maximumStoppedConfigUpdates', 'maximumIncrementalUsd', 'maximumLocalBuilds', 'maximumImagePushes',
-    'productionReady', 'globalAutomationPaused', 'configurationEvidence', 'budget', 'recovery', 'authenticationEvidence', 'nativeClientSha256'])
+    'productionReady', 'globalAutomationPaused', 'configurationEvidence', 'budget', 'recovery', 'authenticationEvidence', 'nativeClientSha256',
+    'namesClientPath', 'namesClientSha256'])
     || !onlyKeys(s.configurationEvidence, ['version', 'providerIdentity', 'providerIdentityDigest', 'flySecretMetadataDigest', 'verifiedAt'])
     || !onlyKeys(s.budget, ['priceEvidenceDigest', 'maximumUsdPerSecond', 'fixedIncrementalUsd'])
     || !onlyKeys(s.authenticationEvidence, ['version', 'ownerAttested', 'issuanceSucceeded', 'app', 'scope', 'tokenId', 'tokenName', 'revokedAt',
@@ -106,6 +107,8 @@ export function validateP10bNoEmailSession(s, now) {
     || !/^sha256:[a-f0-9]{64}$/.test(s.candidateImageDigest || '') || !/^sha256:[a-f0-9]{64}$/.test(s.baselineImageDigest || '')
     || !/^[a-f0-9]{64}$/.test(s.ownerPermissionDigest || '') || !/^[A-Za-z0-9_.:@-]{1,240}$/.test(s.permissionEvidenceId || '')
     || !/^[a-f0-9]{64}$/.test(s.nativeClientSha256 || '')
+    || typeof s.namesClientPath !== 'string' || !/^\/[A-Za-z0-9_./ -]{1,1024}$/.test(s.namesClientPath)
+    || !/^[a-f0-9]{64}$/.test(s.namesClientSha256 || '')
     || !Number.isFinite(now) || !Number.isFinite(Date.parse(s.startedAt)) || !Number.isFinite(Date.parse(s.sessionDeadline))
     || Date.parse(s.sessionDeadline) - Date.parse(s.startedAt) !== 3600000 || now < Date.parse(s.startedAt) || now >= Date.parse(s.sessionDeadline)
     || s.maximumStarts !== 2 || s.maximumStartWindowMs !== 300000 || s.maximumStoppedConfigUpdates !== 3

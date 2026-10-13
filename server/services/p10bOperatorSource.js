@@ -7,8 +7,11 @@ export const P10B_RETAINED_IMAGE = 'sha256:50bc9c9ea37207586f347134e62de15aa2164
 export const P10B_RETAINED_NATIVE_SHA256 = 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088';
 export function assertP10bReviewedCheckout(sourceHead) {
   const root = fileURLToPath(new URL('../../', import.meta.url));
-  if (execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim() !== sourceHead
-    || execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }).trim()) throw Error('Exact clean reviewed source required');
+  const prefix = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-C', root];
+  const options = { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', HOME: process.env.HOME,
+    GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } };
+  if (execFileSync('/usr/bin/git', [...prefix, 'rev-parse', 'HEAD'], options).trim() !== sourceHead
+    || execFileSync('/usr/bin/git', [...prefix, 'status', '--porcelain'], options).trim()) throw Error('Exact clean reviewed source required');
 }
 export function assertP10bNoEmailHostBinding(session, checkSource = assertP10bReviewedCheckout) {
   if (session.sourceHead !== P10B_RETAINED_GUEST_HEAD || session.candidateImageDigest !== P10B_RETAINED_IMAGE

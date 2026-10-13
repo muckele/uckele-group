@@ -161,6 +161,7 @@ async function hostFixture(t, variant = '') {
   const adapter = {
     async getMachine() { reads += 1; return structuredClone(machine); },
     async getSecretMetadata() { return secrets; },
+    async getSecretNames() { return secrets.map(row => row.name).sort(); },
     async startMachine() {
       starts += 1;
       if (variant === 'start-failure') throw new Error('offline-sending-secret');
@@ -774,6 +775,7 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
           process.exit(code);
         }});
     } else if (args[0] === 'machines') process.stdout.write(JSON.stringify([machine]));
+    else if (args[0] === '--secret-names') process.stdout.write(JSON.stringify(['DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY']));
     else if (args[0] === 'secrets') process.stdout.write(JSON.stringify([{name:'DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY',digest:'abc123'}]));
     else if (args[0] === 'machine' && args[1] === 'start') {
       fs.writeFileSync(runtimePath,JSON.stringify({wallStartedAt:Date.now()}));
@@ -812,6 +814,7 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
   `);
   const children = [];
   const adapter = createP10bFlyControl({ environment: { PATH: process.env.PATH, HOME: directory },
+    secretNamesExecutable: fakeFly, secretNamesSha256: sha256(fs.readFileSync(fakeFly)),
     spawnProcess: (_executable, args, options) => {
       assert.equal(options.env.FLY_API_TOKEN, undefined);
       assert.deepEqual(Object.keys(options.env).sort(), ['FLY_NO_UPDATE_CHECK', 'HOME', 'PATH']);
@@ -825,7 +828,7 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
   const evidence = { version: P10B_CONFIGURATION_EVIDENCE_VERSION,
     providerIdentity: structuredClone(P10B_PROVIDER_IDENTITY),
     providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY), verifiedAt: at,
-    flySecretMetadataDigest: digest(secrets), runtimeConfigurationDigests: {
+    flySecretMetadataDigest: digest(secrets.map(row => row.name).sort()), runtimeConfigurationDigests: {
       prepare: '4'.repeat(64), qualify: '5'.repeat(64) } };
   const packet = { version: P10B_RUNTIME_PACKET_VERSION, operation: 'prepare',
     guest: { issuedAt: at, stopAt: new Date(Date.parse(at)+10000).toISOString(), closureGraceMs: 1000, stopReserveMs: 2000 }, target: {
@@ -859,6 +862,8 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
   // injected email responses, not authority granted by the no-send sequence.
   machine.config=structuredClone(prepareConfig);machine.image_ref.digest=`sha256:${'a'.repeat(64)}`;
   const r = prepare.preparation;
+  evidence.flySecretMetadataDigest = digest(secrets);
+  packet.configurationEvidenceDigest = digest(evidence);
   const manifest = { version: P10B_QUALIFICATION_VERSION, runtime: {
     providerIdentity: structuredClone(evidence.providerIdentity), providerIdentityDigest: r.providerIdentityDigest,
     ...packet.target, databaseIdentityHash: r.databaseIdentityHash }, domain: evidence.providerIdentity.domain.name,

@@ -26,6 +26,7 @@ try {
   const environment = p10bInheritedAppTokenEnvironment({ session, approval });
   const result = await runFirstMailboxCli(['--packet', packetPath,
     '--evidence-prefix', path.join(evidence.root, 'p10b-runtime-only-preparation')],
-  { adapter: createP10bFlyControl({ environment }), hostSession: session, hostApproval: approval, hostPhase: phase });
+  { adapter: createP10bFlyControl({ environment, secretNamesExecutable: session.namesClientPath,
+    secretNamesSha256: session.namesClientSha256 }), hostSession: session, hostApproval: approval, hostPhase: phase });
   if (!result.success) process.exitCode = 1;
 } catch { process.stderr.write('No-email preparation failed or held; preserve evidence.\n'); process.exitCode = 1; }

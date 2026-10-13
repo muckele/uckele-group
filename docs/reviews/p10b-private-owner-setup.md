@@ -1,126 +1,132 @@
-# Private owner credential setup and bounded runtime proposal
+# Private owner setup and bounded no-email handoff
 
-This is a future proposal. The launcher correction was approved for offline
-implementation, tests, review and publication only. No token creation, entry,
-authentication, Machine action, image work or runtime is authorized by this file.
+Offline code, tests and publication do not authorize credential creation, private
+entry, authenticated inventory or a Machine start. The owner package remains held
+until separately approved private setup and exact final session approval.
 
-## Frozen artifacts and separate host revision
+## Concrete owner package
 
-`session.sourceHead` remains guest commit
-`c4944a46ac362cdcd002e077d5533b4b0843b1d0`. The immutable image remains
+After the exact reviewed host commit and its CI succeed, the sealed package lives
+at `/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package`.
+Run its checksum-pinned wrapper from a private unrecorded owner terminal:
+
+```sh
+/usr/local/bin/python3 -B /Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package/owner-handoff.py --check-only
+```
+
+Use the same command with `--run` only after separate owner setup authority.
+`--check-only` uses no SDK or private input. It verifies the recipe, Python/Node
+interpreters, fixed entrypoints, exact clean reviewed host checkout, executable
+bindings, concrete output locations and dated public price evidence before any
+credential prompt. Changed/stale files or previously consumed evidence hold.
+The wrapper contains the final concrete recipe SHA256; there are no placeholder
+bundle, evidence or native-helper paths.
+
+Guest commit remains `c4944a46ac362cdcd002e077d5533b4b0843b1d0`; image remains
 `registry.fly.io/uckele-group-p10b@sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc`.
-The retained native executable SHA256 is
+The retained Machine helper remains SHA256
 `de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088`.
-`session.hostSourceHead` and `approval.hostSourceHead` must identify the final
-independently reviewed clean launcher commit. Both are bound by the session digest.
-Guest packets/windows/configuration still carry the guest revision. The narrow
-preparation exception requires the exact derived no-email preparation packet;
-standalone qualification cannot borrow the new host binding.
+The new read-only public client is independently bound by path and SHA256 in the
+recipe and session. It does not replace the Machine mutation helper.
 
-## Owner setup, only after separate approval
+## Private entry and public evidence
 
-1. Prepare a fresh public bundle with the final host revision and a fresh nonce.
-   Keep its status held until all prerequisites and owner approval are complete.
-2. In your own private terminal, outside Codex/transcripts/recorded shells, create
-   one app-scoped credential with the exact nonce-bound name and explicit expiry:
+The script first displays the checked recipe digest, dated prices and exact
+setup scope. The owner must type the exact private-setup approval phrase. Only
+then does it display the nonce-bound two-hour `fly tokens create deploy` command
+for the owner to run personally in a separate private unrecorded terminal.
+No automatic issuance, login, refresh, retry, additional credential or account
+fallback exists. Keep creation output private.
 
-   ```sh
-   fly tokens create deploy --app uckele-group-p10b --expiry 2h --name "p10b-runtime-no-email-<nonce>"
-   ```
+After successful creation, supply actual public issuance start/completion UTC
+(within 60 seconds), matching public token ID/name/effective expiry/unrevoked
+metadata and the attestation that hidden input matches that exact new isolated
+app-deploy token. The app Tokens dashboard or `fly tokens list --app
+uckele-group-p10b` supplies public metadata; creation JSON contains only the
+credential. Requested lifetime or login time cannot prove effective coverage.
+The credential-free public-input validator runs before `getpass`, and the
+preparer repeats admission at the actual preflight start. Bad ID, timing, expired
+scope or insufficient effective coverage holds before hidden input/authentication.
 
-   This prints credential material. Do not paste it into chat, command arguments,
-   source, public JSON, evidence or a persistent owner configuration file. Keep
-   the credential privately for the hidden-input handoff below. No general account
-   permissions or production credentials need to change. If creation fails, stop;
-   no login, retry or renewal is implied by these instructions.
-3. Record UTC timestamps immediately before and after successful creation, and
-   inspect the matching managed token's public ID/name/effective expiry/revocation
-   status in the app's Tokens dashboard or:
+A private TTY is required; getpass echo-fallback warnings are errors. Credential
+bytes remain in private process memory/environment and possible isolated SDK
+state, never argv, public JSON, receipts, source or guest configuration. The
+launcher does not decode the input to independently prove the owner's selection.
 
-   ```sh
-   fly tokens list --app uckele-group-p10b
-   ```
+## Supported names-only preflight
 
-   Publish only the matching public fields. `create deploy --json` contains only
-   the credential; it does not provide public expiry metadata. `auth whoami` and
-   a known login time cannot supply future coverage.
-4. Populate `authenticationEvidence` with version `p10b-app-token-issuance-v1`,
-   `ownerAttested=true`, `issuanceSucceeded=true`, `app=uckele-group-p10b`,
-   `scope=app-deploy`, the matching public `tokenId`, nonce-bound `tokenName`,
-   `issuanceEvidenceId`, canonical UTC `issuanceStartedAt`,
-   `issuanceCompletedAt`, `requestedLifetimeMs=7200000`, `revokedAt=null`, and metadata-derived
-   canonical `expiresAt`. Attest that the privately supplied credential is the
-   same newly created, unrevoked token described by this receipt. The launcher
-   does not decode credential bytes to independently prove that selection.
-   Creation must complete within 60 seconds and before the session starts.
-   Effective expiry must fall within the creation-time bounds plus two hours
-   (one second allowed for server timestamp quantization) and cover the entire
-   original session deadline. Missing metadata, clock mismatch or insufficient
-   coverage holds admission; requested duration alone cannot pass.
-5. After the final public bundle receives fresh explicit runtime approval, use
-   the hidden input from a private terminal in the final clean checkout:
+The normal Fly SDK uses the installed flyctl v0.4.115 GraphQL schema's supported
+`app(name: "uckele-group-p10b") { secrets { name } }` selection. Its own AppData
+fragment requests `secrets { name }`. The request selects no value/digest field;
+unexpected response fields fail closed before hashing/output. There is no REST
+`secrets list --json` fallback in no-email preparation. Preparation binds the
+canonical sorted-name inventory hash. Qualification keeps its existing metadata
+contract and still requires separate email authority.
 
-   ```sh
-   python3 -c '
-   import getpass, os, subprocess, sys, warnings
-   if not sys.stdin.isatty():
-       raise SystemExit("Private terminal required")
-   warnings.simplefilter("error", getpass.GetPassWarning)
-   environment = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
-   environment["FLY_API_TOKEN"] = getpass.getpass("Temporary app token (hidden): ")
-   raise SystemExit(subprocess.call([
-       "/Users/Matt/.nvm/versions/node/v22.23.2/bin/node",
-       "scripts/run-p10b-no-email-session.js", "--execute",
-       "--bundle", "/approved/public-bundle.json",
-       "--evidence", "/fresh/private-evidence",
-       "--native-client", "/approved/p10b-machine-client"
-   ], env=environment))
-   '
-   ```
+The bounded preflight performs two fixed-app stopped-Machine reads, independently
+admits names before public values, validates the complete public configuration
+with both host and retained pure native policy, and keeps only the admitted
+public projection. It checks the exact immutable registry manifest with the same
+opaque token using normal Fly token representation and Docker SDK. It makes no
+build/push or Machine mutation. Unsupported app-token GraphQL/registry access
+holds; it never substitutes account credentials.
 
-   The input is memory/environment only. The launcher creates a fresh 0700
-   temporary `FLY_CONFIG_DIR`, retains the real HOME for archival admission paths,
-   strips competing auth/endpoint overrides and supplies only the opaque app
-   credential to approved local SDK/Fly processes. It never supplies it to guest
-   configuration. Success requires both runtime closure and authenticated-client
-   reap/private-directory cleanup proof. Uncertain cleanup remains held with the
-   private directory preserved. Each local process durably reserves a secret-free
-   pending-reap intent before launch and retires only its own intent after actual
-   verified closure. Remaining descendant intents, marker/filesystem errors or
-   changed directory identity hold cleanup. Do not manually clear unresolved
-   intents. Timestamp comparison presumes synchronized local and server UTC
-   clocks; mismatch fails closed without shifting permission times.
-   Before any baseline restoration, local controllers and the current native
-   client close, and the root independently requires the original private
-   directory identity and no unresolved descendant intents. Only then can an
-   exact baseline update use a new native connection with the same credential;
-   no POST retry or new start is added. This keeps guardian configuration in
-   place while a possible start-capable descendant remains unproved.
-6. After all clients are proved closed and the frozen stopped baseline restored,
-   revoke only this temporary token through its public ID in the app dashboard
-   or `fly tokens revoke <matching-public-ID>`. Revocation needs its own explicit
-   authority within the setup/runtime approval. No automated revocation or token
-   creation is built into the launcher.
+Fly/Docker HOME/config state is private and isolated. A nonempty registry auths
+entry disables Docker's automatic credential-store discovery; no credential
+helper/store is configured. The exact buildx search directory is pinned. No owner
+Fly/Docker config or keychain is read. All preflight commands durably reserve
+pending intents, run in owned groups, and require verified group absence before
+retiring intents. Exited leaders do not release group ownership. Uncertain
+reaping/directory identity/cleanup retains 0700 private SDK state and denies
+handoff. This is possible temporary disk storage of credentials, not a memory-only
+claim. Do not manually clear unresolved intents.
 
-## Revised bounded runtime proposal
+## Concrete final runtime approval
 
-Approve only the final reviewed host commit, unchanged guest/image/native
-identities, one owner-created/private-entered two-hour app token and its exact
-public receipt, fresh names-only isolated secret metadata, complete stopped
-public baseline, immutable manifest verification, cost evidence and exclusive
-archival recovery evidence. The public image/baseline admission evidence must be
-at most 30 minutes old; retained October 13 observations are not current proof.
-The owner permission digest and exact session digest must bind these facts.
+The one-hour clock freezes before the first authenticated preflight. Preparation
+and review consume this original window; nothing renews it. Preflight must finish
+within two minutes. Its positive private cleanup gate precedes bundle sealing.
+The script shows the full sealed public bundle and its exact Node-canonical
+session digest (including monetary floats), then requires the owner to type the
+exact session approval phrase. It preserves the unapproved seal and writes a
+separate approved bundle/approval receipt only after this explicit decision.
 
-The session remains one nonrenewable hour with at most two five-minute starts,
-three stopped configuration updates including exact baseline restoration, and
-less than $1 incremental cost. Keep the independent observer, guest guardian,
-permission closure, artifact/SQLite cleanup before stop, one-shot stop arbitration,
-bounded stop verification and archival preservation. No host stop/retry, auth
-renewal, additional image build/push, provider call, email or production change.
-`productionReady=false`; global automation remains paused. A future one-email
-qualification requires separate approval.
+The source/image/public/native bindings, original deadline, recovery paths and
+historical expected bytes all enter that session digest. The runtime performs
+fresh independent stopped-baseline verification and positive archival recovery;
+it preserves historical attempts/uncertain cleanup evidence. An absent old lock
+alone cannot authorize admission. The current reviewed launcher permits at most
+two five-minute starts and three stopped configuration updates including exact
+restore. Private reap proof precedes restoration; known fixed-auth native reopen
+is permitted only for exact baseline restoration. No host stop/retry or new start
+is introduced. Guest shutdown owns permission/ingress/SQLite/artifact closure.
 
-Primary support: [Fly access tokens](https://docs.fly.io/security/tokens),
-[installed CLI source: token creation](https://github.com/superfly/flyctl/blob/v0.4.115/internal/command/tokens/create.go),
-[public managed-token listing](https://github.com/superfly/flyctl/blob/v0.4.115/internal/command/tokens/list.go).
+Success requires runtime closure plus authenticated-client and private-directory
+cleanup proof. The outer launcher also verifies its owned process group. Timeout,
+refusal, replay or uncertainty preserves evidence and denies success. After closed
+clients, the owner must manually revoke only this new matching public token ID
+under the setup/runtime approval. No automated revocation is implemented. An
+uncertain runtime may need separately approved incident handling; expiry is not
+an immediate revocation receipt.
+
+## Cost and retained limits
+
+The $1 amount is an operational budget/estimate, **not a guaranteed billing cap**.
+The retained October13 18:05:45 UTC public snapshot estimates ten minutes of EWR
+shared 1 CPU/512 MB compute at $0.00085417 ($3.69/30 days). The existing 1 GB volume
+continues at about $0.15/month while stopped. Stopped rootfs costs $0.15/GB/month;
+its actual size is unknown. Snapshots cost $0.08/stored GB/month (earlier count
+zero, not rechecked); North American egress costs $0.02/GB. Separate registry
+charges remain unverified. Retained storage continues after stopping. Stale or
+changed price evidence must be resolved before starting the token clock.
+
+No new capacity/storage, additional build/push, provider call, email, production
+change, merge or deployment is authorized. `productionReady=false`; global
+automation remains paused. Sender remains `P10B Sender
+<sender@p10b-e2e.uckelegroup.com>` and eventual recipient `mathew@uckelegroup.com`.
+A future one-email qualification needs separate approval.
+
+Primary SDK sources: [supported names-only fragment](https://github.com/superfly/flyctl/blob/v0.4.115/gql/genqclient.graphql),
+[GraphQL Secret schema](https://github.com/superfly/flyctl/blob/v0.4.115/gql/schema.graphql),
+[Fly SDK transport](https://github.com/superfly/fly-go/blob/v0.11.3/client.go),
+[normal Docker token representation](https://github.com/superfly/flyctl/blob/v0.4.115/internal/command/auth/docker.go).

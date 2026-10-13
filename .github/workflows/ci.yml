@@ -20,6 +20,8 @@ jobs:
           cache-dependency-path: tools/p10b-machine-client/go.sum
       - working-directory: tools/p10b-machine-client
         run: go test ./... && go build -o /tmp/p10b-machine-client .
+      - working-directory: tools/p10b-public-client
+        run: go test ./... && go build -o /tmp/p10b-public-client .
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -32,6 +34,7 @@ jobs:
       - run: npm ci
       - run: npm audit --omit=dev
       - run: npm run lint
+      - run: python3 -B test/test_p10b_owner_handoff.py
       - run: npm test
       - run: npm run test:ui
       - run: npm run build

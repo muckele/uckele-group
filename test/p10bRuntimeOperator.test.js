@@ -23,6 +23,7 @@ function session() {
     baselineImageDigest: config.image.split('@')[1], baselineConfig: config,
     ownerPermissionDigest: 'd'.repeat(64), permissionEvidenceId: 'owner:offline-stub',
     nativeClientSha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088',
+    namesClientPath: '/offline/names-client', namesClientSha256: 'a'.repeat(64),
     startedAt: new Date(now).toISOString(), sessionDeadline: new Date(now + 3600000).toISOString(),
     maximumStarts: 2, maximumStartWindowMs: 300000, maximumStoppedConfigUpdates: 3,
     maximumIncrementalUsd: 1, maximumLocalBuilds: 1, maximumImagePushes: 1,

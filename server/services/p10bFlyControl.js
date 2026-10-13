@@ -1,19 +1,21 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import { sha256 } from '../utils/security.js';
 import { createP10bControlChannel } from './p10bControlChannel.js';
 import { p10bFailureError } from './p10bRuntimeFailure.js';
 import { reserveP10bLocalReap } from './p10bHostAuthentication.js';
 
 export function createP10bFlyControl({ executable = '/opt/homebrew/bin/fly', environment = process.env,
-  spawnProcess = spawn } = {}) {
+  spawnProcess = spawn, secretNamesExecutable, secretNamesSha256 } = {}) {
   const env = { PATH: environment.PATH, HOME: environment.HOME, FLY_NO_UPDATE_CHECK: '1',
     ...(environment.FLY_CONFIG_DIR ? { FLY_CONFIG_DIR: environment.FLY_CONFIG_DIR } : {}),
     ...(environment.P10B_APP_TOKEN_CONTEXT === 'p10b-app-token-context-v1' ? { P10B_APP_TOKEN_CONTEXT: environment.P10B_APP_TOKEN_CONTEXT } : {}),
     ...(environment.FLY_API_TOKEN ? { FLY_API_TOKEN: environment.FLY_API_TOKEN } : {}) };
   const processes = new Map();
   let retirementUncertain = false;
-  const launch = (args, stdio) => {
+  const launch = (args, stdio, binary = executable) => {
     const reservation = reserveP10bLocalReap(env);
-    const child = spawnProcess(executable, args, { env, stdio });
+    const child = spawnProcess(binary, args, { env, stdio });
     child.p10bTerminationRequested = false;
     const exit = new Promise((resolve) => {
       child.once('error', () => { processes.delete(child); resolve(true); });
@@ -36,9 +38,9 @@ export function createP10bFlyControl({ executable = '/opt/homebrew/bin/fly', env
       timer = setTimeout(() => resolve(false), 1000);
     })]); } finally { clearTimeout(timer); }
   };
-  const command = (stage, args, { signal, timeoutMs = 10000 } = {}) => new Promise((resolve, reject) => {
+  const command = (stage, args, { signal, timeoutMs = 10000 } = {}, binary = executable) => new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(p10bFailureError('transport', stage, null, { reason: 'cancelled' })); return; }
-    const { child } = launch(args, ['ignore', 'pipe', 'pipe']);
+    const { child } = launch(args, ['ignore', 'pipe', 'pipe'], binary);
     let bytes = 0;
     const chunks = [];
     let failed = false;
@@ -88,6 +90,19 @@ export function createP10bFlyControl({ executable = '/opt/homebrew/bin/fly', env
         || !/^[0-9a-f]{6,128}$/i.test(row.digest || '')
         || ['RESEND_API_KEY', 'EMAIL_WEBHOOK_SECRET'].includes(row.name))) throw new Error('Unexpected secret namespace');
       return result.sort((a, b) => a.name.localeCompare(b.name));
+    },
+    async getSecretNames({ app }, options) {
+      if (app !== 'uckele-group-p10b' || typeof secretNamesExecutable !== 'string'
+        || !/^[a-f0-9]{64}$/.test(secretNamesSha256 || '')) throw Error('Bound names-exclusive client required');
+      const stat = fs.lstatSync(secretNamesExecutable);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 128 * 1024 * 1024
+        || sha256(fs.readFileSync(secretNamesExecutable)) !== secretNamesSha256) throw Error('Names-exclusive client changed');
+      const bytes = await command('get-secret-metadata', ['--secret-names'], options, secretNamesExecutable);
+      let names; try { names = JSON.parse(bytes); } catch { throw Error('Names-only output invalid'); }
+      if (!Array.isArray(names) || names.length > 32 || new Set(names).size !== names.length
+        || names.some(name => typeof name !== 'string' || !/^[A-Z0-9_]{1,120}$/.test(name)
+          || ['RESEND_API_KEY', 'EMAIL_WEBHOOK_SECRET'].includes(name))) throw Error('Names-only inventory invalid');
+      return names.sort();
     },
     async startMachine({ app, machineId }, options) {
       await command('start-machine', ['machine', 'start', machineId, '--app', app], options);

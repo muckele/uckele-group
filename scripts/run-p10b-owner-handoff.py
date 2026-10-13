@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Private owner entry. Imports/check-only never accept credentials or use SDKs."""
+import argparse
+import datetime as dt
+import getpass
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+import warnings
+
+SCRIPTS = Path(__file__).resolve().parent
+
+
+class Hold(Exception):
+    pass
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+def utc_after(value, seconds):
+    timestamp = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if timestamp.tzinfo != dt.timezone.utc:
+        raise Hold('UTC public timestamps required')
+    return (timestamp + dt.timedelta(seconds=seconds)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+def normalize_utc(value):
+    return utc_after(value, 0)
+
+
+def read_public(file):
+    file = Path(file)
+    st = file.lstat()
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 1048576:
+        raise Hold('Bounded plain public file required')
+    with file.open() as stream:
+        return json.load(stream)
+
+
+def write_exclusive(file, value):
+    file = Path(file)
+    descriptor = os.open(file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'w') as stream:
+        stream.write(canonical(value) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(file.parent, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def hidden_token():
+    warnings.simplefilter('error', getpass.GetPassWarning)
+    return getpass.getpass('Temporary isolated app token (hidden): ')
+
+
+def bound_file(binding, executable=False):
+    path = Path(binding['path'])
+    st = path.lstat()
+    if not path.is_absolute() or not stat.S_ISREG(st.st_mode) or st.st_size > 268435456:
+        raise Hold('Bound plain artifact required')
+    if hashlib.sha256(path.read_bytes()).hexdigest() != binding['sha256'] or (executable and not os.access(path, os.X_OK)):
+        raise Hold('Bootstrap artifact changed')
+    return path
+
+
+def bootstrap_recipe(file, expected_sha256):
+    if not isinstance(expected_sha256, str) or not re.fullmatch('[a-f0-9]{64}', expected_sha256):
+        raise Hold('Approved public recipe checksum required')
+    path = bound_file({'path': str(Path(file).absolute()), 'sha256': expected_sha256})
+    recipe = read_public(path)
+    bound_file(recipe['files']['node'], executable=True)
+    python = bound_file(recipe['files']['python'], executable=True)
+    if python.resolve() != Path(sys.executable).resolve():
+        raise Hold('Approved Python interpreter required')
+    for name, actual in [('ownerScript', Path(__file__).resolve()), ('preflightScript', SCRIPTS / 'run-p10b-owner-preflight.js')]:
+        if bound_file(recipe['files'][name]) != actual:
+            raise Hold('Fixed reviewed entrypoint required')
+    environment = {'PATH': '/usr/bin:/bin', 'HOME': recipe['ownerHome'],
+                   'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+    prefix = ['/usr/bin/git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-C', str(SCRIPTS.parent)]
+    head = subprocess.run(prefix + ['rev-parse', 'HEAD'], env=environment, capture_output=True, text=True, check=True, timeout=10)
+    dirty = subprocess.run(prefix + ['status', '--porcelain'], env=environment, capture_output=True, text=True, check=True, timeout=10)
+    if head.stdout.strip() != recipe['hostSourceHead'] or dirty.stdout.strip():
+        raise Hold('Clean reviewed bootstrap source required')
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256:
+        raise Hold('Recipe changed during bootstrap')
+    return recipe
+
+
+def settle_owned_group(child):
+    # Signal before wait/reaping the leader, retaining ownership of its PGID even
+    # when it exited while descendants kept pipes or closed their own stdio.
+    term_deadline = time.monotonic() + 2
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        raise Hold('Owned subprocess group termination unverified')
+    try:
+        code = child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        code = child.wait(timeout=2)
+    def absent():
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            raise Hold('Owned subprocess group closure unverified')
+        return False
+    while time.monotonic() < term_deadline:
+        if absent():
+            return code
+        time.sleep(0.025)
+    if not absent():
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            raise Hold('Owned subprocess group termination unverified')
+    end = time.monotonic() + 1
+    while time.monotonic() < end:
+        if absent():
+            return code
+        time.sleep(0.025)
+    raise Hold('Owned subprocess group closure unverified')
+
+
+def run_command(args, environment, timeout):
+    # No shell; only reviewed Node entrypoints. Bound all output and wall time.
+    child = subprocess.Popen(args, env=environment, cwd=SCRIPTS.parent,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    streams = selectors.DefaultSelector()
+    streams.register(child.stdout, selectors.EVENT_READ, 'stdout')
+    streams.register(child.stderr, selectors.EVENT_READ, 'stderr')
+    output = bytearray()
+    total = 0
+    end = time.monotonic() + timeout
+    settling = False
+    try:
+        while streams.get_map():
+            left = end - time.monotonic()
+            if left <= 0:
+                raise Hold('Reviewed local command timed out')
+            for key, _ in streams.select(min(0.1, left)):
+                data = os.read(key.fileobj.fileno(), 65536)
+                if not data:
+                    streams.unregister(key.fileobj)
+                    continue
+                total += len(data)
+                if total > 2097152:
+                    raise Hold('Reviewed local output bound exceeded')
+                if key.data == 'stdout':
+                    output.extend(data)
+        settling = True
+        code = settle_owned_group(child)
+        if code != 0:
+            raise Hold('Reviewed local command held')
+        return json.loads(output)
+    except BaseException:
+        if not settling:
+            settling = True
+            settle_owned_group(child)
+        raise
+    finally:
+        streams.close()
+        child.stdout.close()
+        child.stderr.close()
+
+
+def check_recipe(file, runner=run_command, expected_recipe_sha256=None, bootstrap=bootstrap_recipe):
+    recipe = bootstrap(file, expected_recipe_sha256)
+    environment = {'PATH': '/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin', 'HOME': recipe['ownerHome']}
+    result = runner([recipe['files']['node']['path'], str(SCRIPTS / 'run-p10b-owner-preflight.js'),
+                     '--check-only', '--recipe', str(file)], environment, 30)
+    if result.get('status') != 'STATIC_READY_FOR_SEPARATELY_APPROVED_PRIVATE_SETUP' or not re.fullmatch('[a-f0-9]{64}', result.get('recipeDigest', '')) or result.get('recipeFileSha256') != expected_recipe_sha256:
+        raise Hold('Exact static recipe not ready')
+    return recipe, result, environment
+
+
+def run_owner(recipe_file, runner=run_command, ask=input, token_input=hidden_token,
+              private_tty=lambda: sys.stdin.isatty() and sys.stderr.isatty(), emit=print,
+              expected_recipe_sha256=None, bootstrap=bootstrap_recipe):
+    environment = None
+    recipe = None
+    success = False
+    phase = 'static-check'
+    try:
+        recipe, checked, environment = check_recipe(recipe_file, runner, expected_recipe_sha256, bootstrap)
+        root = Path(recipe['outputDirectory'])
+        for name in ('private-setup-scope.json', 'issuance-receipt.json', 'owner-terminal.json',
+                     'owner-final-approval.json', 'sealed-session.json', 'approved-session.json'):
+            if (root / name).exists():
+                raise Hold('Existing evidence preserved; owner entry already consumed')
+        if not private_tty():
+            raise Hold('Private unrecorded terminal required')
+        phase = 'setup-approval'
+        emit(json.dumps(checked, indent=2))
+        price = read_public(recipe['files']['price']['path'])
+        emit(json.dumps({key: price.get(key) for key in ('observedAt', 'source', 'ewrShared1Cpu512MbPer30DaysUsd',
+             'tenMinuteComputeEstimateUsd', 'volumeUsdPerProvisionedGbMonth', 'stoppedRootfsUsdPerGbMonth',
+             'snapshotsUsdPerStoredGbMonth', 'northAmericaEgressUsdPerGb', 'registrySeparateChargeVerified',
+             'oneUsdIsBillingCap', 'retainedStorageContinues')}, indent=2))
+        emit('Existing 1 GB volume remains charged while stopped. Actual rootfs GB is unknown; separate registry '
+             'charges remain unverified. Historical snapshot count zero has not been rechecked. No new storage/capacity.')
+        emit('This requires separate owner approval for private app-token setup, fixed-target read-only '
+             'preflight and exclusive historical archival recovery. Final runtime approval follows sealed facts. '
+             'No provider calls/email, no auth renewal. The $1 operational budget is not a billing cap; '
+             'retained storage continues. Temporary 0700 Fly/Docker disk state may contain credentials; '
+             'uncertain cleanup is retained. Manually revoke only this new matching token after closed clients.')
+        phrase = 'APPROVE PRIVATE SETUP ' + checked['recipeDigest']
+        if ask('Type ' + phrase + ': ') != phrase:
+            raise Hold('Private setup declined')
+        permission = {'version': 'p10b-owner-private-setup-v1', 'approved': True, 'recipeDigest': checked['recipeDigest'],
+                      'approvedAt': utc_now(), 'providerCalls': 0, 'emails': 0, 'productionReady': False,
+                      'globalAutomationPaused': True, 'exclusiveAdmissionWriters': True, 'recoveryApproved': True}
+        permission_path = root / 'private-setup-scope.json'
+        write_exclusive(permission_path, permission)
+        phase = 'public-issuance'
+        name = 'p10b-runtime-no-email-' + recipe['nonce']
+        emit('Only now, in a separate private unrecorded owner terminal, record UTC immediately before '
+             'and after successful issuance (within 60 seconds), and personally run:')
+        emit('fly tokens create deploy --app uckele-group-p10b --expiry 2h --name "' + name + '"')
+        emit('Keep its printed credential private. Obtain the matching public ID/name/actual effective '
+             'expiry/unrevoked metadata from the app Tokens dashboard or fly tokens list --app '
+             'uckele-group-p10b. No retry/login/renewal is authorized by this handoff.')
+        if ask('Type ISSUED only after that exact creation succeeds: ') != 'ISSUED':
+            raise Hold('No successful issuance')
+        started = normalize_utc(ask('Actual successful issuance start UTC: '))
+        completed = normalize_utc(ask('Actual successful issuance completion UTC: '))
+        token_id = ask('Public token ID for exact name ' + name + ': ')
+        expiry = normalize_utc(ask('Effective expiry UTC from matching public metadata: '))
+        if ask('Type UNREVOKED ' + token_id + ' after checking metadata: ') != 'UNREVOKED ' + token_id:
+            raise Hold('Public revocation status not attested')
+        if ask('Type MATCHED ' + token_id + ' to attest private input matches this exact new app-deploy token: ') != 'MATCHED ' + token_id:
+            raise Hold('Private selection not attested')
+        receipt = {'version': 'p10b-app-token-issuance-v1', 'ownerAttested': True, 'issuanceSucceeded': True,
+                   'app': recipe['app'], 'scope': 'app-deploy', 'tokenId': token_id, 'tokenName': name,
+                   'issuanceEvidenceId': 'private-owner:' + recipe['nonce'], 'issuanceStartedAt': started,
+                   'issuanceCompletedAt': completed, 'requestedLifetimeMs': 7200000, 'revokedAt': None, 'expiresAt': expiry}
+        receipt_path = root / 'issuance-receipt.json'
+        write_exclusive(receipt_path, receipt)
+        phase = 'public-input-admission'
+        validated = runner([recipe['files']['node']['path'], str(SCRIPTS / 'run-p10b-owner-preflight.js'), '--validate-input',
+                            '--recipe', str(recipe_file), '--receipt', str(receipt_path), '--permission', str(permission_path)], environment, 30)
+        if validated.get('status') != 'PUBLIC_INPUTS_VALIDATED' or validated.get('sessionNotStarted') is not True:
+            raise Hold('Public scope/issuance evidence failed before hidden input')
+        phase = 'hidden-entry'
+        token = token_input()
+        if not isinstance(token, str) or not token.strip() or len(token) > 16384 or any(ord(c) < 32 or ord(c) == 127 for c in token):
+            raise Hold('Opaque hidden input invalid')
+        environment['FLY_API_TOKEN'] = token
+        phase = 'read-only-preflight'
+        summary = runner([recipe['files']['node']['path'], str(SCRIPTS / 'run-p10b-owner-preflight.js'), '--prepare',
+                          '--recipe', str(recipe_file), '--receipt', str(receipt_path), '--permission', str(permission_path)],
+                         environment, 125)
+        if summary.get('status') != 'AWAITING_EXACT_OWNER_APPROVAL' or summary.get('preflightCleanupVerified') is not True:
+            raise Hold('Preflight cleanup not proved')
+        sealed_path = Path(recipe['sealedBundlePath'])
+        bundle = read_public(sealed_path)
+        session_canonical = summary['sessionCanonical']
+        if hashlib.sha256(sealed_path.read_bytes()).hexdigest() != summary['sealedBundleSha256'] or hashlib.sha256(session_canonical.encode()).hexdigest() != summary['sessionDigest'] or json.loads(session_canonical) != bundle['session']:
+            raise Hold('Sealed public facts changed')
+        phase = 'final-approval'
+        emit(json.dumps(bundle, indent=2))
+        emit('Original one-hour deadline: ' + summary['sessionDeadline'] + '. Review these exact public facts; '
+             'remaining time is not renewed. At most two five-minute starts and three stopped updates including '
+             'restore. No host stop/retry, additional build/push, provider call, email or production change.')
+        phrase = 'APPROVE SESSION ' + summary['sessionDigest']
+        if ask('Type ' + phrase + ' to authorize this exact bounded no-email runtime: ') != phrase:
+            raise Hold('Concrete runtime declined')
+        final_approval = {'version': 'p10b-owner-final-approval-v1', 'approvedAt': utc_now(),
+                          'sessionDigest': summary['sessionDigest'], 'recipeDigest': checked['recipeDigest'],
+                          'hostSourceHead': recipe['hostSourceHead']}
+        write_exclusive(root / 'owner-final-approval.json', final_approval)
+        bundle['approval']['approved'] = True
+        bundle['status'] = 'OWNER_APPROVED_NO_EMAIL_SESSION'
+        write_exclusive(recipe['approvedBundlePath'], bundle)
+        phase = 'runtime'
+        remaining = (dt.datetime.fromisoformat(summary['sessionDeadline'].replace('Z', '+00:00')) - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        if remaining <= 360:
+            raise Hold('Original session has insufficient remaining time')
+        result = runner([recipe['files']['node']['path'], str(SCRIPTS / 'run-p10b-no-email-session.js'), '--execute',
+                         '--bundle', recipe['approvedBundlePath'], '--evidence', recipe['evidenceDirectory'],
+                         '--native-client', recipe['files']['native']['path']], environment, remaining + 60)
+        closure = read_public(Path(recipe['evidenceDirectory']) / 'p10b-runtime-only-auth-closure.json')
+        if result.get('success') is not True or closure.get('success') is not True or closure.get('cleanupVerified') is not True or closure.get('reapVerified') is not True or closure.get('sessionDigest') != summary['sessionDigest']:
+            raise Hold('Runtime/private cleanup not proved')
+        success = True
+        phase = 'closed'
+        emit('No-email runtime and private cleanup verified. Manually revoke only public token ID ' + token_id +
+             ' after confirming all clients are closed; this script does not revoke it.')
+        return 0
+    except BaseException:
+        emit('Owner session held; preserve evidence and uncertain private directories. No retry or new token. '
+             'Do not clear pending intents. Revoke only the matching new token manually after closed clients '
+             'or under separately approved incident handling.')
+        return 2
+    finally:
+        if environment is not None:
+            environment.pop('FLY_API_TOKEN', None)
+        if recipe is not None:
+            try:
+                write_exclusive(Path(recipe['outputDirectory']) / 'owner-terminal.json',
+                                {'success': success, 'phase': phase, 'closedAt': utc_now(), 'productionReady': False,
+                                 'globalAutomationPaused': True, 'rawErrorsRetained': False,
+                                 'uncertainPrivateCleanupRetained': not success, 'automaticRevocation': False})
+            except Exception:
+                pass  # Existing evidence is never overwritten.
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--recipe', required=True, type=Path)
+    parser.add_argument('--recipe-sha256', required=True)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument('--check-only', action='store_true')
+    modes.add_argument('--run', action='store_true')
+    args = parser.parse_args()
+    if args.check_only:
+        try:
+            _, result, _ = check_recipe(args.recipe, expected_recipe_sha256=args.recipe_sha256)
+            print(json.dumps(result, indent=2))
+            return 0
+        except Exception:
+            print('Static owner setup held. Resolve checks before creating a token.', file=sys.stderr)
+            return 2
+    return run_owner(args.recipe, expected_recipe_sha256=args.recipe_sha256)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
