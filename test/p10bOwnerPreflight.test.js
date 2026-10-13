@@ -3,6 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 const preflight = await import('../server/services/p10bOwnerPreflight.js').catch(() => ({}));
 const digest = value => sha256(stableCanonicalJson(value));
@@ -133,19 +134,21 @@ test('bounded preflight command timeout reaps its owned OS group and contains ra
 });
 test('a surviving group remains owned after its SDK leader exits and is boundedly terminated', async t => {
   const context = preflight.createP10bPreflightContext({ FLY_API_TOKEN: 'offline-private' });
-  const commands = preflight.createP10bPreflightCommands(context);
+  let leader;
+  const commands = preflight.createP10bPreflightCommands(context, { spawnProcess: (...args) => {
+    const child = spawn(...args); leader = child.pid; return child;
+  } });
   const pidFile = path.join(context.directory, 'offline-descendant.pid');
-  let descendant;
-  t.after(async () => { if (descendant) try { process.kill(descendant, 'SIGKILL'); } catch { /* fixture exited */ }
-    await commands.reap(); try { context.cleanup(true); } catch { fs.rmSync(context.directory, { recursive: true, force: true }); } });
+  t.after(async () => { await commands.reap();
+    try { context.cleanup(true); } catch { fs.rmSync(context.directory, { recursive: true, force: true }); } });
   const script = `const{spawn}=require('node:child_process');const fs=require('node:fs');
     const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});child.unref();
     fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));process.stdout.write('public');`;
   await commands.command(process.execPath, ['-e', script], 2000).catch(() => {});
-  descendant = Number(fs.readFileSync(pidFile));
-  // An independent local observer checks that the still-owned child was killed.
-  let alive = true; try { process.kill(descendant, 0); } catch (error) { if (error.code === 'ESRCH') alive = false; }
-  assert.equal(alive, false);
+  assert.ok(Number(fs.readFileSync(pidFile)) > 1);
+  // Observe the owned group, rather than a exited PID that can remain as a
+  // zombie or be reused by another concurrently running fixture.
+  assert.throws(() => process.kill(-leader, 0), error => error.code === 'ESRCH');
   assert.equal(await commands.reap(), true);
   assert.equal(context.cleanup(true), true);
 });
