@@ -677,7 +677,9 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p10b-concrete-'));
   const databasePath = path.join(directory, 'prepared.sqlite');
   const logicalPath = '/data/p10b-first-mailbox-concrete-offline.sqlite';
-  const at = '2026-10-12T16:00:00.000Z';
+  // Preparation timestamps use the real clock. Freeze a fresh evidence time
+  // for this fixture so its separate qualification cannot age out after 24h.
+  const at = new Date().toISOString();
   const machineId = '0803730bd1d7e8';
   const cfg = config(); cfg.storage = { provider: 'sqlite', sqlitePath: logicalPath };
   cfg.protection = { rateLimitRetentionMs: 0 }; cfg.dealHunter.cimProvider.qualificationPhase = 'prepare';
@@ -784,7 +786,7 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
       const fileSystem = Object.fromEntries(['existsSync','writeFileSync','readFileSync','realpathSync','statSync','lstatSync']
         .map((name) => [name,(file,...rest) => fs[name](map(file),...rest)]));
       initializeP10bRuntimeFilesystem(cfg,{sourceHead:${JSON.stringify(sourceHead)},fileSystem,
-        environment:{FLY_APP_NAME:'uckele-group-p10b',FLY_MACHINE_ID:${JSON.stringify(machineId)}},clock:()=>${JSON.stringify(at)}});
+        environment:{FLY_APP_NAME:'uckele-group-p10b',FLY_MACHINE_ID:${JSON.stringify(machineId)}},clock:()=>window.issuedAt});
       machine.state='started'; fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(machine));
     } else if (args[0] === 'ssh') {
       const channel=createP10bControlChannel({input:process.stdin,output:process.stdout});
@@ -796,7 +798,7 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
       await serveP10bQualificationWorker({channel,config:cfg,
         runtime:{app:'uckele-group-p10b',machineId:${JSON.stringify(machineId)},sourceHead:${JSON.stringify(sourceHead)}},
         createStorage:(c)=>createSqliteStorage({...c,storage:{sqlitePath:${JSON.stringify(databasePath)}}}),
-        resolveDatabasePath:()=>${JSON.stringify(databasePath)},clock:()=>${JSON.stringify(at)},
+        resolveDatabasePath:()=>${JSON.stringify(databasePath)},clock:()=>window.issuedAt,
         closeIngress:(options)=>requestP10bIngressClosure(options),
         execute:(opts)=>executeP10bFirstMailboxQualification({...opts,stopTimeoutMs:1000,lifecyclePollMs:20,
           fetcher:async(url,request)=>{if(url!=='https://api.resend.com/emails'||request.method!=='POST')throw Error('unexpected fake request');

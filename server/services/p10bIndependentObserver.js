@@ -5,15 +5,18 @@ import { createP10bOperatorProcesses } from './p10bOperatorProcesses.js';
 import { assertP10bRecoveryAdmission } from './p10bAdmissionRecovery.js';
 import { inspectP10bRecovery } from './p10bOperatorFiles.js';
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase } from './p10bRuntimeOnlyOperator.js';
+import { p10bInheritedAppTokenEnvironment } from './p10bHostAuthentication.js';
 
 export async function runP10bIndependentObserver({ session, approval, phase, machine, nativeExecutable, recovery,
   flyExecutable = '/opt/homebrew/bin/fly', openNative = openP10bNativeMachineClient,
-  processes = createP10bOperatorProcesses(), record, attached = () => {},
+  processes, environment, record, attached = () => {},
   clock = () => Date.now(), interval = globalThis.setInterval, clear = globalThis.clearInterval,
   wait = ms => new Promise(resolve => setTimeout(resolve, ms)), inspectRecovery = () => inspectP10bRecovery(session) }) {
   assertP10bNoEmailApproval(session, approval, clock()); assertP10bFrozenPhase(session, phase);
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
-  const native = await openNative({ executable: nativeExecutable, session, approval, readOnly: true, configs: [phase.config] });
+  if (!environment && openNative === openP10bNativeMachineClient) environment = p10bInheritedAppTokenEnvironment({ session, approval, clock });
+  processes ||= createP10bOperatorProcesses({ environment });
+  const native = await openNative({ executable: nativeExecutable, session, approval, readOnly: true, configs: [phase.config], environment });
   const controls = createP10bObserverControls({ phase, machine, client: native.client, record, clock });
   let timer; let logs; let bytes = 0; let parseFailed = false; let logsExited = false; let logsAttached = false;
   const framer = createJsonObjectFramer(row => { logsAttached = true; controls.log(row); });

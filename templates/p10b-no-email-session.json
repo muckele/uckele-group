@@ -6,10 +6,10 @@
     "app": "uckele-group-p10b",
     "machineId": "0803730bd1d7e8",
     "volumeId": "vol_vwnkpex1k3yx9dnv",
-    "sourceHead": null,
+    "sourceHead": "c4944a46ac362cdcd002e077d5533b4b0843b1d0",
     "nonce": null,
     "candidateImageDigest": null,
-    "nativeClientSha256": null,
+    "nativeClientSha256": "de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088",
     "baselineImageDigest": "sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629",
     "baselineConfig": null,
     "ownerPermissionDigest": null,
@@ -25,9 +25,19 @@
     "productionReady": false,
     "globalAutomationPaused": true,
     "authenticationEvidence": {
-      "version": "p10b-normal-authentication-coverage-v1",
+      "version": "p10b-app-token-issuance-v1",
       "ownerAttested": false,
-      "expiresAt": null
+      "issuanceSucceeded": false,
+      "app": "uckele-group-p10b",
+      "scope": "app-deploy",
+      "tokenId": null,
+      "tokenName": null,
+      "issuanceEvidenceId": null,
+      "issuanceStartedAt": null,
+      "issuanceCompletedAt": null,
+      "requestedLifetimeMs": 7200000,
+      "expiresAt": null,
+      "revokedAt": null
     },
     "configurationEvidence": null,
     "budget": null,
@@ -42,23 +52,25 @@
       "packetDigest": "df7051b7cd424d9d70e924591130149f3932208414055511f201d8db5bcc12e8",
       "evidencePath": "/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-runtime-attempt-4-f15f7d596089/runtime-harness/p10b-runtime-only-preparation",
       "reservedAt": "2026-10-10T07:12:20.821Z"
-    }
+    },
+    "hostSourceHead": null
   },
   "approval": {
     "version": "p10b-no-email-approval-v1",
     "approved": false,
     "sessionDigest": null,
     "ownerPermissionDigest": null,
-    "sourceHead": null,
+    "sourceHead": "c4944a46ac362cdcd002e077d5533b4b0843b1d0",
     "expiresAt": null,
     "recoveryApproved": false,
     "exclusiveAdmissionWriters": false,
     "providerCalls": 0,
-    "emails": 0
+    "emails": 0,
+    "hostSourceHead": null
   },
   "imageEvidence": {
     "version": "p10b-image-prerequisite-v1",
-    "sourceHead": null,
+    "sourceHead": "c4944a46ac362cdcd002e077d5533b4b0843b1d0",
     "imageDigest": null,
     "immutableImage": null,
     "buildCount": null,

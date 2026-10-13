@@ -2,9 +2,10 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
+import { reserveP10bLocalReap } from './p10bHostAuthentication.js';
 
 // No process is created until exact session approval has passed. Native code
-// owns normal Fly authentication; JS only receives closed public responses.
+// consumes opaque Fly authentication; JS only receives closed public responses.
 export async function openP10bNativeMachineClient({ executable, args = ['--serve'], session, approval,
   configs, readOnly = false, recoveryVerified = false, spawnProcess = spawn, clock = () => Date.now(),
   environment = { PATH: process.env.PATH, HOME: process.env.HOME } }) {
@@ -17,6 +18,7 @@ export async function openP10bNativeMachineClient({ executable, args = ['--serve
   const initialization = { version: 'p10b-native-init-v1', approved: true, readOnly,
     sessionCanonical: canonical, sessionDigest: sha256(canonical), configs, recoveryVerified };
   if (Buffer.byteLength(JSON.stringify(initialization)) > 131071) throw Error('Native initialization exceeds bound');
+  const reservation = reserveP10bLocalReap(environment);
   const child = spawnProcess(executable, args, { env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: false });
   let pending; let sequence = 0; let buffer = ''; let failed = false; let closed = false;
   let stderrBytes = 0; let exit;
@@ -37,6 +39,7 @@ export async function openP10bNativeMachineClient({ executable, args = ['--serve
     while ((end = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
       try {
+        if (environment.FLY_API_TOKEN && line.includes(environment.FLY_API_TOKEN)) throw Error();
         const frame = JSON.parse(line); const current = pending;
         if (!current || (current.id === 0 ? frame.version !== 'p10b-native-ready-v1' || frame.ready !== true
           : frame.id !== current.id || typeof frame.ok !== 'boolean')) throw Error();
@@ -54,12 +57,19 @@ export async function openP10bNativeMachineClient({ executable, args = ['--serve
     child.stdin.write(`${JSON.stringify(value)}\n`, error => { if (error) fail(); });
   });
   try { await send(0, initialization, 10000); }
-  catch { await reap(); throw Error('Native initialization failed; retain public diagnostics'); }
+  catch {
+    const error = Error('Native initialization failed; retain public diagnostics');
+    error.reapVerified = await reap();
+    throw error;
+  }
   let posts = 0;
   async function reap() {
     if (!closed) { child.stdin.end(); child.kill('SIGKILL'); }
     let timer;
-    try { return Boolean(await Promise.race([exited.then(() => true), new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); })])); }
+    try {
+      const verified = Boolean(await Promise.race([exited.then(() => true), new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); })]));
+      reservation.retire(verified); return verified;
+    }
     finally { clearTimeout(timer); }
   }
   return { pid: child.pid, client(method = 'GET', body, timeoutMs = 1000) {

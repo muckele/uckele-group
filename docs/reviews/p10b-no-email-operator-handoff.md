@@ -36,7 +36,8 @@ node scripts/run-p10b-no-email-session.js --validate-baseline /fresh/public-base
 ```
 
 The envelope has version `p10b-public-baseline-preflight-v1`, fixed `app`,
-`machineId`, `volumeId`, final `sourceHead`, observed `instanceId`, `state=stopped`,
+`machineId`, `volumeId`, retained guest `sourceHead`, final clean `hostSourceHead`,
+observed `instanceId`, `state=stopped`,
 `observedAt`, independently captured `observedEnvironmentNames`,
 `fullConfigurationRetained=true`, full `baselineConfig`, `baselineImageDigest`
 and `baselineConfigDigest=sha256(stableCanonicalJson(baselineConfig))`.
@@ -85,18 +86,21 @@ This command is documentation, not current execution permission. `--run` uses an
 already completed independently verified recovery instead. A held/closed/consumed
 session or pending/crashed recovery always refuses runtime admission.
 
-The bundle freezes exact source/image/manifest and native executable SHA256, public baseline configuration,
-provider identity/name metadata, owner permission, price/cost, one-hour absolute
-session and public owner-attested authentication expiry covering that session.
-No credential material is included or inspected to infer expiry. A six-minute
-login does not cover a roughly ten-minute demo plus preparation/restoration.
-The agent never renews authentication. Missing/expired authentication fails closed.
+The bundle separately freezes the final clean host revision and retained c494
+guest/image/native artifacts, public baseline configuration, provider identity/name
+metadata, owner permission, price/cost and original one-hour session. Authentication
+uses an owner-created two-hour app-scoped credential with explicit public issuance,
+app/scope, ID/name and effective-expiry evidence. Normal-login expiry attestation
+is rejected. No credential material is included or decoded to infer expiry.
+The agent never creates or renews authentication. Missing or insufficient evidence
+fails before private input is read. See [private owner setup](p10b-private-owner-setup.md).
 
 ## Concrete execution order
 
 1. Validate approval, clean source, fresh immutable image prerequisite, fixed
    app/Machine/volume/capacity, pause/hard-offs and private noncolliding evidence.
-   Read-only recovery clients use normal SDK authentication, including a separate
+   Read-only recovery clients use the opaque isolated app credential through the
+   normal SDK, including a separate
    verifier process, to bind a fresh exact stopped baseline.
 2. Under explicit exclusive-writer recovery approval, write/fsync an intent;
    link the exact old active inode to a noncolliding uncertain-history archive;
@@ -128,7 +132,10 @@ The agent never renews authentication. Missing/expired authentication fails clos
 7. Reap local controllers; on failure preserve bounded read-only observation
    through the original cutoff. No host stop, renewed window or retry is added.
    Restore only a known exact stopped candidate to the frozen baseline. Close
-   authenticated clients, then publish sticky session terminal facts. Uncertain
+   authenticated clients, then publish sticky session terminal facts. The root
+   launcher additionally proves local reaping and isolated authentication-directory
+   cleanup in `p10b-runtime-only-auth-closure.json` before returning success.
+   Nested reap uncertainty holds private cleanup; no raw diagnostic text is copied. Uncertain
    reaping/restoration/closure denies success and holds all subsequent work.
 
 A failed current preparation may retain its new host active reservation. That
@@ -136,19 +143,22 @@ exact packet/evidence/window-bound record remains untouched. It permits only the
 already admitted phase's bounded observation and stopped-baseline rollback;
 an unrelated active record denies both. No active reservation admits a new phase.
 
-At most two starts, three stopped updates, one future local image build and one
-future push fit the frozen one-hour/<$1 envelope. The no-email session admits
+At most two starts and three stopped updates fit the original one-hour/<$1
+envelope. The previously completed single build/push is retained; this host-only
+correction authorizes no additional image work. The no-email session admits
 zero provider calls and zero emails. `productionReady=false` and automation stays
 paused. Source imports perform no authentication, recovery or Machine actions.
 
 ## Remaining live prerequisites
 
-The owner must separately authorize and bind the exact final commit, one rebuilt
-isolated image/registry manifest, current public baseline/configuration/name and
-price evidence, fresh nonce/evidence/window and no-email permission. The owner
-must provide normal authentication with public expiry coverage and exclusive
+The owner must separately authorize and bind the exact final host commit, retained
+c494 guest/image/native artifacts and fresh immutable manifest verification,
+current public baseline/configuration/name and price evidence, fresh
+nonce/evidence/window and no-email permission. The owner must create and privately
+supply one two-hour isolated app credential with public issuance/scope/effective
+expiry/unrevoked evidence, and provide exclusive
 admission writers for exact archival recovery; the old lock must not be deleted
-or cleared without the approved verified archive transaction. The final image
+or cleared without the approved verified archive transaction. The retained image
 must pass a fresh real guardian timing demonstration. Historical timing is
 component evidence only and cannot satisfy that gate.
 

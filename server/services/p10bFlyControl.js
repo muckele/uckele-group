@@ -1,23 +1,33 @@
 import { spawn } from 'node:child_process';
 import { createP10bControlChannel } from './p10bControlChannel.js';
 import { p10bFailureError } from './p10bRuntimeFailure.js';
+import { reserveP10bLocalReap } from './p10bHostAuthentication.js';
 
 export function createP10bFlyControl({ executable = '/opt/homebrew/bin/fly', environment = process.env,
   spawnProcess = spawn } = {}) {
   const env = { PATH: environment.PATH, HOME: environment.HOME, FLY_NO_UPDATE_CHECK: '1',
+    ...(environment.FLY_CONFIG_DIR ? { FLY_CONFIG_DIR: environment.FLY_CONFIG_DIR } : {}),
+    ...(environment.P10B_APP_TOKEN_CONTEXT === 'p10b-app-token-context-v1' ? { P10B_APP_TOKEN_CONTEXT: environment.P10B_APP_TOKEN_CONTEXT } : {}),
     ...(environment.FLY_API_TOKEN ? { FLY_API_TOKEN: environment.FLY_API_TOKEN } : {}) };
   const processes = new Map();
+  let retirementUncertain = false;
   const launch = (args, stdio) => {
+    const reservation = reserveP10bLocalReap(env);
     const child = spawnProcess(executable, args, { env, stdio });
+    child.p10bTerminationRequested = false;
     const exit = new Promise((resolve) => {
       child.once('error', () => { processes.delete(child); resolve(true); });
-      child.once('close', () => { processes.delete(child); resolve(true); });
+      child.once('close', code => {
+        try { reservation.retire(code === 0 || child.p10bTerminationRequested); } catch { retirementUncertain = true; }
+        processes.delete(child); resolve(true);
+      });
     });
     processes.set(child, exit);
     return { child, exit };
   };
   const terminate = async (child, exit) => {
     if (!processes.has(child)) return true;
+    child.p10bTerminationRequested = true;
     // A local Fly/SSH command has no application state to flush. Killing it
     // prevents a delayed start or SSH process from outliving the stop latch.
     child.kill('SIGKILL');
@@ -46,15 +56,16 @@ export function createP10bFlyControl({ executable = '/opt/homebrew/bin/fly', env
     child.once('error', (error) => { cleanup(); reject(p10bFailureError('transport', stage, error)); });
     child.once('close', (code, signal) => {
       cleanup();
-      if (failed || code !== 0) reject(p10bFailureError('transport', stage, null,
+      const output = Buffer.concat(chunks).toString('utf8');
+      if (failed || code !== 0 || (env.FLY_API_TOKEN && output.includes(env.FLY_API_TOKEN))) reject(p10bFailureError('transport', stage, null,
         { reason, exitCode: code, signal }));
-      else resolve(Buffer.concat(chunks).toString('utf8'));
+      else resolve(output);
     });
   });
   return {
     async reap() {
       const outcomes = await Promise.all([...processes].map(([child, exit]) => terminate(child, exit)));
-      return outcomes.every(Boolean) && processes.size === 0;
+      return outcomes.every(Boolean) && processes.size === 0 && !retirementUncertain;
     },
     async getMachine({ app, machineId }, options) {
       const bytes = await command('get-machine', ['machines', 'list', '--app', app, '--json'], options);

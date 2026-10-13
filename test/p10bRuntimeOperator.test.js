@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { config as workerConfig } from './helpers/p10bQualificationFixture.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from '../server/services/p10bProviderIdentity.js';
@@ -9,7 +11,7 @@ const recovery = await import('../server/services/p10bAdmissionRecovery.js').cat
 const diagnostics = await import('../server/services/p10bWorkerDiagnostics.js').catch(() => ({}));
 const digest = value => sha256(stableCanonicalJson(value));
 const now = Date.parse('2026-10-12T12:00:00.000Z');
-const image = `sha256:${'a'.repeat(64)}`;
+const image = 'sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc';
 // Retained baseline key/config shape; the seven newly admitted values are
 // synthetic. No fixture lookup reads Fly metadata or credentials.
 const observedBaseline = JSON.parse(fs.readFileSync(new URL('./fixtures/p10bObservedBaselineShape.json', import.meta.url), 'utf8'));
@@ -17,16 +19,19 @@ const publicEnvironmentCases = JSON.parse(fs.readFileSync(new URL('./fixtures/p1
 function session() {
   const config = structuredClone(observedBaseline);
   return { version: 'p10b-no-email-session-v1', app: 'uckele-group-p10b', machineId: '0803730bd1d7e8',
-    sourceHead: '1'.repeat(40), nonce: 'c'.repeat(24), candidateImageDigest: image,
+    sourceHead: 'c4944a46ac362cdcd002e077d5533b4b0843b1d0', hostSourceHead: '2'.repeat(40), nonce: 'c'.repeat(24), candidateImageDigest: image,
     baselineImageDigest: config.image.split('@')[1], baselineConfig: config,
     ownerPermissionDigest: 'd'.repeat(64), permissionEvidenceId: 'owner:offline-stub',
-    nativeClientSha256: '9'.repeat(64),
+    nativeClientSha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088',
     startedAt: new Date(now).toISOString(), sessionDeadline: new Date(now + 3600000).toISOString(),
     maximumStarts: 2, maximumStartWindowMs: 300000, maximumStoppedConfigUpdates: 3,
     maximumIncrementalUsd: 1, maximumLocalBuilds: 1, maximumImagePushes: 1,
     productionReady: false, globalAutomationPaused: true,
-    authenticationEvidence: { version: 'p10b-normal-authentication-coverage-v1', ownerAttested: true,
-      expiresAt: new Date(now + 3600000).toISOString() },
+    authenticationEvidence: { version: 'p10b-app-token-issuance-v1', ownerAttested: true, issuanceSucceeded: true,
+      app: 'uckele-group-p10b', scope: 'app-deploy', tokenId: 'offline-token-id', revokedAt: null,
+      tokenName: `p10b-runtime-no-email-${'c'.repeat(24)}`, issuanceEvidenceId: 'owner:offline-issuance',
+      issuanceStartedAt: new Date(now - 60000).toISOString(), issuanceCompletedAt: new Date(now - 59000).toISOString(),
+      requestedLifetimeMs: 7200000, expiresAt: new Date(now + 7140000).toISOString() },
     configurationEvidence: { version: 'p10b-isolated-configuration-evidence-v2',
       providerIdentity: P10B_PROVIDER_IDENTITY, providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY),
       flySecretMetadataDigest: 'e'.repeat(64), verifiedAt: new Date(now).toISOString() },
@@ -55,7 +60,7 @@ test('observed 25-key baseline shape passes typed policy; forbidden namespaces a
 test('observed public settings survive both candidates and are bound to approval, phase and full restoration digests', () => {
   const s = session(); const before = digest(s.baselineConfig);
   const approval = { version: 'p10b-no-email-approval-v1', approved: true, sessionDigest: digest(s),
-    ownerPermissionDigest: s.ownerPermissionDigest, sourceHead: s.sourceHead, expiresAt: s.sessionDeadline,
+    ownerPermissionDigest: s.ownerPermissionDigest, sourceHead: s.sourceHead, hostSourceHead: s.hostSourceHead, expiresAt: s.sessionDeadline,
     recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 };
   operator.assertP10bNoEmailApproval(s, approval, now);
   const names = ['ADMIN_ALLOW_PASSWORD_AUTH', 'ADMIN_AUTH_MODE', 'ANALYTICS_ENABLED', 'BACKUP_ENABLED',
@@ -96,12 +101,12 @@ test('preserved auth, analytics and backup switches cannot open preparation rout
 test('full public baseline preflight rejects stale, partial, changed-image/name/digest/source evidence without authentication', async () => {
   const { runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
   const s = session(); const envelope = { version: 'p10b-public-baseline-preflight-v1', app: s.app, machineId: s.machineId,
-    volumeId: 'vol_vwnkpex1k3yx9dnv', sourceHead: s.sourceHead, instanceId: 'observed-instance', state: 'stopped',
+    volumeId: 'vol_vwnkpex1k3yx9dnv', sourceHead: s.sourceHead, hostSourceHead: s.hostSourceHead, instanceId: 'observed-instance', state: 'stopped',
     observedAt: new Date(now).toISOString(), observedEnvironmentNames: Object.keys(s.baselineConfig.env),
     fullConfigurationRetained: true, baselineConfig: s.baselineConfig, baselineImageDigest: s.baselineImageDigest,
     baselineConfigDigest: digest(s.baselineConfig) };
   let calls = 0; const run = e => runP10bNoEmailSessionCli(['--validate-baseline', 'public.json'], { read: () => e,
-    clock: () => now, checkSource: h => { assert.equal(h, s.sourceHead); },
+    clock: () => now, checkSource: h => { assert.equal(h, s.hostSourceHead); },
     openNative: () => { calls++; throw Error(); }, createBoundaries: () => { calls++; throw Error(); } });
   const result = await run(envelope); assert.equal(result.status, 'PUBLIC_BASELINE_VALIDATED');
   assert.equal(result.baselineConfigDigest, digest(s.baselineConfig)); assert.equal(result.environmentNameCount, 25);
@@ -177,7 +182,7 @@ test('native stdio adapter uses a mock helper, denies mutation and reaps timeout
   `);
   const s = session(); s.nativeClientSha256 = sha256(fs.readFileSync(process.execPath));
   const approval = { version: 'p10b-no-email-approval-v1', approved: true, sessionDigest: digest(s),
-    ownerPermissionDigest: s.ownerPermissionDigest, sourceHead: s.sourceHead, expiresAt: s.sessionDeadline,
+    ownerPermissionDigest: s.ownerPermissionDigest, sourceHead: s.sourceHead, hostSourceHead: s.hostSourceHead, expiresAt: s.sessionDeadline,
     recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 };
   let spawned = 0;
   await assert.rejects(openP10bNativeMachineClient({ session: s, approval: {}, clock: () => now,
@@ -254,12 +259,12 @@ test('no-email operator rejects unapproved or closed sessions before constructin
   assert.equal(calls, 0);
 });
 
-function recoveryFixture() {
+function recoveryFixture({ directory = '/mock-admission', evidenceRoot = '/fresh/recovery' } = {}) {
   const s = session(); const f = new Map(); const operations = [];
   const record = { version: 'p10b-machine-owner-v1', packetDigest: '4'.repeat(64), evidencePath: '/preserved/failed', reservedAt: '2026-10-10T07:12:20.821Z' };
-  const bytes = JSON.stringify(record); const directory = '/mock-admission';
+  const bytes = JSON.stringify(record);
   s.recovery = { directory, activePath: `${directory}/0803730bd1d7e8.active.json`, archivePath: `${directory}/0803730bd1d7e8.active.json.archived-uncertain-${s.nonce}.json`,
-    attemptPath: `${directory}/${record.packetDigest}.attempt.json`, intentPath: '/fresh/recovery/intent.json', terminalPath: '/fresh/recovery/terminal.json',
+    attemptPath: `${directory}/${record.packetDigest}.attempt.json`, intentPath: `${evidenceRoot}/p10b-recovery-intent.json`, terminalPath: `${evidenceRoot}/p10b-recovery-terminal.json`,
     expectedSha256: sha256(bytes), ...record };
   const item = { bytes, inode: '42', device: '7', mode: 384, owner: 501, mtime: 100, regular: true, symlink: false };
   f.set(s.recovery.activePath, item); f.set(s.recovery.attemptPath, { ...item, bytes: 'retained-attempt', inode: '43' });
@@ -275,7 +280,7 @@ function recoveryFixture() {
   };
   const baseline = { id: s.machineId, state: 'stopped', region: 'ewr', instance_id: 'old-version', image_ref: { digest: s.baselineImageDigest }, config: s.baselineConfig };
   const approval = { version: 'p10b-no-email-approval-v1', approved: true, sessionDigest: digest(s), ownerPermissionDigest: s.ownerPermissionDigest,
-    sourceHead: s.sourceHead, expiresAt: s.sessionDeadline, recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 };
+    sourceHead: s.sourceHead, hostSourceHead: s.hostSourceHead, expiresAt: s.sessionDeadline, recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 };
   const independentBaseline = { machineDigest: digest(baseline), independent: true, observedAt: new Date(now).toISOString() };
   const inspect = () => ({ activeAbsent: !f.has(s.recovery.activePath), archiveSha256: sha256(f.get(s.recovery.archivePath).bytes),
     archiveDevice: f.get(s.recovery.archivePath).device, archiveInode: f.get(s.recovery.archivePath).inode, attemptSha256: sha256(f.get(s.recovery.attemptPath).bytes) });
@@ -315,8 +320,8 @@ test('recovery rejects unparseable stopped-observation time without writing an i
   assert.equal(x.operations.length, 0);
 });
 
-function operatorFixture() {
-  const x = recoveryFixture(); const evidence = memoryEvidence(); let clock = now; let updates = 0; const order = [];
+function operatorFixture(paths) {
+  const x = recoveryFixture(paths); const evidence = memoryEvidence(); let clock = now; let updates = 0; const order = [];
   const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval, baseline: x.baseline,
     independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => clock, operatorPid: 5010 });
   const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
@@ -326,6 +331,7 @@ function operatorFixture() {
     preparation: { providerCalls: 0, productionReady: false, ingressClosed: true, sqliteClosed: true,
       guestShutdown: { handoffVerified: true, cleanupUncertain: false, failure: false, authorityClosed: true, ingressClosed: true, workerSqliteClosed: true } } };
   const options = { session: x.s, approval: x.approval, recovery: { ...recovered, verification }, inspectRecovery: x.inspect,
+    verifyPrivateReap: () => true,
     evidence, clock: () => clock, createBoundaries: async () => ({
       client: async (method = 'GET', body) => { if (method === 'POST') { updates++; machine = { ...machine, config: body.config,
         instance_id: `version-${updates}`, image_ref: { digest: body.config.image.split('@')[1] } }; } return structuredClone(machine); },
@@ -353,6 +359,14 @@ test('operator runs guardian proof then preparation and restores baseline, with 
   await assert.rejects(operator.runP10bNoEmailOperator(options)); assert.equal(updates(), 3);
 });
 
+
+test('unresolved descendant reap blocks restoration before a third update can remove guardian configuration', async () => {
+  const f = operatorFixture(); let gates = 0;
+  f.options.verifyPrivateReap = () => { gates++; throw Error('synthetic descendant intent'); };
+  await assert.rejects(operator.runP10bNoEmailOperator(f.options));
+  assert.equal(gates, 1); assert.equal(f.updates(), 2);
+  assert.equal(f.evidence.read('p10b-runtime-only-session-closure.json').restored, false);
+});
 
 test('operator failure matrix keeps sticky closure and restores stopped baseline without retry or preparation promotion', async t => {
   for (const failure of ['constructor','demo-proof','stale-result','reap','settle','close']) await t.test(failure, async () => {
@@ -414,18 +428,21 @@ test('retained current-phase failure reservation permits settlement and baseline
     baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
   const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
   const phase = operator.createP10bRuntimePhase(x.s, 'prepare', now); let activeRecord; let posts = 0;
+  let nativeCloses = 0; let nativeOpens = 0;
   const inspect = () => ({ ...x.inspect(), activeAbsent: !activeRecord, ...(activeRecord ? { activeRecord } : {}) });
   const b = await createP10bNoEmailBoundaries({ session: x.s, approval: x.approval, evidence,
     recovery: { ...recovered, verification }, inspectRecovery: inspect, clock: () => now,
     processes: { command: async () => JSON.stringify([x.baseline]), terminate: async () => true, reap: async () => true },
-    openNative: async () => ({ client: async (method = 'GET') => { if (method === 'POST') posts++;
-      return { ...x.baseline, config: phase.config, image_ref: { digest: image } }; }, close: async () => true }) });
+    openNative: async () => { nativeOpens++; return { client: async (method = 'GET') => { if (method === 'POST') posts++;
+      return { ...x.baseline, config: phase.config, image_ref: { digest: image } }; }, close: async () => { nativeCloses++; return true; } }; } });
   await b.authorizePhase(phase);
   activeRecord = { version: 'p10b-machine-owner-v1', packetDigest: digest(phase.packet),
     evidencePath: `${evidence.root}/p10b-runtime-only-preparation`, reservedAt: phase.window.issuedAt };
   await assert.rejects(b.client()); // No new runtime admission with an active reservation.
   assert.equal(await b.settle(phase), true);
+  assert.equal(await b.reap(), true); assert.equal(nativeCloses, 1);
   assert.equal((await b.client()).state, 'stopped');
+  assert.equal(nativeOpens, 2);
   await b.client('POST', { config: x.s.baselineConfig, current_version: 'old-version', skip_launch: true });
   assert.equal(posts, 1);
   await assert.rejects(b.client('POST', { config: phase.config }));
@@ -458,4 +475,79 @@ test('six-minute authentication coverage and traversal-shaped recovery digests c
   assert.throws(() => recovery.recoverP10bAdmissionReservation({ session: x.s, approval: { ...x.approval, sessionDigest: digest(x.s) },
     baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 }));
   assert.equal(x.operations.length, 0);
+});
+
+test('host CLI completes both offline phases with separately bound guest source and cleans private auth after restoration', async () => {
+  const { runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
+  const { createP10bAppTokenContext } = await import('../server/services/p10bHostAuthentication.js');
+  const root = '/synthetic/private-evidence';
+  const f = operatorFixture({ directory: path.join(os.homedir(), '.uckele-group-p10b-host'), evidenceRoot: root });
+  f.evidence.root = root;
+  f.evidence.write('p10b-recovery-independent-verification.json', f.options.recovery.verification);
+  const s = f.options.session; let context; let received;
+  const imageEvidence = { version: 'p10b-image-prerequisite-v1', sourceHead: s.sourceHead, imageDigest: image,
+    immutableImage: `registry.fly.io/uckele-group-p10b@${image}`, buildCount: 1, pushCount: 1,
+    registryManifestVerified: true, manifestEvidenceDigest: '8'.repeat(64), verifiedAt: s.startedAt };
+  const result = await runP10bNoEmailSessionCli(['--run', '--bundle', '/synthetic/bundle', '--evidence', root, '--native-client', '/synthetic/helper'], {
+    read(file) { if (file === '/synthetic/bundle') return { session: s, approval: f.options.approval, imageEvidence };
+      return file === s.recovery.intentPath ? f.options.recovery.intent : f.options.recovery.terminal; },
+    clock: f.options.clock, checkSource: head => { assert.equal(head, s.hostSourceHead); },
+    createEvidence: () => f.evidence, inspectRecovery: f.options.inspectRecovery,
+    createAuth(input) { context = createP10bAppTokenContext({ ...input, environment: { FLY_API_TOKEN: 'synthetic-private-credential' } }); return context; },
+    processes: { reap: async () => true },
+    createBoundaries(input) { received = input; return f.options.createBoundaries(); },
+    openNative() { throw Error('stubbed operator needs no native process'); } });
+  assert.equal(result.success, true); assert.equal(result.restored, true); assert.equal(f.updates(), 3);
+  assert.deepEqual(f.order, ['demo', 'prepare']); assert.equal(received.environment.FLY_API_TOKEN, undefined);
+  assert.equal(fs.existsSync(context.environment.FLY_CONFIG_DIR), false);
+  assert.equal(JSON.stringify([...f.evidence.files]).includes('synthetic-private-credential'), false);
+});
+
+test('host CLI holds private cleanup when native initialization cannot prove reap', async () => {
+  const { runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
+  const root = '/synthetic/private-evidence';
+  const f = operatorFixture({ directory: path.join(os.homedir(), '.uckele-group-p10b-host'), evidenceRoot: root });
+  f.evidence.root = root; const s = f.options.session; let cleanupReaped;
+  const imageEvidence = { version: 'p10b-image-prerequisite-v1', sourceHead: s.sourceHead, imageDigest: image,
+    immutableImage: `registry.fly.io/uckele-group-p10b@${image}`, buildCount: 1, pushCount: 1,
+    registryManifestVerified: true, manifestEvidenceDigest: '8'.repeat(64), verifiedAt: s.startedAt };
+  await assert.rejects(runP10bNoEmailSessionCli(['--execute', '--bundle', '/synthetic/bundle', '--evidence', root, '--native-client', '/synthetic/helper'], {
+    read: () => ({ session: s, approval: f.options.approval, imageEvidence }), clock: f.options.clock,
+    checkSource: () => {}, createEvidence: () => f.evidence, processes: { reap: async () => true },
+    createAuth: () => ({ environment: {}, cleanup({ reaped }) { cleanupReaped = reaped; if (!reaped) throw Error('cleanup held'); } }),
+    openNative: async () => { throw Object.assign(Error('synthetic native failure'), { reapVerified: false }); } }));
+  assert.equal(cleanupReaped, false);
+});
+
+test('host CLI unresolved private descendant intent blocks restoration and retains both closure holds', async t => {
+  const { runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
+  const { createP10bAppTokenContext } = await import('../server/services/p10bHostAuthentication.js');
+  const root = '/synthetic/private-evidence';
+  const f = operatorFixture({ directory: path.join(os.homedir(), '.uckele-group-p10b-host'), evidenceRoot: root });
+  f.evidence.root = root; const s = f.options.session; let context;
+  f.evidence.write('p10b-recovery-independent-verification.json', f.options.recovery.verification);
+  const imageEvidence = { version: 'p10b-image-prerequisite-v1', sourceHead: s.sourceHead, imageDigest: image,
+    immutableImage: `registry.fly.io/uckele-group-p10b@${image}`, buildCount: 1, pushCount: 1,
+    registryManifestVerified: true, manifestEvidenceDigest: '8'.repeat(64), verifiedAt: s.startedAt };
+  t.after(() => { if (context) fs.rmSync(context.environment.FLY_CONFIG_DIR, { recursive: true, force: true }); });
+  await assert.rejects(runP10bNoEmailSessionCli(['--run', '--bundle', '/synthetic/bundle', '--evidence', root, '--native-client', '/synthetic/helper'], {
+    read(file) { if (file === '/synthetic/bundle') return { session: s, approval: f.options.approval, imageEvidence };
+      return file === s.recovery.intentPath ? f.options.recovery.intent : f.options.recovery.terminal; },
+    clock: f.options.clock, checkSource: () => {}, createEvidence: () => f.evidence, inspectRecovery: f.options.inspectRecovery,
+    createAuth(input) { context = createP10bAppTokenContext({ ...input, environment: { FLY_API_TOKEN: 'synthetic-private-credential' } }); return context; },
+    processes: { reap: async () => true },
+    async createBoundaries() {
+      const b = await f.options.createBoundaries(); const preparation = b.runPreparation;
+      b.runPreparation = async input => {
+        const result = await preparation(input);
+        fs.writeFileSync(path.join(context.environment.FLY_CONFIG_DIR, '.p10b-reap-synthetic.pending'), 'synthetic pending reap', { mode: 0o600 });
+        return result;
+      };
+      return b;
+    } }));
+  assert.equal(f.updates(), 2); assert.equal(f.evidence.read('p10b-runtime-only-session-closure.json').restored, false);
+  assert.equal(f.evidence.read('p10b-runtime-only-auth-closure.json').cleanupVerified, false);
+  assert.equal(f.evidence.read('p10b-runtime-only-auth-closure.json').success, false);
+  assert.equal(fs.existsSync(context.environment.FLY_CONFIG_DIR), true);
+  assert.equal(JSON.stringify([...f.evidence.files]).includes('synthetic-private-credential'), false);
 });

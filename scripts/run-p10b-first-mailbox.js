@@ -1,14 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
 import { runP10bQualificationHost, validateP10bRuntimePacket } from '../server/services/p10bQualificationHost.js';
 import { createP10bFlyControl } from '../server/services/p10bFlyControl.js';
+import { assertP10bReviewedCheckout, assertP10bPreparationHostSource } from '../server/services/p10bOperatorSource.js';
 
 // Invocation is explicit and has no startup registration. A future owner
 // approval must bind this exact packet and command; merely importing it does
 // not contact Fly or an email provider.
-export async function runFirstMailboxCli(args, { adapter = createP10bFlyControl() } = {}) {
+export async function runFirstMailboxCli(args, { adapter, hostSession, hostApproval, hostPhase } = {}) {
   if (args.length !== 4 || args[0] !== '--packet' || args[2] !== '--evidence-prefix') {
     throw new Error('Expected --packet FILE --evidence-prefix PATH');
   }
@@ -16,10 +16,10 @@ export async function runFirstMailboxCli(args, { adapter = createP10bFlyControl(
   if (bytes.length > 65536) throw new Error('Runtime packet exceeds bound');
   const packet = JSON.parse(bytes);
   validateP10bRuntimePacket(packet, new Date().toISOString());
-  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const head = execFileSync('git', ['-C', root, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8' }).trim();
-  const dirty = execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' });
-  if (head !== packet.sourceHead || dirty.trim()) throw new Error('Exact clean reviewed source is required');
+  if (hostSession || hostApproval || hostPhase) assertP10bPreparationHostSource({ session: hostSession, approval: hostApproval,
+    phase: hostPhase, packet });
+  else assertP10bReviewedCheckout(packet.sourceHead);
+  adapter ||= createP10bFlyControl();
   const cancellation = new AbortController();
   const cancel = () => cancellation.abort();
   process.on('SIGINT', cancel); process.on('SIGTERM', cancel);

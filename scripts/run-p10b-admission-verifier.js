@@ -3,17 +3,19 @@ import { assertP10bNoEmailApproval } from '../server/services/p10bRuntimeOnlyOpe
 import { verifyP10bAdmissionArchive } from '../server/services/p10bAdmissionRecovery.js';
 import { openP10bNativeMachineClient } from '../server/services/p10bNativeMachineClient.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
-import { assertP10bReviewedCheckout } from '../server/services/p10bOperatorSource.js';
+import { assertP10bNoEmailHostBinding } from '../server/services/p10bOperatorSource.js';
+import { p10bInheritedAppTokenEnvironment } from '../server/services/p10bHostAuthentication.js';
 try {
   if (process.argv.length !== 5 || !['--baseline', '--archive'].includes(process.argv[2])) throw Error();
   const input = readP10bPublicJson(process.argv[3]);
   assertP10bNoEmailApproval(input.session, input.approval, Date.now());
-  assertP10bReviewedCheckout(input.session.sourceHead);
+  assertP10bNoEmailHostBinding(input.session);
   const evidence = createP10bOperatorEvidence(process.argv[4]);
   if (evidence.has('SESSION_NOT_APPROVED') || evidence.has('p10b-runtime-only-session-closure.json')) throw Error();
   if (process.argv[2] === '--baseline') {
+    const environment = p10bInheritedAppTokenEnvironment(input);
     const native = await openP10bNativeMachineClient({ executable: input.nativeExecutable,
-      session: input.session, approval: input.approval, readOnly: true, configs: [input.session.baselineConfig] });
+      session: input.session, approval: input.approval, readOnly: true, configs: [input.session.baselineConfig], environment });
     let reapVerified;
     try {
       const machine = await native.client();

@@ -62,15 +62,37 @@ export function validateP10bBaselineConfig(c, imageDigest) {
 }
 
 export function validateP10bNoEmailSession(s, now) {
-  if (!onlyKeys(s, ['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'nonce', 'candidateImageDigest', 'baselineImageDigest',
+  if (!onlyKeys(s, ['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'hostSourceHead', 'nonce', 'candidateImageDigest', 'baselineImageDigest',
     'baselineConfig', 'ownerPermissionDigest', 'permissionEvidenceId', 'startedAt', 'sessionDeadline', 'maximumStarts',
     'maximumStartWindowMs', 'maximumStoppedConfigUpdates', 'maximumIncrementalUsd', 'maximumLocalBuilds', 'maximumImagePushes',
     'productionReady', 'globalAutomationPaused', 'configurationEvidence', 'budget', 'recovery', 'authenticationEvidence', 'nativeClientSha256'])
     || !onlyKeys(s.configurationEvidence, ['version', 'providerIdentity', 'providerIdentityDigest', 'flySecretMetadataDigest', 'verifiedAt'])
     || !onlyKeys(s.budget, ['priceEvidenceDigest', 'maximumUsdPerSecond', 'fixedIncrementalUsd'])
-    || !onlyKeys(s.authenticationEvidence, ['version', 'ownerAttested', 'expiresAt'])
-    || s.authenticationEvidence.version !== 'p10b-normal-authentication-coverage-v1'
-    || s.authenticationEvidence.ownerAttested !== true || !Number.isFinite(Date.parse(s.authenticationEvidence.expiresAt))
+    || !onlyKeys(s.authenticationEvidence, ['version', 'ownerAttested', 'issuanceSucceeded', 'app', 'scope', 'tokenId', 'tokenName', 'revokedAt',
+      'issuanceEvidenceId', 'issuanceStartedAt', 'issuanceCompletedAt', 'requestedLifetimeMs', 'expiresAt'])
+    || s.authenticationEvidence.version !== 'p10b-app-token-issuance-v1'
+    || s.authenticationEvidence.ownerAttested !== true || s.authenticationEvidence.issuanceSucceeded !== true
+    || s.authenticationEvidence.revokedAt !== null
+    || s.authenticationEvidence.app !== 'uckele-group-p10b' || s.authenticationEvidence.scope !== 'app-deploy'
+    || !/^[A-Za-z0-9_:-]{1,120}$/.test(s.authenticationEvidence.tokenId || '')
+    || s.authenticationEvidence.tokenName !== `p10b-runtime-no-email-${s.nonce}`
+    || !/^[A-Za-z0-9_.:@-]{1,240}$/.test(s.authenticationEvidence.issuanceEvidenceId || '')
+    || !Number.isFinite(Date.parse(s.authenticationEvidence.issuanceStartedAt))
+    || !Number.isFinite(Date.parse(s.authenticationEvidence.issuanceCompletedAt))
+    || !Number.isFinite(Date.parse(s.authenticationEvidence.expiresAt))
+    || new Date(s.authenticationEvidence.issuanceStartedAt).toISOString() !== s.authenticationEvidence.issuanceStartedAt
+    || new Date(s.authenticationEvidence.issuanceCompletedAt).toISOString() !== s.authenticationEvidence.issuanceCompletedAt
+    || new Date(s.authenticationEvidence.expiresAt).toISOString() !== s.authenticationEvidence.expiresAt
+    || Date.parse(s.authenticationEvidence.issuanceCompletedAt) > Date.parse(s.startedAt)
+    || Date.parse(s.authenticationEvidence.issuanceCompletedAt) > now
+    || Date.parse(s.authenticationEvidence.issuanceCompletedAt) < Date.parse(s.authenticationEvidence.issuanceStartedAt)
+    || Date.parse(s.authenticationEvidence.issuanceCompletedAt) - Date.parse(s.authenticationEvidence.issuanceStartedAt) > 60000
+    || s.authenticationEvidence.requestedLifetimeMs !== 7200000
+    // Creation JSON contains only the opaque token. Public managed-token
+    // metadata supplies effective expiry; local issuance timestamps bound it.
+    // One second tolerates server timestamp quantization, never coverage loss.
+    || Date.parse(s.authenticationEvidence.expiresAt) < Date.parse(s.authenticationEvidence.issuanceStartedAt) + 7199000
+    || Date.parse(s.authenticationEvidence.expiresAt) > Date.parse(s.authenticationEvidence.issuanceCompletedAt) + 7200000
     || Date.parse(s.authenticationEvidence.expiresAt) < Date.parse(s.sessionDeadline)
     || (s.recovery && !onlyKeys(s.recovery, ['directory', 'activePath', 'archivePath', 'attemptPath', 'intentPath', 'terminalPath',
       'expectedSha256', 'version', 'packetDigest', 'evidencePath', 'reservedAt']))
@@ -79,7 +101,8 @@ export function validateP10bNoEmailSession(s, now) {
       || ('version' in s.recovery && s.recovery.version !== 'p10b-machine-owner-v1')))
     || s?.version !== 'p10b-no-email-session-v1' || s.app !== 'uckele-group-p10b' || s.machineId !== '0803730bd1d7e8'
     || ('volumeId' in s && s.volumeId !== 'vol_vwnkpex1k3yx9dnv')
-    || !/^[a-f0-9]{40}$/.test(s.sourceHead || '') || !/^[a-f0-9]{24}$/.test(s.nonce || '')
+    || !/^[a-f0-9]{40}$/.test(s.sourceHead || '') || !/^[a-f0-9]{40}$/.test(s.hostSourceHead || '')
+    || s.hostSourceHead === s.sourceHead || !/^[a-f0-9]{24}$/.test(s.nonce || '')
     || !/^sha256:[a-f0-9]{64}$/.test(s.candidateImageDigest || '') || !/^sha256:[a-f0-9]{64}$/.test(s.baselineImageDigest || '')
     || !/^[a-f0-9]{64}$/.test(s.ownerPermissionDigest || '') || !/^[A-Za-z0-9_.:@-]{1,240}$/.test(s.permissionEvidenceId || '')
     || !/^[a-f0-9]{64}$/.test(s.nativeClientSha256 || '')
@@ -134,10 +157,11 @@ export function createP10bRuntimePhase(input, label, now = Date.now()) {
 
 export function assertP10bNoEmailApproval(session, approval, now) {
   validateP10bNoEmailSession(session, now);
-  if (!onlyKeys(approval, ['version', 'approved', 'sessionDigest', 'ownerPermissionDigest', 'sourceHead', 'expiresAt',
+  if (!onlyKeys(approval, ['version', 'approved', 'sessionDigest', 'ownerPermissionDigest', 'sourceHead', 'hostSourceHead', 'expiresAt',
     'recoveryApproved', 'exclusiveAdmissionWriters', 'providerCalls', 'emails']) || approval?.version !== 'p10b-no-email-approval-v1' || approval.approved !== true
     || approval.sessionDigest !== digest(session) || approval.ownerPermissionDigest !== session.ownerPermissionDigest
-    || approval.sourceHead !== session.sourceHead || approval.expiresAt !== session.sessionDeadline
+    || approval.sourceHead !== session.sourceHead || approval.hostSourceHead !== session.hostSourceHead
+    || approval.expiresAt !== session.sessionDeadline
     || approval.recoveryApproved !== true || approval.exclusiveAdmissionWriters !== true
     || approval.providerCalls !== 0 || approval.emails !== 0) throw Error('Fresh exact no-email owner approval required');
 }
@@ -153,9 +177,10 @@ export function assertP10bFrozenPhase(session, phase) {
 // native authenticated helper and independent observer processes; tests use
 // fake authentication/Machine actions, never the real admission directory.
 export async function runP10bNoEmailOperator({ session: input, approval, evidence, recovery, inspectRecovery,
-  createBoundaries, clock = () => Date.now() }) {
+  createBoundaries, verifyPrivateReap, clock = () => Date.now() }) {
   const session = structuredClone(input);
   assertP10bNoEmailApproval(session, approval, clock());
+  if (typeof verifyPrivateReap !== 'function') throw Error('Explicit private descendant-reap gate required');
   if (evidence.has('SESSION_NOT_APPROVED') || evidence.has('p10b-runtime-only-session-closure.json')
     || evidence.has('p10b-runtime-only-operator-intent.json')) throw Error('No-email session held, closed or consumed');
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
@@ -214,6 +239,10 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       catch { safeToRestore = false; failure ||= 'stop-settlement-unverified'; }
       try { if (await boundaries.reap() !== true) { safeToRestore = false; failure ||= 'local-reap-failed'; } }
       catch { safeToRestore = false; failure ||= 'local-reap-failed'; }
+      if (safeToRestore) {
+        try { if (await verifyPrivateReap() !== true) { safeToRestore = false; failure ||= 'descendant-reap-unverified'; } }
+        catch { safeToRestore = false; failure ||= 'descendant-reap-unverified'; }
+      }
       if (safeToRestore) {
         try { await control.restoreBaseline(boundaries.client, session.baselineConfig, configs); restored = true; }
         catch { failure ||= 'restoration-unverified'; }

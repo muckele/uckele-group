@@ -4,12 +4,14 @@ import { assertP10bRecoveryAdmission } from '../server/services/p10bAdmissionRec
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase } from '../server/services/p10bRuntimeOnlyOperator.js';
 import { runFirstMailboxCli } from './run-p10b-first-mailbox.js';
 import { stableCanonicalJson } from '../server/utils/security.js';
-import { assertP10bReviewedCheckout } from '../server/services/p10bOperatorSource.js';
+import { assertP10bNoEmailHostBinding } from '../server/services/p10bOperatorSource.js';
+import { p10bInheritedAppTokenEnvironment } from '../server/services/p10bHostAuthentication.js';
+import { createP10bFlyControl } from '../server/services/p10bFlyControl.js';
 try {
   if (process.argv.length !== 3) throw Error();
   const { session, approval, phase, recovery } = readP10bPublicJson(process.argv[2]);
   assertP10bNoEmailApproval(session, approval, Date.now()); assertP10bFrozenPhase(session, phase);
-  assertP10bReviewedCheckout(session.sourceHead);
+  assertP10bNoEmailHostBinding(session);
   if (phase.label !== 'prepare') throw Error();
   const evidence = createP10bOperatorEvidence(path.dirname(path.resolve(process.argv[2])));
   if (evidence.has('SESSION_NOT_APPROVED') || evidence.has('p10b-runtime-only-session-closure.json')
@@ -21,7 +23,9 @@ try {
   if (retained.operation !== 'prepare' || stableCanonicalJson(retained) !== stableCanonicalJson(phase.packet)
     || Date.now() < Date.parse(phase.window.issuedAt) || Date.now() - Date.parse(phase.window.issuedAt) > 60000
     || Date.parse(phase.window.stopAt) - Date.now() < 240000) throw Error();
+  const environment = p10bInheritedAppTokenEnvironment({ session, approval });
   const result = await runFirstMailboxCli(['--packet', packetPath,
-    '--evidence-prefix', path.join(evidence.root, 'p10b-runtime-only-preparation')]);
+    '--evidence-prefix', path.join(evidence.root, 'p10b-runtime-only-preparation')],
+  { adapter: createP10bFlyControl({ environment }), hostSession: session, hostApproval: approval, hostPhase: phase });
   if (!result.success) process.exitCode = 1;
 } catch { process.stderr.write('No-email preparation failed or held; preserve evidence.\n'); process.exitCode = 1; }

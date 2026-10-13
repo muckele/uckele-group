@@ -8,7 +8,8 @@ import { recoverP10bAdmissionReservation } from './p10bAdmissionRecovery.js';
 import { openP10bNativeMachineClient } from './p10bNativeMachineClient.js';
 import { createP10bNoEmailBoundaries } from './p10bNoEmailBoundaries.js';
 import { createP10bOperatorProcesses } from './p10bOperatorProcesses.js';
-import { assertP10bReviewedCheckout } from './p10bOperatorSource.js';
+import { assertP10bReviewedCheckout, assertP10bNoEmailHostBinding, P10B_RETAINED_GUEST_HEAD } from './p10bOperatorSource.js';
+import { createP10bAppTokenContext } from './p10bHostAuthentication.js';
 
 export function assertP10bImagePrerequisite(session, image, now = Date.now()) {
   if (image?.version !== 'p10b-image-prerequisite-v1' || image.sourceHead !== session.sourceHead
@@ -19,15 +20,17 @@ export function assertP10bImagePrerequisite(session, image, now = Date.now()) {
     || now - Date.parse(image.verifiedAt) > 1800000) throw Error('Fresh exact approved image evidence required');
 }
 export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson,
-  openNative = openP10bNativeMachineClient, processes = createP10bOperatorProcesses(),
+  openNative = openP10bNativeMachineClient, processes,
   createBoundaries = createP10bNoEmailBoundaries, clock = () => Date.now(),
-  checkSource = assertP10bReviewedCheckout } = {}) {
+  checkSource = assertP10bReviewedCheckout, createAuth = createP10bAppTokenContext,
+  createEvidence = createP10bOperatorEvidence, inspectRecovery = inspectP10bRecovery } = {}) {
   if (args.length === 2 && args[0] === '--validate-baseline') {
     const e = read(args[1]);
     if (e?.version !== 'p10b-public-baseline-preflight-v1' || e.app !== 'uckele-group-p10b'
       || e.machineId !== '0803730bd1d7e8' || e.volumeId !== 'vol_vwnkpex1k3yx9dnv'
-      || !/^[a-f0-9]{40}$/.test(e.sourceHead || '') || !/^[A-Za-z0-9-]{1,80}$/.test(e.instanceId || '')
-      || Object.keys(e).some(k => !['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'instanceId', 'state',
+      || e.sourceHead !== P10B_RETAINED_GUEST_HEAD || !/^[a-f0-9]{40}$/.test(e.hostSourceHead || '')
+      || e.hostSourceHead === e.sourceHead || !/^[A-Za-z0-9-]{1,80}$/.test(e.instanceId || '')
+      || Object.keys(e).some(k => !['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'hostSourceHead', 'instanceId', 'state',
         'observedAt', 'observedEnvironmentNames', 'fullConfigurationRetained', 'baselineConfig', 'baselineImageDigest', 'baselineConfigDigest'].includes(k))
       || e.state !== 'stopped' || e.fullConfigurationRetained !== true
       || !Number.isFinite(Date.parse(e.observedAt)) || Date.parse(e.observedAt) > clock()
@@ -39,10 +42,10 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
     }
     validateP10bBaselineConfig(e.baselineConfig, e.baselineImageDigest);
     if (e.baselineConfigDigest !== sha256(stableCanonicalJson(e.baselineConfig))) throw Error('Full public baseline digest mismatch');
-    checkSource(e.sourceHead);
+    checkSource(e.hostSourceHead);
     return { status: 'PUBLIC_BASELINE_VALIDATED', baselineImageDigest: e.baselineImageDigest,
       baselineConfigDigest: sha256(stableCanonicalJson(e.baselineConfig)), observedAt: e.observedAt,
-      sourceHead: e.sourceHead, instanceId: e.instanceId,
+      sourceHead: e.sourceHead, hostSourceHead: e.hostSourceHead, instanceId: e.instanceId,
       environmentNameCount: e.observedEnvironmentNames.length, productionReady: false };
   }
   if (args.length === 2 && args[0] === '--validate-template') {
@@ -56,15 +59,16 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
       || bundle.session?.candidateImageDigest !== null || bundle.session?.ownerPermissionDigest !== null) throw Error('Held template contract invalid');
     return { status: 'SESSION_NOT_APPROVED', executableImplementation: true, productionReady: false,
       missing: ['fresh exact source/image/registry evidence', 'owner no-email session and exclusive recovery approval',
-        'normal Fly authentication', 'fresh independent stopped baseline and positive archived-reservation proof'] };
+        'owner-created two-hour isolated app credential and public issuance/scope/expiry evidence',
+        'fresh independent stopped baseline and positive archived-reservation proof'] };
   }
   if (args.length !== 7 || !['--execute', '--run'].includes(args[0]) || args[1] !== '--bundle'
     || args[3] !== '--evidence' || args[5] !== '--native-client') throw Error('Expected --execute|--run --bundle FILE --evidence DIR --native-client FILE');
   const { session, approval, imageEvidence, status } = read(args[2]);
   if (status === 'SESSION_NOT_APPROVED') throw Error('Session is held');
   assertP10bNoEmailApproval(session, approval, clock()); assertP10bImagePrerequisite(session, imageEvidence, clock());
-  checkSource(session.sourceHead);
-  const evidence = createP10bOperatorEvidence(args[4]);
+  assertP10bNoEmailHostBinding(session, checkSource);
+  const evidence = createEvidence(args[4]);
   if (evidence.has('SESSION_NOT_APPROVED') || evidence.has('p10b-runtime-only-session-closure.json')
     || evidence.has('p10b-runtime-only-operator-intent.json')) throw Error('Session held, closed or consumed');
   const nativeExecutable = path.resolve(args[6]); const directory = path.join(os.homedir(), '.uckele-group-p10b-host');
@@ -75,11 +79,18 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
     || e.intentPath !== path.join(evidence.root, 'p10b-recovery-intent.json')
     || e.terminalPath !== path.join(evidence.root, 'p10b-recovery-terminal.json')) throw Error('Frozen recovery paths required');
   const verifier = fileURLToPath(new URL('../../scripts/run-p10b-admission-verifier.js', import.meta.url));
-  let native;
+  const auth = createAuth({ session, approval, clock });
+  processes ||= createP10bOperatorProcesses({ environment: auth.environment });
+  const natives = []; let initializationUncertain = false;
+  const authenticatedNative = async options => {
+    try { const client = await openNative({ ...options, environment: auth.environment }); natives.push(client); return client; }
+    catch (error) { if (error?.reapVerified !== true) initializationUncertain = true; throw Error('Native admission failed; preserve private cleanup hold'); }
+  };
+  let native; let result; let failed = false; let cleanupHeld = false;
   try {
     if (args[0] === '--execute') {
       evidence.write('p10b-recovery-verifier-input.json', { session, approval, nativeExecutable });
-      native = await openNative({ executable: nativeExecutable, session, approval, readOnly: true, configs: [session.baselineConfig] });
+      native = await authenticatedNative({ executable: nativeExecutable, session, approval, readOnly: true, configs: [session.baselineConfig] });
       const baseline = await native.client();
       if (await native.close() !== true) throw Error('Recovery read client not reaped'); native = null;
       const input = path.join(evidence.root, 'p10b-recovery-verifier-input.json');
@@ -90,9 +101,32 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
     }
     const recovery = { intent: read(e.intentPath), terminal: read(e.terminalPath),
       verification: evidence.read('p10b-recovery-independent-verification.json') };
-    return await runP10bNoEmailOperator({ session, approval, evidence, recovery,
-      inspectRecovery: () => inspectP10bRecovery(session), clock,
+    result = await runP10bNoEmailOperator({ session, approval, evidence, recovery,
+      inspectRecovery: () => inspectRecovery(session), clock,
+      verifyPrivateReap() {
+        if (initializationUncertain) throw Error('Native descendant reaping uncertain');
+        return auth.assertReaped();
+      },
       createBoundaries: input => createBoundaries({ ...input, evidence, recovery,
-        inspectRecovery: () => inspectP10bRecovery(session), nativeExecutable }) });
-  } finally { await processes.reap(); if (native) await native.reap(); }
+        inspectRecovery: () => inspectRecovery(session), nativeExecutable, processes,
+        environment: auth.environment, openNative: authenticatedNative }) });
+  } catch { failed = true; }
+  finally {
+    let reaped = !initializationUncertain;
+    try { if (await processes.reap() !== true) reaped = false; } catch { reaped = false; }
+    for (const client of natives) {
+      try { if (await client.reap() !== true) reaped = false; } catch { reaped = false; }
+    }
+    let cleanupVerified = false;
+    try { cleanupVerified = auth.cleanup({ reaped }) === true; } catch { /* retain the private directory on uncertainty */ }
+    evidence.write('p10b-runtime-only-auth-closure.json', { sessionDigest: sha256(stableCanonicalJson(session)),
+      closedAt: new Date(clock()).toISOString(), directReapVerified: reaped,
+      reapVerified: reaped && cleanupVerified, cleanupVerified,
+      success: !failed && Boolean(result?.success) && reaped && cleanupVerified, productionReady: false,
+      ...(!cleanupVerified && auth.environment.FLY_CONFIG_DIR ? { privateAuthDirectory: auth.environment.FLY_CONFIG_DIR } : {}) });
+    cleanupHeld = !reaped || !cleanupVerified;
+  }
+  if (cleanupHeld) throw Error('Private authentication cleanup held; preserve evidence');
+  if (failed) throw Error('No-email session failed; preserve evidence');
+  return result;
 }

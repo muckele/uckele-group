@@ -9,6 +9,8 @@ import { proveP10bGuardianStop } from './p10bRuntimeObservation.js';
 import { assertP10bRecoveryAdmission, assertP10bCurrentPhaseSettlement } from './p10bAdmissionRecovery.js';
 import { P10B_GUARDIAN_EXIT_PREFIX } from './p10bGuardianParent.js';
 import { sanitizeP10bGuardianLog } from './p10bRuntimeObserver.js';
+import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
+import { p10bInheritedAppTokenEnvironment } from './p10bHostAuthentication.js';
 
 const script = name => fileURLToPath(new URL(`../../scripts/${name}`, import.meta.url));
 const digest = value => sha256(stableCanonicalJson(value));
@@ -57,8 +59,11 @@ export function verifyP10bPreparationObservation(rows, phase, machine, result) {
 // recovery gate and exact session approval have both passed.
 export async function createP10bNoEmailBoundaries({ session, approval, evidence, recovery, inspectRecovery,
   nativeExecutable, flyExecutable = '/opt/homebrew/bin/fly', nodeExecutable = process.execPath,
-  processes = createP10bOperatorProcesses(), openNative = openP10bNativeMachineClient, clock = () => Date.now() }) {
+  processes, environment, openNative = openP10bNativeMachineClient, clock = () => Date.now() }) {
+  assertP10bNoEmailApproval(session, approval, clock());
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
+  if (!environment && openNative === openP10bNativeMachineClient) environment = p10bInheritedAppTokenEnvironment({ session, approval, clock });
+  processes ||= createP10bOperatorProcesses({ environment });
   let native; let posts = 0; let settlementPhase; const configs = [session.baselineConfig];
   const observers = []; const controllers = [];
   async function authorizePhase(phase) {
@@ -66,7 +71,7 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     if (!Array.isArray(listed) || listed.length !== 1 || listed[0].id !== session.machineId) throw Error('Exact sole isolated Machine required');
     if (native && await native.close() !== true) throw Error('Previous native client not reaped');
     configs.push(phase.config);
-    native = await openNative({ executable: nativeExecutable, session, approval, configs, recoveryVerified: true });
+    native = await openNative({ executable: nativeExecutable, session, approval, configs, recoveryVerified: true, environment });
   }
   async function client(method = 'GET', body, timeout = 1000) {
     if (settlementPhase) {
@@ -74,7 +79,7 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
         evidenceRoot: evidence.root, now: clock() });
       if (method === 'POST' && stableCanonicalJson(body?.config) !== stableCanonicalJson(session.baselineConfig)) throw Error('Settlement only permits frozen baseline restoration');
     } else assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
-    if (!native) native = await openNative({ executable: nativeExecutable, session, approval, configs, recoveryVerified: true });
+    if (!native) native = await openNative({ executable: nativeExecutable, session, approval, configs, recoveryVerified: true, environment });
     if (method === 'POST') { if (++posts > 3) throw Error('Stopped update budget consumed'); }
     return native.client(method, body, timeout);
   }
@@ -165,5 +170,10 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     return stopped && controllersReaped;
   }
   return { authorizePhase, client, startObserver, demonstrate, runPreparation, settle,
-    async reap() { return processes.reap(); }, async close() { return !native || await native.close(); } };
+    async reap() {
+      if (await processes.reap() !== true) return false;
+      if (native && await native.close() !== true) return false;
+      native = null;
+      return true;
+    }, async close() { return !native || await native.close(); } };
 }
