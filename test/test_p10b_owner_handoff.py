@@ -229,6 +229,50 @@ class OwnerEntryTests(unittest.TestCase):
         self.assertEqual(self.token_calls, 0)
         self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
 
+    def test_issuance_confirmation_explicitly_requests_literal_word_not_token(self):
+        prompts = []
+        def ask(prompt):
+            prompts.append(prompt)
+            return self.ask(prompt)
+        self.assertEqual(self.invoke_with_public_input(ask, []), 0)
+        issued = [prompt for prompt in prompts if 'ISSUED' in prompt]
+        self.assertEqual(len(issued), 1)
+        self.assertIn('literal ISSUED', issued[0])
+        self.assertIn('NOT THE TOKEN', issued[0])
+
+    def test_wrong_issuance_confirmation_or_interruption_consumes_attempt_before_credentials(self):
+        secret = 'fm2_SYNTHETIC_PRIVATE_INPUT'
+        for response in (secret, EOFError, KeyboardInterrupt):
+            with self.subTest(response=response):
+                self.setUp()
+                prompts, messages = [], []
+                def ask(prompt):
+                    prompts.append(prompt)
+                    if 'ISSUED' in prompt:
+                        if isinstance(response, type):
+                            raise response()
+                        return response
+                    return self.ask(prompt)
+                self.assertEqual(self.invoke_with_public_input(ask, messages), 2)
+                terminal = (self.root / 'owner-terminal.json').read_bytes()
+                permission = (self.root / 'private-setup-scope.json').read_bytes()
+                self.assertEqual(json.loads(terminal)['phase'], 'public-issuance')
+                self.assertFalse(json.loads(terminal)['credentialInputRequested'])
+                self.assertFalse(json.loads(terminal)['authenticatedPreflightRequested'])
+                self.assertEqual(self.token_calls, 0)
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                for name in ('issuance-receipt.json', 'sealed-session.json', 'approved-session.json', 'owner-final-approval.json'):
+                    self.assertFalse((self.root / name).exists())
+                count = len(prompts)
+                self.assertEqual(self.invoke_with_public_input(ask, messages), 2)
+                self.assertEqual(len(prompts), count)
+                self.assertEqual((self.root / 'owner-terminal.json').read_bytes(), terminal)
+                self.assertEqual((self.root / 'private-setup-scope.json').read_bytes(), permission)
+                self.assertNotIn(secret, '\n'.join(prompts + messages))
+                for file in self.root.rglob('*'):
+                    if file.is_file():
+                        self.assertNotIn(secret.encode(), file.read_bytes())
+
     def test_refusal_before_credential_input(self):
         for mode in ['scope-refusal', 'creation-failed', 'metadata-refusal', 'bad-expiry', 'empty-id', 'expiry-coverage', 'scope-delayed']:
             with self.subTest(mode=mode):

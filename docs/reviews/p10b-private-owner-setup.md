@@ -10,7 +10,7 @@ After the exact reviewed host commit and its CI succeed, use only the fresh,
 independently reviewed package bound to that commit. Its `OWNER-HANDOFF.md`
 contains the concrete checksum-pinned wrapper command and its artifact manifest
 binds the exact recipe, instructions and executable files. The preserved v2
-package and the package bound to `76ced45` have consumed owner attempts; neither
+package and the packages bound to `76ced45` and `8d37fc3` have consumed owner attempts; none
 may be retried or rebound to another source revision.
 
 Run the package's exact command with `--check-only` first. Use the same command
@@ -44,7 +44,13 @@ for the owner to run personally in a separate private unrecorded terminal.
 No automatic issuance, login, refresh, retry, additional credential or account
 fallback exists. Keep creation output private.
 
-After successful creation, supply actual public issuance start/completion UTC
+After successful creation, type the literal word `ISSUED`, **NOT THE TOKEN**, at
+the issuance confirmation prompt. Enter the credential only at the later hidden
+credential prompt, after public metadata has been validated. A token pasted at
+the `ISSUED` prompt holds and consumes the attempt before authentication; preserve
+its evidence and retire only that matching token after clients close.
+
+Then supply actual public issuance start/completion UTC
 (within 60 seconds), matching public token ID/name/effective expiry/unrevoked
 metadata and the attestation that hidden input matches that exact new isolated
 app-deploy token. The app Tokens dashboard or the separate pinned app-scoped

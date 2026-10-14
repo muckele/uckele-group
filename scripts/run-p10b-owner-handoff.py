@@ -373,7 +373,7 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
              'No retry/login/renewal is authorized by this handoff.')
         emit('Paste one public field at a time. Never paste combined timestamp/token output. '
              'Public entry is hidden to protect accidental private paste.')
-        if ask('Type ISSUED only after that exact creation succeeds: ') != 'ISSUED':
+        if ask('Type literal ISSUED, NOT THE TOKEN, only after that exact creation succeeds: ') != 'ISSUED':
             raise Hold('No successful issuance')
         started = read_public_input(ask, 'issuance-start-utc', 'Actual successful issuance start UTC: ', emit, normalize_utc, 'INVALID_UTC')
         completed = read_public_input(ask, 'issuance-completion-utc', 'Actual successful issuance completion UTC: ', emit, normalize_utc, 'INVALID_UTC')
