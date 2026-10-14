@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Private owner entry. Imports/check-only never accept credentials or use SDKs."""
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import errno
 import getpass
@@ -14,6 +15,7 @@ import signal
 import stat
 import subprocess
 import sys
+import termios
 import time
 import warnings
 
@@ -22,6 +24,101 @@ SCRIPTS = Path(__file__).resolve().parent
 
 class Hold(Exception):
     pass
+
+
+class PublicInputHold(Hold):
+    def __init__(self, field, code):
+        self.field = field
+        self.code = code
+        super().__init__('Public input held')
+
+
+@contextmanager
+def private_owner_console():
+    # getpass uses the controlling tty. Keep echo disabled between prompts too,
+    # then discard queued paste before restoring the owner's terminal mode.
+    descriptor = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+    previous = None
+    handlers = {}
+    def terminate(_number, _frame):
+        raise Hold('Private owner entry terminated')
+    try:
+        if not os.isatty(descriptor):
+            raise Hold('Private controlling terminal required')
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            handlers[number] = signal.getsignal(number)
+            signal.signal(number, terminate)
+        # Preserve ordinary KeyboardInterrupt while reading, but prevent a
+        # second interrupt from cutting short the final queued-input flush.
+        handlers[signal.SIGINT] = signal.getsignal(signal.SIGINT)
+        previous = termios.tcgetattr(descriptor)
+        masked = list(previous)
+        masked[3] &= ~termios.ECHO
+        termios.tcsetattr(descriptor, termios.TCSAFLUSH, masked)
+        yield
+    finally:
+        # Block the whole set atomically: sequential per-signal changes leave
+        # a window where a second termination can skip the queued-input flush.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set(handlers))
+        try:
+            if previous is not None:
+                # On an uncertain flush, do not turn echo back on over queued
+                # input. Caller records a fixed closure hold, never raw errors.
+                termios.tcflush(descriptor, termios.TCIFLUSH)
+                termios.tcsetattr(descriptor, termios.TCSAFLUSH, previous)
+        finally:
+            try:
+                os.close(descriptor)
+            finally:
+                try:
+                    for number, handler in handlers.items():
+                        signal.signal(number, handler)
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def masked_owner_input(prompt):
+    descriptor = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+    try:
+        termios.tcflush(descriptor, termios.TCIFLUSH)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', getpass.GetPassWarning)
+            return getpass.getpass(prompt)
+    finally:
+        try:
+            termios.tcflush(descriptor, termios.TCIFLUSH)
+        finally:
+            os.close(descriptor)
+
+
+def read_public_input(ask, field, prompt, emit, normalize, invalid_code):
+    # One correction of syntax only. Approval, issuance success and all later
+    # authority/coverage/consumed-state checks remain one-shot.
+    for attempt in range(2):
+        try:
+            value = ask(prompt)
+        except EOFError:
+            raise PublicInputHold(field, 'INPUT_ENDED') from None
+        except KeyboardInterrupt:
+            raise PublicInputHold(field, 'INPUT_CANCELLED') from None
+        except (OSError, termios.error, getpass.GetPassWarning):
+            raise PublicInputHold(field, 'PRIVATE_INPUT_UNAVAILABLE') from None
+        try:
+            if not isinstance(value, str) or len(value) > 256:
+                raise ValueError()
+            return normalize(value)
+        except (ValueError, TypeError, Hold):
+            # Never print or persist the rejected value or its exception.
+            value = None
+            emit('Public field ' + field + ' rejected: ' + invalid_code + '. Paste only this field; entry is hidden.')
+            if attempt == 1:
+                raise PublicInputHold(field, invalid_code) from None
+
+
+def normalize_public_token_id(value):
+    if not re.fullmatch(r'[A-Za-z0-9_:-]{1,120}', value) or value.lower().startswith(('fm1_', 'fm2_', 'bearer')):
+        raise ValueError()
+    return value
 
 
 def canonical(value):
@@ -214,13 +311,18 @@ def check_recipe(file, runner=run_command, expected_recipe_sha256=None, bootstra
     return recipe, result, environment
 
 
-def run_owner(recipe_file, runner=run_command, ask=input, token_input=hidden_token,
+def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_token,
               private_tty=lambda: sys.stdin.isatty() and sys.stderr.isatty(), emit=print,
               expected_recipe_sha256=None, bootstrap=bootstrap_recipe):
     environment = None
     recipe = None
     success = False
     phase = 'static-check'
+    console = None
+    public_input_field = None
+    public_input_error = None
+    credential_input_requested = False
+    authenticated_preflight_requested = False
     try:
         recipe, checked, environment = check_recipe(recipe_file, runner, expected_recipe_sha256, bootstrap)
         root = Path(recipe['outputDirectory'])
@@ -230,6 +332,10 @@ def run_owner(recipe_file, runner=run_command, ask=input, token_input=hidden_tok
                 raise Hold('Existing evidence preserved; owner entry already consumed')
         if not private_tty():
             raise Hold('Private unrecorded terminal required')
+        if ask is None:
+            console = private_owner_console()
+            console.__enter__()
+            ask = masked_owner_input
         phase = 'setup-approval'
         emit(json.dumps(checked, indent=2))
         price = read_public(recipe['files']['price']['path'])
@@ -260,12 +366,14 @@ def run_owner(recipe_file, runner=run_command, ask=input, token_input=hidden_tok
         emit('Keep its printed credential private. Obtain the matching public ID/name/actual effective '
              'expiry/unrevoked metadata from the app Tokens dashboard or fly tokens list --app '
              'uckele-group-p10b. No retry/login/renewal is authorized by this handoff.')
+        emit('Paste one public field at a time. Never paste combined timestamp/token output. '
+             'Public entry is hidden to protect accidental private paste.')
         if ask('Type ISSUED only after that exact creation succeeds: ') != 'ISSUED':
             raise Hold('No successful issuance')
-        started = normalize_utc(ask('Actual successful issuance start UTC: '))
-        completed = normalize_utc(ask('Actual successful issuance completion UTC: '))
-        token_id = ask('Public token ID for exact name ' + name + ': ')
-        expiry = normalize_utc(ask('Effective expiry UTC from matching public metadata: '))
+        started = read_public_input(ask, 'issuance-start-utc', 'Actual successful issuance start UTC: ', emit, normalize_utc, 'INVALID_UTC')
+        completed = read_public_input(ask, 'issuance-completion-utc', 'Actual successful issuance completion UTC: ', emit, normalize_utc, 'INVALID_UTC')
+        token_id = read_public_input(ask, 'public-token-id', 'Public token ID for exact name ' + name + ': ', emit, normalize_public_token_id, 'INVALID_PUBLIC_ID')
+        expiry = read_public_input(ask, 'effective-expiry-utc', 'Effective expiry UTC from matching public metadata: ', emit, normalize_utc, 'INVALID_UTC')
         if ask('Type UNREVOKED ' + token_id + ' after checking metadata: ') != 'UNREVOKED ' + token_id:
             raise Hold('Public revocation status not attested')
         if ask('Type MATCHED ' + token_id + ' to attest private input matches this exact new app-deploy token: ') != 'MATCHED ' + token_id:
@@ -282,11 +390,13 @@ def run_owner(recipe_file, runner=run_command, ask=input, token_input=hidden_tok
         if validated.get('status') != 'PUBLIC_INPUTS_VALIDATED' or validated.get('sessionNotStarted') is not True:
             raise Hold('Public scope/issuance evidence failed before hidden input')
         phase = 'hidden-entry'
+        credential_input_requested = True
         token = token_input()
         if not isinstance(token, str) or not token.strip() or len(token) > 16384 or any(ord(c) < 32 or ord(c) == 127 for c in token):
             raise Hold('Opaque hidden input invalid')
         environment['FLY_API_TOKEN'] = token
         phase = 'read-only-preflight'
+        authenticated_preflight_requested = True
         summary = runner([recipe['files']['node']['path'], str(SCRIPTS / 'run-p10b-owner-preflight.js'), '--prepare',
                           '--recipe', str(recipe_file), '--receipt', str(receipt_path), '--permission', str(permission_path)],
                          environment, 125)
@@ -324,10 +434,11 @@ def run_owner(recipe_file, runner=run_command, ask=input, token_input=hidden_tok
             raise Hold('Runtime/private cleanup not proved')
         success = True
         phase = 'closed'
-        emit('No-email runtime and private cleanup verified. Manually revoke only public token ID ' + token_id +
-             ' after confirming all clients are closed; this script does not revoke it.')
         return 0
-    except BaseException:
+    except BaseException as error:
+        if isinstance(error, PublicInputHold):
+            public_input_field = error.field
+            public_input_error = error.code
         emit('Owner session held; preserve evidence and uncertain private directories. No retry or new token. '
              'Do not clear pending intents. Revoke only the matching new token manually after closed clients '
              'or under separately approved incident handling.')
@@ -335,14 +446,31 @@ def run_owner(recipe_file, runner=run_command, ask=input, token_input=hidden_tok
     finally:
         if environment is not None:
             environment.pop('FLY_API_TOKEN', None)
+        console_closure_failed = False
+        if console is not None:
+            try:
+                console.__exit__(None, None, None)
+            except BaseException:
+                console_closure_failed = True
+                success = False
+                phase = 'private-input-closure-held'
+                emit('Private input closure held: PRIVATE_INPUT_CLOSURE_UNVERIFIED. No continuation.')
         if recipe is not None:
             try:
                 write_exclusive(Path(recipe['outputDirectory']) / 'owner-terminal.json',
                                 {'success': success, 'phase': phase, 'closedAt': utc_now(), 'productionReady': False,
                                  'globalAutomationPaused': True, 'rawErrorsRetained': False,
-                                 'uncertainPrivateCleanupRetained': not success, 'automaticRevocation': False})
+                                 'uncertainPrivateCleanupRetained': not success, 'automaticRevocation': False,
+                                 'publicInputField': public_input_field, 'publicInputError': public_input_error,
+                                 'credentialInputRequested': credential_input_requested,
+                                 'authenticatedPreflightRequested': authenticated_preflight_requested})
             except Exception:
                 pass  # Existing evidence is never overwritten.
+        if console_closure_failed:
+            return 2
+        if success:
+            emit('No-email runtime and private cleanup verified. Manually revoke only public token ID ' + token_id +
+                 ' after confirming all clients are closed; this script does not revoke it.')
 
 
 def main():

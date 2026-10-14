@@ -741,17 +741,7 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
   fs.writeFileSync(fakeFly, `
     import fs from 'node:fs';
     import { spawn } from 'node:child_process';
-    import { runP10bGuestGuardian } from ${JSON.stringify(new URL('../server/services/p10bGuestGuardian.js', import.meta.url).href)};
-    import { runP10bGuardianParent } from ${JSON.stringify(new URL('../server/services/p10bGuardianParent.js', import.meta.url).href)};
-    import { assertP10bGuestReady } from ${JSON.stringify(new URL('../server/services/p10bGuestShutdown.js', import.meta.url).href)};
-    import { createP10bControlChannel } from ${JSON.stringify(new URL('../server/services/p10bControlChannel.js', import.meta.url).href)};
-    import { serveP10bQualificationWorker } from ${JSON.stringify(new URL('../server/services/p10bQualificationWorker.js', import.meta.url).href)};
-    import { createSqliteStorage } from ${JSON.stringify(new URL('../server/storage/sqlite.js', import.meta.url).href)};
-    import { executeP10bFirstMailboxQualification } from ${JSON.stringify(new URL('../server/services/pursueCimControlledMailboxHarness.js', import.meta.url).href)};
-    import { createServer } from 'node:http';
-    import { installP10bIngressClosure, requestP10bIngressClosure } from ${JSON.stringify(new URL('../server/services/p10bIngressClosure.js', import.meta.url).href)};
-    import { initializeP10bRuntimeFilesystem } from ${JSON.stringify(new URL('../server/services/p10bRuntime.js', import.meta.url).href)};
-    import { ingestFakeLifecycle } from ${JSON.stringify(new URL('./helpers/p10bQualificationFixture.js', import.meta.url).href)};
+    // Metadata models the external API without loading the worker graph.
     const args = process.argv.slice(2);
     if (!['offline-guest', 'offline-guardian'].includes(args[0])) fs.appendFileSync(${JSON.stringify(commands)}, JSON.stringify(args)+'\\n');
     const machine = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}));
@@ -759,10 +749,12 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
     const window=JSON.parse(cfg.dealHunter.cimProvider.qualificationGuestWindow);
     const runtimePath=${JSON.stringify(databasePath)}+'.offline-boot-'+window.phase+'.json';
     if(args[0]==='offline-guardian') {
+      const { runP10bGuestGuardian } = await import(${JSON.stringify(new URL('../server/services/p10bGuestGuardian.js', import.meta.url).href)});
       const boot=JSON.parse(fs.readFileSync(runtimePath));
       await runP10bGuestGuardian({window,databasePath:${JSON.stringify(databasePath)},
         clock:()=>Date.parse(window.issuedAt)+Date.now()-boot.wallStartedAt});
     } else if(args[0]==='offline-guest') {
+      const { runP10bGuardianParent } = await import(${JSON.stringify(new URL('../server/services/p10bGuardianParent.js', import.meta.url).href)});
       const boot=JSON.parse(fs.readFileSync(runtimePath));
       await runP10bGuardianParent({window,databasePath:${JSON.stringify(databasePath)},
         launch:({environment})=>spawn(process.execPath,[${JSON.stringify(fakeFly)},'offline-guardian'],
@@ -778,6 +770,8 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
     else if (args[0] === '--secret-names') process.stdout.write(JSON.stringify(['DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY']));
     else if (args[0] === 'secrets') process.stdout.write(JSON.stringify([{name:'DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY',digest:'abc123'}]));
     else if (args[0] === 'machine' && args[1] === 'start') {
+      const { assertP10bGuestReady } = await import(${JSON.stringify(new URL('../server/services/p10bGuestShutdown.js', import.meta.url).href)});
+      const { initializeP10bRuntimeFilesystem } = await import(${JSON.stringify(new URL('../server/services/p10bRuntime.js', import.meta.url).href)});
       fs.writeFileSync(runtimePath,JSON.stringify({wallStartedAt:Date.now()}));
       const guest=spawn(process.execPath,[${JSON.stringify(fakeFly)},'offline-guest'],{detached:true,stdio:'ignore'});
       guest.unref();
@@ -791,6 +785,13 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
         environment:{FLY_APP_NAME:'uckele-group-p10b',FLY_MACHINE_ID:${JSON.stringify(machineId)}},clock:()=>window.issuedAt});
       machine.state='started'; fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify(machine));
     } else if (args[0] === 'ssh') {
+      const { createP10bControlChannel } = await import(${JSON.stringify(new URL('../server/services/p10bControlChannel.js', import.meta.url).href)});
+      const { serveP10bQualificationWorker } = await import(${JSON.stringify(new URL('../server/services/p10bQualificationWorker.js', import.meta.url).href)});
+      const { createSqliteStorage } = await import(${JSON.stringify(new URL('../server/storage/sqlite.js', import.meta.url).href)});
+      const { executeP10bFirstMailboxQualification } = await import(${JSON.stringify(new URL('../server/services/pursueCimControlledMailboxHarness.js', import.meta.url).href)});
+      const { createServer } = await import('node:http');
+      const { installP10bIngressClosure, requestP10bIngressClosure } = await import(${JSON.stringify(new URL('../server/services/p10bIngressClosure.js', import.meta.url).href)});
+      const { ingestFakeLifecycle } = await import(${JSON.stringify(new URL('./helpers/p10bQualificationFixture.js', import.meta.url).href)});
       const channel=createP10bControlChannel({input:process.stdin,output:process.stdout});
       const server=createServer();await new Promise((resolve)=>server.listen(0,'127.0.0.1',resolve));
       const runtime={app:'uckele-group-p10b',machineId:${JSON.stringify(machineId)},sourceHead:${JSON.stringify(sourceHead)}};
