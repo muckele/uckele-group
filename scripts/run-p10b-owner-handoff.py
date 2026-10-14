@@ -11,6 +11,7 @@ import os
 import re
 from pathlib import Path
 import selectors
+import shlex
 import signal
 import stat
 import subprocess
@@ -360,12 +361,16 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         write_exclusive(permission_path, permission)
         phase = 'public-issuance'
         name = 'p10b-runtime-no-email-' + recipe['nonce']
+        fly_command = ['/usr/bin/env', '-u', 'FLY_UPDATE_CHECK', 'FLY_NO_UPDATE_CHECK=1', recipe['files']['fly']['path']]
         emit('Only now, in a separate private unrecorded owner terminal, record UTC immediately before '
              'and after successful issuance (within 60 seconds), and personally run:')
-        emit('fly tokens create deploy --app uckele-group-p10b --expiry 2h --name "' + name + '"')
+        emit(shlex.join(fly_command + ['tokens', 'create', 'deploy', '--app', recipe['app'], '--expiry', '2h', '--name', name]))
         emit('Keep its printed credential private. Obtain the matching public ID/name/actual effective '
-             'expiry/unrevoked metadata from the app Tokens dashboard or fly tokens list --app '
-             'uckele-group-p10b. No retry/login/renewal is authorized by this handoff.')
+             'expiry/unrevoked metadata from the app Tokens dashboard, or run this separate read-only command '
+             'only after successful issuance:')
+        emit(shlex.join(fly_command + ['tokens', 'list', '--app', recipe['app'], '--scope', 'app']))
+        emit('Both commands use the checksum-bound executable and disable update checks; never substitute bare fly. '
+             'No retry/login/renewal is authorized by this handoff.')
         emit('Paste one public field at a time. Never paste combined timestamp/token output. '
              'Public entry is hidden to protect accidental private paste.')
         if ask('Type ISSUED only after that exact creation succeeds: ') != 'ISSUED':

@@ -6,6 +6,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -38,7 +39,7 @@ class OwnerEntryTests(unittest.TestCase):
         self.evidence.mkdir(mode=0o700)
         price_path = self.root / 'price.json'
         handoff.write_exclusive(price_path, {'source': 'https://docs.fly.io/about/pricing', 'oneUsdIsBillingCap': False})
-        self.recipe = {'version': 'p10b-owner-preparer-recipe-v1', 'files': {'node': {'path': '/offline/node'}, 'native': {'path': '/offline/native'}, 'price': {'path': str(price_path)}},
+        self.recipe = {'version': 'p10b-owner-preparer-recipe-v1', 'files': {'node': {'path': '/offline/node'}, 'fly': {'path': '/offline/pinned-flyctl'}, 'native': {'path': '/offline/native'}, 'price': {'path': str(price_path)}},
                        'app': 'uckele-group-p10b', 'nonce': 'c' * 24, 'ownerHome': '/Users/Matt',
                        'hostSourceHead': '2' * 40, 'outputDirectory': str(self.root), 'evidenceDirectory': str(self.evidence),
                        'sealedBundlePath': str(self.root / 'sealed-session.json'),
@@ -150,6 +151,83 @@ class OwnerEntryTests(unittest.TestCase):
         for file in self.root.rglob('*'):
             if file.is_file():
                 self.assertNotIn(b'offline-private-token', file.read_bytes())
+
+    def test_owner_creation_command_ignores_wrong_path_architecture_and_forced_update(self):
+        wrong_directory = self.root / 'wrong-path'
+        pinned_directory = self.root / "verified arm64 cli's directory"
+        wrong_directory.mkdir()
+        pinned_directory.mkdir()
+        def stub(file, version, architecture):
+            file.write_text('#!' + handoff.sys.executable + '\n'
+                            'import json,os,sys\n'
+                            'print(json.dumps({"version":' + repr(version) + ',"architecture":' + repr(architecture) + ',\n'
+                            '"argv":sys.argv[1:],"forceUpdatePresent":"FLY_UPDATE_CHECK" in os.environ,\n'
+                            '"noUpdate":os.environ.get("FLY_NO_UPDATE_CHECK")}))\n')
+            file.chmod(0o700)
+        stub(wrong_directory / 'fly', '0.4.87', 'darwin/amd64')
+        pinned = pinned_directory / 'flyctl'
+        stub(pinned, '0.4.115', 'darwin/arm64')
+        self.recipe['files']['fly'] = {'path': str(pinned), 'sha256': hashlib.sha256(pinned.read_bytes()).hexdigest()}
+        self.recipe_path.write_text(json.dumps(self.recipe))
+        self.mode = 'creation-failed'
+        emitted = []
+        self.assertEqual(handoff.run_owner(self.recipe_path, self.runner, self.ask, self.token, lambda: True,
+                         emitted.append, expected_recipe_sha256=hashlib.sha256(self.recipe_path.read_bytes()).hexdigest(),
+                         bootstrap=lambda _path, _sha: self.recipe), 2)
+        commands = [line for line in emitted if ' tokens create deploy ' in line]
+        self.assertEqual(len(commands), 1)
+        environment = {'PATH': str(wrong_directory) + ':/usr/bin:/bin', 'HOME': str(self.root),
+                       'FLY_UPDATE_CHECK': '1', 'FLY_NO_UPDATE_CHECK': '0'}
+        wrong = subprocess.run(['fly', 'version'], env=environment, capture_output=True, text=True, check=True, timeout=5)
+        self.assertEqual(json.loads(wrong.stdout)['architecture'], 'darwin/amd64')
+        result = subprocess.run(['/bin/sh', '-c', commands[0]], env=environment,
+                                capture_output=True, text=True, check=True, timeout=5)
+        selected = json.loads(result.stdout)
+        self.assertEqual(selected['version'], '0.4.115')
+        self.assertEqual(selected['architecture'], 'darwin/arm64')
+        self.assertFalse(selected['forceUpdatePresent'])
+        self.assertEqual(selected['noUpdate'], '1')
+        self.assertEqual(selected['argv'], ['tokens', 'create', 'deploy', '--app', 'uckele-group-p10b',
+                         '--expiry', '2h', '--name', 'p10b-runtime-no-email-' + self.recipe['nonce']])
+        metadata_commands = [line for line in emitted if ' tokens list ' in line]
+        self.assertEqual(len(metadata_commands), 1)
+        metadata = subprocess.run(['/bin/sh', '-c', metadata_commands[0]], env=environment,
+                                  capture_output=True, text=True, check=True, timeout=5)
+        metadata = json.loads(metadata.stdout)
+        self.assertEqual(metadata['version'], '0.4.115')
+        self.assertEqual(metadata['architecture'], 'darwin/arm64')
+        self.assertFalse(metadata['forceUpdatePresent'])
+        self.assertEqual(metadata['noUpdate'], '1')
+        self.assertEqual(metadata['argv'], ['tokens', 'list', '--app', 'uckele-group-p10b', '--scope', 'app'])
+        self.assertFalse(any(line.startswith('fly ') for line in emitted))
+        self.assertEqual(shlex.split(commands[0])[0], '/usr/bin/env')
+        self.assertEqual(self.token_calls, 0)
+        self.assertFalse(Path(self.recipe['approvedBundlePath']).exists())
+
+    def test_failed_creation_consumes_attempt_without_issuance_or_replay(self):
+        self.mode = 'creation-failed'
+        prompts = []
+        def ask(prompt):
+            prompts.append(prompt)
+            return self.ask(prompt)
+        def invoke():
+            return handoff.run_owner(self.recipe_path, self.runner, ask, self.token, lambda: True,
+                     lambda _value: None, expected_recipe_sha256=hashlib.sha256(self.recipe_path.read_bytes()).hexdigest(),
+                     bootstrap=lambda _path, _sha: self.recipe)
+        self.assertEqual(invoke(), 2)
+        permission = (self.root / 'private-setup-scope.json').read_bytes()
+        terminal = (self.root / 'owner-terminal.json').read_bytes()
+        self.assertEqual(json.loads(terminal)['phase'], 'public-issuance')
+        self.assertFalse(json.loads(terminal)['credentialInputRequested'])
+        self.assertFalse(json.loads(terminal)['authenticatedPreflightRequested'])
+        self.assertFalse((self.root / 'issuance-receipt.json').exists())
+        count = len(prompts)
+        self.assertEqual(invoke(), 2)
+        self.assertEqual(len(prompts), count)
+        self.assertEqual((self.root / 'private-setup-scope.json').read_bytes(), permission)
+        self.assertEqual((self.root / 'owner-terminal.json').read_bytes(), terminal)
+        self.assertEqual(self.token_calls, 0)
+        self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
 
     def test_refusal_before_credential_input(self):
         for mode in ['scope-refusal', 'creation-failed', 'metadata-refusal', 'bad-expiry', 'empty-id', 'expiry-coverage', 'scope-delayed']:

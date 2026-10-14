@@ -6,15 +6,15 @@ until separately approved private setup and exact final session approval.
 
 ## Concrete owner package
 
-After the exact reviewed host commit and its CI succeed, the sealed package lives
-at `/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package-v2`.
-Run its checksum-pinned wrapper from a private unrecorded owner terminal:
+After the exact reviewed host commit and its CI succeed, use only the fresh,
+independently reviewed package bound to that commit. Its `OWNER-HANDOFF.md`
+contains the concrete checksum-pinned wrapper command and its artifact manifest
+binds the exact recipe, instructions and executable files. The preserved v2
+package and the package bound to `76ced45` have consumed owner attempts; neither
+may be retried or rebound to another source revision.
 
-```sh
-/usr/local/bin/python3 -B /Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-preparer-offline-20261013/owner-package-v2/owner-handoff.py --check-only
-```
-
-Use the same command with `--run` only after separate owner setup authority.
+Run the package's exact command with `--check-only` first. Use the same command
+with `--run` only after separate new owner setup authority.
 `--check-only` uses no SDK or private input. It verifies the recipe, Python/Node
 interpreters, fixed entrypoints, exact clean reviewed host checkout, executable
 bindings, concrete output locations and dated public price evidence before any
@@ -33,7 +33,13 @@ recipe and session. It does not replace the Machine mutation helper.
 
 The script first displays the checked recipe digest, dated prices and exact
 setup scope. The owner must type the exact private-setup approval phrase. Only
-then does it display the nonce-bound two-hour `fly tokens create deploy` command
+then does it display the nonce-bound two-hour token-creation command using the
+recipe's checksum-bound absolute Fly executable. It unsets `FLY_UPDATE_CHECK`
+and sets `FLY_NO_UPDATE_CHECK=1`; the force-update variable otherwise takes
+precedence. The separate app-scoped public metadata command uses the same
+pinned executable and update suppression. Neither command depends on the
+owner's shell PATH, alias or a different architecture/version installation.
+Never replace either command with bare `fly`. The token-creation command is
 for the owner to run personally in a separate private unrecorded terminal.
 No automatic issuance, login, refresh, retry, additional credential or account
 fallback exists. Keep creation output private.
@@ -41,10 +47,13 @@ fallback exists. Keep creation output private.
 After successful creation, supply actual public issuance start/completion UTC
 (within 60 seconds), matching public token ID/name/effective expiry/unrevoked
 metadata and the attestation that hidden input matches that exact new isolated
-app-deploy token. The app Tokens dashboard or `fly tokens list --app
-uckele-group-p10b` supplies public metadata; creation JSON contains only the
+app-deploy token. The app Tokens dashboard or the separate pinned app-scoped
+metadata command supplies public metadata; creation JSON contains only the
 credential. Requested lifetime or login time cannot prove effective coverage.
-The credential-free public-input validator runs before `getpass`, and the
+Public fields are entered one at a time through masked prompts; never paste
+combined timestamp/token output. A public syntax correction does not renew
+authority. The credential-free public-input validator runs before hidden
+credential input, and the
 preparer repeats admission at the actual preflight start. Bad ID, timing, expired
 scope or insufficient effective coverage holds before hidden input/authentication.
 
