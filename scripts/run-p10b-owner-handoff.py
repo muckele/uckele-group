@@ -163,7 +163,7 @@ def normalize_utc(value):
     return utc_after(value, 0)
 
 
-def import_public_token_metadata(recipe, expected_directory=None):
+def import_public_token_metadata(recipe, expected_directory=None, with_snapshot=False):
     # Public metadata only, prepared locally from the owner's verified listing.
     # No SDK, credential input, token decoding or identity inference occurs here.
     try:
@@ -190,17 +190,23 @@ def import_public_token_metadata(recipe, expected_directory=None):
                 # Only a missing leaf inside this validated directory is a
                 # coordination wait. Root/file integrity failures remain fatal.
                 raise PublicMetadataNotReady(identity) from None
+            with os.fdopen(descriptor, 'rb') as stream:
+                before = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                        or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 65536
+                        or (with_snapshot and before.st_nlink != 1)):
+                    raise ValueError()
+                raw = stream.read(65537)
+                after = os.fstat(stream.fileno())
+                if (len(raw) != before.st_size or _public_identity(before) != _public_identity(after)
+                        or _public_identity(os.stat('public-token-metadata.json', dir_fd=directory,
+                                                   follow_symlinks=False)) != _public_identity(before)):
+                    raise ValueError()
+            current_root = os.stat(recipe['outputDirectory'], follow_symlinks=False)
+            if (current_root.st_dev, current_root.st_ino) != identity:
+                raise ValueError()
         finally:
             os.close(directory)
-        with os.fdopen(descriptor, 'rb') as stream:
-            before = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
-                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 65536):
-                raise ValueError()
-            raw = stream.read(65537)
-            after = os.fstat(stream.fileno())
-            if len(raw) > 65536 or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                raise ValueError()
         metadata = json.loads(raw, object_pairs_hook=unique_object, parse_constant=invalid_constant)
         if (not isinstance(metadata, dict) or set(metadata) != {'version', 'app', 'tokens'}
                 or metadata['version'] != 'p10b-owner-token-metadata-v1' or metadata['app'] != recipe['app']
@@ -227,6 +233,9 @@ def import_public_token_metadata(recipe, expected_directory=None):
                 matches.append(row)
         if len(matches) != 1 or matches[0]['revokedAt'] is not None:
             raise ValueError()
+        if with_snapshot:
+            return matches[0], {'sha256': hashlib.sha256(raw).hexdigest(),
+                                'fileIdentity': _public_identity(before), 'directoryIdentity': identity}
         return matches[0]
     except PublicMetadataNotReady:
         raise
@@ -247,6 +256,170 @@ def ready_public_token_metadata(recipe, ask, emit):
     if ask('Type literal METADATA READY only after the public file is prepared, NOT THE TOKEN: ') != 'METADATA READY':
         raise PublicInputHold('public-token-metadata', 'METADATA_NOT_CONFIRMED')
     return import_public_token_metadata(recipe, expected_directory=identity)
+
+
+class PublicIssuanceNotReady(PublicInputHold):
+    def __init__(self, parent_identity):
+        super().__init__('owner-public-issuance', 'PUBLIC_ISSUANCE_NOT_READY')
+        self.parent_identity = parent_identity
+
+
+def _public_identity(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _strict_public_json(raw):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError()
+            value[key] = item
+        return value
+    def invalid(_value):
+        raise ValueError()
+    return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid)
+
+
+def import_owner_public_issuance(recipe, recipe_digest, permission_path, expected_parent=None):
+    # The owner-operated reviewed wrapper creates these public records. Never
+    # invoke it, read its creator output, or parse its separate listing here.
+    descriptors = []
+    try:
+        target = Path(recipe['ownerIssuanceDirectory'])
+        if not target.is_absolute() or str(target) != os.path.normpath(str(target)) or target.name != 'owner-public-issuance':
+            raise ValueError()
+        parent = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.append(parent)
+        parent_info = os.fstat(parent)
+        if parent_info.st_uid != os.getuid() or stat.S_IMODE(parent_info.st_mode) != 0o700:
+            raise ValueError()
+        parent_identity = (parent_info.st_dev, parent_info.st_ino)
+        if expected_parent is not None and expected_parent != parent_identity:
+            raise ValueError()
+        try:
+            directory = os.open(target.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        except FileNotFoundError:
+            raise PublicIssuanceNotReady(parent_identity) from None
+        descriptors.append(directory)
+        root = os.fstat(directory)
+        if root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
+            raise ValueError()
+        records, hashes, identities = {}, {}, {}
+        for name in ('intent.json', 'creator-result.json', 'list-result.json', 'public-staging-ready.json'):
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            descriptors.append(descriptor)
+            before = os.fstat(descriptor)
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1
+                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 65536):
+                raise ValueError()
+            raw = os.read(descriptor, 65537)
+            if len(raw) != before.st_size:
+                raise ValueError()
+            identities[name] = _public_identity(before)
+            records[name] = _strict_public_json(raw)
+            hashes[name] = hashlib.sha256(raw).hexdigest()
+        for name, descriptor in zip(records, descriptors[2:]):
+            if (_public_identity(os.fstat(descriptor)) != identities[name]
+                    or _public_identity(os.stat(name, dir_fd=directory, follow_symlinks=False)) != identities[name]):
+                raise ValueError()
+        current_root = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+        current_parent = os.stat(target.parent, follow_symlinks=False)
+        if ((current_root.st_dev, current_root.st_ino) != (root.st_dev, root.st_ino)
+                or (current_parent.st_dev, current_parent.st_ino) != parent_identity):
+            raise ValueError()
+        identities['directory'] = (root.st_dev, root.st_ino)
+        identities['parent'] = parent_identity
+        permission_raw = public_package_bytes(permission_path)
+        permission = _strict_public_json(permission_raw)
+        intent = records['intent.json']
+        expected = {'version': 'p10b-owner-issuance-intent-v1', 'app': recipe['app'],
+                    'tokenName': 'p10b-runtime-no-email-' + recipe['nonce'], 'recipeDigest': recipe_digest,
+                    'setupPermissionSha256': hashlib.sha256(permission_raw).hexdigest(), 'noRetry': True,
+                    'productionReady': False, 'globalAutomationPaused': True}
+        if set(intent) != set(expected) | {'attemptedAt'} or any(type(intent[k]) is not type(v) or intent[k] != v for k, v in expected.items()):
+            raise ValueError()
+        results = []
+        result_keys = {'startedAt', 'completedAt', 'exitCode', 'normalReturn', 'elapsedMonotonicMs',
+                       'ownedGroupClosed', 'closedWithoutSignals', 'success'}
+        for name, limit in [('creator-result.json', 60000), ('list-result.json', 30000)]:
+            result = records[name]
+            if (set(result) != result_keys or type(result['exitCode']) is not int or result['exitCode'] != 0
+                    or any(result[key] is not True for key in ['normalReturn', 'ownedGroupClosed', 'closedWithoutSignals', 'success'])
+                    or type(result['elapsedMonotonicMs']) is not int or not 0 <= result['elapsedMonotonicMs'] <= limit):
+                raise ValueError()
+            start, end = result['startedAt'], result['completedAt']
+            if normalize_utc(start) != start or normalize_utc(end) != end:
+                raise ValueError()
+            if not 0 <= (dt.datetime.fromisoformat(end.replace('Z', '+00:00')) - dt.datetime.fromisoformat(start.replace('Z', '+00:00'))).total_seconds() * 1000 <= limit:
+                raise ValueError()
+            results.append(result)
+        creator, listed = results
+        marker = records['public-staging-ready.json']
+        expected_marker = {'version': 'p10b-owner-public-staging-v1', 'app': recipe['app'],
+            'tokenName': expected['tokenName'], 'recipeDigest': recipe_digest,
+            'issuanceStartedAt': creator['startedAt'], 'issuanceCompletedAt': creator['completedAt'],
+            'creationSucceeded': True, 'listSucceeded': True, 'ownedGroupsClosed': True,
+            'matchingPublicRowVerified': False, 'metadataImported': False, 'providerCalls': 0, 'emails': 0,
+            'productionReady': False, 'globalAutomationPaused': True}
+        if set(marker) != set(expected_marker) or any(type(marker[k]) is not type(v) or marker[k] != v for k, v in expected_marker.items()):
+            raise ValueError()
+        chronology = [permission['approvedAt'], intent['attemptedAt'], creator['startedAt'], creator['completedAt'],
+                      listed['startedAt'], listed['completedAt'], utc_now()]
+        if any(normalize_utc(value) != value for value in chronology) or chronology != sorted(chronology):
+            raise ValueError()
+        selected, metadata_snapshot = import_public_token_metadata(recipe, with_snapshot=True)
+        hashes['public-token-metadata.json'] = metadata_snapshot['sha256']
+        identities['public-token-metadata.json'] = metadata_snapshot
+        review = {'version': 'p10b-owner-public-review-v1', 'recipeDigest': recipe_digest,
+                  'issuanceStartedAt': creator['startedAt'], 'issuanceCompletedAt': creator['completedAt'],
+                  'selectedPublicToken': selected, 'sourceSha256': hashes,
+                  'attestations': {'ownerIssuanceSucceeded': True, 'publicMetadataUnrevoked': True,
+                                   'privateCredentialMatchesSelectedToken': True},
+                  'credentialIdentityIndependentlyVerified': False}
+        return review, identities
+    except PublicIssuanceNotReady:
+        raise
+    except Exception:
+        raise PublicInputHold('owner-public-issuance', 'INVALID_PUBLIC_ISSUANCE') from None
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def ready_owner_public_issuance(recipe, checked, permission_path, ask, emit):
+    try:
+        return import_owner_public_issuance(recipe, checked['recipeDigest'], permission_path)
+    except PublicIssuanceNotReady as missing:
+        identity = missing.parent_identity
+    emit('Use only the separately reviewed owner-operated issuance wrapper, once, under this setup consent. '
+         'It records original UTCs and a separate public listing; its creator output stays private. '
+         'Have the verified public metadata staged before continuing. No credential has been requested.')
+    for attempt in range(2):
+        value = ask('Type PUBLIC RECORD READY only after the wrapper and public staging complete, NOT THE TOKEN: ')
+        if value == 'PUBLIC RECORD READY':
+            return import_owner_public_issuance(recipe, checked['recipeDigest'], permission_path, identity)
+        failed = value == 'FAILED'
+        value = None
+        if failed or attempt == 1:
+            raise PublicInputHold('owner-public-issuance', 'PUBLIC_RECORD_NOT_CONFIRMED')
+        emit('Entry discarded. Type the words PUBLIC RECORD READY only after staging; one correction, no new issuance.')
+
+
+def public_session_summary(bundle, summary):
+    session = bundle['session']
+    return {'status': 'AWAITING_EXACT_OWNER_APPROVAL', 'sessionDigest': summary['sessionDigest'],
+            'completeSealedBundlePath': summary['sealedBundlePath'],
+            **{key: session.get(key) for key in ('app', 'machineId', 'volumeId', 'hostSourceHead', 'sourceHead',
+                'candidateImageDigest', 'baselineImageDigest', 'startedAt', 'sessionDeadline', 'maximumStarts',
+                'maximumStartWindowMs', 'maximumStoppedConfigUpdates', 'maximumIncrementalUsd',
+                'maximumLocalBuilds', 'maximumImagePushes', 'productionReady', 'globalAutomationPaused')},
+            'tokenId': session.get('authenticationEvidence', {}).get('tokenId'),
+            'tokenExpiresAt': session.get('authenticationEvidence', {}).get('expiresAt'),
+            'ownerPermissionDigest': session['ownerPermissionDigest'],
+            'recovery': session.get('recovery'), 'preflightCleanupVerified': summary['preflightCleanupVerified'],
+            'providerCalls': 0, 'emails': 0, 'runtimeApproved': False}
 
 
 def public_package_bytes(file):
@@ -451,7 +624,7 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         recipe, checked, environment = check_recipe(recipe_file, runner, expected_recipe_sha256, bootstrap)
         root = Path(recipe['outputDirectory'])
         for name in ('private-setup-scope.json', 'issuance-receipt.json', 'owner-terminal.json',
-                     'owner-final-approval.json', 'sealed-session.json', 'approved-session.json'):
+                     'owner-final-approval.json', 'sealed-session.json', 'approved-session.json', 'owner-public-input-review.json'):
             if (root / name).exists():
                 raise Hold('Existing evidence preserved; owner entry already consumed')
         if not private_tty():
@@ -483,36 +656,54 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         permission_path = root / 'private-setup-scope.json'
         write_exclusive(permission_path, permission)
         phase = 'public-issuance'
-        name = 'p10b-runtime-no-email-' + recipe['nonce']
-        fly_command = ['/usr/bin/env', '-u', 'FLY_UPDATE_CHECK', 'FLY_NO_UPDATE_CHECK=1', recipe['files']['fly']['path']]
-        emit('Only now, in a separate private unrecorded owner terminal, record UTC immediately before '
-             'and after successful issuance (within 60 seconds), and personally run:')
-        emit(shlex.join(fly_command + ['tokens', 'create', 'deploy', '--app', recipe['app'], '--expiry', '2h', '--name', name]))
-        emit('Keep its printed credential private. Obtain the matching public ID/name/actual effective '
-             'expiry/unrevoked metadata from the app Tokens dashboard, or run this separate read-only command '
-             'only after successful issuance:')
-        emit(shlex.join(fly_command + ['tokens', 'list', '--app', recipe['app'], '--scope', 'app']))
-        emit('Both commands use the checksum-bound executable and disable update checks; never substitute bare fly. '
-             'No retry/login/renewal is authorized by this handoff.')
-        emit('Paste one public field at a time. Never paste combined timestamp/token output. '
-             'Public entry is hidden to protect accidental private paste.')
-        emit('Before confirming ISSUED, have the public metadata helper prepare public-token-metadata.json '
-             'in this package from the verified matching public listing. Never share the credential in chat. '
-             'The local import selects ID and expiry; no manual ID/expiry entry or authenticated lookup.')
-        confirm_issuance(ask, emit)
-        started = read_public_input(ask, 'issuance-start-utc', 'Actual successful issuance start UTC: ', emit, normalize_utc, 'INVALID_UTC')
-        completed = read_public_input(ask, 'issuance-completion-utc', 'Actual successful issuance completion UTC: ', emit, normalize_utc, 'INVALID_UTC')
-        selected = ready_public_token_metadata(recipe, ask, emit)
+        if 'ownerIssuanceDirectory' in recipe:
+            review, identities = ready_owner_public_issuance(recipe, checked, permission_path, ask, emit)
+            emit('Owner-attested public facts; opaque credential identity is not independently verified:')
+            emit(json.dumps(review, indent=2))
+            public_digest = hashlib.sha256(canonical(review).encode()).hexdigest()
+            phrase = 'CONFIRM PUBLIC FACTS ' + public_digest
+            if ask('Type ' + phrase + ' to attest successful owner issuance, unrevoked metadata and matching private credential: ') != phrase:
+                raise Hold('Public facts declined')
+            repeated, repeated_identities = import_owner_public_issuance(recipe, checked['recipeDigest'], permission_path)
+            if repeated != review or repeated_identities != identities:
+                raise Hold('Public facts changed after review')
+            write_exclusive(root / 'owner-public-input-review.json', {**review, 'publicReviewDigest': public_digest,
+                            'ownerAttested': True, 'approvedAt': utc_now()})
+            started, completed = review['issuanceStartedAt'], review['issuanceCompletedAt']
+            selected = review['selectedPublicToken']
+        else:
+            name = 'p10b-runtime-no-email-' + recipe['nonce']
+            fly_command = ['/usr/bin/env', '-u', 'FLY_UPDATE_CHECK', 'FLY_NO_UPDATE_CHECK=1', recipe['files']['fly']['path']]
+            emit('Only now, in a separate private unrecorded owner terminal, record UTC immediately before '
+                 'and after successful issuance (within 60 seconds), and personally run:')
+            emit(shlex.join(fly_command + ['tokens', 'create', 'deploy', '--app', recipe['app'], '--expiry', '2h', '--name', name]))
+            emit('Keep its printed credential private. Obtain the matching public ID/name/actual effective '
+                 'expiry/unrevoked metadata from the app Tokens dashboard, or run this separate read-only command '
+                 'only after successful issuance:')
+            emit(shlex.join(fly_command + ['tokens', 'list', '--app', recipe['app'], '--scope', 'app']))
+            emit('Both commands use the checksum-bound executable and disable update checks; never substitute bare fly. '
+                 'No retry/login/renewal is authorized by this handoff.')
+            emit('Paste one public field at a time. Never paste combined timestamp/token output. '
+                 'Public entry is hidden to protect accidental private paste.')
+            emit('Before confirming ISSUED, have the public metadata helper prepare public-token-metadata.json '
+                 'in this package from the verified matching public listing. Never share the credential in chat. '
+                 'The local import selects ID and expiry; no manual ID/expiry entry or authenticated lookup.')
+            confirm_issuance(ask, emit)
+            started = read_public_input(ask, 'issuance-start-utc', 'Actual successful issuance start UTC: ', emit, normalize_utc, 'INVALID_UTC')
+            completed = read_public_input(ask, 'issuance-completion-utc', 'Actual successful issuance completion UTC: ', emit, normalize_utc, 'INVALID_UTC')
+            selected = ready_public_token_metadata(recipe, ask, emit)
         if (hashlib.sha256(public_package_bytes(recipe_file)).hexdigest() != expected_recipe_sha256
                 or public_package_bytes(permission_path) != (canonical(permission) + '\n').encode()):
             raise Hold('Original public setup bindings changed')
+        name = selected['tokenName']
         token_id, expiry = selected['tokenId'], selected['expiresAt']
-        emit('Selected owner-attested public token metadata; opaque credential identity is not independently verified:')
-        emit(json.dumps({'app': recipe['app'], **selected}, indent=2))
-        if ask('Type literal UNREVOKED after checking the displayed matching metadata: ') != 'UNREVOKED':
-            raise Hold('Public revocation status not attested')
-        if ask('Type literal MATCHED to attest private input matches this displayed exact new app-deploy token: ') != 'MATCHED':
-            raise Hold('Private selection not attested')
+        if 'ownerIssuanceDirectory' not in recipe:
+            emit('Selected owner-attested public token metadata; opaque credential identity is not independently verified:')
+            emit(json.dumps({'app': recipe['app'], **selected}, indent=2))
+            if ask('Type literal UNREVOKED after checking the displayed matching metadata: ') != 'UNREVOKED':
+                raise Hold('Public revocation status not attested')
+            if ask('Type literal MATCHED to attest private input matches this displayed exact new app-deploy token: ') != 'MATCHED':
+                raise Hold('Private selection not attested')
         receipt = {'version': 'p10b-app-token-issuance-v1', 'ownerAttested': True, 'issuanceSucceeded': True,
                    'app': recipe['app'], 'scope': 'app-deploy', 'tokenId': token_id, 'tokenName': name,
                    'issuanceEvidenceId': 'private-owner:' + recipe['nonce'], 'issuanceStartedAt': started,
@@ -543,7 +734,7 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         if hashlib.sha256(sealed_path.read_bytes()).hexdigest() != summary['sealedBundleSha256'] or hashlib.sha256(session_canonical.encode()).hexdigest() != summary['sessionDigest'] or json.loads(session_canonical) != bundle['session']:
             raise Hold('Sealed public facts changed')
         phase = 'final-approval'
-        emit(json.dumps(bundle, indent=2))
+        emit(json.dumps(public_session_summary(bundle, summary) if 'ownerIssuanceDirectory' in recipe else bundle, indent=2))
         emit('Original one-hour deadline: ' + summary['sessionDeadline'] + '. Review these exact public facts; '
              'remaining time is not renewed. At most two five-minute starts and three stopped updates including '
              'restore. No host stop/retry, additional build/push, provider call, email or production change.')

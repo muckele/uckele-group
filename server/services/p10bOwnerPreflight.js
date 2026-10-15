@@ -34,6 +34,12 @@ export function checkP10bOwnerRecipe(recipe, { checkSource = assertP10bReviewedC
     checkFile(recipe.files[name]);
     if (name !== 'price') fs.accessSync(recipe.files[name].path, fs.constants.X_OK);
   }
+  if ('ownerIssuanceDirectory' in recipe) {
+    const directory = recipe.ownerIssuanceDirectory;
+    if (typeof directory !== 'string' || !path.isAbsolute(directory) || path.resolve(directory) !== directory
+      || path.basename(directory) !== 'owner-public-issuance') deny('Exact owner public receipt directory required');
+    privateDirectory(path.dirname(directory));
+  }
   privateDirectory(recipe.outputDirectory); privateDirectory(recipe.evidenceDirectory);
   if (path.dirname(recipe.evidenceDirectory) !== recipe.outputDirectory
     || recipe.sealedBundlePath !== path.join(recipe.outputDirectory, 'sealed-session.json')

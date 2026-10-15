@@ -156,3 +156,14 @@ test('a surviving group remains owned after its SDK leader exits and is boundedl
   assert.equal(await commands.reap(), true);
   assert.equal(context.cleanup(true), true);
 });
+
+test('consolidated receipt location is bound statically without creating an issuance directory or accepting aliases', t => {
+  const f = fixture(t);
+  f.recipe.ownerIssuanceDirectory = path.join(f.root, 'owner-public-issuance');
+  assert.equal(preflight.checkP10bOwnerRecipe(f.recipe, f.options).authenticatedActions, 0);
+  assert.equal(fs.existsSync(f.recipe.ownerIssuanceDirectory), false);
+  for (const bad of [null, 17, 'relative/owner-public-issuance', `${f.root}/alias/../owner-public-issuance`, f.root]) {
+    f.recipe.ownerIssuanceDirectory = bad;
+    assert.throws(() => preflight.checkP10bOwnerRecipe(f.recipe, f.options));
+  }
+});
