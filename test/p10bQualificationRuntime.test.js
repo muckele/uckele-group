@@ -818,7 +818,8 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
     secretNamesExecutable: fakeFly, secretNamesSha256: sha256(fs.readFileSync(fakeFly)),
     spawnProcess: (_executable, args, options) => {
       assert.equal(options.env.FLY_API_TOKEN, undefined);
-      assert.deepEqual(Object.keys(options.env).sort(), ['FLY_NO_UPDATE_CHECK', 'HOME', 'PATH']);
+      assert.equal(options.env.FLY_AGENT_ISOLATED, '1');
+      assert.deepEqual(Object.keys(options.env).sort(), ['FLY_AGENT_ISOLATED', 'FLY_NO_UPDATE_CHECK', 'HOME', 'PATH']);
       const child = spawn(process.execPath, [fakeFly, ...args], options);
       child.stderr.on('data', (chunk) => fs.appendFileSync(path.join(directory, 'fake-stderr.log'), chunk));
       children.push(child); return child;
