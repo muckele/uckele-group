@@ -7,7 +7,8 @@ import path from 'node:path';
 import { sha256, stableCanonicalJson } from '../../server/utils/security.js';
 import { checkP10bOwnerRecipe, validateP10bOwnerPublicInputs, prepareP10bOwnerBundle,
   boundP10bOwnerFile, createP10bPreflightCommands } from '../../server/services/p10bOwnerPreflight.js';
-const [mode, root] = process.argv.slice(2);
+import { P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 } from '../../server/services/p10bStoppedUpdateContract.js';
+const [mode, root, operation] = process.argv.slice(2);
 const file = path.join(root, 'recipe.json');
 const baseline = JSON.parse(fs.readFileSync(new URL('../fixtures/p10bObservedBaselineShape.json', import.meta.url)));
 const manifest = fs.readFileSync(new URL('../fixtures/p10bRetainedCandidateManifest.json', import.meta.url), 'utf8');
@@ -30,11 +31,16 @@ if (mode === '--fixture') {
       price: { path: path.join(root, 'price.json'), sha256: sha256(fs.readFileSync(path.join(root, 'price.json'))) } },
     recovery: { directory: path.join(root, '.uckele-group-p10b-host'), activePath: path.join(root, '.uckele-group-p10b-host/0803730bd1d7e8.active.json'),
       packetDigest: 'a'.repeat(64), expectedSha256: 'b'.repeat(64), reservedAt: '2026-10-10T07:12:20.821Z', evidencePath: '/offline/historical-evidence' } });
+  if (operation === '--diagnostic') {
+    const diagnostic = read('recipe.json'); diagnostic.version = 'p10b-owner-stopped-update-recipe-v1';
+    diagnostic.files.diagnosticNative = { path: process.execPath, sha256: P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 };
+    fs.writeFileSync(file, JSON.stringify(diagnostic), { mode: 0o600 });
+  }
   process.exit(0);
 }
 const recipe = read('recipe.json');
 const options = { checkSource: head => { if (head !== '2'.repeat(40)) throw Error('fixture source drift'); },
-  checkFile: item => item === recipe.files.native ? item.path : boundP10bOwnerFile(item) };
+  checkFile: item => item === recipe.files.native || item === recipe.files.diagnosticNative ? item.path : boundP10bOwnerFile(item) };
 let result;
 if (mode === '--check-only') result = { ...checkP10bOwnerRecipe(recipe, options), recipeFileSha256: sha256(fs.readFileSync(file)) };
 else if (mode === '--validate-input') result = validateP10bOwnerPublicInputs({ recipe, receipt: read('issuance-receipt.json'),
@@ -69,8 +75,12 @@ import { URL } from 'node:url';import path from 'node:path';fs.writeFileSync(pat
   const digest = sha256(stableCanonicalJson(approved.session));
   if (approved.approval.approved !== true || approved.approval.sessionDigest !== digest) throw Error('approval mismatch');
   write('execution-boundary.json', { sessionDigest: digest, runtimeSimulated: true, providerCalls: 0, emails: 0 });
-  fs.writeFileSync(path.join(recipe.evidenceDirectory, 'p10b-runtime-only-auth-closure.json'),
+  const diagnostic = recipe.version === 'p10b-owner-stopped-update-recipe-v1';
+  if (diagnostic && (approved.session.version !== 'p10b-stopped-update-session-v1' || approved.session.maximumStarts !== 0
+    || approved.approval.version !== 'p10b-stopped-update-approval-v1')) throw Error('wrong diagnostic authority');
+  fs.writeFileSync(path.join(recipe.evidenceDirectory, diagnostic ? 'p10b-stopped-update-auth-closure.json' : 'p10b-runtime-only-auth-closure.json'),
     JSON.stringify({ success: true, cleanupVerified: true, reapVerified: true, sessionDigest: digest }), { mode: 0o600, flag: 'wx' });
-  result = { success: true, productionReady: false };
+  result = { success: true, productionReady: false,
+    ...(diagnostic ? { operation: 'stopped-update-diagnostic', maximumStarts: 0, qualificationAllowed: false, restored: true, mutationSettled: true } : {}) };
 } else throw Error('unknown offline mode');
 process.stdout.write(JSON.stringify(result));

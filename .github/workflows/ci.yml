@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 22
       - working-directory: tools/p10b-machine-client
-        run: go test ./... && go build -o /tmp/p10b-machine-client . && go test -c -o /tmp/p10b-offline-update-transport .
+        run: go test ./... && go test -tags p10b_stopped_diagnostic ./... && go build -o /tmp/p10b-machine-client . && go build -tags p10b_stopped_diagnostic -o /tmp/p10b-stopped-update-client . && go test -c -o /tmp/p10b-offline-update-transport .
       - name: Verify native SDK files stay in the private auth context without Machine requests
         env:
           P10B_OFFLINE_NATIVE_CLIENT: /tmp/p10b-machine-client
@@ -31,6 +31,10 @@ jobs:
         env:
           P10B_OFFLINE_UPDATE_TRANSPORT: /tmp/p10b-offline-update-transport
         run: node --test test/p10bNativeUpdateTransport.test.js
+      - name: Verify zero-start diagnostic, SDK timeouts and late remote acceptance with fake HTTP
+        env:
+          P10B_OFFLINE_STOPPED_DIAGNOSTIC: /tmp/p10b-offline-update-transport
+        run: node --test test/p10bStoppedDiagnosticTransport.test.js
       - working-directory: tools/p10b-public-client
         run: go test ./... && go build -o /tmp/p10b-public-client .
   validate:
@@ -47,6 +51,7 @@ jobs:
       - run: npm run lint
       - run: python3 -B test/test_p10b_owner_handoff.py
       - run: python3 -B test/test_p10b_consolidated_handoff.py
+      - run: python3 -B test/test_p10b_stopped_update_handoff.py
       - run: npm test
       - run: npm run test:ui
       - run: npm run build

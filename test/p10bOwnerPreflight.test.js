@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
+import { P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 } from '../server/services/p10bStoppedUpdateContract.js';
 const preflight = await import('../server/services/p10bOwnerPreflight.js').catch(() => ({}));
 const digest = value => sha256(stableCanonicalJson(value));
 const baseline = JSON.parse(fs.readFileSync(new URL('./fixtures/p10bObservedBaselineShape.json', import.meta.url)));
@@ -71,6 +72,26 @@ test('preparer seals actual bounded public facts with original clock and no manu
   assert.equal(f.commands.filter(c => c.args[0] === 'machines').length, 2);
   assert.equal(f.commands.some(c => c.args[0] === 'secrets'), false);
   assert.equal(fs.existsSync(result.privateAuthDirectory), false);
+});
+test('stopped diagnostic preparer seals only zero-start authority after actual public preflight and cleanup', async t => {
+  const f = fixture(t);
+  f.recipe.version = 'p10b-owner-stopped-update-recipe-v1';
+  f.recipe.ownerIssuanceDirectory = path.join(f.root, 'owner-public-issuance');
+  f.recipe.files.diagnosticNative = { path: process.execPath, sha256: P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 };
+  f.permission.recipeDigest = digest(f.recipe);
+  const original = f.options.checkFile;
+  f.options.checkFile = item => item === f.recipe.files.diagnosticNative ? item.path : original(item);
+  const result = await preflight.prepareP10bOwnerBundle({ ...f, ...f.options });
+  const bundle = JSON.parse(fs.readFileSync(f.recipe.sealedBundlePath));
+  assert.equal(bundle.version, 'p10b-stopped-update-bundle-v1');
+  assert.equal(bundle.session.version, 'p10b-stopped-update-session-v1');
+  assert.equal(bundle.session.maximumStarts, 0); assert.equal(bundle.session.maximumStartWindowMs, 0);
+  assert.equal(bundle.session.maximumDiagnosticPosts, 1); assert.equal(bundle.session.maximumRestorationPosts, 1);
+  assert.equal(bundle.session.maximumStoppedConfigUpdates, 2); assert.equal(bundle.session.qualificationAllowed, false);
+  assert.equal(bundle.approval.version, 'p10b-stopped-update-approval-v1'); assert.equal(bundle.approval.approved, false);
+  assert.equal(result.operation, 'stopped-update-diagnostic'); assert.equal(result.preflightCleanupVerified, true);
+  assert.equal(fs.existsSync(result.privateAuthDirectory), false);
+  assert.equal(f.commands.some(c => c.args.some(a => a === 'start' || a === 'update')), false);
 });
 test('environment name admission precedes value access', () => {
   assert.equal(typeof preflight.projectP10bStoppedBaseline, 'function');

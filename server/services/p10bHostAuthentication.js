@@ -3,6 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
+import { assertP10bStoppedUpdateApproval } from './p10bStoppedUpdateContract.js';
+const assertCredentialApproval = (session, approval, now) => session?.version === 'p10b-stopped-update-session-v1'
+  ? assertP10bStoppedUpdateApproval(session, approval, now) : assertP10bNoEmailApproval(session, approval, now);
 
 // Opaque, owner-supplied input only. No creation, parsing, renewal or persistent
 // account configuration is performed here. Public issuance evidence is separate.
@@ -64,7 +67,7 @@ export function reserveP10bLocalReap(environment = {}) {
 }
 
 export function createP10bAppTokenContext({ session, approval, clock = () => Date.now(), environment = process.env }) {
-  assertP10bNoEmailApproval(session, approval, clock());
+  assertCredentialApproval(session, approval, clock());
   // Validate input before allocating anything, and ignore any owner's config dir.
   const env = privateEnvironment(environment, undefined);
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-app-auth-'));
@@ -94,7 +97,7 @@ export function createP10bAppTokenContext({ session, approval, clock = () => Dat
 }
 
 export function p10bInheritedAppTokenEnvironment({ session, approval, clock = () => Date.now(), environment = process.env }) {
-  assertP10bNoEmailApproval(session, approval, clock());
+  assertCredentialApproval(session, approval, clock());
   const directory = environment.FLY_CONFIG_DIR;
   privateDirectory(directory);
   return privateEnvironment(environment, directory);

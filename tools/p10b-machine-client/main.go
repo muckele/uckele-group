@@ -42,10 +42,11 @@ type request struct {
 	Body      json.RawMessage `json:"body,omitempty"`
 }
 type response struct {
-	ID      int             `json:"id"`
-	OK      bool            `json:"ok"`
-	Error   string          `json:"error,omitempty"`
-	Machine json.RawMessage `json:"machine,omitempty"`
+	ID          int                 `json:"id"`
+	OK          bool                `json:"ok"`
+	Error       string              `json:"error,omitempty"`
+	Machine     json.RawMessage     `json:"machine,omitempty"`
+	Observation *requestObservation `json:"observation,omitempty"`
 }
 type service struct {
 	builder       requestBuilder
@@ -55,6 +56,7 @@ type service struct {
 	allowedConfig map[string]bool
 	posts, reads  int
 	source, image string
+	diagnostic    *stoppedDiagnosticPolicy
 }
 type initPacket struct {
 	Version          string            `json:"version"`
@@ -225,7 +227,15 @@ func publicSetting(name, value string) bool {
 	}
 	return true
 }
-func (s *service) request(ctx context.Context, r request) response {
+func (s *service) request(ctx context.Context, r request) (out response) {
+	started := time.Now()
+	observation := &requestObservation{}
+	if s.diagnostic != nil {
+		defer func() { observation.ElapsedMs = time.Since(started).Milliseconds(); out.Observation = observation }()
+		if (r.Method == "POST" && r.TimeoutMs != 10000) || (r.Method == "GET" && r.TimeoutMs > 1000) || s.reads >= 128 {
+			return response{ID: r.ID, Error: "request-denied"}
+		}
+	}
 	denied := response{ID: r.ID, Error: "request-denied"}
 	if (r.Method != "GET" && r.Method != "POST") || r.TimeoutMs < 1 || r.TimeoutMs > 10000 || !time.Now().Before(s.deadline) || s.reads >= 8192 {
 		return denied
@@ -243,6 +253,9 @@ func (s *service) request(ctx context.Context, r request) response {
 		}
 		c, err := canonical(body.Config)
 		if err != nil || !s.allowedConfig[hash(c)] {
+			return denied
+		}
+		if s.diagnostic != nil && !s.diagnostic.writeAllowed(s.posts, hash(c), body.CurrentVersion) {
 			return denied
 		}
 		s.posts++
@@ -274,6 +287,7 @@ func (s *service) request(ctx context.Context, r request) response {
 	if ctx.Err() != nil || !time.Now().Before(s.deadline) {
 		return response{ID: r.ID, Error: "timed-out"}
 	}
+	observation.Dispatched = true
 	res, err := s.client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -282,6 +296,10 @@ func (s *service) request(ctx context.Context, r request) response {
 		return response{ID: r.ID, Error: "request-failed"}
 	}
 	defer res.Body.Close()
+	if res.StatusCode >= 100 && res.StatusCode <= 599 {
+		status := res.StatusCode
+		observation.HTTPStatus = &status
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return response{ID: r.ID, Error: "http-failed"}
 	}
@@ -295,6 +313,15 @@ func (s *service) request(ctx context.Context, r request) response {
 	}
 	if ctx.Err() != nil || !time.Now().Before(s.deadline) {
 		return response{ID: r.ID, Error: "timed-out"}
+	}
+	if s.diagnostic != nil {
+		var m map[string]json.RawMessage
+		json.Unmarshal(machine, &m)
+		delete(m, "events")
+		if r.Method == "GET" {
+			s.diagnostic.observe(m)
+		}
+		machine, _ = json.Marshal(m)
 	}
 	return response{ID: r.ID, OK: true, Machine: machine}
 }
@@ -512,7 +539,7 @@ func serve(input io.Reader, output io.Writer, factory func(context.Context) (req
 	}
 	return scanner.Err()
 }
-func main() {
+func runNativeMain() {
 	if len(os.Args) != 2 || os.Args[1] != "--serve" {
 		fmt.Fprintln(os.Stderr, "Native client requires explicit approved session.")
 		os.Exit(1)

@@ -196,7 +196,8 @@ class RealComponentTTYTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.node = legacy.shutil.which('node')
         self.helper = Path(__file__).resolve().parent / 'helpers/p10bConsolidatedPreflightFixture.mjs'
-        legacy.subprocess.run([self.node, str(self.helper), '--fixture', str(self.root)], check=True,
+        legacy.subprocess.run([self.node, str(self.helper), '--fixture', str(self.root)] +
+                              (['--diagnostic'] if getattr(self, 'diagnostic_mode', False) else []), check=True,
                               capture_output=True, timeout=15)
         self.recipe = handoff.read_public(self.root / 'recipe.json')
         self.secret = 'fm2_SYNTHETIC_OWNER_TTY_CREDENTIAL'
@@ -206,6 +207,9 @@ spec=importlib.util.spec_from_file_location('handoff',sys.argv[1]);h=importlib.u
 root=pathlib.Path(sys.argv[2]);node=sys.argv[3];helper=sys.argv[4];recipe=json.loads((root/'recipe.json').read_text())
 def runner(args,environment,timeout):
  mode=next(item for item in args if item in ['--check-only','--validate-input','--prepare','--execute'])
+ if mode=='--execute' and recipe['version']=='p10b-owner-stopped-update-recipe-v1':
+  assert pathlib.Path(args[1]).name=='run-p10b-stopped-update-diagnostic.js'
+  assert args[-1]==recipe['files']['diagnosticNative']['path']
  result=h.run_command([node,helper,mode,str(root)],environment,timeout)
  return result
 sys.exit(h.run_owner(root/'recipe.json',runner=runner,expected_recipe_sha256=hashlib.sha256((root/'recipe.json').read_bytes()).hexdigest(),bootstrap=lambda _p,_s:recipe))
@@ -327,15 +331,17 @@ input('SYNTHETIC_OWNER_DONE')
                 self.assertEqual(code, 2)
                 self.assertFalse((self.root / 'sealed-session.json').exists())
             else:
-                output = self.until(child, b' to authorize this exact bounded no-email runtime: ')
-                session_digest = re.findall(rb'APPROVE SESSION ([a-f0-9]{64})', output)[-1]
+                output = self.until(child, b' to authorize this exact ')
+                prefix = b'APPROVE STOPPED UPDATE ' if getattr(self, 'diagnostic_mode', False) else b'APPROVE SESSION '
+                self.assertIn(prefix, output)
+                session_digest = re.findall(re.escape(prefix) + rb'([a-f0-9]{64})', output)[-1]
                 sealed = handoff.read_public(self.root / 'sealed-session.json')
                 self.assertEqual(sealed['approval']['sessionDigest'], session_digest.decode())
                 self.assertFalse(sealed['approval']['approved'])
                 closure = handoff.read_public(self.root / 'runtime-evidence/p10b-owner-preflight-closure.json')
                 self.assertTrue(closure['reaped'] and closure['cleanupVerified'])
                 self.assertFalse(Path(closure['privateAuthDirectory']).exists())
-                os.write(child[1], b'\n' if mode == 'decline-session' else b'APPROVE SESSION ' + session_digest + b'\n')
+                os.write(child[1], b'\n' if mode == 'decline-session' else prefix + session_digest + b'\n')
                 code, output = self.drain(child)
                 self.assertEqual(code, 2 if mode == 'decline-session' else 0, output[-3000:])
                 if mode == 'success':

@@ -419,6 +419,9 @@ def public_session_summary(bundle, summary):
             'tokenExpiresAt': session.get('authenticationEvidence', {}).get('expiresAt'),
             'ownerPermissionDigest': session['ownerPermissionDigest'],
             'recovery': session.get('recovery'), 'preflightCleanupVerified': summary['preflightCleanupVerified'],
+            **({key: session[key] for key in ('operation', 'baselineInstanceId', 'baselineObservedAt', 'diagnosticConfigDigest',
+                'nativeClientSha256', 'maximumDiagnosticPosts', 'maximumRestorationPosts', 'requestTimeoutMs',
+                'maximumObservationMs', 'maximumRunMs', 'qualificationAllowed')} if session.get('version') == 'p10b-stopped-update-session-v1' else {}),
             'providerCalls': 0, 'emails': 0, 'runtimeApproved': False}
 
 
@@ -622,6 +625,11 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
     authenticated_preflight_requested = False
     try:
         recipe, checked, environment = check_recipe(recipe_file, runner, expected_recipe_sha256, bootstrap)
+        diagnostic = recipe.get('version') == 'p10b-owner-stopped-update-recipe-v1'
+        if diagnostic and (checked.get('operation') != 'stopped-update-diagnostic' or checked.get('maximumStarts') != 0
+                           or checked.get('maximumDiagnosticPosts') != 1 or checked.get('maximumRestorationPosts') != 1
+                           or checked.get('qualificationAllowed') is not False):
+            raise Hold('Exact stopped-only setup scope required')
         root = Path(recipe['outputDirectory'])
         for name in ('private-setup-scope.json', 'issuance-receipt.json', 'owner-terminal.json',
                      'owner-final-approval.json', 'sealed-session.json', 'approved-session.json', 'owner-public-input-review.json'):
@@ -643,10 +651,14 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         emit('Existing 1 GB volume remains charged while stopped. Actual rootfs GB is unknown; separate registry '
              'charges remain unverified. Historical snapshot count zero has not been rechecked. No new storage/capacity.')
         emit('This requires separate owner approval for private app-token setup, fixed-target read-only '
-             'preflight and exclusive historical archival recovery. Final runtime approval follows sealed facts. '
+             'preflight and exclusive historical archival recovery. '
+             + ('Final stopped-update-only approval follows sealed facts. ' if diagnostic else 'Final runtime approval follows sealed facts. ') +
              'No provider calls/email, no auth renewal. The $1 operational budget is not a billing cap; '
              'retained storage continues. Temporary 0700 Fly/Docker disk state may contain credentials; '
              'uncertain cleanup is retained. Manually revoke only this new matching token after closed clients.')
+        if diagnostic:
+            emit('Stopped-only scope: zero starts or qualification, one diagnostic POST and at most one conditional baseline restoration POST; '
+                 '10-second requests, no retry, build, push, provider call or email. A timeout can leave remote mutation uncertain.')
         phrase = 'APPROVE PRIVATE SETUP ' + checked['recipeDigest']
         if ask('Type ' + phrase + ': ') != phrase:
             raise Hold('Private setup declined')
@@ -733,29 +745,48 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         session_canonical = summary['sessionCanonical']
         if hashlib.sha256(sealed_path.read_bytes()).hexdigest() != summary['sealedBundleSha256'] or hashlib.sha256(session_canonical.encode()).hexdigest() != summary['sessionDigest'] or json.loads(session_canonical) != bundle['session']:
             raise Hold('Sealed public facts changed')
+        if diagnostic:
+            session = bundle['session']
+            if (bundle.get('version') != 'p10b-stopped-update-bundle-v1' or session.get('version') != 'p10b-stopped-update-session-v1'
+                    or bundle['approval'].get('version') != 'p10b-stopped-update-approval-v1' or session.get('maximumStarts') != 0
+                    or session.get('maximumStartWindowMs') != 0 or session.get('qualificationAllowed') is not False
+                    or session.get('maximumDiagnosticPosts') != 1 or session.get('maximumRestorationPosts') != 1
+                    or session.get('maximumStoppedConfigUpdates') != 2 or session.get('requestTimeoutMs') != 10000
+                    or session.get('maximumRunMs') != 120000 or session.get('nativeClientSha256') != recipe['files']['diagnosticNative']['sha256']):
+                raise Hold('Sealed stopped-only authority changed')
         phase = 'final-approval'
         emit(json.dumps(public_session_summary(bundle, summary) if 'ownerIssuanceDirectory' in recipe else bundle, indent=2))
-        emit('Original one-hour deadline: ' + summary['sessionDeadline'] + '. Review these exact public facts; '
-             'remaining time is not renewed. At most two five-minute starts and three stopped updates including '
-             'restore. No host stop/retry, additional build/push, provider call, email or production change.')
-        phrase = 'APPROVE SESSION ' + summary['sessionDigest']
-        if ask('Type ' + phrase + ' to authorize this exact bounded no-email runtime: ') != phrase:
+        if diagnostic:
+            emit('Original diagnostic approval cutoff: ' + summary['sessionDeadline'] + '. Zero starts or qualification. '
+                 'One stopped update, at most one conditional baseline restoration; no retry. Requests are bounded to 10 seconds, '
+                 'observations to 10 seconds each and the operation to 120 seconds. Unresolved remote mutation remains a hold, '
+                 'even after local cleanup. No build, push, provider call, email or production change.')
+        else:
+            emit('Original one-hour deadline: ' + summary['sessionDeadline'] + '. Review these exact public facts; '
+                 'remaining time is not renewed. At most two five-minute starts and three stopped updates including '
+                 'restore. No host stop/retry, additional build/push, provider call, email or production change.')
+        phrase = ('APPROVE STOPPED UPDATE ' if diagnostic else 'APPROVE SESSION ') + summary['sessionDigest']
+        if ask('Type ' + phrase + (' to authorize this exact stopped-only diagnostic: ' if diagnostic else ' to authorize this exact bounded no-email runtime: ')) != phrase:
             raise Hold('Concrete runtime declined')
-        final_approval = {'version': 'p10b-owner-final-approval-v1', 'approvedAt': utc_now(),
+        final_approval = {'version': 'p10b-owner-final-stopped-update-approval-v1' if diagnostic else 'p10b-owner-final-approval-v1', 'approvedAt': utc_now(),
                           'sessionDigest': summary['sessionDigest'], 'recipeDigest': checked['recipeDigest'],
                           'hostSourceHead': recipe['hostSourceHead']}
         write_exclusive(root / 'owner-final-approval.json', final_approval)
         bundle['approval']['approved'] = True
-        bundle['status'] = 'OWNER_APPROVED_NO_EMAIL_SESSION'
+        bundle['status'] = 'OWNER_APPROVED_STOPPED_UPDATE_DIAGNOSTIC' if diagnostic else 'OWNER_APPROVED_NO_EMAIL_SESSION'
         write_exclusive(recipe['approvedBundlePath'], bundle)
-        phase = 'runtime'
+        phase = 'stopped-update-diagnostic' if diagnostic else 'runtime'
         remaining = (dt.datetime.fromisoformat(summary['sessionDeadline'].replace('Z', '+00:00')) - dt.datetime.now(dt.timezone.utc)).total_seconds()
-        if remaining <= 360:
+        if remaining <= (150 if diagnostic else 360):
             raise Hold('Original session has insufficient remaining time')
-        result = runner([recipe['files']['node']['path'], str(SCRIPTS / 'run-p10b-no-email-session.js'), '--execute',
+        result = runner([recipe['files']['node']['path'], str(SCRIPTS / ('run-p10b-stopped-update-diagnostic.js' if diagnostic else 'run-p10b-no-email-session.js')), '--execute',
                          '--bundle', recipe['approvedBundlePath'], '--evidence', recipe['evidenceDirectory'],
-                         '--native-client', recipe['files']['native']['path']], environment, remaining + 60)
-        closure = read_public(Path(recipe['evidenceDirectory']) / 'p10b-runtime-only-auth-closure.json')
+                         '--native-client', recipe['files']['diagnosticNative' if diagnostic else 'native']['path']], environment, min(180, remaining + 30) if diagnostic else remaining + 60)
+        closure = read_public(Path(recipe['evidenceDirectory']) / ('p10b-stopped-update-auth-closure.json' if diagnostic else 'p10b-runtime-only-auth-closure.json'))
+        if diagnostic and (result.get('operation') != 'stopped-update-diagnostic' or result.get('maximumStarts') != 0
+                           or result.get('qualificationAllowed') is not False or result.get('restored') is not True
+                           or result.get('mutationSettled') is not True):
+            raise Hold('Stopped-only settlement not proved')
         if result.get('success') is not True or closure.get('success') is not True or closure.get('cleanupVerified') is not True or closure.get('reapVerified') is not True or closure.get('sessionDigest') != summary['sessionDigest']:
             raise Hold('Runtime/private cleanup not proved')
         success = True
