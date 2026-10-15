@@ -157,6 +157,67 @@ def normalize_utc(value):
     return utc_after(value, 0)
 
 
+def import_public_token_metadata(recipe):
+    # Public metadata only, prepared locally from the owner's verified listing.
+    # No SDK, credential input, token decoding or identity inference occurs here.
+    try:
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError()
+                result[key] = value
+            return result
+        def invalid_constant(_value):
+            raise ValueError()
+        directory = os.open(recipe['outputDirectory'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            root = os.fstat(directory)
+            if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
+                raise ValueError()
+            descriptor = os.open('public-token-metadata.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        finally:
+            os.close(directory)
+        with os.fdopen(descriptor, 'rb') as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                    or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 65536):
+                raise ValueError()
+            raw = stream.read(65537)
+            after = os.fstat(stream.fileno())
+            if len(raw) > 65536 or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise ValueError()
+        metadata = json.loads(raw, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+        if (not isinstance(metadata, dict) or set(metadata) != {'version', 'app', 'tokens'}
+                or metadata['version'] != 'p10b-owner-token-metadata-v1' or metadata['app'] != recipe['app']
+                or not isinstance(metadata['tokens'], list) or not 1 <= len(metadata['tokens']) <= 128):
+            raise ValueError()
+        matches, identifiers = [], set()
+        for row in metadata['tokens']:
+            if not isinstance(row, dict) or set(row) != {'tokenId', 'tokenName', 'expiresAt', 'revokedAt'}:
+                raise ValueError()
+            token_id = normalize_public_token_id(row['tokenId'])
+            if token_id.lower().startswith('flyv1') or token_id in identifiers:
+                raise ValueError()
+            identifiers.add(token_id)
+            if not isinstance(row['tokenName'], str) or not re.fullmatch(r'p10b-runtime-no-email-[a-f0-9]{24}', row['tokenName']):
+                raise ValueError()
+            for field in ('expiresAt', 'revokedAt'):
+                if field == 'revokedAt' and row[field] is None:
+                    continue
+                if not isinstance(row[field], str) or len(row[field]) > 40:
+                    raise ValueError()
+                if normalize_utc(row[field]) != row[field]:
+                    raise ValueError()
+            if row['tokenName'] == 'p10b-runtime-no-email-' + recipe['nonce']:
+                matches.append(row)
+        if len(matches) != 1 or matches[0]['revokedAt'] is not None:
+            raise ValueError()
+        return matches[0]
+    except Exception:
+        raise PublicInputHold('public-token-metadata', 'INVALID_PUBLIC_METADATA') from None
+
+
 def read_public(file):
     file = Path(file)
     st = file.lstat()
@@ -389,14 +450,19 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
              'No retry/login/renewal is authorized by this handoff.')
         emit('Paste one public field at a time. Never paste combined timestamp/token output. '
              'Public entry is hidden to protect accidental private paste.')
+        emit('Before confirming ISSUED, have the public metadata helper prepare public-token-metadata.json '
+             'in this package from the verified matching public listing. Never share the credential in chat. '
+             'The local import selects ID and expiry; no manual ID/expiry entry or authenticated lookup.')
         confirm_issuance(ask, emit)
         started = read_public_input(ask, 'issuance-start-utc', 'Actual successful issuance start UTC: ', emit, normalize_utc, 'INVALID_UTC')
         completed = read_public_input(ask, 'issuance-completion-utc', 'Actual successful issuance completion UTC: ', emit, normalize_utc, 'INVALID_UTC')
-        token_id = read_public_input(ask, 'public-token-id', 'Public token ID for exact name ' + name + ': ', emit, normalize_public_token_id, 'INVALID_PUBLIC_ID')
-        expiry = read_public_input(ask, 'effective-expiry-utc', 'Effective expiry UTC from matching public metadata: ', emit, normalize_utc, 'INVALID_UTC')
-        if ask('Type UNREVOKED ' + token_id + ' after checking metadata: ') != 'UNREVOKED ' + token_id:
+        selected = import_public_token_metadata(recipe)
+        token_id, expiry = selected['tokenId'], selected['expiresAt']
+        emit('Selected owner-attested public token metadata; opaque credential identity is not independently verified:')
+        emit(json.dumps({'app': recipe['app'], **selected}, indent=2))
+        if ask('Type literal UNREVOKED after checking the displayed matching metadata: ') != 'UNREVOKED':
             raise Hold('Public revocation status not attested')
-        if ask('Type MATCHED ' + token_id + ' to attest private input matches this exact new app-deploy token: ') != 'MATCHED ' + token_id:
+        if ask('Type literal MATCHED to attest private input matches this displayed exact new app-deploy token: ') != 'MATCHED':
             raise Hold('Private selection not attested')
         receipt = {'version': 'p10b-app-token-issuance-v1', 'ownerAttested': True, 'issuanceSucceeded': True,
                    'app': recipe['app'], 'scope': 'app-deploy', 'tokenId': token_id, 'tokenName': name,

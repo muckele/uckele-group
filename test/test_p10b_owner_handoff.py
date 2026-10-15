@@ -51,6 +51,114 @@ class OwnerEntryTests(unittest.TestCase):
         self.mode = ''
         self.creation_start = None
         self.summary = None
+        self.metadata_path = self.root / 'public-token-metadata.json'
+        self.metadata = {'version': 'p10b-owner-token-metadata-v1', 'app': self.recipe['app'], 'tokens': [
+            {'tokenId': 'older-public-id', 'tokenName': 'p10b-runtime-no-email-' + 'a' * 24,
+             'expiresAt': handoff.utc_after(handoff.utc_now(), 7200), 'revokedAt': handoff.utc_now()},
+            {'tokenId': 'offline-public-id', 'tokenName': 'p10b-runtime-no-email-' + self.recipe['nonce'],
+             'expiresAt': handoff.utc_after(handoff.utc_now(), 7200), 'revokedAt': None}]}
+        handoff.write_exclusive(self.metadata_path, self.metadata)
+
+    def test_local_metadata_import_selects_exact_row_without_id_or_expiry_entry(self):
+        prompts, messages = [], []
+        def ask(prompt):
+            prompts.append(prompt)
+            if 'UNREVOKED' in prompt:
+                return 'UNREVOKED'
+            if 'MATCHED' in prompt:
+                return 'MATCHED'
+            return self.ask(prompt)
+        self.assertEqual(self.invoke_with_public_input(ask, messages), 0)
+        self.assertFalse(any('Public token ID' in p or 'Effective expiry' in p for p in prompts))
+        receipt = handoff.read_public(self.root / 'issuance-receipt.json')
+        selected = self.metadata['tokens'][1]
+        self.assertEqual(receipt['tokenId'], selected['tokenId'])
+        self.assertEqual(receipt['expiresAt'], selected['expiresAt'])
+        self.assertEqual(receipt['tokenName'], selected['tokenName'])
+        self.assertIn('owner-attested', '\n'.join(messages))
+        self.assertNotIn('older-public-id', '\n'.join(messages))
+        self.assertEqual(self.token_calls, 1)
+        self.assertNotIn('FLY_API_TOKEN', self.calls[1][1])
+
+    def test_metadata_import_holds_on_directory_or_read_identity_uncertainty(self):
+        self.root.chmod(0o755)
+        with self.assertRaises(handoff.PublicInputHold):
+            handoff.import_public_token_metadata(self.recipe)
+        self.root.chmod(0o700)
+        real_fstat = os.fstat
+        calls = 0
+        def changed(descriptor):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                with self.metadata_path.open('ab') as stream:
+                    stream.write(b' ')
+            return real_fstat(descriptor)
+        with patch.object(handoff.os, 'fstat', side_effect=changed):
+            with self.assertRaises(handoff.PublicInputHold):
+                handoff.import_public_token_metadata(self.recipe)
+
+    def test_public_import_requires_literal_match_attestation_before_credentials(self):
+        issued_at = handoff.utc_now()
+        snapshots = []
+        def ask(prompt):
+            if 'issuance start' in prompt or 'issuance completion' in prompt:
+                return issued_at
+            if 'MATCHED' in prompt:
+                snapshots.append(self.metadata_path.read_bytes())
+                return 'MATCHED offline-public-id'  # The new prompt requires the literal word.
+            return self.ask(prompt)
+        original = self.metadata_path.read_bytes()
+        self.assertEqual(self.invoke_with_public_input(ask, []), 2)
+        self.assertEqual(snapshots, [original])
+        self.assertEqual(self.token_calls, 0)
+        self.assertFalse((self.root / 'issuance-receipt.json').exists())
+
+    def test_invalid_metadata_import_holds_before_credentials_without_raw_output(self):
+        for mode in ('missing', 'symlink', 'fifo', 'permissions', 'oversized', 'malformed', 'duplicate-key',
+                     'extra-field', 'wrong-app', 'no-match', 'duplicate-match', 'duplicate-id',
+                     'revoked', 'bad-expiry', 'noncanonical-expiry', 'nan', 'credential-id', 'credential-name'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.metadata_path.unlink()
+                selected = self.metadata['tokens'][1]
+                secret = 'FlyV1_SYNTHETIC_PRIVATE_INPUT'
+                raw = None
+                if mode == 'symlink':
+                    target = self.root / 'metadata-target.json'
+                    handoff.write_exclusive(target, self.metadata)
+                    self.metadata_path.symlink_to(target)
+                elif mode == 'fifo': os.mkfifo(self.metadata_path, 0o600)
+                elif mode == 'oversized': raw = b' ' * 65537
+                elif mode == 'malformed': raw = secret.encode()
+                elif mode == 'duplicate-key':
+                    raw = json.dumps(self.metadata).replace('"version":', '"version": "' + secret + '", "version":', 1).encode()
+                elif mode == 'extra-field': selected['credential'] = secret
+                elif mode == 'wrong-app': self.metadata['app'] = 'different-app'
+                elif mode == 'no-match': self.metadata['tokens'].pop()
+                elif mode == 'duplicate-match': self.metadata['tokens'].append(dict(selected, tokenId='other-id'))
+                elif mode == 'duplicate-id': self.metadata['tokens'][0]['tokenId'] = selected['tokenId']
+                elif mode == 'revoked': selected['revokedAt'] = handoff.utc_now()
+                elif mode == 'bad-expiry': selected['expiresAt'] = secret
+                elif mode == 'noncanonical-expiry': selected['expiresAt'] = selected['expiresAt'].replace('Z', '+00:00')
+                elif mode == 'nan': selected['revokedAt'] = float('nan')
+                elif mode == 'credential-id': selected['tokenId'] = secret
+                elif mode == 'credential-name': selected['tokenName'] = secret
+                if mode not in ('missing', 'symlink', 'fifo'):
+                    if raw is None: handoff.write_exclusive(self.metadata_path, self.metadata)
+                    else:
+                        self.metadata_path.write_bytes(raw)
+                        self.metadata_path.chmod(0o600)
+                    if mode == 'permissions': self.metadata_path.chmod(0o644)
+                messages = []
+                self.assertEqual(self.invoke_with_public_input(self.ask, messages), 2)
+                self.assertEqual(self.token_calls, 0)
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                terminal = handoff.read_public(self.root / 'owner-terminal.json')
+                self.assertEqual(terminal['publicInputField'], 'public-token-metadata')
+                self.assertEqual(terminal['publicInputError'], 'INVALID_PUBLIC_METADATA')
+                self.assertNotIn(secret, '\n'.join(messages) + json.dumps(terminal))
+                self.assertFalse((self.root / 'issuance-receipt.json').exists())
 
     def ask(self, prompt):
         if 'APPROVE PRIVATE SETUP' in prompt:
@@ -61,17 +169,14 @@ class OwnerEntryTests(unittest.TestCase):
             self.creation_start = handoff.utc_now()
             return self.creation_start
         if 'issuance completion' in prompt:
+            if self.mode in ('empty-id', 'bad-expiry'):
+                self.metadata['tokens'][1]['tokenId' if self.mode == 'empty-id' else 'expiresAt'] = ''
+                self.metadata_path.write_text(json.dumps(self.metadata))
             return handoff.utc_now()
-        if 'Public token ID' in prompt:
-            if self.mode == 'empty-id':
-                return ''
-            return 'offline-public-id'
-        if 'Effective expiry' in prompt:
-            return 'bad time' if self.mode == 'bad-expiry' else handoff.utc_after(self.creation_start, 7200)
         if 'UNREVOKED' in prompt:
-            return '' if self.mode == 'metadata-refusal' else 'UNREVOKED offline-public-id'
+            return '' if self.mode == 'metadata-refusal' else 'UNREVOKED'
         if 'MATCHED' in prompt:
-            return 'MATCHED offline-public-id'
+            return '' if self.mode == 'match-refusal' else 'MATCHED'
         if 'APPROVE SESSION' in prompt:
             return '' if self.mode == 'final-refusal' else 'APPROVE SESSION ' + self.summary['sessionDigest']
         raise AssertionError('unexpected prompt: ' + prompt)
@@ -453,7 +558,7 @@ t.doCleanups()
                     os.close(master)
 
     def test_refusal_before_credential_input(self):
-        for mode in ['scope-refusal', 'creation-failed', 'metadata-refusal', 'bad-expiry', 'empty-id', 'expiry-coverage', 'scope-delayed']:
+        for mode in ['scope-refusal', 'creation-failed', 'metadata-refusal', 'match-refusal', 'bad-expiry', 'empty-id', 'expiry-coverage', 'scope-delayed']:
             with self.subTest(mode=mode):
                 self.setUp()
                 self.mode = mode
@@ -560,12 +665,14 @@ t.doCleanups()
                 self.assertEqual(terminal.get('publicInputError'), code)
                 self.assertEqual(self.token_calls, 0)
 
-    def test_credential_like_public_id_is_rejected_before_echo_or_receipt(self):
+    def test_credential_like_imported_id_is_rejected_before_echo_or_receipt(self):
         secret = 'fm2_SYNTHETIC_PRIVATE_INPUT'
+        self.metadata['tokens'][1]['tokenId'] = secret
+        self.metadata_path.write_text(json.dumps(self.metadata))
         prompts = []
         def ask(prompt):
             prompts.append(prompt)
-            return secret if 'Public token ID' in prompt else self.ask(prompt)
+            return self.ask(prompt)
         self.assertEqual(self.invoke_with_public_input(ask, []), 2)
         self.assertNotIn(secret, '\n'.join(prompts))
         self.assertFalse((self.root / 'issuance-receipt.json').exists())

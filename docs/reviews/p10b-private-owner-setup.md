@@ -10,7 +10,7 @@ After the exact reviewed host commit and its CI succeed, use only the fresh,
 independently reviewed package bound to that commit. Its `OWNER-HANDOFF.md`
 contains the concrete checksum-pinned wrapper command and its artifact manifest
 binds the exact recipe, instructions and executable files. The preserved v2
-package and the packages bound to `76ced45`, `8d37fc3` and `0a04384` have consumed owner attempts; none
+package and the packages bound to `76ced45`, `8d37fc3`, `0a04384` and `2f60079` have consumed owner attempts; none
 may be retried or rebound to another source revision.
 
 Run the package's exact command with `--check-only` first. Use the same command
@@ -56,16 +56,43 @@ matching token after clients close. This local correction repeats no issuance,
 approval, preflight or runtime; it changes no target, recorded issuance dates,
 permission receipt, expiry or session clock. A consumed attempt cannot be reopened.
 
-Then supply actual public issuance start/completion UTC
-(within 60 seconds), matching public token ID/name/effective expiry/unrevoked
-metadata and the attestation that hidden input matches that exact new isolated
-app-deploy token. The app Tokens dashboard or the separate pinned app-scoped
-metadata command supplies public metadata; creation JSON contains only the
-credential. Requested lifetime or login time cannot prove effective coverage.
-Public fields are entered one at a time through masked prompts; never paste
-combined timestamp/token output. A public syntax correction does not renew
-authority. The credential-free public-input validator runs before hidden
-credential input, and the
+Before confirming `ISSUED`, have the assisting agent prepare the fixed local
+`public-token-metadata.json` file in the fresh package from **verified public
+metadata only**. Share only the matching public listing and original issuance
+times with the assistant; never send creation output or the credential to chat.
+The app Tokens dashboard or the separate pinned app-scoped metadata command
+supplies public metadata; creation JSON contains only the credential. No automatic
+token creation, authenticated metadata discovery or CLI table parser is added.
+
+The import contract is a 0600 owner-owned plain JSON file in the package's 0700
+directory, with exactly `version`, `app` and `tokens` fields. Version is
+`p10b-owner-token-metadata-v1`, app is `uckele-group-p10b`, and `tokens` contains
+1–128 public rows. Each row has exactly `tokenId`, `tokenName`, `expiresAt` and
+`revokedAt`. Times are canonical UTC ISO strings with milliseconds and `Z`;
+`revokedAt` can be null. Names use `p10b-runtime-no-email-` plus 24 lowercase
+hexadecimal characters. The helper normalizes verified public listing timestamps
+when preparing this file, without changing their actual times. The launcher
+selects exactly one case-sensitive name for this recipe's nonce and requires it
+to be unrevoked. Duplicate IDs or matching names, missing matches, malformed/extra fields,
+secret-shaped IDs, duplicate JSON keys, noncanonical times, symlinks, unsafe
+permissions, changing files and oversized input hold before credential entry.
+The read is bounded through an owner-directory descriptor; nonregular files
+cannot block it. Only the validated selected public row is displayed. The
+unselected rows and rejected values are never echoed or copied to new evidence.
+
+Then supply the **original** successful issuance start/completion UTC, within
+60 seconds, through the existing masked prompts. The launcher imports the local
+metadata once: there are no manual ID/expiry prompts, path fallback, polling or
+metadata retry. Confirm the displayed row with literal `UNREVOKED`, then literal
+`MATCHED` to attest that the private input belongs to that exact new isolated
+app-deploy token. Neither confirmation requires copying its ID. The resulting
+issuance receipt retains the existing schema, original times and exact imported
+ID/name/effective expiry. Requested lifetime or login time cannot prove coverage.
+A public timestamp syntax correction does not renew authority. Missing or invalid
+metadata consumes the attempt; preserve it and retire the matching token after
+clients close. Stage the file before advancing; never reopen a consumed package.
+
+The credential-free public-input validator runs before hidden credential input, and the
 preparer repeats admission at the actual preflight start. Bad ID, timing, expired
 scope or insufficient effective coverage holds before hidden input/authentication.
 
@@ -73,6 +100,11 @@ A private TTY is required; getpass echo-fallback warnings are errors. Credential
 bytes remain in private process memory/environment and possible isolated SDK
 state, never argv, public JSON, receipts, source or guest configuration. The
 launcher does not decode the input to independently prove the owner's selection.
+Local metadata selection is still owner-attested public evidence, not independent
+proof that the opaque credential has that ID. Agent preparation and later
+approved automated test/cleanup do not authorize agent credential access. Private
+creation and hidden credential input remain owner-only; exact runtime approval
+remains a separate owner decision.
 
 ## Supported names-only preflight
 
