@@ -10,7 +10,7 @@ After the exact reviewed host commit and its CI succeed, use only the fresh,
 independently reviewed package bound to that commit. Its `OWNER-HANDOFF.md`
 contains the concrete checksum-pinned wrapper command and its artifact manifest
 binds the exact recipe, instructions and executable files. The preserved v2
-package and the packages bound to `76ced45` and `8d37fc3` have consumed owner attempts; none
+package and the packages bound to `76ced45`, `8d37fc3` and `0a04384` have consumed owner attempts; none
 may be retried or rebound to another source revision.
 
 Run the package's exact command with `--check-only` first. Use the same command
@@ -46,9 +46,15 @@ fallback exists. Keep creation output private.
 
 After successful creation, type the literal word `ISSUED`, **NOT THE TOKEN**, at
 the issuance confirmation prompt. Enter the credential only at the later hidden
-credential prompt, after public metadata has been validated. A token pasted at
-the `ISSUED` prompt holds and consumes the attempt before authentication; preserve
-its evidence and retire only that matching token after clients close.
+credential prompt, after public metadata has been validated. The running attempt
+allows one correction of a mistaken confirmation entry: it discards the value
+without echo or persistence, flushes queued input, explains the expected word and
+later credential location, then asks once more. `FAILED` closes immediately.
+A second invalid entry, EOF, cancellation or uncertain read/flush closes the
+attempt before authentication. Preserve that evidence and retire only the
+matching token after clients close. This local correction repeats no issuance,
+approval, preflight or runtime; it changes no target, recorded issuance dates,
+permission receipt, expiry or session clock. A consumed attempt cannot be reopened.
 
 Then supply actual public issuance start/completion UTC
 (within 60 seconds), matching public token ID/name/effective expiry/unrevoked

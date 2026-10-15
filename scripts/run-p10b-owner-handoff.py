@@ -116,6 +116,22 @@ def read_public_input(ask, field, prompt, emit, normalize, invalid_code):
                 raise PublicInputHold(field, invalid_code) from None
 
 
+def confirm_issuance(ask, emit):
+    # Correct input once within this attempt; never repeat issuance or consent.
+    # The production masked reader flushes queued input before/after each read;
+    # any read, flush or interruption error propagates straight to closure.
+    for attempt in range(2):
+        value = ask('Type literal ISSUED, NOT THE TOKEN, only after that exact creation succeeds: ')
+        if value == 'ISSUED':
+            return
+        failed = value == 'FAILED'
+        value = None
+        if failed or attempt == 1:
+            raise Hold('No successful issuance confirmation')
+        emit('Entry discarded. Type the WORD ISSUED. Paste the token only at the later hidden credential prompt. '
+             'One correction only; do not create another token.')
+
+
 def normalize_public_token_id(value):
     if not re.fullmatch(r'[A-Za-z0-9_:-]{1,120}', value) or value.lower().startswith(('fm1_', 'fm2_', 'bearer')):
         raise ValueError()
@@ -373,8 +389,7 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
              'No retry/login/renewal is authorized by this handoff.')
         emit('Paste one public field at a time. Never paste combined timestamp/token output. '
              'Public entry is hidden to protect accidental private paste.')
-        if ask('Type literal ISSUED, NOT THE TOKEN, only after that exact creation succeeds: ') != 'ISSUED':
-            raise Hold('No successful issuance')
+        confirm_issuance(ask, emit)
         started = read_public_input(ask, 'issuance-start-utc', 'Actual successful issuance start UTC: ', emit, normalize_utc, 'INVALID_UTC')
         completed = read_public_input(ask, 'issuance-completion-utc', 'Actual successful issuance completion UTC: ', emit, normalize_utc, 'INVALID_UTC')
         token_id = read_public_input(ask, 'public-token-id', 'Public token ID for exact name ' + name + ': ', emit, normalize_public_token_id, 'INVALID_PUBLIC_ID')

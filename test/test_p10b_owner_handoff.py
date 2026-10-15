@@ -273,6 +273,185 @@ class OwnerEntryTests(unittest.TestCase):
                     if file.is_file():
                         self.assertNotIn(secret.encode(), file.read_bytes())
 
+    def test_one_issuance_confirmation_correction_preserves_permission_and_issuance_times(self):
+        secret = 'fm2_SYNTHETIC_MISTAKEN_CONFIRMATION'
+        responses = [secret, 'ISSUED']
+        prompts, messages, permissions = [], [], []
+        self.creation_start = handoff.utc_now()
+        issued_at = self.creation_start
+        def ask(prompt):
+            prompts.append(prompt)
+            if 'ISSUED' in prompt:
+                permissions.append((self.root / 'private-setup-scope.json').read_bytes())
+                return responses.pop(0)
+            if 'issuance start' in prompt or 'issuance completion' in prompt:
+                return issued_at
+            return self.ask(prompt)
+        self.assertEqual(self.invoke_with_public_input(ask, messages), 0)
+        self.assertEqual(responses, [])
+        self.assertEqual(len(permissions), 2)
+        self.assertEqual(permissions[0], permissions[1])
+        self.assertEqual(permissions[0], (self.root / 'private-setup-scope.json').read_bytes())
+        receipt = handoff.read_public(self.root / 'issuance-receipt.json')
+        self.assertEqual(receipt['issuanceStartedAt'], issued_at)
+        self.assertEqual(receipt['issuanceCompletedAt'], issued_at)
+        self.assertEqual(receipt['tokenName'], 'p10b-runtime-no-email-' + self.recipe['nonce'])
+        self.assertEqual(self.token_calls, 1)
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.calls[2][1]['FLY_API_TOKEN'], 'offline-private-token')
+        self.assertEqual(self.calls[3][1]['FLY_API_TOKEN'], 'offline-private-token')
+        notice = '\n'.join(messages)
+        self.assertIn('Entry discarded', notice)
+        self.assertIn('WORD ISSUED', notice)
+        self.assertIn('later hidden credential prompt', notice)
+        self.assertNotIn(secret, '\n'.join(prompts + messages))
+        for file in self.root.rglob('*'):
+            if file.is_file():
+                self.assertNotIn(secret.encode(), file.read_bytes())
+
+    def test_confirmation_correction_does_not_bypass_public_admission_or_authorize_runtime(self):
+        for mode in ('scope-delayed', 'final-refusal'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.mode = mode
+                responses = ['fm2_SYNTHETIC_MISTAKEN_CONFIRMATION', 'ISSUED']
+                def ask(prompt):
+                    return responses.pop(0) if 'ISSUED' in prompt else self.ask(prompt)
+                self.assertEqual(self.invoke_with_public_input(ask, []), 2)
+                self.assertEqual(responses, [])
+                self.assertFalse(any('--execute' in args for args, _, _ in self.calls))
+                self.assertFalse((self.root / 'approved-session.json').exists())
+                if mode == 'scope-delayed':
+                    self.assertEqual(self.token_calls, 0)
+                    self.assertFalse(any('--prepare' in args for args, _, _ in self.calls))
+                else:
+                    self.assertEqual(self.token_calls, 1)
+                    self.assertTrue((self.root / 'sealed-session.json').exists())
+
+    def test_failed_issuance_attestation_closes_without_offering_correction(self):
+        prompts = []
+        def ask(prompt):
+            prompts.append(prompt)
+            return 'FAILED' if 'ISSUED' in prompt else self.ask(prompt)
+        self.assertEqual(self.invoke_with_public_input(ask, []), 2)
+        self.assertEqual(sum('ISSUED' in prompt for prompt in prompts), 1)
+        self.assertEqual(self.token_calls, 0)
+        self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+
+    def test_confirmation_interruption_on_correction_never_requests_credentials(self):
+        for error in (EOFError, KeyboardInterrupt, OSError):
+            with self.subTest(error=error):
+                self.setUp()
+                count = 0
+                messages = []
+                def ask(prompt):
+                    nonlocal count
+                    if 'ISSUED' in prompt:
+                        count += 1
+                        if count == 1:
+                            return 'fm2_SYNTHETIC_MISTAKEN_CONFIRMATION'
+                        raise error('SYNTHETIC_PRIVATE_ERROR')
+                    return self.ask(prompt)
+                self.assertEqual(self.invoke_with_public_input(ask, messages), 2)
+                self.assertEqual(count, 2)
+                self.assertEqual(self.token_calls, 0)
+                self.assertFalse((self.root / 'issuance-receipt.json').exists())
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                self.assertNotIn('SYNTHETIC_PRIVATE_ERROR', '\n'.join(messages))
+
+    def test_owned_synthetic_tty_confirmation_correction_flushes_paste_and_holds_on_uncertainty(self):
+        code = """import importlib.util,json,os,select,sys,termios
+from pathlib import Path
+from unittest.mock import patch
+spec=importlib.util.spec_from_file_location('fixtures',sys.argv[1]);f=importlib.util.module_from_spec(spec);spec.loader.exec_module(f)
+t=f.OwnerEntryTests();t.setUp();m=f.handoff;mode=sys.argv[2]
+real_input=m.masked_owner_input;real_flush=m.termios.tcflush;count=0;flushes=0;permission=None
+def ask(prompt):
+ global count,permission
+ if 'ISSUED' in prompt:
+  count+=1
+  current=(t.root/'private-setup-scope.json').read_bytes()
+  if permission is None:permission=current
+  assert current==permission
+  return real_input(prompt)
+ return t.ask(prompt)
+def flush(fd,queue):
+ global flushes
+ flushes+=1
+ if mode=='flush-failure' and flushes==2:raise termios.error('SYNTHETIC_PRIVATE_FLUSH_ERROR')
+ return real_flush(fd,queue)
+def token():
+ print('HIDDEN_INPUT_REQUESTED',flush=True)
+ return t.token()
+with patch.object(m,'masked_owner_input',ask),patch.object(m.termios,'tcflush',flush):
+ result=m.run_owner(t.recipe_path,runner=t.runner,token_input=token,private_tty=lambda:True,emit=lambda s:print(s,flush=True),expected_recipe_sha256=f.hashlib.sha256(t.recipe_path.read_bytes()).hexdigest(),bootstrap=lambda *_:t.recipe)
+terminal=json.loads((t.root/'owner-terminal.json').read_text())
+files=[p.read_bytes() for p in t.root.rglob('*') if p.is_file()]
+assert not any(b'fm2_SYNTHETIC_PASTE' in b or b'SYNTHETIC_RESIDUAL' in b for b in files)
+assert termios.tcgetattr(0)[3]&termios.ECHO
+assert not select.select([sys.stdin],[],[],0.1)[0]
+assert (t.root/'private-setup-scope.json').read_bytes()==permission
+print('RESULT '+json.dumps({'exit':result,'prompts':count,'credentialCalls':t.token_calls,'authenticated':terminal['authenticatedPreflightRequested'],'phase':terminal['phase'],'receipt':(t.root/'issuance-receipt.json').exists()}),flush=True)
+t.doCleanups()
+"""
+        prompt = b'Type literal ISSUED, NOT THE TOKEN, only after that exact creation succeeds: '
+        for mode in ('recover', 'second-invalid', 'interrupt', 'eof', 'flush-failure'):
+            with self.subTest(mode=mode):
+                master, slave = pty.openpty()
+                def controlling_tty():
+                    os.setsid()
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                child = subprocess.Popen([handoff.sys.executable, '-B', '-c', code, str(Path(__file__).resolve()), mode],
+                                         stdin=slave, stdout=slave, stderr=slave, preexec_fn=controlling_tty,
+                                         env={'PATH': str(Path(shutil.which('node')).parent) + ':/usr/bin:/bin', 'HOME': str(self.root)})
+                os.close(slave)
+                output = bytearray()
+                def until(marker, occurrences=1):
+                    end = time.monotonic() + 5
+                    while output.count(marker) < occurrences and time.monotonic() < end:
+                        if select.select([master], [], [], 0.1)[0]:
+                            try:
+                                data = os.read(master, 65536)
+                            except OSError:
+                                break
+                            if not data:
+                                break
+                            output.extend(data)
+                    self.assertGreaterEqual(output.count(marker), occurrences, output.decode(errors='replace'))
+                try:
+                    until(prompt)
+                    os.write(master, b'fm2_SYNTHETIC_PASTE\nISSUED\nSYNTHETIC_RESIDUAL\n')
+                    if mode != 'flush-failure':
+                        until(prompt, 2)
+                        self.assertIsNone(child.poll(), 'queued paste advanced the correction')
+                        self.assertNotIn(b'HIDDEN_INPUT_REQUESTED', output)
+                        if mode == 'recover':
+                            os.write(master, b'ISSUED\nSYNTHETIC_RESIDUAL\n')
+                        elif mode == 'second-invalid':
+                            os.write(master, b'fm2_SYNTHETIC_PASTE\nSYNTHETIC_RESIDUAL\n')
+                        elif mode == 'eof':
+                            os.write(master, b'\x04')
+                        else:
+                            child.send_signal(signal.SIGINT)
+                    until(b'RESULT ')
+                    self.assertEqual(child.wait(timeout=5), 0)
+                    line = output.split(b'RESULT ', 1)[1].splitlines()[0]
+                    result = json.loads(line)
+                    recovered = mode == 'recover'
+                    self.assertEqual(result['exit'], 0 if recovered else 2)
+                    self.assertEqual(result['prompts'], 1 if mode == 'flush-failure' else 2)
+                    self.assertEqual(result['credentialCalls'], 1 if recovered else 0)
+                    self.assertEqual(result['authenticated'], recovered)
+                    self.assertEqual(result['receipt'], recovered)
+                    self.assertNotIn(b'fm2_SYNTHETIC_PASTE', output)
+                    self.assertNotIn(b'SYNTHETIC_RESIDUAL', output)
+                    self.assertNotIn(b'SYNTHETIC_PRIVATE_FLUSH_ERROR', output)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=5)
+                    os.close(master)
+
     def test_refusal_before_credential_input(self):
         for mode in ['scope-refusal', 'creation-failed', 'metadata-refusal', 'bad-expiry', 'empty-id', 'expiry-coverage', 'scope-delayed']:
             with self.subTest(mode=mode):
