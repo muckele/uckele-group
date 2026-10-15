@@ -42,6 +42,52 @@ function fixture() {
 }
 function exported(module, name) { assert.equal(typeof module[name], 'function', `${name} is implemented`); return module[name]; }
 
+async function assertPrivateSdkLockIsolation(t, executable, args) {
+  const { spawn, execFileSync } = await import('node:child_process');
+  const { openP10bNativeMachineClient } = await import('../server/services/p10bNativeMachineClient.js');
+  const checkout = fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-offline-sdk-checkout-'));
+  const git = (...command) => execFileSync('/usr/bin/git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    '-c', 'user.name=Offline', '-c', 'user.email=offline@example.test', '-C', checkout, ...command],
+  { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', HOME: checkout, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } }).trim();
+  git('init', '-q'); git('commit', '-q', '--allow-empty', '-m', 'Offline fixture');
+  assert.equal(git('status', '--porcelain'), '');
+  const f = fixture(); const offset = Date.now() - now - 1000;
+  for (const key of ['startedAt', 'sessionDeadline']) f.session[key] = new Date(Date.parse(f.session[key]) + offset).toISOString();
+  for (const key of ['issuanceStartedAt', 'issuanceCompletedAt', 'expiresAt']) {
+    f.session.authenticationEvidence[key] = new Date(Date.parse(f.session.authenticationEvidence[key]) + offset).toISOString();
+  }
+  f.session.configurationEvidence.verifiedAt = f.session.startedAt;
+  f.session.nativeClientSha256 = sha256(fs.readFileSync(executable));
+  f.approval.sessionDigest = digest(f.session); f.approval.expiresAt = f.session.sessionDeadline; f.clock = Date.now;
+  const context = auth.createP10bAppTokenContext({ ...f, environment: { HOME: checkout, FLY_API_TOKEN: canary } });
+  t.after(() => { context.cleanup({ reaped: true }); fs.rmSync(checkout, { recursive: true, force: true }); });
+  const client = await openP10bNativeMachineClient({ ...f, executable, args, readOnly: true,
+    configs: [f.session.baselineConfig], environment: context.environment,
+    // The pre-fix native inherits this synthetic checkout; never the real repository.
+    spawnProcess(file, argv, options) { return spawn(file, argv, { ...options, cwd: options.cwd ?? checkout }); } });
+  // Initialization constructs the SDK only. No Machine request is sent.
+  assert.equal(await client.reap(), true);
+  assert.deepEqual({ checkoutStatus: git('status', '--porcelain'),
+    lockInPrivateContext: fs.existsSync(path.join(context.environment.FLY_CONFIG_DIR, 'flyctl.config.lock')) },
+  { checkoutStatus: '', lockInPrivateContext: true });
+  context.cleanup({ reaped: true });
+  assert.equal(fs.existsSync(context.environment.FLY_CONFIG_DIR), false);
+}
+
+test('relative SDK lock stays inside private authentication instead of dirtying the checkout', async t => {
+  await assertPrivateSdkLockIsolation(t, process.execPath, ['--input-type=module', '-e', `
+    import fs from 'node:fs'; import readline from 'node:readline';
+    for await (const line of readline.createInterface({ input: process.stdin })) {
+      JSON.parse(line); fs.closeSync(fs.openSync('flyctl.config.lock', 'a', 0o600));
+      process.stdout.write(JSON.stringify({ version: 'p10b-native-ready-v1', ready: true }) + '\\n');
+    }`]);
+});
+
+test('real native SDK lock stays inside private authentication with zero Machine requests',
+  { skip: !process.env.P10B_OFFLINE_NATIVE_CLIENT }, async t => {
+    await assertPrivateSdkLockIsolation(t, process.env.P10B_OFFLINE_NATIVE_CLIENT, ['--serve']);
+  });
+
 test('explicit two-hour app issuance admits a separate host revision without changing guest identity or limits', () => {
   const { session } = fixture();
   assert.equal(validateP10bNoEmailSession(session, now), true);

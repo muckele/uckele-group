@@ -31,6 +31,12 @@ function syncDirectory(directory) {
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
 
+export function p10bAppTokenWorkingDirectory(environment = {}) {
+  if (environment.P10B_APP_TOKEN_CONTEXT !== 'p10b-app-token-context-v1') return undefined;
+  privateDirectory(environment.FLY_CONFIG_DIR);
+  return environment.FLY_CONFIG_DIR;
+}
+
 // Reserve before spawning. A failed/abrupt descendant leaves its own intent;
 // the root never treats an exited controller as proof of descendant reaping.
 export function reserveP10bLocalReap(environment = {}) {

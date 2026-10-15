@@ -134,6 +134,22 @@ reaping/directory identity/cleanup retains 0700 private SDK state and denies
 handoff. This is possible temporary disk storage of credentials, not a memory-only
 claim. Do not manually clear unresolved intents.
 
+Authenticated native children also run with their working directory set to the
+validated 0700 app-auth directory. Fly SDK v0.4.115 loads the selected config file
+from `FLY_CONFIG_DIR`, but its config lock uses a separate uninitialized global
+directory in this helper. Without the explicit working directory, that relative
+`flyctl.config.lock` dirties the checkout and the independent recovery verifier
+correctly rejects it. The source cleanliness gate remains strict. The host fix
+retains the frozen native executable and image; it grants no incident cleanup,
+retry or new runtime authority. A failed/consumed package remains preserved.
+
+The regression initializes the real native helper with a synthetic credential,
+sends no Machine request, verifies the synthetic checkout stays clean, and
+requires the SDK lock to reside inside the private context before verified reap
+and cleanup. The native CI job runs this check against its locally built helper;
+the ordinary server suite also checks relative-file isolation with a real local
+child process. Local red/green reproduction additionally denied all network.
+
 ## Concrete final runtime approval
 
 The one-hour clock freezes before the first authenticated preflight. Preparation

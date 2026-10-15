@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
-import { reserveP10bLocalReap } from './p10bHostAuthentication.js';
+import { p10bAppTokenWorkingDirectory, reserveP10bLocalReap } from './p10bHostAuthentication.js';
 
 // No process is created until exact session approval has passed. Native code
 // consumes opaque Fly authentication; JS only receives closed public responses.
@@ -18,8 +18,10 @@ export async function openP10bNativeMachineClient({ executable, args = ['--serve
   const initialization = { version: 'p10b-native-init-v1', approved: true, readOnly,
     sessionCanonical: canonical, sessionDigest: sha256(canonical), configs, recoveryVerified };
   if (Buffer.byteLength(JSON.stringify(initialization)) > 131071) throw Error('Native initialization exceeds bound');
+  // The SDK's relative config lock must stay inside the private auth context too.
+  const cwd = p10bAppTokenWorkingDirectory(environment);
   const reservation = reserveP10bLocalReap(environment);
-  const child = spawnProcess(executable, args, { env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: false });
+  const child = spawnProcess(executable, args, { cwd, env: environment, stdio: ['pipe', 'pipe', 'pipe'], detached: false });
   let pending; let sequence = 0; let buffer = ''; let failed = false; let closed = false;
   let stderrBytes = 0; let exit;
   const exited = new Promise(resolve => { exit = resolve; });

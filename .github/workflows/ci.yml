@@ -18,8 +18,15 @@ jobs:
         with:
           go-version: '1.26.9'
           cache-dependency-path: tools/p10b-machine-client/go.sum
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
       - working-directory: tools/p10b-machine-client
         run: go test ./... && go build -o /tmp/p10b-machine-client .
+      - name: Verify native SDK files stay in the private auth context without Machine requests
+        env:
+          P10B_OFFLINE_NATIVE_CLIENT: /tmp/p10b-machine-client
+        run: node --test --test-name-pattern='SDK lock stays' test/p10bHostAuthentication.test.js
       - working-directory: tools/p10b-public-client
         run: go test ./... && go build -o /tmp/p10b-public-client .
   validate:
