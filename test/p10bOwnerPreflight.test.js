@@ -66,6 +66,7 @@ test('preparer seals actual bounded public facts with original clock and no manu
   assert.equal(bundle.approval.approved, false); assert.equal(bundle.session.ownerPermissionDigest, digest(f.permission));
   assert.equal(Date.parse(bundle.session.sessionDeadline) - Date.parse(bundle.session.startedAt), 3600000);
   assert.deepEqual(bundle.session.baselineConfig, baseline);
+  assert.deepEqual(bundle.session.flyExecutable, f.recipe.files.fly);
   assert.equal(bundle.session.configurationEvidence.flySecretMetadataDigest, digest(['DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY']));
   assert.equal(f.commands.filter(c => c.args[0] === 'machines').length, 2);
   assert.equal(f.commands.some(c => c.args[0] === 'secrets'), false);
@@ -105,6 +106,9 @@ test('preparer failure, changed metadata, digest drift and uncertain reap never 
     assert.equal(fs.existsSync(f.recipe.sealedBundlePath), false);
     const closure = JSON.parse(fs.readFileSync(path.join(f.recipe.evidenceDirectory, 'p10b-owner-preflight-closure.json')));
     assert.equal(closure.success, false);
+    assert.equal(closure.failureStage, { SDK_FAILURE: 'baseline-names-read', REGISTRY_DRIFT: 'immutable-registry-manifest',
+      BASELINE_DRIFT: 'baseline-values-read', REAP_UNCERTAIN: 'preflight-local-reap' }[mode]);
+    assert.equal(JSON.stringify(closure).includes('private remote text'), false);
     if (mode === 'REAP_UNCERTAIN') {
       assert.equal(closure.cleanupVerified, false); assert.equal(fs.existsSync(closure.privateAuthDirectory), true);
       fs.rmSync(closure.privateAuthDirectory, { recursive: true, force: true });

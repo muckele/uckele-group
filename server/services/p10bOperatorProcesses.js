@@ -1,31 +1,17 @@
 import { spawn } from 'node:child_process';
-import { reserveP10bLocalReap } from './p10bHostAuthentication.js';
+import { spawnP10bOwnedProcess } from './p10bOwnedProcess.js';
 
 export function createP10bOperatorProcesses({ spawnProcess = spawn,
   environment = { PATH: process.env.PATH, HOME: process.env.HOME, FLY_NO_UPDATE_CHECK: '1' } } = {}) {
   const active = new Set();
   let retirementUncertain = false;
   function launch(executable, args, options = {}) {
-    const reservation = reserveP10bLocalReap(environment);
-    const child = spawnProcess(executable, args, { env: environment, detached: false,
-      stdio: ['pipe', 'pipe', 'pipe'], ...options });
-    let terminal; const exited = new Promise(resolve => { terminal = resolve; });
-    const entry = { child, exited, group: options.detached === true, terminationRequested: false }; active.add(entry);
-    child.once('error', () => { if (!child.pid) { active.delete(entry); terminal({ code: null, signal: null }); } });
-    child.once('close', (code, signal) => {
-      try { reservation.retire(code === 0 || entry.terminationRequested); } catch { retirementUncertain = true; }
-      active.delete(entry); terminal({ code, signal });
-    });
+    const entry = spawnP10bOwnedProcess(executable, args, { environment, options, spawnProcess }); active.add(entry);
+    entry.exited.then(() => { if (!entry.reaped) retirementUncertain = true; active.delete(entry); });
     return entry;
   }
   async function terminate(entry) {
-    if (!active.has(entry)) return true;
-    entry.terminationRequested = true;
-    if (entry.group) { try { process.kill(-entry.child.pid, 'SIGKILL'); } catch { entry.child.kill('SIGKILL'); } }
-    else entry.child.kill('SIGKILL');
-    let timer;
-    try { return await Promise.race([entry.exited.then(() => true), new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); })]); }
-    finally { clearTimeout(timer); }
+    return entry.terminate();
   }
   async function command(executable, args, timeoutMs = 10000) {
     const entry = launch(executable, args); let bytes = 0; let exceeded = false; const chunks = [];
@@ -39,7 +25,7 @@ export function createP10bOperatorProcesses({ spawnProcess = spawn,
     });
     const result = await Promise.race([entry.exited, cutoff]); clearTimeout(timer);
     const output = Buffer.concat(chunks).toString('utf8');
-    if (exceeded || !result || result.code !== 0 || result.signal !== null
+    if (exceeded || !result || !entry.reaped || result.code !== 0 || result.signal !== null
       || (environment.FLY_API_TOKEN && output.includes(environment.FLY_API_TOKEN))) throw Error('Bounded public command failed');
     return output;
   }

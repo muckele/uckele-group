@@ -12,7 +12,7 @@ function privateEnvironment(environment, directory) {
     || [...token].some(c => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) {
     throw Error('Private app credential input required');
   }
-  return { PATH: environment.PATH, HOME: environment.HOME, FLY_NO_UPDATE_CHECK: '1',
+  return { PATH: environment.PATH, HOME: environment.HOME, FLY_NO_UPDATE_CHECK: '1', FLY_AGENT_ISOLATED: '1',
     FLY_CONFIG_DIR: directory, FLY_API_TOKEN: token, P10B_APP_TOKEN_CONTEXT: 'p10b-app-token-context-v1' };
 }
 

@@ -83,7 +83,7 @@ export function createP10bPreflightContext(environment) {
     context.assertReaped(); fs.rmSync(directory, { recursive: true, force: false }); delete context.environment.FLY_API_TOKEN; cleaned = true; return true;
   } };
   Object.defineProperty(context, 'environment', { value: { PATH: '/usr/bin:/bin', HOME: path.join(directory, 'home'),
-    FLY_CONFIG_DIR: directory, DOCKER_CONFIG: path.join(directory, 'docker'), FLY_NO_UPDATE_CHECK: '1',
+    FLY_CONFIG_DIR: directory, DOCKER_CONFIG: path.join(directory, 'docker'), FLY_NO_UPDATE_CHECK: '1', FLY_AGENT_ISOLATED: '1',
     P10B_APP_TOKEN_CONTEXT: 'p10b-app-token-context-v1', FLY_API_TOKEN: token }, enumerable: false });
   return context;
 }
@@ -179,6 +179,7 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
   const evidence = createP10bOperatorEvidence(recipe.evidenceDirectory);
   const context = createP10bPreflightContext(environment); const commands = createCommands(context);
   let session; let imageEvidence; let failed = true; let interrupted = false; let reaped = false; let cleanupVerified = false;
+  let failureStage = null; let stage = 'baseline-names-read';
   const stopOnSignal = () => { interrupted = true; failed = true; void commands.reap(); };
   process.on('SIGTERM', stopOnSignal); process.on('SIGINT', stopOnSignal);
   try {
@@ -188,14 +189,18 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
     };
     evidence.write('p10b-owner-setup-scope.json', permission); evidence.write('p10b-owner-public-issuance.json', receipt);
     const first = projectP10bStoppedBaseline(JSON.parse(await run(recipe.files.fly.path, ['machines', 'list', '--app', recipe.app, '--json'])), true);
+    stage = 'baseline-values-read';
     const actual = projectP10bStoppedBaseline(JSON.parse(await run(recipe.files.fly.path, ['machines', 'list', '--app', recipe.app, '--json'])));
     if (actual.instanceId !== first.instanceId || stableCanonicalJson(actual.environmentNames) !== stableCanonicalJson(first.environmentNames)) deny('Independent baseline identity/name drift');
+    stage = 'native-public-policy';
     await run(recipe.files.probe.path, ['-test.run=^TestBoundedPublicBaselineProbe$', '-test.v'], 10000, stableCanonicalJson(actual.baselineConfig));
     const baselineObservedAt = new Date(clock()).toISOString();
+    stage = 'names-only-inventory';
     const names = JSON.parse(await run(recipe.files.names.path, ['--secret-names']));
     if (!Array.isArray(names) || names.length > 32 || new Set(names).size !== names.length
       || names.some(name => typeof name !== 'string' || !/^[A-Z0-9_]{1,120}$/.test(name) || ['RESEND_API_KEY', 'EMAIL_WEBHOOK_SECRET'].includes(name))) deny('Names-only inventory denied');
     names.sort();
+    stage = 'private-registry-configuration';
     await run(recipe.files.names.path, ['--registry-config'], 5000);
     // Nonempty auths prevents Docker's default credential-store discovery.
     // Pin buildx's first search directory; HOME is also a fresh empty directory.
@@ -205,6 +210,7 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
       || typeof config.auths['registry.fly.io'].auth !== 'string') deny('Isolated SDK registry configuration required');
     config.cliPluginsExtraDirs = [path.dirname(recipe.files.buildx.path)];
     fs.writeFileSync(dockerConfig, JSON.stringify(config), { mode: 0o600 });
+    stage = 'immutable-registry-manifest';
     const rawManifest = await run(recipe.files.docker.path,
       ['--config', context.environment.DOCKER_CONFIG, 'buildx', 'imagetools', 'inspect', '--raw', recipe.candidateImage], 20000);
     if (`sha256:${sha256(rawManifest)}` !== P10B_RETAINED_IMAGE) deny('Immutable candidate registry digest drift');
@@ -221,6 +227,7 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
       sessionDeadline: new Date(started + 3600000).toISOString(), maximumStarts: 2, maximumStartWindowMs: 300000,
       maximumStoppedConfigUpdates: 3, maximumIncrementalUsd: 1, maximumLocalBuilds: 1, maximumImagePushes: 1,
       productionReady: false, globalAutomationPaused: true, nativeClientSha256: recipe.files.native.sha256,
+      flyExecutable: structuredClone(recipe.files.fly),
       namesClientPath: recipe.files.names.path, namesClientSha256: recipe.files.names.sha256, authenticationEvidence: receipt,
       configurationEvidence: { version: 'p10b-isolated-configuration-evidence-v2', providerIdentity: P10B_PROVIDER_IDENTITY,
         providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY), flySecretMetadataDigest: digest(names), verifiedAt: observedAt },
@@ -228,6 +235,7 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
       recovery: { ...recipe.recovery, attemptPath: path.join(recipe.recovery.directory, `${recipe.recovery.packetDigest}.attempt.json`),
         archivePath: path.join(recipe.recovery.directory, `${recipe.machineId}.active.json.archived-uncertain-${recipe.nonce}.json`),
         intentPath: path.join(recipe.evidenceDirectory, 'p10b-recovery-intent.json'), terminalPath: path.join(recipe.evidenceDirectory, 'p10b-recovery-terminal.json') } };
+    stage = 'session-seal-validation';
     if (interrupted || clock() - started >= 120000) deny('Original preflight deadline expired');
     validateP10bNoEmailSession(session, clock()); checkSource(recipe.hostSourceHead);
     evidence.write('p10b-owner-public-baseline.json', { ...actual, observedAt: baselineObservedAt, configurationDigest: digest(actual.baselineConfig),
@@ -235,12 +243,13 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
     evidence.write('p10b-owner-secret-names.json', { names, namesDigest: digest(names), observedAt, valueDerivedDigestsRequested: false });
     evidence.write('p10b-owner-immutable-manifest.json', manifest);
     failed = interrupted;
-  } catch { failed = true; }
+  } catch { failed = true; failureStage = stage; }
   finally {
     process.removeListener('SIGTERM', stopOnSignal); process.removeListener('SIGINT', stopOnSignal);
     try { reaped = await commands.reap() === true; } catch { reaped = false; }
     try { cleanupVerified = context.cleanup(reaped) === true; } catch { cleanupVerified = false; }
     evidence.write('p10b-owner-preflight-closure.json', { success: !failed && reaped && cleanupVerified, reaped, cleanupVerified,
+      failureStage: failureStage || (interrupted ? 'preflight-interrupted' : !reaped ? 'preflight-local-reap' : !cleanupVerified ? 'preflight-private-cleanup' : null),
       closedAt: new Date(clock()).toISOString(), privateAuthDirectory: context.directory, productionReady: false, providerCalls: 0, emails: 0 });
   }
   if (failed || !reaped || !cleanupVerified) deny('Preflight held; preserve evidence and uncertain private directories');

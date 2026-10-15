@@ -11,6 +11,7 @@ import { P10B_GUARDIAN_EXIT_PREFIX } from './p10bGuardianParent.js';
 import { sanitizeP10bGuardianLog } from './p10bRuntimeObserver.js';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
 import { p10bInheritedAppTokenEnvironment } from './p10bHostAuthentication.js';
+import { assertP10bFlyExecutable } from './p10bOperatorSource.js';
 
 const script = name => fileURLToPath(new URL(`../../scripts/${name}`, import.meta.url));
 const digest = value => sha256(stableCanonicalJson(value));
@@ -58,15 +59,17 @@ export function verifyP10bPreparationObservation(rows, phase, machine, result) {
 // Concrete normal CLI/SDK wiring is dormant until the operator's positive
 // recovery gate and exact session approval have both passed.
 export async function createP10bNoEmailBoundaries({ session, approval, evidence, recovery, inspectRecovery,
-  nativeExecutable, flyExecutable = '/opt/homebrew/bin/fly', nodeExecutable = process.execPath,
+  nativeExecutable, flyExecutable = session?.flyExecutable?.path, nodeExecutable = process.execPath,
   processes, environment, openNative = openP10bNativeMachineClient, clock = () => Date.now() }) {
   assertP10bNoEmailApproval(session, approval, clock());
+  assertP10bFlyExecutable(session, flyExecutable);
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
   if (!environment && openNative === openP10bNativeMachineClient) environment = p10bInheritedAppTokenEnvironment({ session, approval, clock });
   processes ||= createP10bOperatorProcesses({ environment });
   let native; let posts = 0; let settlementPhase; const configs = [session.baselineConfig];
   const observers = []; const controllers = [];
   async function authorizePhase(phase) {
+    assertP10bFlyExecutable(session, flyExecutable);
     const listed = JSON.parse(await processes.command(flyExecutable, ['machines', 'list', '--app', session.app, '--json'], 10000));
     if (!Array.isArray(listed) || listed.length !== 1 || listed[0].id !== session.machineId) throw Error('Exact sole isolated Machine required');
     if (native && await native.close() !== true) throw Error('Previous native client not reaped');

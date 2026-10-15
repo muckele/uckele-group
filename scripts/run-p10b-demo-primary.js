@@ -5,7 +5,7 @@ import { assertP10bRecoveryAdmission } from '../server/services/p10bAdmissionRec
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase } from '../server/services/p10bRuntimeOnlyOperator.js';
 import { openP10bNativeMachineClient } from '../server/services/p10bNativeMachineClient.js';
 import { stableCanonicalJson } from '../server/utils/security.js';
-import { assertP10bNoEmailHostBinding } from '../server/services/p10bOperatorSource.js';
+import { assertP10bNoEmailHostBinding, assertP10bFlyExecutable } from '../server/services/p10bOperatorSource.js';
 import { p10bInheritedAppTokenEnvironment } from '../server/services/p10bHostAuthentication.js';
 let processes;
 try {
@@ -13,6 +13,7 @@ try {
   const { session, approval, phase, recovery, flyExecutable, nativeExecutable, machine } = readP10bPublicJson(process.argv[2]);
   assertP10bNoEmailApproval(session, approval, Date.now());
   assertP10bNoEmailHostBinding(session);
+  assertP10bFlyExecutable(session, flyExecutable);
   assertP10bFrozenPhase(session, phase); if (phase.label !== 'demo') throw Error();
   const evidence = createP10bOperatorEvidence(path.dirname(path.resolve(process.argv[2])));
   if (evidence.has('SESSION_NOT_APPROVED') || evidence.has('p10b-runtime-only-session-closure.json')) throw Error();

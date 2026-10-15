@@ -66,7 +66,10 @@ export function validateP10bNoEmailSession(s, now) {
     'baselineConfig', 'ownerPermissionDigest', 'permissionEvidenceId', 'startedAt', 'sessionDeadline', 'maximumStarts',
     'maximumStartWindowMs', 'maximumStoppedConfigUpdates', 'maximumIncrementalUsd', 'maximumLocalBuilds', 'maximumImagePushes',
     'productionReady', 'globalAutomationPaused', 'configurationEvidence', 'budget', 'recovery', 'authenticationEvidence', 'nativeClientSha256',
-    'namesClientPath', 'namesClientSha256'])
+    'namesClientPath', 'namesClientSha256', 'flyExecutable'])
+    || !onlyKeys(s.flyExecutable, ['path', 'sha256'])
+    || typeof s.flyExecutable.path !== 'string' || !/^\/[A-Za-z0-9_./ -]{1,1024}$/.test(s.flyExecutable.path)
+    || !/^[a-f0-9]{64}$/.test(s.flyExecutable.sha256 || '')
     || !onlyKeys(s.configurationEvidence, ['version', 'providerIdentity', 'providerIdentityDigest', 'flySecretMetadataDigest', 'verifiedAt'])
     || !onlyKeys(s.budget, ['priceEvidenceDigest', 'maximumUsdPerSecond', 'fixedIncrementalUsd'])
     || !onlyKeys(s.authenticationEvidence, ['version', 'ownerAttested', 'issuanceSucceeded', 'app', 'scope', 'tokenId', 'tokenName', 'revokedAt',
@@ -190,11 +193,13 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
   evidence.write('p10b-runtime-only-operator-intent.json', { sessionDigest: digest(session), at: new Date(clock()).toISOString() });
   const control = createP10bRuntimeOnlyControl({ session, evidence, clock });
   let boundaries;
-  let result; let failure = null; let restored = false; let activePhase; const configs = [];
+  let result; let failure = null; let failureStage = null; let stage = 'construct-boundaries';
+  let restored = false; let activePhase; const configs = [];
   try {
     boundaries = await createBoundaries({ session, approval });
     let previous = session.baselineConfig;
     for (const label of ['demo', 'prepare']) {
+      stage = `${label}-planning`;
       control.assertTime(label === 'demo' ? 660000 : 360000);
       assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
       const phase = createP10bRuntimePhase(session, label, clock()); configs.push(phase.config);
@@ -202,14 +207,18 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       evidence.write(`p10b-runtime-only-${label}-packet.json`, phase.packet);
       evidence.write(`p10b-runtime-only-${label}-window.json`, phase.window);
       evidence.write(`p10b-runtime-only-${label}-config.json`, phase.config);
+      stage = `${label}-authorize`;
       await boundaries.authorizePhase?.(phase);
+      stage = `${label}-stopped-update`;
       const machine = await control.guardedUpdate(boundaries.client, previous, phase.config, label);
       control.assertWindow(phase.window);
+      stage = `${label}-observer-attachment`;
       const observer = await boundaries.startObserver({ phase, machine });
       if (observer?.attached !== true || observer.separateSession !== true || observer.instanceId !== machine.instance_id
         || observer.imageDigest !== session.candidateImageDigest) throw Error('Independent observer attachment required');
       evidence.write(`p10b-runtime-only-${label}-start-intent.json`, { at: new Date(clock()).toISOString(), window: phase.window });
       control.assertWindow(phase.window);
+      stage = `${label}-execution-proof`;
       if (label === 'demo') {
         const proof = await boundaries.demonstrate({ phase, observer, machine });
         if (proof?.success !== true || proof.windowDigest !== digest(phase.window) || proof.observerSurvived !== true
@@ -234,7 +243,7 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       }
       previous = phase.config;
     }
-  } catch { failure = 'runtime-proof-failed'; }
+  } catch { failure = 'runtime-proof-failed'; failureStage = stage; }
   finally {
     if (boundaries) {
       let safeToRestore = true;
@@ -253,7 +262,7 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       try { if (await boundaries.close() !== true) failure ||= 'native-close-failed'; } catch { failure ||= 'native-close-failed'; }
     }
     evidence.write('p10b-runtime-only-session-closure.json', { closedAt: new Date(clock()).toISOString(),
-      sessionDigest: digest(session), failure, restored, success: !failure && Boolean(result), productionReady: false, globalAutomationPaused: true });
+      sessionDigest: digest(session), failure, failureStage: failureStage || failure, restored, success: !failure && Boolean(result), productionReady: false, globalAutomationPaused: true });
   }
   if (failure) throw Error('No-email runtime proof failed; preserve evidence and hold');
   return { success: true, restored, preparation: result, productionReady: false, globalAutomationPaused: true };

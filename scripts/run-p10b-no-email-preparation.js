@@ -4,7 +4,7 @@ import { assertP10bRecoveryAdmission } from '../server/services/p10bAdmissionRec
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase } from '../server/services/p10bRuntimeOnlyOperator.js';
 import { runFirstMailboxCli } from './run-p10b-first-mailbox.js';
 import { stableCanonicalJson } from '../server/utils/security.js';
-import { assertP10bNoEmailHostBinding } from '../server/services/p10bOperatorSource.js';
+import { assertP10bNoEmailHostBinding, assertP10bFlyExecutable } from '../server/services/p10bOperatorSource.js';
 import { p10bInheritedAppTokenEnvironment } from '../server/services/p10bHostAuthentication.js';
 import { createP10bFlyControl } from '../server/services/p10bFlyControl.js';
 try {
@@ -26,7 +26,8 @@ try {
   const environment = p10bInheritedAppTokenEnvironment({ session, approval });
   const result = await runFirstMailboxCli(['--packet', packetPath,
     '--evidence-prefix', path.join(evidence.root, 'p10b-runtime-only-preparation')],
-  { adapter: createP10bFlyControl({ environment, secretNamesExecutable: session.namesClientPath,
+  { adapter: createP10bFlyControl({ executable: assertP10bFlyExecutable(session), executableSha256: session.flyExecutable.sha256,
+    environment, secretNamesExecutable: session.namesClientPath,
     secretNamesSha256: session.namesClientSha256 }), hostSession: session, hostApproval: approval, hostPhase: phase });
   if (!result.success) process.exitCode = 1;
 } catch { process.stderr.write('No-email preparation failed or held; preserve evidence.\n'); process.exitCode = 1; }

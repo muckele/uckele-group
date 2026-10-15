@@ -150,6 +150,33 @@ and cleanup. The native CI job runs this check against its locally built helper;
 the ordinary server suite also checks relative-file isolation with a real local
 child process. Local red/green reproduction additionally denied all network.
 
+The sealed session now retains the exact preflight Fly executable path and SHA256.
+Runtime, observer, demonstration and preparation all use that binding; a missing,
+changed or substituted executable denies before authentication. The private
+environment forces `FLY_AGENT_ISOLATED=1`. Each runtime Fly command receives a
+unique socket inside the private directory and runs in its own owned process
+group. Cleanup waits for positive absence of the entire group, including an SDK
+agent whose immediate CLI leader has exited. A denied probe, surviving group or
+uncertain nested controller keeps its pending intent and private directory.
+
+The observer establishes log readiness with one successful bounded
+`logs --json --no-tail` read for the exact app and Machine. An empty buffer is a
+valid completed read before start. This uses the pinned SDK's finite polling
+path; it makes no claim that a streaming subscription has attached. Subsequent
+nonoverlapping reads run every 750 ms through the observation cutoff. The first
+read has a five-second bound; subsequent reads have a 700 ms bound and a checked
+completion deadline, including the final read. Failed reads, malformed framing or missed polls latch
+failure. Only closed-schema public guardian records survive; exact repeated
+records are deduplicated using the original provider timestamp precision so
+distinct records cannot collapse into one apparent proof. Machine metadata and
+the final unique guardian/whole-Machine exit proof remain independently required.
+
+Public failure receipts record fixed recovery/runtime stage names. Raw SDK
+errors, authentication material and arbitrary application logs remain excluded.
+Offline constructor tests and a synthetic external-boundary owner-command
+rehearsal establish host behavior only. They do not prove a live guest execution,
+baseline restoration, incident private-directory cleanup or mailbox exchange.
+
 ## Concrete final runtime approval
 
 The one-hour clock freezes before the first authenticated preflight. Preparation

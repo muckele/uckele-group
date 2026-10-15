@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { createP10bFlyControl } from '../server/services/p10bFlyControl.js';
 import { p10bRuntimeFailure, validateP10bRuntimeFailure } from '../server/services/p10bRuntimeFailure.js';
@@ -96,6 +98,26 @@ test('concrete local command retains exit and timeout provenance without stderr'
     });
     assert.equal(await adapter.reap(), true);
   });
+});
+
+test('command timeout rejects within its bound even when group termination is denied', async t => {
+  const originalKill = process.kill; const deniedPid = 2147483001;
+  process.kill = (pid, signal) => {
+    if (pid === -deniedPid) throw Object.assign(Error('synthetic denied group'), { code: 'EPERM' });
+    return originalKill(pid, signal);
+  };
+  t.after(() => { process.kill = originalKill; });
+  const child = new EventEmitter();
+  Object.assign(child, { pid: deniedPid, stdout: new PassThrough(), stderr: new PassThrough() });
+  const adapter = createP10bFlyControl({ environment: {}, spawnProcess: () => child });
+  let timer;
+  const cutoff = new Promise((_, reject) => { timer = setTimeout(() => reject(Error('unbounded command wait')), 2500); });
+  try {
+    await assert.rejects(Promise.race([adapter.getMachine(target, { timeoutMs: 30 }), cutoff]), error => {
+      assert.equal(error.p10bFailure?.reason, 'timed-out'); return true;
+    });
+    assert.equal(await adapter.reap(), false);
+  } finally { clearTimeout(timer); }
 });
 
 test('SSH transport drains a diagnostic frame before reporting nonzero child exit', async t => {

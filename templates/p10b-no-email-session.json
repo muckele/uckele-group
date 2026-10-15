@@ -10,6 +10,7 @@
     "nonce": null,
     "candidateImageDigest": null,
     "nativeClientSha256": "de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088",
+    "flyExecutable": null,
     "baselineImageDigest": "sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629",
     "baselineConfig": null,
     "ownerPermissionDigest": null,

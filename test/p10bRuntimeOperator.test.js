@@ -23,6 +23,7 @@ function session() {
     baselineImageDigest: config.image.split('@')[1], baselineConfig: config,
     ownerPermissionDigest: 'd'.repeat(64), permissionEvidenceId: 'owner:offline-stub',
     nativeClientSha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088',
+    flyExecutable: { path: process.execPath, sha256: sha256(fs.readFileSync(process.execPath)) },
     namesClientPath: '/offline/names-client', namesClientSha256: 'a'.repeat(64),
     startedAt: new Date(now).toISOString(), sessionDeadline: new Date(now + 3600000).toISOString(),
     maximumStarts: 2, maximumStartWindowMs: 300000, maximumStoppedConfigUpdates: 3,
@@ -398,28 +399,110 @@ test('unknown public package fields fail before authentication or evidence publi
   await assert.rejects(operator.runP10bNoEmailOperator(f.options));assert.equal(calls,0);assert.equal(f.evidence.files.size,0);
 });
 
-test('independent observer wiring preserves continuous cadence and reaps both mock boundaries', async () => {
+async function observerPollFixture(command = async () => '', late = false) {
   const { runP10bIndependentObserver } = await import('../server/services/p10bIndependentObserver.js');
-  const { EventEmitter } = await import('node:events'); const { PassThrough } = await import('node:stream');
   const x = recoveryFixture(); const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
     baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
   const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
   const phase = operator.createP10bRuntimePhase(x.s, 'demo', now); let clock = now; let scheduled; let nativeReaps = 0; let processReaps = 0;
-  const rows = []; let metadataCalls = 0; let attached;
-  const logs = { child: new EventEmitter(), exited: new Promise(() => {}) };
-  Object.assign(logs.child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
-  const processes = { launch() { queueMicrotask(() => logs.child.stdout.write('{"message":"private-canary"}\n')); return logs; },
-    async reap() { processReaps++; return true; }, async terminate() { return true; } };
+  const rows = []; const reads = []; let metadataCalls = 0; let attached;
+  const processes = { async command(file, args, timeout) {
+    assert.equal(file, x.s.flyExecutable.path); assert.ok(args.includes('--no-tail'));
+    assert.equal(timeout, reads.length ? 700 : 5000);
+    reads.push(clock); return command({ phase, index: reads.length, at: clock, advance(ms) { clock += ms; } }); },
+    async reap() { processReaps++; return true; } };
   const machine = { ...x.baseline, config: phase.config, image_ref: { digest: image } };
   const success = await runP10bIndependentObserver({ session: x.s, approval: x.approval, phase, machine,
     recovery: { ...recovered, verification }, inspectRecovery: x.inspect, record: row => rows.push(row), attached: value => { attached = value; },
     processes, clock: () => clock, interval(tick) { scheduled = tick; return 1; }, clear: () => {},
-    async wait(ms) { const end = clock + ms; while (clock + 750 <= end) { clock += 750; await scheduled(); } clock = end; },
+    async wait(ms) { const end = clock + ms + (late ? 300 : 0); while (clock + 750 <= end) { clock += 750; await scheduled(); } clock = end; },
     async openNative(input) { assert.equal(input.readOnly, true); return { async client() { metadataCalls++; return structuredClone(machine); },
       async reap() { nativeReaps++; return true; } }; } });
-  assert.equal(success, true); assert.equal(attached.separateSession, true); assert.ok(metadataCalls > 400);
+  return { success, attached, metadataCalls, nativeReaps, processReaps, rows, reads, phase };
+}
+
+test('independent observer accepts successful empty log polls and preserves continuous metadata cadence through the final read', async () => {
+  const { success, attached, metadataCalls, nativeReaps, processReaps, rows, reads, phase } = await observerPollFixture();
+  assert.equal(success, true); assert.equal(attached.separateSession, true); assert.ok(metadataCalls >= 400);
   assert.ok(nativeReaps >= 1 && processReaps >= 1); assert.equal(JSON.stringify(rows).includes('private-canary'), false);
+  assert.equal(reads[0], now); assert.equal(reads.at(-1), Date.parse(phase.window.stopAt));
+  assert.ok(reads.length <= 410);
   assert.equal(rows.at(-1).kind, 'observer-finished'); assert.equal(rows.at(-1).normalCompletion, true);
+});
+
+test('slow successful final log poll cannot admit normal observer completion', async () => {
+  const f = await observerPollFixture(async ({ phase, at, advance }) => {
+    if (at === Date.parse(phase.window.stopAt)) advance(751);
+    return '';
+  });
+  assert.equal(f.success, false); assert.equal(f.rows.at(-1).normalCompletion, false);
+  assert.ok(f.rows.some(row => row.kind === 'observer-log-read-error'));
+});
+
+test('later failed, malformed, incomplete and missed log polls latch failure through observer completion', async t => {
+  for (const failure of ['read', 'malformed', 'incomplete', 'late']) await t.test(failure, async () => {
+    const f = await observerPollFixture(async ({ index }) => {
+      if (index !== 2) return '';
+      if (failure === 'read') throw Error('private-canary');
+      return failure === 'malformed' ? '{"broken":}' : failure === 'incomplete' ? '{"broken":' : '';
+    }, failure === 'late');
+    assert.equal(f.success, false); assert.equal(f.attached.separateSession, true);
+    assert.equal(f.rows.at(-1).normalCompletion, false);
+    assert.ok(f.nativeReaps > 0 && f.processReaps > 0);
+    assert.ok(f.rows.some(row => row.kind === (failure === 'late' ? 'observer-log-missed-poll' : 'observer-log-read-error')));
+    assert.equal(JSON.stringify(f.rows).includes('private-canary'), false);
+  });
+});
+
+test('overlapping log polls deduplicate exact guardian records but preserve distinct provider nanoseconds', async () => {
+  const { P10B_GUARDIAN_EXIT_PREFIX } = await import('../server/services/p10bGuardianParent.js');
+  const f = await observerPollFixture(async ({ phase, index }) => {
+    if (index < 2) return '';
+    const value = { version: 'p10b-guardian-child-exit-v1', windowDigest: digest(phase.window), productionReady: false,
+      bindingVerified: true, code: 0, signal: null, spawnFailed: false, guardianPid: 5001, parentPid: 5000,
+      exitedAt: '2026-10-12T12:04:00.000Z', parentStartedAt: '2026-10-12T12:00:00.000Z',
+      readyDigest: 'a'.repeat(64), receiptDigest: 'b'.repeat(64), startDigest: 'c'.repeat(64) };
+    const row = { instance: session().machineId, region: 'ewr', timestamp: '2026-10-12T12:04:00.334578044Z',
+      message: P10B_GUARDIAN_EXIT_PREFIX + JSON.stringify(value) };
+    return [row, row, { ...row, timestamp: '2026-10-12T12:04:00.334578045Z' },
+      { ...row, message: 'private-canary' }].map(v => JSON.stringify(v)).join('\n');
+  });
+  const logs = f.rows.filter(row => row.kind === 'platform-log');
+  assert.equal(f.success, true); assert.equal(logs.length, 2);
+  assert.equal(logs[0].timestamp, logs[1].timestamp); // The proof layer still sees ambiguity.
+  assert.equal(JSON.stringify(f.rows).includes('private-canary'), false);
+});
+
+test('failed initial log read cannot admit the first start and the operator retains its failure stage', async () => {
+  const { runP10bIndependentObserver } = await import('../server/services/p10bIndependentObserver.js');
+  const { EventEmitter } = await import('node:events'); const { PassThrough } = await import('node:stream');
+  const f = operatorFixture(); let clock = now; let starts = 0; let attachments = 0; let nativeReaps = 0; let logReaps = 0;
+  f.options.clock = () => clock;
+  const original = f.options.createBoundaries;
+  f.options.createBoundaries = async () => {
+    const boundaries = await original();
+    boundaries.demonstrate = async () => { starts++; throw Error('cold logs must not authorize a start'); };
+    boundaries.startObserver = async ({ phase, machine }) => {
+      const child = new EventEmitter();
+      Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+      // Empty successful reads are valid; a failed query must never attach.
+      const logs = { child, exited: new Promise(() => {}) };
+      return runP10bIndependentObserver({ ...f.options, phase, machine, record: () => {},
+        attached: () => { attachments++; }, interval: () => 1, clear: () => {},
+        async wait(ms) { clock += ms; },
+        processes: { launch: () => logs, async command() { throw Error('synthetic log read failed'); }, async reap() { logReaps++; return true; } },
+        async openNative() { return { client: async () => structuredClone(machine),
+          async reap() { nativeReaps++; return true; } }; } });
+    };
+    return boundaries;
+  };
+  await assert.rejects(operator.runP10bNoEmailOperator(f.options), /runtime proof failed/);
+  assert.equal(starts, 0); assert.equal(attachments, 0);
+  assert.ok(nativeReaps > 0 && logReaps > 0);
+  assert.equal(f.evidence.files.has('p10b-runtime-only-demo-start-intent.json'), false);
+  assert.equal(f.evidence.read('p10b-runtime-only-session-closure.json').success, false);
+  assert.equal(f.evidence.read('p10b-runtime-only-session-closure.json').restored, true);
+  assert.equal(f.evidence.read('p10b-runtime-only-session-closure.json').failureStage, 'demo-observer-attachment');
 });
 
 test('retained current-phase failure reservation permits settlement and baseline rollback but never new-phase admission', async () => {
@@ -518,6 +601,7 @@ test('host CLI holds private cleanup when native initialization cannot prove rea
     createAuth: () => ({ environment: {}, cleanup({ reaped }) { cleanupReaped = reaped; if (!reaped) throw Error('cleanup held'); } }),
     openNative: async () => { throw Object.assign(Error('synthetic native failure'), { reapVerified: false }); } }));
   assert.equal(cleanupReaped, false);
+  assert.equal(f.evidence.read('p10b-runtime-only-auth-closure.json').failureStage, 'recovery-native-initialization');
 });
 
 test('host CLI unresolved private descendant intent blocks restoration and retains both closure holds', async t => {

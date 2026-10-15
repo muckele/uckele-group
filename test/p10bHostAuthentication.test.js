@@ -19,6 +19,7 @@ function fixture() {
     volumeId: 'vol_vwnkpex1k3yx9dnv', sourceHead: 'c4944a46ac362cdcd002e077d5533b4b0843b1d0', hostSourceHead: '2'.repeat(40),
     candidateImageDigest: 'sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc',
     nativeClientSha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088',
+    flyExecutable: { path: process.execPath, sha256: sha256(fs.readFileSync(process.execPath)) },
     namesClientPath: '/offline/names-client', namesClientSha256: 'a'.repeat(64),
     baselineImageDigest: baselineConfig.image.split('@')[1], baselineConfig, nonce: 'c'.repeat(24),
     ownerPermissionDigest: 'd'.repeat(64), permissionEvidenceId: 'owner:offline-stub',
@@ -123,6 +124,31 @@ test('host binding rejects stale host checkout and changed retained guest/image/
   }
 });
 
+test('session-bound Fly identity rejects changed files and alternate paths before runtime auth or evidence', async t => {
+  const { runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-offline-fly-binding-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'fly'); fs.writeFileSync(file, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  const f = fixture(); f.session.flyExecutable = { path: file, sha256: sha256(fs.readFileSync(file)) };
+  f.approval.sessionDigest = digest(f.session);
+  assert.equal(source.assertP10bFlyExecutable(f.session), file);
+  assert.throws(() => source.assertP10bFlyExecutable(f.session, process.execPath));
+  for (const mutate of [s => { delete s.flyExecutable; }, s => { s.flyExecutable.path = 'fly'; },
+    s => { s.flyExecutable.sha256 = 'unknown'; }, s => { s.flyExecutable.extra = true; }]) {
+    const session = structuredClone(f.session); mutate(session);
+    assert.throws(() => validateP10bNoEmailSession(session, now));
+  }
+  fs.appendFileSync(file, '# changed\n');
+  let authCalls = 0; let evidenceCalls = 0;
+  await assert.rejects(runP10bNoEmailSessionCli(['--execute', '--bundle', '/offline/bundle', '--evidence', '/offline/evidence', '--native-client', '/offline/native'],
+    { read: () => ({ session: f.session, approval: f.approval, status: 'OWNER_APPROVED_NO_EMAIL_SESSION',
+      imageEvidence: { version: 'p10b-image-prerequisite-v1', sourceHead: f.session.sourceHead,
+        imageDigest: f.session.candidateImageDigest, immutableImage: `registry.fly.io/uckele-group-p10b@${f.session.candidateImageDigest}`,
+        buildCount: 1, pushCount: 1, registryManifestVerified: true, manifestEvidenceDigest: 'a'.repeat(64), verifiedAt: f.session.startedAt } }),
+    clock: f.clock, checkSource: () => {}, createAuth() { authCalls++; }, createEvidence() { evidenceCalls++; } }), /Fly executable changed/);
+  assert.equal(authCalls, 0); assert.equal(evidenceCalls, 0);
+});
+
 test('preparation host exception binds the exact no-email phase; qualification and stale packets cannot borrow it', () => {
   const bind = exported(source, 'assertP10bPreparationHostSource'); const f = fixture();
   const phase = createP10bRuntimePhase(f.session, 'prepare', now);
@@ -142,6 +168,7 @@ test('private context transmits only opaque local auth, never serializes it or p
   const context = create({ ...f, environment: original }); t.after(() => context.cleanup({ reaped: true }));
   const env = context.environment; const directory = env.FLY_CONFIG_DIR;
   assert.equal(env.HOME, original.HOME); assert.notEqual(directory, original.FLY_CONFIG_DIR);
+  assert.equal(env.FLY_AGENT_ISOLATED, '1');
   assert.equal(fs.lstatSync(directory).mode & 0o777, 0o700); assert.deepEqual(fs.readdirSync(directory), []);
   assert.equal(env.FLY_API_TOKEN, canary); assert.equal(env.NODE_OPTIONS, undefined); assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
   assert.equal(JSON.stringify(context).includes(canary), false); assert.deepEqual(original.FLY_CONFIG_DIR, '/must-not-use-owner-config');
@@ -153,6 +180,28 @@ test('private context transmits only opaque local auth, never serializes it or p
   assert.equal(result.includes(canary), false); assert.equal(await processes.reap(), true);
   fs.writeFileSync(path.join(directory, 'synthetic-sdk-cache'), canary, { mode: 0o600 });
   context.cleanup({ reaped: true }); assert.equal(fs.existsSync(directory), false); assert.equal(env.FLY_API_TOKEN, undefined);
+});
+
+test('SDK-style agent descendants stay in owned command groups until positive closure', async t => {
+  const { spawn } = await import('node:child_process');
+  const f = fixture(); const context = auth.createP10bAppTokenContext({ ...f, environment: { FLY_API_TOKEN: canary } });
+  const pidFile = path.join(context.environment.FLY_CONFIG_DIR, 'synthetic-agent.pid'); let group;
+  const processes = createP10bOperatorProcesses({ environment: context.environment,
+    spawnProcess(file, args, options) {
+      assert.equal(options.detached, true);
+      assert.equal(options.env.FLY_AGENT_ISOLATED, '1');
+      const child = spawn(file, args, options); group = child.pid; return child;
+    } });
+  t.after(async () => { await processes.reap(); context.cleanup({ reaped: true }); });
+  const code = `const {spawn}=require('node:child_process'); const fs=require('node:fs');
+    const agent=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],
+      {stdio:'ignore',detached:process.env.FLY_AGENT_ISOLATED!=='1'}); agent.unref();
+    fs.writeFileSync(${JSON.stringify(pidFile)},String(agent.pid)); process.stdout.write('public');`;
+  assert.equal(await processes.command(process.execPath, ['-e', code], 3000), 'public');
+  assert.ok(Number(fs.readFileSync(pidFile)) > 1);
+  assert.throws(() => process.kill(-group, 0), error => error.code === 'ESRCH');
+  assert.equal(await processes.reap(), true);
+  assert.equal(context.assertReaped(), true);
 });
 
 test('denial does not read private input; uncertain reap preserves isolated directory and fails closed', () => {
