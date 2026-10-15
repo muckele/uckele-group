@@ -44,3 +44,27 @@ for (const mode of ['extra-status-field', 'string-status', 'contradictory-dispat
     }
   });
 }
+
+for (const mode of ['valid', 'wrong-version', 'running', 'extra-field', 'machine-frame']) {
+  test(`WAIT IPC exposes only a bound closed nonrunning settlement: ${mode}`, async () => {
+    const { session, approval } = stoppedDiagnosticFixture();
+    session.nativeClientSha256 = sha256(fs.readFileSync(process.execPath)); approval.sessionDigest = diagnosticDigest(session);
+    const context = createP10bAppTokenContext({ session, approval, environment: { PATH: '/usr/bin:/bin', HOME: '/tmp', FLY_API_TOKEN: 'synthetic-wait-ipc-canary' } });
+    const code = `const rl=require('node:readline').createInterface({input:process.stdin});let initialized=false;
+      rl.on('line',line=>{const input=JSON.parse(line);if(!initialized){initialized=true;console.log(JSON.stringify({version:'p10b-stopped-native-ready-v1',ready:true}));return;}
+      const frame={id:input.id,ok:true,settlement:{ok:true,state:'created',version:'acknowledged-version'},observation:{httpStatus:200,elapsedMs:1,dispatched:true}};
+      ${mode === 'wrong-version' ? "frame.settlement.version='different-version';" : ''}
+      ${mode === 'running' ? "frame.settlement.state='started';" : ''}
+      ${mode === 'extra-field' ? "frame.settlement.rawBody='private-canary';" : ''}
+      ${mode === 'machine-frame' ? 'frame.machine={};delete frame.settlement;' : ''}
+      console.log(JSON.stringify(frame));});`;
+    let native; let reaped = false;
+    try {
+      native = await openP10bStoppedUpdateClient({ executable: process.execPath, args: ['-e', code], session, approval,
+        configs: [session.baselineConfig, session.diagnosticConfig], environment: context.environment, recoveryVerified: true });
+      if (mode === 'valid') assert.deepEqual((await native.client('WAIT', { version: 'acknowledged-version' }, 9000)).settlement,
+        { ok: true, state: 'created', version: 'acknowledged-version' });
+      else await assert.rejects(native.client('WAIT', { version: 'acknowledged-version' }, 9000), error => publicP10bStoppedUpdateFailure(error)?.code === 'bridge-protocol');
+    } finally { if (native) reaped = await native.reap(); assert.equal(reaped, true); context.cleanup({ reaped }); }
+  });
+}

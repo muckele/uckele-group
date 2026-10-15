@@ -5,7 +5,7 @@ import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
 import { p10bAppTokenWorkingDirectory, reserveP10bLocalReap } from './p10bHostAuthentication.js';
 import { P10bNativeRequestError } from './p10bNativeFailure.js';
-import { assertP10bStoppedUpdateApproval, checkedP10bStoppedObservation, P10bStoppedUpdateRequestError } from './p10bStoppedUpdateContract.js';
+import { assertP10bStoppedUpdateApproval, checkedP10bStoppedObservation, checkedP10bStoppedSettlement, P10bStoppedUpdateRequestError } from './p10bStoppedUpdateContract.js';
 
 // No process is created until exact session approval has passed. Native code
 // consumes opaque Fly authentication; JS only receives closed public responses.
@@ -61,25 +61,29 @@ async function openMachineClient(diagnostic, { executable, args = diagnostic ? [
         const frame = JSON.parse(line); const current = pending;
         if (!current || (current.id === 0 ? frame.version !== (diagnostic ? 'p10b-stopped-native-ready-v1' : 'p10b-native-ready-v1') || frame.ready !== true
           : frame.id !== current.id || typeof frame.ok !== 'boolean')) throw Error();
-        if (current.id !== 0 && Object.keys(frame).some(k => !['id', 'ok', 'error', 'machine', ...(diagnostic ? ['observation'] : [])].includes(k))) throw Error();
+        if (current.id !== 0 && Object.keys(frame).some(k => !['id', 'ok', 'error', 'machine', ...(diagnostic ? ['observation', 'settlement'] : [])].includes(k))) throw Error();
         if (diagnostic && current.id === 0 && Object.keys(frame).some(k => !['version', 'ready'].includes(k))) throw Error();
         if (frame.error !== undefined && !['request-denied', 'request-failed', 'timed-out', 'http-failed', 'output-bound', 'invalid-output'].includes(frame.error)) throw Error();
         if (current.id !== 0 && (frame.ok === true ? frame.error !== undefined
-          : frame.error === undefined || frame.machine !== undefined)) throw Error();
+          : frame.error === undefined || frame.machine !== undefined || frame.settlement !== undefined)) throw Error();
         const observation = diagnostic && current.id !== 0 ? checkedP10bStoppedObservation(frame.observation, frame.ok ? null : frame.error) : null;
-        if (diagnostic && current.id !== 0 && frame.ok && frame.machine === undefined) throw Error();
+        if (diagnostic && current.id !== 0 && frame.ok && (current.method === 'WAIT'
+          ? frame.machine !== undefined || frame.settlement === undefined
+          : frame.machine === undefined || frame.settlement !== undefined)) throw Error();
+        const settlement = diagnostic && current.id !== 0 && frame.ok && current.method === 'WAIT'
+          ? checkedP10bStoppedSettlement(frame.settlement, current.version) : null;
         const failure = current.id !== 0 && frame.ok !== true ? diagnostic ? new P10bStoppedUpdateRequestError({
           code: frame.error, method: current.method, timeoutMs: current.timeoutMs, observation }) : new P10bNativeRequestError({
           code: frame.error, method: current.method, timeoutMs: current.timeoutMs }) : null;
         clearTimeout(current.timer); pending = null;
         if (failure) current.reject(failure);
-        else current.resolve(current.id === 0 ? true : diagnostic ? { machine: frame.machine, observation } : frame.machine);
+        else current.resolve(current.id === 0 ? true : diagnostic ? { ...(settlement ? { settlement } : { machine: frame.machine }), observation } : frame.machine);
       } catch { fail('bridge-protocol'); return; }
     }
   });
   const send = (id, value, timeoutMs) => new Promise((resolve, reject) => {
     if (failed || closed || pending || clock() >= Date.parse(session.sessionDeadline)) { reject(Error('Native client unavailable')); return; }
-    pending = { id, resolve, reject, method: value.method, timeoutMs: value.timeoutMs, startedMonotonic: performance.now(),
+    pending = { id, resolve, reject, method: value.method, version: value.body?.version, timeoutMs: value.timeoutMs, startedMonotonic: performance.now(),
       timer: setTimeout(() => fail('bridge-timeout'), timeoutMs) };
     child.stdin.write(`${JSON.stringify(value)}\n`, error => { if (error) fail(); });
   });
@@ -100,10 +104,12 @@ async function openMachineClient(diagnostic, { executable, args = diagnostic ? [
     finally { clearTimeout(timer); }
   }
   return { pid: child.pid, client(method = 'GET', body, timeoutMs = 1000) {
-    if (!['GET', 'POST'].includes(method) || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10000
+    if (!(diagnostic ? ['GET', 'POST', 'WAIT'] : ['GET', 'POST']).includes(method) || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10000
       || (method === 'POST' && (readOnly || posts >= (diagnostic ? 2 : 3)))
-      || (diagnostic && (method === 'POST' ? timeoutMs !== 10000 : timeoutMs > 1000))) return Promise.reject(diagnostic
-        ? new P10bStoppedUpdateRequestError({ code: 'request-denied', method: ['GET', 'POST'].includes(method) ? method : 'GET',
+      || (diagnostic && (method === 'POST' ? timeoutMs !== 10000 : method === 'WAIT'
+        ? timeoutMs < 1000 || timeoutMs > 9000 || !body || Object.keys(body).join(',') !== 'version' || !/^[A-Za-z0-9-]{1,80}$/.test(body.version || '')
+        : timeoutMs > 1000))) return Promise.reject(diagnostic
+        ? new P10bStoppedUpdateRequestError({ code: 'request-denied', method: ['GET', 'POST', 'WAIT'].includes(method) ? method : 'GET',
           timeoutMs: Number.isInteger(timeoutMs) && timeoutMs >= 1 && timeoutMs <= 10000 ? timeoutMs : 1000,
           observation: { httpStatus: null, elapsedMs: 0, dispatched: false } }) : Error('Native request denied'));
     if (method === 'POST') posts++;

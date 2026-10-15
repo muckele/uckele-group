@@ -47,6 +47,7 @@ type response struct {
 	Error       string              `json:"error,omitempty"`
 	Machine     json.RawMessage     `json:"machine,omitempty"`
 	Observation *requestObservation `json:"observation,omitempty"`
+	Settlement  *stoppedSettlement  `json:"settlement,omitempty"`
 }
 type service struct {
 	builder       requestBuilder
@@ -230,25 +231,34 @@ func publicSetting(name, value string) bool {
 func (s *service) request(ctx context.Context, r request) (out response) {
 	started := time.Now()
 	observation := &requestObservation{}
+	writeAttempted := false
 	if s.diagnostic != nil {
-		defer func() { observation.ElapsedMs = time.Since(started).Milliseconds(); out.Observation = observation }()
-		if (r.Method == "POST" && r.TimeoutMs != 10000) || (r.Method == "GET" && r.TimeoutMs > 1000) || s.reads >= 128 {
+		defer func() {
+			observation.ElapsedMs = time.Since(started).Milliseconds()
+			out.Observation = observation
+			if !out.OK && (writeAttempted || s.diagnostic.primaryAttempted && (r.Method == "GET" || r.Method == "WAIT")) {
+				s.diagnostic.hold = true
+			}
+		}()
+		if (r.Method == "POST" && r.TimeoutMs != 10000) || (r.Method == "GET" && r.TimeoutMs > 1000) || (r.Method == "WAIT" && (r.TimeoutMs < 1000 || r.TimeoutMs > 9000)) || s.reads >= 128 {
 			return response{ID: r.ID, Error: "request-denied"}
 		}
 	}
 	denied := response{ID: r.ID, Error: "request-denied"}
-	if (r.Method != "GET" && r.Method != "POST") || r.TimeoutMs < 1 || r.TimeoutMs > 10000 || !time.Now().Before(s.deadline) || s.reads >= 8192 {
+	if (r.Method != "GET" && r.Method != "POST" && !(r.Method == "WAIT" && s.diagnostic != nil)) || r.TimeoutMs < 1 || r.TimeoutMs > 10000 || !time.Now().Before(s.deadline) || s.reads >= 8192 {
 		return denied
 	}
 	var in interface{}
 	path := endpoint
+	method := r.Method
+	waitVersion := ""
 	if r.Method == "POST" {
 		var body struct {
 			Config         json.RawMessage `json:"config"`
 			CurrentVersion string          `json:"current_version"`
 			SkipLaunch     bool            `json:"skip_launch"`
 		}
-		if s.readOnly || s.posts >= 3 || strict(r.Body, &body) != nil || !body.SkipLaunch || !regexp.MustCompile(`^[A-Za-z0-9-]{1,80}$`).MatchString(body.CurrentVersion) || !publicConfig(body.Config) {
+		if s.readOnly || s.posts >= 3 || (s.diagnostic != nil && !uniqueStoppedObject(r.Body)) || strict(r.Body, &body) != nil || !body.SkipLaunch || !regexp.MustCompile(`^[A-Za-z0-9-]{1,80}$`).MatchString(body.CurrentVersion) || !publicConfig(body.Config) {
 			return denied
 		}
 		c, err := canonical(body.Config)
@@ -258,8 +268,29 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 		if s.diagnostic != nil && !s.diagnostic.writeAllowed(s.posts, hash(c), body.CurrentVersion) {
 			return denied
 		}
+		if s.diagnostic != nil {
+			s.diagnostic.beginWrite(s.posts)
+			writeAttempted = true
+		}
 		s.posts++
 		in = json.RawMessage(r.Body)
+		if s.diagnostic != nil {
+			// The SDK serializes exactly the object whose config was validated;
+			// nested duplicate source keys cannot reach a server parser intact.
+			body.Config = c
+			in = body
+		}
+	} else if r.Method == "WAIT" {
+		var body struct {
+			Version string `json:"version"`
+		}
+		if !uniqueStoppedObject(r.Body) || strict(r.Body, &body) != nil || !regexp.MustCompile(`^[A-Za-z0-9-]{1,80}$`).MatchString(body.Version) || !s.diagnostic.beginWait(body.Version) {
+			return denied
+		}
+		waitVersion = body.Version
+		path += "/wait?state=settled&timeout=" + strconv.Itoa(r.TimeoutMs/1000) + "&version=" + waitVersion
+		method = "GET"
+		s.reads++
 	} else {
 		if len(r.Body) > 0 {
 			return denied
@@ -271,20 +302,30 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 	if left := time.Until(s.deadline); duration > left {
 		duration = left
 	}
+	if s.diagnostic != nil && (r.Method == "WAIT" || r.Method == "GET") && !s.diagnostic.phaseDeadline.IsZero() {
+		if left := time.Until(s.diagnostic.phaseDeadline); duration > left {
+			duration = left
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
-	req, err := s.builder.NewRequest(ctx, r.Method, path, in, nil)
+	req, err := s.builder.NewRequest(ctx, method, path, in, nil)
 	if err != nil {
 		return response{ID: r.ID, Error: "request-failed"}
 	}
-	if req.URL.Scheme != "https" || req.URL.Host != "api.machines.dev" || req.URL.Path != "/v1"+endpoint || req.URL.RawQuery != "" || req.URL.User != nil {
+	wantPath, wantQuery := "/v1"+endpoint, ""
+	if r.Method == "WAIT" {
+		wantPath += "/wait"
+		wantQuery = "state=settled&timeout=" + strconv.Itoa(r.TimeoutMs/1000) + "&version=" + waitVersion
+	}
+	if req.URL.Scheme != "https" || req.URL.Host != "api.machines.dev" || req.URL.Path != wantPath || req.URL.RawQuery != wantQuery || req.URL.User != nil {
 		return denied
 	}
 	// Direct Do: SDK retry wrappers and replayable mutation bodies are excluded.
 	req.GetBody = nil
 	req.Header.Del("Idempotency-Key")
 	req.Header.Del("X-Idempotency-Key")
-	if ctx.Err() != nil || !time.Now().Before(s.deadline) {
+	if ctx.Err() != nil || !time.Now().Before(s.deadline) || (s.diagnostic != nil && !s.diagnostic.phaseAllows(r.Method)) {
 		return response{ID: r.ID, Error: "timed-out"}
 	}
 	observation.Dispatched = true
@@ -307,19 +348,29 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 	if err != nil || len(b) > 1048576 {
 		return response{ID: r.ID, Error: "output-bound"}
 	}
+	if r.Method == "WAIT" {
+		settlement, err := s.diagnostic.settlement(b, waitVersion)
+		if err != nil {
+			return response{ID: r.ID, Error: "invalid-output"}
+		}
+		if ctx.Err() != nil || !time.Now().Before(s.deadline) || !s.diagnostic.finishWait() {
+			return response{ID: r.ID, Error: "timed-out"}
+		}
+		return response{ID: r.ID, OK: true, Settlement: settlement}
+	}
 	machine, err := s.machine(b)
 	if err != nil {
 		return response{ID: r.ID, Error: "invalid-output"}
 	}
-	if ctx.Err() != nil || !time.Now().Before(s.deadline) {
+	if ctx.Err() != nil || !time.Now().Before(s.deadline) || (s.diagnostic != nil && r.Method == "GET" && !s.diagnostic.phaseAllows("GET")) {
 		return response{ID: r.ID, Error: "timed-out"}
 	}
 	if s.diagnostic != nil {
 		var m map[string]json.RawMessage
 		json.Unmarshal(machine, &m)
 		delete(m, "events")
-		if r.Method == "GET" {
-			s.diagnostic.observe(m)
+		if !stoppedImageMatches(m) || (r.Method == "POST" && !s.diagnostic.acknowledge(s.posts, m)) || (r.Method == "GET" && !s.diagnostic.observe(m)) {
+			return response{ID: r.ID, Error: "invalid-output"}
 		}
 		machine, _ = json.Marshal(m)
 	}

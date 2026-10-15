@@ -12,7 +12,7 @@ export function stoppedDiagnosticFixture(now = Date.now() - 1000) {
   window.issuedAt = new Date(now).toISOString(); window.stopAt = new Date(now + 300000).toISOString();
   window.runBinding = diagnosticDigest({ identity: `demo-${nonce}`, ownerPermissionDigest: owner });
   config.env.P10B_GUEST_WINDOW = stableCanonicalJson(window);
-  const session = { version: 'p10b-stopped-update-session-v1', operation: 'stopped-update-diagnostic',
+  const session = { version: 'p10b-stopped-update-session-v2', operation: 'stopped-update-diagnostic', recoveryPolicy: 'acknowledged-only-nonrunning-v1',
     app: 'uckele-group-p10b', machineId: '0803730bd1d7e8', volumeId: 'vol_vwnkpex1k3yx9dnv',
     sourceHead: 'c4944a46ac362cdcd002e077d5533b4b0843b1d0', hostSourceHead: '2'.repeat(40), nonce,
     baselineConfig: structuredClone(retained.baseline), baselineImageDigest: retained.baseline.image.split('@')[1],
@@ -35,7 +35,7 @@ export function stoppedDiagnosticFixture(now = Date.now() - 1000) {
       providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY), flySecretMetadataDigest: diagnosticDigest([]), verifiedAt: new Date(now).toISOString() },
     budget: { priceEvidenceDigest: 'f'.repeat(64), maximumUsdPerSecond: 0.000002, fixedIncrementalUsd: 0.8 },
     namesClientPath: '/offline/names', namesClientSha256: 'e'.repeat(64) };
-  return { session, approval: { version: 'p10b-stopped-update-approval-v1', approved: true, sessionDigest: diagnosticDigest(session),
+  return { session, approval: { version: 'p10b-stopped-update-approval-v2', approved: true, sessionDigest: diagnosticDigest(session),
     ownerPermissionDigest: owner, sourceHead: session.sourceHead, hostSourceHead: session.hostSourceHead,
     expiresAt: session.sessionDeadline, recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 } };
 }

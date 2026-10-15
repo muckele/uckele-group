@@ -1,13 +1,13 @@
 import { performance } from 'node:perf_hooks';
-import { setTimeout as waitDefault } from 'node:timers/promises';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
-import { assertP10bStoppedUpdateApproval, checkedP10bStoppedObservation, publicP10bStoppedUpdateFailure } from './p10bStoppedUpdateContract.js';
+import { assertP10bStoppedUpdateApproval, checkedP10bStoppedObservation, checkedP10bStoppedSettlement, publicP10bStoppedUpdateFailure } from './p10bStoppedUpdateContract.js';
 const digest = value => sha256(stableCanonicalJson(value));
 const same = (a, b) => stableCanonicalJson(a) === stableCanonicalJson(b);
+const nonrunning = m => ['created', 'stopped'].includes(m.state);
 // This controller has no start/observer/qualification boundary. The native
-// mode independently restricts the same two exact stopped-only writes.
+// mode independently gates acknowledgement, settlement and the two exact writes.
 export async function runP10bStoppedUpdateDiagnostic({ session, approval, evidence, createClient,
-  assertAdmission, clock = Date.now, wait = waitDefault, runDeadline = Math.min(clock() + 120000, Date.parse(session.sessionDeadline)) }) {
+  assertAdmission, clock = Date.now, runDeadline = Math.min(clock() + 120000, Date.parse(session.sessionDeadline)) }) {
   assertP10bStoppedUpdateApproval(session, approval, clock());
   if (typeof assertAdmission !== 'function' || assertAdmission() !== true || !Number.isFinite(runDeadline)
     || runDeadline > clock() + 120000 || runDeadline > Date.parse(session.sessionDeadline)) throw Error('Diagnostic admission required');
@@ -39,7 +39,7 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     evidence.write(`p10b-stopped-update-observation-${++sequence}.json`, { label, at: new Date(clock()).toISOString(),
       instanceId: m.instance_id, state: m.state, imageDigest: m.image_ref.digest, configDigest: digest(m.config),
       configuration: m.config, observation });
-    if (m.state === 'stopped' && same(m.config, session.baselineConfig)) baselineObserved = true;
+    if (nonrunning(m) && same(m.config, session.baselineConfig)) baselineObserved = true;
     return m;
   };
   const write = async (config, current, label) => {
@@ -47,12 +47,16 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     evidence.write(`p10b-stopped-update-${label}-intent.json`, { at: new Date(clock()).toISOString(),
       currentVersion: current.instance_id, configDigest: digest(config), skip_launch: true, timeoutMs: 10000 });
     requireTime(label === 'diagnostic' ? 40000 : 20000); admit();
-    const start = performance.now();
+    const start = performance.now(); const startedAt = clock();
     let outcome;
     try {
       const response = await native.client('POST', { config, current_version: current.instance_id, skip_launch: true }, 10000);
-      machine(response.machine);
-      outcome = { code: null, method: 'POST', timeoutMs: 10000, observation: checkedP10bStoppedObservation(response.observation) };
+      const acknowledged = machine(response.machine);
+      requireTime(); admit();
+      const observation = checkedP10bStoppedObservation(response.observation);
+      if (clock() - startedAt >= 10000 || observation.elapsedMs >= 10000
+        || acknowledged.instance_id === current.instance_id || acknowledged.instance_id === session.baselineInstanceId || !same(acknowledged.config, config)) throw Error('Unusable update acknowledgement');
+      outcome = { code: null, method: 'POST', timeoutMs: 10000, observation, acknowledgedVersion: acknowledged.instance_id };
     } catch (error) {
       outcome = publicP10bStoppedUpdateFailure(error) || { code: 'bridge-failed', method: 'POST', timeoutMs: 10000,
         observation: { httpStatus: null, elapsedMs: Math.max(0, Math.round(performance.now() - start)), dispatched: null } };
@@ -60,17 +64,30 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     evidence.write(`p10b-stopped-update-${label}-outcome.json`, outcome);
     return outcome;
   };
-  const find = async (label, accept) => {
+  const settledReadback = async (outcome, config, label) => {
     const end = Math.min(clock() + 10000, runDeadline - 20000);
-    do {
-      const current = await observe(label, end);
+    const timeoutMs = Math.min(9000, end - clock() - 1);
+    requireTime(); admit();
+    if (timeoutMs < 1000) throw Error('Settlement cutoff reached');
+    const started = performance.now();
+    try {
+      const response = await native.client('WAIT', { version: outcome.acknowledgedVersion }, timeoutMs);
       requireTime(); admit();
-      if (clock() >= end) break;
-      if (accept(current)) return current;
-      if (clock() >= end) break;
-      await wait(Math.min(250, end - clock()));
-    } while (clock() < end);
-    return null;
+      const settlement = checkedP10bStoppedSettlement(response.settlement, outcome.acknowledgedVersion);
+      const observation = checkedP10bStoppedObservation(response.observation);
+      if (clock() >= end || observation.elapsedMs >= timeoutMs) throw Error('Exact acknowledged settlement required');
+      evidence.write(`p10b-stopped-update-${label}-settlement.json`, { version: settlement.version, state: settlement.state, observation });
+    } catch (error) {
+      evidence.write(`p10b-stopped-update-${label}-settlement-failure.json`, publicP10bStoppedUpdateFailure(error) || {
+        code: 'bridge-failed', method: 'WAIT', timeoutMs, observation: { httpStatus: null,
+          elapsedMs: Math.max(0, Math.round(performance.now() - started)), dispatched: null } });
+      throw Error('Acknowledged settlement unverified');
+    }
+    const current = await observe(label, end);
+    requireTime(); admit();
+    if (clock() >= end || current.instance_id !== outcome.acknowledgedVersion
+      || !nonrunning(current) || !same(current.config, config)) throw Error('Acknowledged current version changed');
+    return current;
   };
   try {
     native = await createClient(); stage = 'before-observation';
@@ -78,17 +95,18 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     if (before.state !== 'stopped' || before.instance_id !== session.baselineInstanceId || !same(before.config, session.baselineConfig)) throw Error('Frozen stopped baseline changed');
     stage = 'diagnostic-write'; attempted = true;
     primary = await write(session.diagnosticConfig, before, 'diagnostic');
-    stage = 'after-observation';
-    const accepted = await find('after', m => m.state === 'stopped' && m.instance_id !== before.instance_id && same(m.config, session.diagnosticConfig));
-    if (accepted) {
+    // An uncertain primary outcome permanently withholds automatic restoration.
+    // Neither later visibility nor a wait/lease is a fence for an ambiguous POST.
+    if (primary.code === null) {
+      stage = 'diagnostic-settlement';
+      const accepted = await settledReadback(primary, session.diagnosticConfig, 'after');
       stage = 'conditional-restoration';
-      // Only an exact observed stopped diagnostic version authorizes this
-      // separately budgeted baseline CAS. No replay of the diagnostic write.
       restoration = await write(session.baselineConfig, accepted, 'restoration');
-      stage = 'restoration-observation';
-      const checked = await find('restoration', m => m.state === 'stopped'
-        && m.instance_id !== accepted.instance_id && same(m.config, session.baselineConfig));
-      if (checked && restoration.code === null) { restored = true; mutationSettled = true; }
+      if (restoration.code === null) {
+        stage = 'restoration-settlement';
+        await settledReadback(restoration, session.baselineConfig, 'restoration');
+        restored = true; mutationSettled = true;
+      }
     } else if (primary.observation.dispatched === false && baselineObserved) mutationSettled = true;
     if (!mutationSettled) failureStage = 'mutation-settlement-unverified';
     else if (primary.code !== null) failureStage = 'diagnostic-request-failed';
@@ -97,8 +115,8 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     if (native) { try { nativeReapVerified = await native.reap() === true; } catch { nativeReapVerified = false; } }
     if (!nativeReapVerified) failureStage ||= 'native-reap-unverified';
   }
-  const result = { version: 'p10b-stopped-update-closure-v1', operation: 'stopped-update-diagnostic', closedAt: new Date(clock()).toISOString(),
-    sessionDigest: digest(session), primary, restoration, baselineObserved, mutationSettled,
+  const result = { version: 'p10b-stopped-update-closure-v2', operation: 'stopped-update-diagnostic', closedAt: new Date(clock()).toISOString(),
+    sessionDigest: digest(session), recoveryPolicy: session.recoveryPolicy, primary, restoration, baselineObserved, mutationSettled,
     mutationUncertain: attempted && !mutationSettled, restored, nativeReapVerified, failureStage,
     success: !failureStage && restored && nativeReapVerified, maximumStarts: 0,
     qualificationAllowed: false, providerCalls: 0, emails: 0, productionReady: false, globalAutomationPaused: true };

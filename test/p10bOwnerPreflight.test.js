@@ -75,23 +75,40 @@ test('preparer seals actual bounded public facts with original clock and no manu
 });
 test('stopped diagnostic preparer seals only zero-start authority after actual public preflight and cleanup', async t => {
   const f = fixture(t);
-  f.recipe.version = 'p10b-owner-stopped-update-recipe-v1';
+  f.recipe.version = 'p10b-owner-stopped-update-recipe-v2';
   f.recipe.ownerIssuanceDirectory = path.join(f.root, 'owner-public-issuance');
   f.recipe.files.diagnosticNative = { path: process.execPath, sha256: P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 };
   f.permission.recipeDigest = digest(f.recipe);
   const original = f.options.checkFile;
   f.options.checkFile = item => item === f.recipe.files.diagnosticNative ? item.path : original(item);
+  assert.equal(preflight.checkP10bOwnerRecipe(f.recipe, f.options).recoveryPolicy, 'acknowledged-only-nonrunning-v1');
   const result = await preflight.prepareP10bOwnerBundle({ ...f, ...f.options });
   const bundle = JSON.parse(fs.readFileSync(f.recipe.sealedBundlePath));
-  assert.equal(bundle.version, 'p10b-stopped-update-bundle-v1');
-  assert.equal(bundle.session.version, 'p10b-stopped-update-session-v1');
+  assert.equal(bundle.version, 'p10b-stopped-update-bundle-v2');
+  assert.equal(bundle.session.version, 'p10b-stopped-update-session-v2');
+  assert.equal(bundle.session.recoveryPolicy, 'acknowledged-only-nonrunning-v1');
   assert.equal(bundle.session.maximumStarts, 0); assert.equal(bundle.session.maximumStartWindowMs, 0);
   assert.equal(bundle.session.maximumDiagnosticPosts, 1); assert.equal(bundle.session.maximumRestorationPosts, 1);
   assert.equal(bundle.session.maximumStoppedConfigUpdates, 2); assert.equal(bundle.session.qualificationAllowed, false);
-  assert.equal(bundle.approval.version, 'p10b-stopped-update-approval-v1'); assert.equal(bundle.approval.approved, false);
+  assert.equal(bundle.approval.version, 'p10b-stopped-update-approval-v2'); assert.equal(bundle.approval.approved, false);
   assert.equal(result.operation, 'stopped-update-diagnostic'); assert.equal(result.preflightCleanupVerified, true);
+  assert.equal(result.recoveryPolicy, 'acknowledged-only-nonrunning-v1');
+  assert.equal(bundle.session.requestTimeoutMs, 10000); assert.equal(bundle.session.maximumObservationMs, 10000);
+  assert.equal(bundle.session.maximumRunMs, 120000);
+  assert.equal(Date.parse(bundle.session.sessionDeadline) - Date.parse(bundle.session.startedAt), 900000);
   assert.equal(fs.existsSync(result.privateAuthDirectory), false);
   assert.equal(f.commands.some(c => c.args.some(a => a === 'start' || a === 'update')), false);
+});
+test('superseded diagnostic recipe refuses before public commands or private allocation', async t => {
+  const f = fixture(t); f.recipe.version = 'p10b-owner-stopped-update-recipe-v1';
+  f.recipe.ownerIssuanceDirectory = path.join(f.root, 'owner-public-issuance');
+  f.recipe.files.diagnosticNative = { path: process.execPath, sha256: P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 };
+  f.permission.recipeDigest = digest(f.recipe);
+  const original = f.options.checkFile;
+  f.options.checkFile = item => item === f.recipe.files.diagnosticNative ? item.path : original(item);
+  await assert.rejects(preflight.prepareP10bOwnerBundle({ ...f, ...f.options }), /Fixed reviewed recipe required/);
+  assert.equal(f.commands.length, 0); assert.equal(fs.readdirSync(f.recipe.evidenceDirectory).length, 0);
+  assert.equal(fs.existsSync(f.recipe.sealedBundlePath), false);
 });
 test('environment name admission precedes value access', () => {
   assert.equal(typeof preflight.projectP10bStoppedBaseline, 'function');

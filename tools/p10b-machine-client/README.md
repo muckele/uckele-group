@@ -29,3 +29,18 @@ status and proves local termination within its bounded reap interval.
 Do not invoke the normal bootstrap until a separately approved live session,
 image prerequisite, owner-authentication coverage and positive recovery proof
 have passed. Compiling this helper grants no Machine or email authority.
+
+The separately compiled `p10b_stopped_diagnostic` mode has only the
+`--serve-stopped-update-diagnostic` entry point and accepts the v2 zero-start
+session with `recoveryPolicy=acknowledged-only-nonrunning-v1`. It permits one
+candidate POST and at most one eligible baseline POST. Each successful update
+must acknowledge the exact configuration and new version. Diagnostic-only IPC
+`WAIT` accepts only `{version}` and becomes a single GET to the fixed Machine's
+`/wait` endpoint with `state=settled`, that acknowledged version and a bounded
+timeout. It has no retry wrapper. Only a closed successful nonrunning settlement
+followed by a fresh exact current-version/configuration GET can admit restoration.
+WAIT and readback share one immutable ten-second window; a delayed read cannot
+renew it. Initial admission remains stopped; post-update created or stopped is
+allowed. Failed/unknown writes, failed settlement, drift or expired observation
+hold further mutation permanently. Later visibility cannot authorize recovery
+from an ambiguous request. Recovery then needs separate approval.

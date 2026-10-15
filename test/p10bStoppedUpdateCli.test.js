@@ -31,7 +31,7 @@ function fixture() {
     archiveDevice: item.device, archiveInode: item.inode, attemptSha256: sha256(files.get(r.attemptPath).bytes) });
   const evidence = { root, has: name => records.has(name), read: name => records.get(name), write(name, value) {
     assert.equal(records.has(name), false); records.set(name, structuredClone(value)); } };
-  const bundle = { version: 'p10b-stopped-update-bundle-v1', status: 'OWNER_APPROVED_STOPPED_UPDATE_DIAGNOSTIC', session, approval,
+  const bundle = { version: 'p10b-stopped-update-bundle-v2', status: 'OWNER_APPROVED_STOPPED_UPDATE_DIAGNOSTIC', session, approval,
     imageEvidence: { version: 'p10b-image-prerequisite-v1', sourceHead: session.sourceHead, imageDigest: session.candidateImageDigest,
       immutableImage: `registry.fly.io/uckele-group-p10b@${session.candidateImageDigest}`, buildCount: 1, pushCount: 1,
       registryManifestVerified: true, manifestEvidenceDigest: '8'.repeat(64), verifiedAt: session.startedAt } };
@@ -54,6 +54,7 @@ function fixture() {
       assert.deepEqual(input.configs, [session.baselineConfig, session.diagnosticConfig]);
       assert.equal(input.environment.FLY_API_TOKEN, 'synthetic-offline-auth-canary');
       return { async client(method = 'GET', body) {
+        if (method === 'WAIT') return { settlement: { ok: true, state: 'stopped', version: instance }, observation: { httpStatus: 200, elapsedMs: 1, dispatched: true } };
         if (method === 'POST') {
           assert.equal(input.readOnly, false); assert.equal(input.recoveryVerified, true); posts++;
           assert.equal(body.skip_launch, true); assert.equal(body.current_version, instance);

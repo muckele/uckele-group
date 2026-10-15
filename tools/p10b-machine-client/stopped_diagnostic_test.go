@@ -87,11 +87,11 @@ func diagnosticInitializationFixture(t *testing.T) (map[string]interface{}, init
 	c, _ = canonical(c)
 	b, _ := json.Marshal(f["baseline"])
 	b, _ = canonical(b)
-	session := map[string]interface{}{"version": "p10b-stopped-update-session-v1", "operation": "stopped-update-diagnostic", "app": "uckele-group-p10b", "machineId": "0803730bd1d7e8", "volumeId": "vol_vwnkpex1k3yx9dnv", "sourceHead": "c4944a46ac362cdcd002e077d5533b4b0843b1d0", "candidateImageDigest": "sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc", "baselineImageDigest": "sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629", "baselineConfig": json.RawMessage(b), "diagnosticConfig": json.RawMessage(c), "diagnosticConfigDigest": hash(c), "baselineInstanceId": f["currentVersion"], "nonce": nonce, "ownerPermissionDigest": owner, "startedAt": start.Format(time.RFC3339Nano), "sessionDeadline": end.Format(time.RFC3339Nano), "maximumStarts": 0, "maximumStartWindowMs": 0, "qualificationAllowed": false, "maximumDiagnosticPosts": 1, "maximumRestorationPosts": 1, "maximumStoppedConfigUpdates": 2, "requestTimeoutMs": 10000, "maximumObservationMs": 10000, "maximumRunMs": 120000, "maximumLocalBuilds": 0, "maximumImagePushes": 0, "productionReady": false, "globalAutomationPaused": true}
+	session := map[string]interface{}{"version": "p10b-stopped-update-session-v2", "operation": "stopped-update-diagnostic", "recoveryPolicy": "acknowledged-only-nonrunning-v1", "app": "uckele-group-p10b", "machineId": "0803730bd1d7e8", "volumeId": "vol_vwnkpex1k3yx9dnv", "sourceHead": "c4944a46ac362cdcd002e077d5533b4b0843b1d0", "candidateImageDigest": "sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc", "baselineImageDigest": "sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629", "baselineConfig": json.RawMessage(b), "diagnosticConfig": json.RawMessage(c), "diagnosticConfigDigest": hash(c), "baselineInstanceId": f["currentVersion"], "nonce": nonce, "ownerPermissionDigest": owner, "startedAt": start.Format(time.RFC3339Nano), "sessionDeadline": end.Format(time.RFC3339Nano), "maximumStarts": 0, "maximumStartWindowMs": 0, "qualificationAllowed": false, "maximumDiagnosticPosts": 1, "maximumRestorationPosts": 1, "maximumStoppedConfigUpdates": 2, "requestTimeoutMs": 10000, "maximumObservationMs": 10000, "maximumRunMs": 120000, "maximumLocalBuilds": 0, "maximumImagePushes": 0, "productionReady": false, "globalAutomationPaused": true}
 	return session, initPacket{Version: "p10b-stopped-native-init-v1", Approved: true, RecoveryVerified: true, Configs: []json.RawMessage{b, c}}
 }
 func TestStoppedDiagnosticInitializationRejectsWiderOrMalformedAuthorityBeforeAuthentication(t *testing.T) {
-	cases := []string{"valid", "operation", "legacy", "starts", "qualification", "posts", "timeout", "machine", "version", "owner", "baseline-hard-off", "config-sequence", "recovery", "approval"}
+	cases := []string{"valid", "operation", "legacy", "old-stopped", "recovery-policy", "starts", "qualification", "posts", "timeout", "machine", "version", "owner", "baseline-hard-off", "config-sequence", "recovery", "approval"}
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
 			s, p := diagnosticInitializationFixture(t)
@@ -100,6 +100,10 @@ func TestStoppedDiagnosticInitializationRejectsWiderOrMalformedAuthorityBeforeAu
 				s["operation"] = "qualification"
 			case "legacy":
 				s["version"] = "p10b-no-email-session-v1"
+			case "old-stopped":
+				s["version"] = "p10b-stopped-update-session-v1"
+			case "recovery-policy":
+				s["recoveryPolicy"] = "candidate-visibility"
 			case "starts":
 				s["maximumStarts"] = 2
 			case "qualification":

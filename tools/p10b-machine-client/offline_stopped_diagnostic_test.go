@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -24,7 +25,9 @@ type diagnosticLoopbackHTTP struct {
 }
 
 func (t *diagnosticLoopbackHTTP) RoundTrip(request *http.Request) (*http.Response, error) {
-	if request.URL.String() != "https://api.machines.dev/v1"+endpoint || (request.Method != "GET" && request.Method != "POST") || request.GetBody != nil || request.Header.Get("Idempotency-Key") != "" || request.Header.Get("X-Idempotency-Key") != "" {
+	ordinary := request.URL.String() == "https://api.machines.dev/v1"+endpoint && (request.Method == "GET" || request.Method == "POST")
+	wait := request.Method == "GET" && request.URL.Scheme == "https" && request.URL.Host == "api.machines.dev" && request.URL.Path == "/v1"+endpoint+"/wait" && request.URL.User == nil && request.URL.Fragment == "" && regexp.MustCompile(`^state=settled&timeout=[1-9]&version=[A-Za-z0-9-]{1,80}$`).MatchString(request.URL.RawQuery)
+	if (!ordinary && !wait) || request.GetBody != nil || request.Header.Get("Idempotency-Key") != "" || request.Header.Get("X-Idempotency-Key") != "" {
 		return nil, errors.New("offline endpoint denied")
 	}
 	var data []byte
@@ -35,7 +38,7 @@ func (t *diagnosticLoopbackHTTP) RoundTrip(request *http.Request) (*http.Respons
 			return nil, errors.New("offline body bound")
 		}
 	}
-	proxy, err := http.NewRequestWithContext(request.Context(), request.Method, t.base+"/v1"+endpoint, bytes.NewReader(data))
+	proxy, err := http.NewRequestWithContext(request.Context(), request.Method, t.base+request.URL.RequestURI(), bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}

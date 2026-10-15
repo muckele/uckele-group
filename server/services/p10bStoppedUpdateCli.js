@@ -23,7 +23,7 @@ export async function runP10bStoppedUpdateCli(args, { read = readP10bPublicJson,
   const enteredAt = clock();
   if (!Number.isFinite(enteredAt)) throw Error('Diagnostic entry clock required');
   const { version, session, approval, imageEvidence, status } = read(args[2]);
-  if (version !== 'p10b-stopped-update-bundle-v1' || status !== 'OWNER_APPROVED_STOPPED_UPDATE_DIAGNOSTIC') throw Error('Diagnostic is held');
+  if (version !== 'p10b-stopped-update-bundle-v2' || status !== 'OWNER_APPROVED_STOPPED_UPDATE_DIAGNOSTIC') throw Error('Diagnostic is held');
   assertP10bStoppedUpdateApproval(session, approval, clock()); assertP10bImagePrerequisite(session, imageEvidence, clock());
   assertP10bStoppedUpdateHostBinding(session, checkSource); assertP10bFlyExecutable(session);
   const runDeadline = Math.min(enteredAt + session.maximumRunMs, Date.parse(session.sessionDeadline));

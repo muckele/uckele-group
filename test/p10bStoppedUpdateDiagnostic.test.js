@@ -21,6 +21,10 @@ function fakeBoundary(session, mode, advance) {
   const calls = [];
   return { calls, async client(method = 'GET', body, timeoutMs) {
     calls.push({ method, body, timeoutMs });
+    if (method === 'WAIT') {
+      assert.equal(body.version, version); advance(1);
+      return { settlement: { ok: true, state: 'stopped', version }, observation: { httpStatus: 200, elapsedMs: 1, dispatched: true } };
+    }
     if (method === 'POST') {
       writes++; assert.equal(body.skip_launch, true); assert.equal(body.current_version, version);
       if (writes === 1 && mode !== 'success') {
@@ -53,11 +57,11 @@ for (const mode of ['success', 'timeout-baseline-only', 'late-acceptance']) {
       createClient: async () => native, assertAdmission: () => true, clock: () => now,
       wait: async ms => { now += ms; } });
     const posts = native.calls.filter(c => c.method === 'POST');
-    assert.equal(posts.length, mode === 'timeout-baseline-only' ? 1 : 2);
+    assert.equal(posts.length, mode === 'success' ? 2 : 1);
     assert.equal(posts[0].timeoutMs, 10000); assert.deepEqual(posts[0].body.config, session.diagnosticConfig);
     if (posts.length === 2) assert.deepEqual(posts[1].body.config, session.baselineConfig);
-    assert.equal(result.restored, mode !== 'timeout-baseline-only');
-    assert.equal(result.mutationUncertain, mode === 'timeout-baseline-only');
+    assert.equal(result.restored, mode === 'success');
+    assert.equal(result.mutationUncertain, mode !== 'success');
     assert.equal(result.nativeReapVerified, true);
     assert.equal(result.primary.code, mode === 'success' ? null : 'timed-out');
     assert.equal(result.success, mode === 'success');
@@ -120,23 +124,24 @@ test('withdrawn admission after client creation blocks reads and writes and stil
   assert.equal(result.success, false); assert.equal(result.failureStage, 'before-observation');
   assert.equal(native.calls.some(c => c.method), false); assert.equal(result.nativeReapVerified, true);
 });
-test('a candidate arriving after the observation cutoff cannot authorize restoration', async () => {
-  let now = Date.now(); const start = now; const { session, approval } = stoppedDiagnosticFixture(now);
-  const evidence = evidenceStore(); let reads = 0; let posts = 0; const timeouts = [];
+test('fresh readback arriving after the shared settlement window cannot authorize restoration', async () => {
+  let now = Date.now(); const { session, approval } = stoppedDiagnosticFixture(now); const evidence = evidenceStore();
+  let posts = 0; let reads = 0; let readTimeout;
   const response = (candidate, version) => ({ machine: { id: session.machineId, region: 'ewr', state: 'stopped',
     instance_id: version, config: candidate ? session.diagnosticConfig : session.baselineConfig,
     image_ref: { digest: candidate ? session.candidateImageDigest : session.baselineImageDigest } },
     observation: { httpStatus: 200, elapsedMs: 0, dispatched: true } });
   const native = { async client(method, body, timeoutMs) {
     if (method === 'POST') { posts++; return response(true, 'candidate-version'); }
-    timeouts.push(timeoutMs); reads++;
-    if (reads <= 2) return response(false, session.baselineInstanceId);
-    now += 10; return response(true, 'candidate-version');
+    if (method === 'WAIT') { now += 8999; return { settlement: { ok: true, state: 'stopped', version: 'candidate-version' },
+      observation: { httpStatus: 200, elapsedMs: 8999, dispatched: true } }; }
+    reads++;
+    if (reads === 1) return response(false, session.baselineInstanceId);
+    readTimeout = timeoutMs; now += 1001; return response(true, 'candidate-version');
   }, async reap() { return true; } };
   const result = await operator.runP10bStoppedUpdateDiagnostic({ session, approval, evidence,
-    createClient: async () => native, assertAdmission: () => true, clock: () => now,
-    wait: async ms => { now = Math.max(now + ms, start + 9995); } });
-  assert.equal(posts, 1); assert.equal(timeouts.at(-1), 5);
+    createClient: async () => native, assertAdmission: () => true, clock: () => now });
+  assert.equal(posts, 1); assert.equal(readTimeout, 1000);
   assert.equal(result.restored, false); assert.equal(result.mutationUncertain, true);
 });
 test('admission withdrawn during durable intent blocks dispatch', async () => {
@@ -162,4 +167,49 @@ test('diagnostic recovery metadata rejects hidden fields and malformed public bi
     const { session, approval } = stoppedDiagnosticFixture(); session.recovery = recovery; approval.sessionDigest = digest(session);
     assert.throws(() => contract.assertP10bStoppedUpdateApproval(session, approval));
   }
+});
+
+for (const mode of ['created', 'unusable-primary', 'wrong-ack-version', 'wrong-ack-config', 'wrong-wait-version', 'failed-wait', 'running-wait', 'drift-after-wait', 'uncertain-restoration', 'late-wait', 'wait-http-rejection', 'reused-baseline-restoration-version']) {
+  test(`acknowledgement and settlement gates: ${mode}`, async () => {
+    let now = Date.now(); const { session, approval } = stoppedDiagnosticFixture(now); const evidence = evidenceStore();
+    let config = session.baselineConfig; let version = session.baselineInstanceId; let posts = 0; let waits = 0;
+    const state = () => posts && mode === 'created' ? 'created' : 'stopped';
+    const native = { async client(method, body) {
+      if (method === 'WAIT') {
+        waits++; assert.equal(body.version, version);
+        if (mode === 'wait-http-rejection') throw new contract.P10bStoppedUpdateRequestError({ code: 'http-failed', method: 'WAIT', timeoutMs: 9000, observation: { httpStatus: 503, elapsedMs: 1, dispatched: true } });
+        if (mode === 'late-wait') now += 10001;
+        return { settlement: { ok: true, state: mode === 'failed-wait' ? 'failed' : mode === 'running-wait' ? 'started' : state(),
+          version: mode === 'wrong-wait-version' ? 'wrong-version' : version }, observation: { httpStatus: 200, elapsedMs: 1, dispatched: true } };
+      }
+      if (method === 'POST') {
+        posts++; config = body.config; version = mode === 'reused-baseline-restoration-version' && posts === 2 ? session.baselineInstanceId : `acknowledged-${posts}`;
+        if (mode === 'uncertain-restoration' && posts === 2) throw new contract.P10bStoppedUpdateRequestError({ code: 'timed-out', method, timeoutMs: 10000,
+          observation: { httpStatus: null, elapsedMs: 10000, dispatched: true } });
+      }
+      const response = { machine: { id: session.machineId, state: state(), region: 'ewr', instance_id: version,
+        config: structuredClone(config), image_ref: { digest: config.image.split('@')[1] } }, observation: { httpStatus: 200, elapsedMs: 1, dispatched: true } };
+      if (method === 'POST' && posts === 1) {
+        if (mode === 'unusable-primary') response.machine = null;
+        if (mode === 'wrong-ack-version') response.machine.instance_id = session.baselineInstanceId;
+        if (mode === 'wrong-ack-config') { response.machine.config = session.baselineConfig; response.machine.image_ref.digest = session.baselineImageDigest; }
+      }
+      if (method === 'GET' && waits && mode === 'drift-after-wait') response.machine.instance_id = 'unacknowledged-version';
+      return response;
+    }, async reap() { return true; } };
+    const result = await operator.runP10bStoppedUpdateDiagnostic({ session, approval, evidence, createClient: async () => native,
+      assertAdmission: () => true, clock: () => now, wait: async ms => { now += ms; } });
+    assert.equal(posts, ['created', 'uncertain-restoration', 'reused-baseline-restoration-version'].includes(mode) ? 2 : 1);
+    assert.equal(result.success, mode === 'created');
+    assert.equal(result.restored, mode === 'created');
+    assert.equal(result.mutationUncertain, mode !== 'created');
+    assert.equal(result.nativeReapVerified, true);
+    if (['unusable-primary', 'wrong-ack-version', 'wrong-ack-config'].includes(mode)) assert.equal(waits, 0);
+    if (mode === 'wait-http-rejection') assert.equal(evidence.records.get('p10b-stopped-update-after-settlement-failure.json')?.observation.httpStatus, 503);
+  });
+}
+test('old diagnostic consent cannot authorize the revised recovery contract', () => {
+  const { session, approval } = stoppedDiagnosticFixture();
+  session.version = 'p10b-stopped-update-session-v1'; approval.version = 'p10b-stopped-update-approval-v1'; approval.sessionDigest = digest(session);
+  assert.throws(() => contract.assertP10bStoppedUpdateApproval(session, approval));
 });

@@ -207,7 +207,7 @@ spec=importlib.util.spec_from_file_location('handoff',sys.argv[1]);h=importlib.u
 root=pathlib.Path(sys.argv[2]);node=sys.argv[3];helper=sys.argv[4];recipe=json.loads((root/'recipe.json').read_text())
 def runner(args,environment,timeout):
  mode=next(item for item in args if item in ['--check-only','--validate-input','--prepare','--execute'])
- if mode=='--execute' and recipe['version']=='p10b-owner-stopped-update-recipe-v1':
+ if mode=='--execute' and recipe['version']=='p10b-owner-stopped-update-recipe-v2':
   assert pathlib.Path(args[1]).name=='run-p10b-stopped-update-diagnostic.js'
   assert args[-1]==recipe['files']['diagnosticNative']['path']
  result=h.run_command([node,helper,mode,str(root)],environment,timeout)
@@ -332,22 +332,39 @@ input('SYNTHETIC_OWNER_DONE')
                 self.assertFalse((self.root / 'sealed-session.json').exists())
             else:
                 output = self.until(child, b' to authorize this exact ')
-                prefix = b'APPROVE STOPPED UPDATE ' if getattr(self, 'diagnostic_mode', False) else b'APPROVE SESSION '
+                prefix = b'APPROVE CONDITIONAL STOPPED UPDATE ' if getattr(self, 'diagnostic_mode', False) else b'APPROVE SESSION '
                 self.assertIn(prefix, output)
                 session_digest = re.findall(re.escape(prefix) + rb'([a-f0-9]{64})', output)[-1]
                 sealed = handoff.read_public(self.root / 'sealed-session.json')
                 self.assertEqual(sealed['approval']['sessionDigest'], session_digest.decode())
                 self.assertFalse(sealed['approval']['approved'])
+                if getattr(self, 'diagnostic_mode', False):
+                    self.assertEqual(sealed['version'], 'p10b-stopped-update-bundle-v2')
+                    self.assertEqual(sealed['session']['version'], 'p10b-stopped-update-session-v2')
+                    self.assertEqual(sealed['approval']['version'], 'p10b-stopped-update-approval-v2')
+                    self.assertEqual(sealed['session']['recoveryPolicy'], 'acknowledged-only-nonrunning-v1')
+                    self.assertIn(b'acknowledged-only-nonrunning-v1', output)
+                    self.assertIn(b'created or stopped', output)
+                    self.assertIn(b'timely valid primary acknowledgement', output)
+                    self.assertIn(b'version-scoped settlement', output)
+                    self.assertIn(b'no automatic restoration', output)
+                    self.assertIn(b'separately approved recovery', output)
                 closure = handoff.read_public(self.root / 'runtime-evidence/p10b-owner-preflight-closure.json')
                 self.assertTrue(closure['reaped'] and closure['cleanupVerified'])
                 self.assertFalse(Path(closure['privateAuthDirectory']).exists())
-                os.write(child[1], b'\n' if mode == 'decline-session' else prefix + session_digest + b'\n')
+                consent = prefix + session_digest + b'\n'
+                if mode == 'decline-session': consent = b'\n'
+                if mode == 'old-diagnostic-consent': consent = b'APPROVE STOPPED UPDATE ' + session_digest + b'\n'
+                os.write(child[1], consent)
                 code, output = self.drain(child)
-                self.assertEqual(code, 2 if mode == 'decline-session' else 0, output[-3000:])
+                self.assertEqual(code, 2 if mode in ('decline-session', 'old-diagnostic-consent') else 0, output[-3000:])
                 if mode == 'success':
                     approved = handoff.read_public(self.root / 'approved-session.json')
                     boundary = handoff.read_public(self.root / 'execution-boundary.json')
                     self.assertEqual(approved['session'], sealed['session'])
+                    if getattr(self, 'diagnostic_mode', False):
+                        final = handoff.read_public(self.root / 'owner-final-approval.json')
+                        self.assertEqual(final['version'], 'p10b-owner-final-stopped-update-approval-v2')
                     self.assertEqual(boundary['sessionDigest'], session_digest.decode())
                     self.assertTrue(boundary['runtimeSimulated'])
                     self.assertEqual(approved['session']['authenticationEvidence']['issuanceStartedAt'],

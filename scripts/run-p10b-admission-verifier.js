@@ -9,7 +9,7 @@ import { p10bInheritedAppTokenEnvironment } from '../server/services/p10bHostAut
 try {
   if (process.argv.length !== 5 || !['--baseline', '--archive'].includes(process.argv[2])) throw Error();
   const input = readP10bPublicJson(process.argv[3]);
-  const diagnostic = input.session?.version === 'p10b-stopped-update-session-v1';
+  const diagnostic = input.session?.version === 'p10b-stopped-update-session-v2';
   (diagnostic ? assertP10bStoppedUpdateApproval : assertP10bNoEmailApproval)(input.session, input.approval, Date.now());
   (diagnostic ? assertP10bStoppedUpdateHostBinding : assertP10bNoEmailHostBinding)(input.session);
   const evidence = createP10bOperatorEvidence(process.argv[4]);

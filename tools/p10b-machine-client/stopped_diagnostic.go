@@ -22,30 +22,177 @@ type requestObservation struct {
 type stoppedDiagnosticPolicy struct {
 	baseline, candidate, baselineVersion string
 	lastConfig, lastVersion              string
-	lastStopped                          bool
+	lastStopped, lastNonrunning          bool
 	lastAt                               time.Time
+	primaryAttempted, restoreAttempted   bool
+	primaryVersion, restoreVersion       string
+	primaryWait, restoreWait             bool
+	primarySettled, restoreSettled       bool
+	phaseDeadline                        time.Time
+	hold                                 bool
+}
+type stoppedSettlement struct {
+	OK      bool   `json:"ok"`
+	State   string `json:"state"`
+	Version string `json:"version"`
+}
+
+func stoppedImageMatches(m map[string]json.RawMessage) bool {
+	var config struct {
+		Image string `json:"image"`
+	}
+	var image struct {
+		Digest string `json:"digest"`
+	}
+	if json.Unmarshal(m["config"], &config) != nil || json.Unmarshal(m["image_ref"], &image) != nil {
+		return false
+	}
+	_, digest, ok := strings.Cut(config.Image, "@")
+	return ok && digest == image.Digest
 }
 
 func enableStoppedDiagnostic(s *service, baseline, candidate []byte, version string) {
 	s.diagnostic = &stoppedDiagnosticPolicy{baseline: hash(baseline), candidate: hash(candidate), baselineVersion: version}
 }
 func (d *stoppedDiagnosticPolicy) writeAllowed(posts int, config, version string) bool {
-	if !d.lastStopped || time.Since(d.lastAt) > time.Second || version != d.lastVersion {
+	if d.hold || time.Since(d.lastAt) > time.Second || version != d.lastVersion {
 		return false
 	}
 	if posts == 0 {
-		return config == d.candidate && d.lastConfig == d.baseline && version == d.baselineVersion
+		return !d.primaryAttempted && d.lastStopped && config == d.candidate && d.lastConfig == d.baseline && version == d.baselineVersion
 	}
-	return posts == 1 && config == d.baseline && d.lastConfig == d.candidate && version != d.baselineVersion
+	return posts == 1 && !d.restoreAttempted && d.primaryVersion != "" && d.primarySettled && d.lastNonrunning && !d.phaseDeadline.IsZero() && time.Now().Before(d.phaseDeadline) && config == d.baseline && d.lastConfig == d.candidate && version == d.primaryVersion
 }
-func (d *stoppedDiagnosticPolicy) observe(m map[string]json.RawMessage) {
-	var state string
+func (d *stoppedDiagnosticPolicy) beginWrite(posts int) {
+	if posts == 0 {
+		d.primaryAttempted = true
+	} else {
+		d.restoreAttempted = true
+	}
+	d.lastAt = time.Time{}
+}
+func (d *stoppedDiagnosticPolicy) acknowledge(posts int, m map[string]json.RawMessage) bool {
+	var state, version string
 	json.Unmarshal(m["state"], &state)
-	json.Unmarshal(m["instance_id"], &d.lastVersion)
+	json.Unmarshal(m["instance_id"], &version)
 	config, _ := canonical(m["config"])
-	d.lastConfig = hash(config)
+	if d.hold || !map[string]bool{"created": true, "stopped": true, "replacing": true}[state] {
+		return false
+	}
+	if posts == 1 && hash(config) == d.candidate && version != d.baselineVersion {
+		d.primaryVersion = version
+		return true
+	}
+	if posts == 2 && hash(config) == d.baseline && version != d.primaryVersion && version != d.baselineVersion {
+		d.restoreVersion = version
+		return true
+	}
+	return false
+}
+func (d *stoppedDiagnosticPolicy) beginWait(version string) bool {
+	if d.hold {
+		return false
+	}
+	if d.restoreAttempted {
+		if d.restoreVersion == "" || version != d.restoreVersion || d.restoreWait {
+			return false
+		}
+		d.restoreWait = true
+	} else {
+		if d.primaryVersion == "" || version != d.primaryVersion || d.primaryWait {
+			return false
+		}
+		d.primaryWait = true
+	}
+	d.lastAt = time.Time{}
+	d.phaseDeadline = time.Now().Add(10 * time.Second)
+	return true
+}
+func (d *stoppedDiagnosticPolicy) settlement(raw []byte, version string) (*stoppedSettlement, error) {
+	var wire struct {
+		OK      *bool           `json:"ok"`
+		State   string          `json:"state"`
+		Version string          `json:"version"`
+		EventID json.RawMessage `json:"event_id"`
+	}
+	if !uniqueStoppedObject(raw) || strict(raw, &wire) != nil || wire.OK == nil || !*wire.OK || wire.Version != version || (wire.State != "created" && wire.State != "stopped") {
+		return nil, errors.New("invalid-output")
+	}
+	return &stoppedSettlement{OK: true, State: wire.State, Version: wire.Version}, nil
+}
+func uniqueStoppedObject(raw []byte) bool {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	first, err := d.Token()
+	if err != nil || first != json.Delim('{') {
+		return false
+	}
+	seen := map[string]bool{}
+	for d.More() {
+		key, err := d.Token()
+		name, ok := key.(string)
+		if err != nil || !ok || seen[name] {
+			return false
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if d.Decode(&value) != nil {
+			return false
+		}
+	}
+	last, err := d.Token()
+	return err == nil && last == json.Delim('}') && d.Decode(new(interface{})) == io.EOF
+}
+func (d *stoppedDiagnosticPolicy) finishWait() bool {
+	if d.phaseDeadline.IsZero() || !time.Now().Before(d.phaseDeadline) {
+		return false
+	}
+	if d.restoreAttempted {
+		d.restoreSettled = true
+	} else {
+		d.primarySettled = true
+	}
+	// Only a fresh exact GET after this successful wait may authorize a write.
+	d.lastAt = time.Time{}
+	return true
+}
+func (d *stoppedDiagnosticPolicy) phaseAllows(method string) bool {
+	if d.phaseDeadline.IsZero() {
+		return method != "WAIT"
+	}
+	return time.Now().Before(d.phaseDeadline)
+}
+func (d *stoppedDiagnosticPolicy) observe(m map[string]json.RawMessage) bool {
+	var state, version string
+	json.Unmarshal(m["state"], &state)
+	json.Unmarshal(m["instance_id"], &version)
+	config, _ := canonical(m["config"])
+	if !d.phaseAllows("GET") {
+		d.hold = true
+		return false
+	}
+	if d.primaryAttempted {
+		// Reads remain available for uncertain remote-state evidence, but can
+		// never convert a failed/missing acknowledgement into write authority.
+		if d.hold || d.primaryVersion == "" || (d.restoreAttempted && d.restoreVersion == "") {
+			return true
+		}
+		wantConfig, wantVersion := d.candidate, d.primaryVersion
+		if d.restoreAttempted {
+			wantConfig, wantVersion = d.baseline, d.restoreVersion
+		}
+		if hash(config) != wantConfig || version != wantVersion || (state != "created" && state != "stopped") {
+			d.hold = true
+			return false
+		}
+	} else if hash(config) != d.baseline || version != d.baselineVersion || state != "stopped" {
+		d.hold = true
+		return false
+	}
+	d.lastConfig, d.lastVersion = hash(config), version
 	d.lastStopped = state == "stopped"
+	d.lastNonrunning = state == "created" || state == "stopped"
 	d.lastAt = time.Now()
+	return true
 }
 func stoppedBaselineHardOff(raw []byte) bool {
 	var config struct {
@@ -75,6 +222,7 @@ func initializeStoppedDiagnostic(raw []byte, factory func(context.Context) (requ
 	var session struct {
 		Version         string          `json:"version"`
 		Operation       string          `json:"operation"`
+		RecoveryPolicy  string          `json:"recoveryPolicy"`
 		App             string          `json:"app"`
 		Machine         string          `json:"machineId"`
 		Volume          string          `json:"volumeId"`
@@ -103,7 +251,7 @@ func initializeStoppedDiagnostic(raw []byte, factory func(context.Context) (requ
 		Production      *bool           `json:"productionReady"`
 		Paused          bool            `json:"globalAutomationPaused"`
 	}
-	if json.Unmarshal([]byte(packet.SessionCanonical), &session) != nil || session.Version != "p10b-stopped-update-session-v1" || session.Operation != "stopped-update-diagnostic" || session.App != "uckele-group-p10b" || session.Machine != "0803730bd1d7e8" || session.Volume != "vol_vwnkpex1k3yx9dnv" || session.Source != "c4944a46ac362cdcd002e077d5533b4b0843b1d0" || session.Image != "sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc" || session.BaselineImage != "sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629" || session.Starts == nil || *session.Starts != 0 || session.Window == nil || *session.Window != 0 || session.Qualification == nil || *session.Qualification || session.DiagnosticPosts != 1 || session.RestorePosts != 1 || session.Updates != 2 || session.Timeout != 10000 || session.Observe != 10000 || session.Run != 120000 || session.Builds == nil || *session.Builds != 0 || session.Pushes == nil || *session.Pushes != 0 || session.Production == nil || *session.Production || !session.Paused {
+	if json.Unmarshal([]byte(packet.SessionCanonical), &session) != nil || session.Version != "p10b-stopped-update-session-v2" || session.Operation != "stopped-update-diagnostic" || session.RecoveryPolicy != "acknowledged-only-nonrunning-v1" || session.App != "uckele-group-p10b" || session.Machine != "0803730bd1d7e8" || session.Volume != "vol_vwnkpex1k3yx9dnv" || session.Source != "c4944a46ac362cdcd002e077d5533b4b0843b1d0" || session.Image != "sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc" || session.BaselineImage != "sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629" || session.Starts == nil || *session.Starts != 0 || session.Window == nil || *session.Window != 0 || session.Qualification == nil || *session.Qualification || session.DiagnosticPosts != 1 || session.RestorePosts != 1 || session.Updates != 2 || session.Timeout != 10000 || session.Observe != 10000 || session.Run != 120000 || session.Builds == nil || *session.Builds != 0 || session.Pushes == nil || *session.Pushes != 0 || session.Production == nil || *session.Production || !session.Paused {
 		return nil, denied
 	}
 	start, e1 := time.Parse(time.RFC3339Nano, session.Started)

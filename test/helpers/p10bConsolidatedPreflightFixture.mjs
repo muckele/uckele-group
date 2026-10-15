@@ -32,7 +32,7 @@ if (mode === '--fixture') {
     recovery: { directory: path.join(root, '.uckele-group-p10b-host'), activePath: path.join(root, '.uckele-group-p10b-host/0803730bd1d7e8.active.json'),
       packetDigest: 'a'.repeat(64), expectedSha256: 'b'.repeat(64), reservedAt: '2026-10-10T07:12:20.821Z', evidencePath: '/offline/historical-evidence' } });
   if (operation === '--diagnostic') {
-    const diagnostic = read('recipe.json'); diagnostic.version = 'p10b-owner-stopped-update-recipe-v1';
+    const diagnostic = read('recipe.json'); diagnostic.version = 'p10b-owner-stopped-update-recipe-v2';
     diagnostic.files.diagnosticNative = { path: process.execPath, sha256: P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 };
     fs.writeFileSync(file, JSON.stringify(diagnostic), { mode: 0o600 });
   }
@@ -75,9 +75,9 @@ import { URL } from 'node:url';import path from 'node:path';fs.writeFileSync(pat
   const digest = sha256(stableCanonicalJson(approved.session));
   if (approved.approval.approved !== true || approved.approval.sessionDigest !== digest) throw Error('approval mismatch');
   write('execution-boundary.json', { sessionDigest: digest, runtimeSimulated: true, providerCalls: 0, emails: 0 });
-  const diagnostic = recipe.version === 'p10b-owner-stopped-update-recipe-v1';
-  if (diagnostic && (approved.session.version !== 'p10b-stopped-update-session-v1' || approved.session.maximumStarts !== 0
-    || approved.approval.version !== 'p10b-stopped-update-approval-v1')) throw Error('wrong diagnostic authority');
+  const diagnostic = recipe.version === 'p10b-owner-stopped-update-recipe-v2';
+  if (diagnostic && (approved.session.version !== 'p10b-stopped-update-session-v2' || approved.session.maximumStarts !== 0 || approved.session.recoveryPolicy !== 'acknowledged-only-nonrunning-v1'
+    || approved.approval.version !== 'p10b-stopped-update-approval-v2')) throw Error('wrong diagnostic authority');
   fs.writeFileSync(path.join(recipe.evidenceDirectory, diagnostic ? 'p10b-stopped-update-auth-closure.json' : 'p10b-runtime-only-auth-closure.json'),
     JSON.stringify({ success: true, cleanupVerified: true, reapVerified: true, sessionDigest: digest }), { mode: 0o600, flag: 'wx' });
   result = { success: true, productionReady: false,

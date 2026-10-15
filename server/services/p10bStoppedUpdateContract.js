@@ -8,7 +8,7 @@ const only = (value, keys) => value && typeof value === 'object' && !Array.isArr
   && Object.keys(value).every(key => keys.includes(key));
 const date = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-export const P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 = '992be4e7b7c62d44157fcf47f4966084fec5f08dcad972669821743102b7d997';
+export const P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 = '4e23c99f93c81f53c005b3bedaed9dd1fc9a6b3e7ee15a8b856b4026e96ee87a';
 export function createP10bStoppedDiagnosticConfig(session) {
   // This is frozen configuration data only. No runtime packet, permission or
   // guest execution capability is created by this diagnostic.
@@ -44,14 +44,14 @@ function authentication(s, now) {
     && Date.parse(a.expiresAt) >= Date.parse(s.sessionDeadline);
 }
 export function validateP10bStoppedUpdateSession(s, now = Date.now()) {
-  const keys = ['version', 'operation', 'app', 'machineId', 'volumeId', 'sourceHead', 'hostSourceHead', 'nonce',
+  const keys = ['version', 'operation', 'recoveryPolicy', 'app', 'machineId', 'volumeId', 'sourceHead', 'hostSourceHead', 'nonce',
     'baselineConfig', 'baselineImageDigest', 'baselineInstanceId', 'baselineObservedAt', 'candidateImageDigest',
     'diagnosticConfig', 'diagnosticConfigDigest', 'ownerPermissionDigest', 'permissionEvidenceId', 'startedAt', 'sessionDeadline',
     'maximumStarts', 'maximumStartWindowMs', 'qualificationAllowed', 'maximumDiagnosticPosts', 'maximumRestorationPosts',
     'maximumStoppedConfigUpdates', 'requestTimeoutMs', 'maximumObservationMs', 'maximumRunMs', 'maximumLocalBuilds',
     'maximumImagePushes', 'maximumIncrementalUsd', 'productionReady', 'globalAutomationPaused', 'nativeClientSha256',
     'authenticationEvidence', 'configurationEvidence', 'budget', 'flyExecutable', 'namesClientPath', 'namesClientSha256', 'recovery'];
-  if (!only(s, keys) || s.version !== 'p10b-stopped-update-session-v1' || s.operation !== 'stopped-update-diagnostic'
+  if (!only(s, keys) || s.version !== 'p10b-stopped-update-session-v2' || s.operation !== 'stopped-update-diagnostic' || s.recoveryPolicy !== 'acknowledged-only-nonrunning-v1'
     || s.app !== 'uckele-group-p10b' || s.machineId !== '0803730bd1d7e8' || s.volumeId !== 'vol_vwnkpex1k3yx9dnv'
     || s.sourceHead !== P10B_RETAINED_GUEST_HEAD || s.candidateImageDigest !== P10B_RETAINED_IMAGE
     || typeof s.hostSourceHead !== 'string' || !/^[a-f0-9]{40}$/.test(s.hostSourceHead) || s.hostSourceHead === s.sourceHead
@@ -100,7 +100,7 @@ export function assertP10bStoppedUpdateApproval(session, approval, now = Date.no
   validateP10bStoppedUpdateSession(session, now);
   if (!only(approval, ['version', 'approved', 'sessionDigest', 'ownerPermissionDigest', 'sourceHead', 'hostSourceHead',
     'expiresAt', 'recoveryApproved', 'exclusiveAdmissionWriters', 'providerCalls', 'emails'])
-    || approval.version !== 'p10b-stopped-update-approval-v1' || approval.approved !== true
+    || approval.version !== 'p10b-stopped-update-approval-v2' || approval.approved !== true
     || approval.sessionDigest !== digest(session) || approval.ownerPermissionDigest !== session.ownerPermissionDigest
     || approval.sourceHead !== session.sourceHead || approval.hostSourceHead !== session.hostSourceHead
     || approval.expiresAt !== session.sessionDeadline || approval.recoveryApproved !== true
@@ -129,9 +129,15 @@ export function checkedP10bStoppedObservation(observation, code = null) {
   }
   return { httpStatus: observation.httpStatus, elapsedMs: observation.elapsedMs, dispatched: observation.dispatched };
 }
+export function checkedP10bStoppedSettlement(value, version) {
+  if (!value || Object.keys(value).sort().join(',') !== 'ok,state,version' || value.ok !== true
+    || !['created', 'stopped'].includes(value.state) || !/^[A-Za-z0-9-]{1,80}$/.test(value.version || '')
+    || value.version !== version) throw Error('Closed version-bound nonrunning settlement required');
+  return { ok: true, state: value.state, version: value.version };
+}
 function checkedFailure(facts) {
   if (!facts || Object.keys(facts).sort().join(',') !== 'code,method,observation,timeoutMs'
-    || !failureCodes.has(facts.code) || !['GET', 'POST'].includes(facts.method)
+    || !failureCodes.has(facts.code) || !['GET', 'POST', 'WAIT'].includes(facts.method)
     || !Number.isInteger(facts.timeoutMs) || facts.timeoutMs < 1 || facts.timeoutMs > 10000) throw Error('Closed diagnostic failure required');
   return { code: facts.code, method: facts.method, timeoutMs: facts.timeoutMs,
     observation: checkedP10bStoppedObservation(facts.observation, facts.code) };

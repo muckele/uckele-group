@@ -4,7 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
 import { assertP10bStoppedUpdateApproval } from './p10bStoppedUpdateContract.js';
-const assertCredentialApproval = (session, approval, now) => session?.version === 'p10b-stopped-update-session-v1'
+const assertCredentialApproval = (session, approval, now) => session?.version === 'p10b-stopped-update-session-v2'
   ? assertP10bStoppedUpdateApproval(session, approval, now) : assertP10bNoEmailApproval(session, approval, now);
 
 // Opaque, owner-supplied input only. No creation, parsing, renewal or persistent
