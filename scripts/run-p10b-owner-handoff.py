@@ -34,6 +34,12 @@ class PublicInputHold(Hold):
         super().__init__('Public input held')
 
 
+class PublicMetadataNotReady(PublicInputHold):
+    def __init__(self, directory_identity):
+        self.directory_identity = directory_identity
+        super().__init__('public-token-metadata', 'PUBLIC_METADATA_NOT_READY')
+
+
 @contextmanager
 def private_owner_console():
     # getpass uses the controlling tty. Keep echo disabled between prompts too,
@@ -157,7 +163,7 @@ def normalize_utc(value):
     return utc_after(value, 0)
 
 
-def import_public_token_metadata(recipe):
+def import_public_token_metadata(recipe, expected_directory=None):
     # Public metadata only, prepared locally from the owner's verified listing.
     # No SDK, credential input, token decoding or identity inference occurs here.
     try:
@@ -175,7 +181,15 @@ def import_public_token_metadata(recipe):
             root = os.fstat(directory)
             if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid() or stat.S_IMODE(root.st_mode) != 0o700:
                 raise ValueError()
-            descriptor = os.open('public-token-metadata.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            identity = (root.st_dev, root.st_ino)
+            if expected_directory is not None and identity != expected_directory:
+                raise ValueError()
+            try:
+                descriptor = os.open('public-token-metadata.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            except FileNotFoundError:
+                # Only a missing leaf inside this validated directory is a
+                # coordination wait. Root/file integrity failures remain fatal.
+                raise PublicMetadataNotReady(identity) from None
         finally:
             os.close(directory)
         with os.fdopen(descriptor, 'rb') as stream:
@@ -214,8 +228,40 @@ def import_public_token_metadata(recipe):
         if len(matches) != 1 or matches[0]['revokedAt'] is not None:
             raise ValueError()
         return matches[0]
+    except PublicMetadataNotReady:
+        raise
     except Exception:
         raise PublicInputHold('public-token-metadata', 'INVALID_PUBLIC_METADATA') from None
+
+
+def ready_public_token_metadata(recipe, ask, emit):
+    try:
+        return import_public_token_metadata(recipe)
+    except PublicMetadataNotReady as missing:
+        identity = missing.directory_identity
+    emit('Public metadata is not ready. Keep the same token and original issuance times; '
+         'do not create another token or rerun this launcher. Leave this prompt waiting while '
+         'the helper stages verified public metadata at ' +
+         str(Path(recipe['outputDirectory']) / 'public-token-metadata.json') +
+         '. No credential or authentication has been requested. One explicit recheck is available.')
+    if ask('Type literal METADATA READY only after the public file is prepared, NOT THE TOKEN: ') != 'METADATA READY':
+        raise PublicInputHold('public-token-metadata', 'METADATA_NOT_CONFIRMED')
+    return import_public_token_metadata(recipe, expected_directory=identity)
+
+
+def public_package_bytes(file):
+    descriptor = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > 1048576):
+            raise Hold('Bounded public package file required')
+        raw = stream.read(1048577)
+        after = os.fstat(stream.fileno())
+        if (len(raw) > 1048576 or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise Hold('Public package file changed during read')
+        return raw
 
 
 def read_public(file):
@@ -456,7 +502,10 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         confirm_issuance(ask, emit)
         started = read_public_input(ask, 'issuance-start-utc', 'Actual successful issuance start UTC: ', emit, normalize_utc, 'INVALID_UTC')
         completed = read_public_input(ask, 'issuance-completion-utc', 'Actual successful issuance completion UTC: ', emit, normalize_utc, 'INVALID_UTC')
-        selected = import_public_token_metadata(recipe)
+        selected = ready_public_token_metadata(recipe, ask, emit)
+        if (hashlib.sha256(public_package_bytes(recipe_file)).hexdigest() != expected_recipe_sha256
+                or public_package_bytes(permission_path) != (canonical(permission) + '\n').encode()):
+            raise Hold('Original public setup bindings changed')
         token_id, expiry = selected['tokenId'], selected['expiresAt']
         emit('Selected owner-attested public token metadata; opaque credential identity is not independently verified:')
         emit(json.dumps({'app': recipe['app'], **selected}, indent=2))

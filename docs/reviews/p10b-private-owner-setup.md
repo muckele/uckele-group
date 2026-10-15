@@ -88,9 +88,19 @@ metadata retry. Confirm the displayed row with literal `UNREVOKED`, then literal
 app-deploy token. Neither confirmation requires copying its ID. The resulting
 issuance receipt retains the existing schema, original times and exact imported
 ID/name/effective expiry. Requested lifetime or login time cannot prove coverage.
-A public timestamp syntax correction does not renew authority. Missing or invalid
-metadata consumes the attempt; preserve it and retire the matching token after
-clients close. Stage the file before advancing; never reopen a consumed package.
+A public timestamp syntax correction does not renew authority. If the metadata
+file has not been staged after `ISSUED` and the original two timestamps, the
+launcher stays in this running attempt before any credential input. It prints the
+exact public file path and asks for literal `METADATA READY` once. Leave that
+prompt waiting while the helper stages the verified public import; use the same
+token and original issuance times. This offers one recheck, not another issuance,
+approval or launcher run. The validated directory identity, recipe bytes and
+original setup permission must remain unchanged. Only a genuinely absent leaf
+file is recoverable: an unsafe directory/file, malformed schema, mismatched
+identity, revoked token or failed second read closes before private input. Those
+files stay preserved. Cancellation, EOF, flush uncertainty or a different readiness
+response also closes. Never reopen a consumed package or overwrite rejected input
+to bypass a hold. After closure, retire only the matching token after clients close.
 
 The credential-free public-input validator runs before hidden credential input, and the
 preparer repeats admission at the actual preflight start. Bad ID, timing, expired

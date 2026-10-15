@@ -114,8 +114,61 @@ class OwnerEntryTests(unittest.TestCase):
         self.assertEqual(self.token_calls, 0)
         self.assertFalse((self.root / 'issuance-receipt.json').exists())
 
+    def test_missing_metadata_after_issued_and_timestamps_waits_once_without_consuming(self):
+        self.metadata_path.unlink()
+        start = handoff.utc_now()
+        completed = handoff.utc_after(start, 1)
+        prompts, messages, permissions = [], [], []
+        def ask(prompt):
+            prompts.append(prompt)
+            if 'issuance start' in prompt:
+                return start
+            if 'issuance completion' in prompt:
+                return completed
+            if 'METADATA READY' in prompt:
+                self.assertEqual(self.token_calls, 0)
+                self.assertEqual(len(self.calls), 1)
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                for name in ('owner-terminal.json', 'issuance-receipt.json', 'sealed-session.json',
+                             'approved-session.json', 'owner-final-approval.json'):
+                    self.assertFalse((self.root / name).exists())
+                permissions.append((self.root / 'private-setup-scope.json').read_bytes())
+                handoff.write_exclusive(self.metadata_path, self.metadata)
+                return 'METADATA READY'
+            return self.ask(prompt)
+        self.assertEqual(self.invoke_with_public_input(ask, messages), 0)
+        self.assertEqual(sum('METADATA READY' in p for p in prompts), 1)
+        self.assertEqual(sum('literal ISSUED' in p for p in prompts), 1)
+        self.assertEqual(sum('APPROVE PRIVATE SETUP' in p for p in prompts), 1)
+        self.assertEqual(permissions, [(self.root / 'private-setup-scope.json').read_bytes()])
+        receipt = handoff.read_public(self.root / 'issuance-receipt.json')
+        self.assertEqual((receipt['issuanceStartedAt'], receipt['issuanceCompletedAt']), (start, completed))
+        self.assertEqual(receipt['tokenName'], 'p10b-runtime-no-email-' + self.recipe['nonce'])
+        self.assertEqual(self.token_calls, 1)
+        self.assertEqual(len(self.calls), 4)
+        self.assertIn(str(self.metadata_path), '\n'.join(messages))
+        self.assertIn('same token', '\n'.join(messages))
+
+    def test_missing_metadata_recheck_is_bounded_and_consumed_failure_cannot_reopen(self):
+        self.metadata_path.unlink()
+        prompts, messages = [], []
+        def ask(prompt):
+            prompts.append(prompt)
+            return 'METADATA READY' if 'METADATA READY' in prompt else self.ask(prompt)
+        self.assertEqual(self.invoke_with_public_input(ask, messages), 2)
+        self.assertEqual(sum('METADATA READY' in p for p in prompts), 1)
+        terminal = (self.root / 'owner-terminal.json').read_bytes()
+        self.assertEqual(json.loads(terminal)['publicInputError'], 'PUBLIC_METADATA_NOT_READY')
+        self.assertEqual(self.token_calls, 0)
+        self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+        handoff.write_exclusive(self.metadata_path, self.metadata)
+        count = len(prompts)
+        self.assertEqual(self.invoke_with_public_input(ask, messages), 2)
+        self.assertEqual(len(prompts), count)
+        self.assertEqual((self.root / 'owner-terminal.json').read_bytes(), terminal)
+
     def test_invalid_metadata_import_holds_before_credentials_without_raw_output(self):
-        for mode in ('missing', 'symlink', 'fifo', 'permissions', 'oversized', 'malformed', 'duplicate-key',
+        for mode in ('symlink', 'fifo', 'permissions', 'oversized', 'malformed', 'duplicate-key',
                      'extra-field', 'wrong-app', 'no-match', 'duplicate-match', 'duplicate-id',
                      'revoked', 'bad-expiry', 'noncanonical-expiry', 'nan', 'credential-id', 'credential-name'):
             with self.subTest(mode=mode):
@@ -159,6 +212,184 @@ class OwnerEntryTests(unittest.TestCase):
                 self.assertEqual(terminal['publicInputError'], 'INVALID_PUBLIC_METADATA')
                 self.assertNotIn(secret, '\n'.join(messages) + json.dumps(terminal))
                 self.assertFalse((self.root / 'issuance-receipt.json').exists())
+                self.assertFalse(any('One explicit recheck' in m for m in messages))
+
+    def test_missing_metadata_wait_cancellation_or_wrong_confirmation_closes_without_private_input(self):
+        secret = 'fm2_SYNTHETIC_WRONG_READINESS'
+        for response in (secret, EOFError, KeyboardInterrupt, OSError, termios.error):
+            with self.subTest(response=response):
+                self.setUp()
+                self.metadata_path.unlink()
+                prompts, messages = [], []
+                def ask(prompt):
+                    prompts.append(prompt)
+                    if 'METADATA READY' in prompt:
+                        if isinstance(response, type):
+                            raise response('SYNTHETIC_PRIVATE_READ_ERROR')
+                        return response
+                    return self.ask(prompt)
+                self.assertEqual(self.invoke_with_public_input(ask, messages), 2)
+                self.assertEqual(sum('METADATA READY' in p for p in prompts), 1)
+                terminal = handoff.read_public(self.root / 'owner-terminal.json')
+                self.assertFalse(terminal['credentialInputRequested'])
+                self.assertFalse(terminal['authenticatedPreflightRequested'])
+                self.assertEqual(self.token_calls, 0)
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                self.assertFalse((self.root / 'issuance-receipt.json').exists())
+                self.assertNotIn(secret, '\n'.join(messages) + json.dumps(terminal))
+                self.assertNotIn('SYNTHETIC_PRIVATE_READ_ERROR', '\n'.join(messages) + json.dumps(terminal))
+
+    def test_missing_metadata_recheck_rejects_unsafe_or_mismatched_file_without_repair(self):
+        for mode in ('malformed', 'symlink', 'permissions', 'wrong-app', 'wrong-name', 'revoked'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.metadata_path.unlink()
+                snapshots, prompts, messages = [], [], []
+                def ask(prompt):
+                    prompts.append(prompt)
+                    if 'METADATA READY' in prompt:
+                        if mode == 'malformed':
+                            self.metadata_path.write_bytes(b'fm2_SYNTHETIC_INVALID_METADATA')
+                            self.metadata_path.chmod(0o600)
+                        elif mode == 'symlink':
+                            target = self.root / 'metadata-target.json'
+                            handoff.write_exclusive(target, self.metadata)
+                            self.metadata_path.symlink_to(target)
+                        else:
+                            if mode == 'wrong-app':
+                                self.metadata['app'] = 'another-app'
+                            elif mode == 'wrong-name':
+                                self.metadata['tokens'][1]['tokenName'] = 'p10b-runtime-no-email-' + 'd' * 24
+                            elif mode == 'revoked':
+                                self.metadata['tokens'][1]['revokedAt'] = handoff.utc_now()
+                            handoff.write_exclusive(self.metadata_path, self.metadata)
+                            if mode == 'permissions':
+                                self.metadata_path.chmod(0o644)
+                        snapshots.append(self.metadata_path.read_bytes())
+                        return 'METADATA READY'
+                    return self.ask(prompt)
+                self.assertEqual(self.invoke_with_public_input(ask, messages), 2)
+                self.assertEqual(sum('METADATA READY' in p for p in prompts), 1)
+                self.assertEqual(snapshots, [self.metadata_path.read_bytes()])
+                terminal = handoff.read_public(self.root / 'owner-terminal.json')
+                self.assertEqual(terminal['publicInputError'], 'INVALID_PUBLIC_METADATA')
+                self.assertEqual(self.token_calls, 0)
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                self.assertFalse((self.root / 'issuance-receipt.json').exists())
+                self.assertNotIn('fm2_SYNTHETIC_INVALID_METADATA', '\n'.join(messages) + json.dumps(terminal))
+
+    def test_metadata_recheck_requires_the_same_validated_directory_identity(self):
+        self.metadata_path.unlink()
+        with self.assertRaises(handoff.PublicMetadataNotReady) as missing:
+            handoff.import_public_token_metadata(self.recipe)
+        identity = missing.exception.directory_identity
+        handoff.write_exclusive(self.metadata_path, self.metadata)
+        replacement = self.root / 'another-valid-directory'
+        replacement.mkdir(mode=0o700)
+        with patch.object(handoff.os, 'fstat', return_value=replacement.stat()):
+            with self.assertRaises(handoff.PublicInputHold) as held:
+                handoff.import_public_token_metadata(self.recipe, expected_directory=identity)
+        self.assertEqual(held.exception.code, 'INVALID_PUBLIC_METADATA')
+
+    def test_metadata_wait_preserves_public_binding_and_authority_admission_guards(self):
+        for mode in ('permission-changed', 'recipe-changed', 'scope-delayed', 'expiry-coverage', 'final-refusal'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.mode = mode
+                self.metadata_path.unlink()
+                start = handoff.utc_now()
+                completed = handoff.utc_after(start, 1)
+                def ask(prompt):
+                    if 'issuance start' in prompt:
+                        return start
+                    if 'issuance completion' in prompt:
+                        return completed
+                    if 'METADATA READY' in prompt:
+                        handoff.write_exclusive(self.metadata_path, self.metadata)
+                        if mode == 'permission-changed':
+                            permission = self.root / 'private-setup-scope.json'
+                            permission.write_bytes(permission.read_bytes() + b' ')
+                        elif mode == 'recipe-changed':
+                            self.recipe_path.write_bytes(self.recipe_path.read_bytes() + b' ')
+                        return 'METADATA READY'
+                    return self.ask(prompt)
+                self.assertEqual(self.invoke_with_public_input(ask, []), 2)
+                self.assertFalse(any('--execute' in args for args, _, _ in self.calls))
+                self.assertFalse((self.root / 'approved-session.json').exists())
+                if mode == 'final-refusal':
+                    self.assertEqual(self.token_calls, 1)
+                    self.assertTrue((self.root / 'sealed-session.json').exists())
+                else:
+                    self.assertEqual(self.token_calls, 0)
+                    self.assertFalse(any('--prepare' in args for args, _, _ in self.calls))
+                receipt = self.root / 'issuance-receipt.json'
+                if receipt.exists():
+                    value = handoff.read_public(receipt)
+                    self.assertEqual((value['issuanceStartedAt'], value['issuanceCompletedAt']), (start, completed))
+
+    def test_metadata_wait_binding_recheck_rejects_symlink_even_with_original_bytes(self):
+        for name in ('recipe.json', 'private-setup-scope.json'):
+            with self.subTest(name=name):
+                self.setUp()
+                self.metadata_path.unlink()
+                def ask(prompt):
+                    if 'METADATA READY' in prompt:
+                        handoff.write_exclusive(self.metadata_path, self.metadata)
+                        original = self.root / name
+                        retained = self.root / (name + '.preserved')
+                        original.rename(retained)
+                        original.symlink_to(retained)
+                        return 'METADATA READY'
+                    return self.ask(prompt)
+                self.assertEqual(self.invoke_with_public_input(ask, []), 2)
+                self.assertEqual(self.token_calls, 0)
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                self.assertTrue((self.root / name).is_symlink())
+                self.assertFalse((self.root / 'issuance-receipt.json').exists())
+
+    def test_metadata_wait_binding_recheck_rejects_fifo_without_blocking(self):
+        for name in ('recipe.json', 'private-setup-scope.json'):
+            with self.subTest(name=name):
+                self.setUp()
+                self.metadata_path.unlink()
+                def ask(prompt):
+                    if 'METADATA READY' in prompt:
+                        handoff.write_exclusive(self.metadata_path, self.metadata)
+                        file = self.root / name
+                        file.rename(self.root / (name + '.preserved'))
+                        os.mkfifo(file, 0o600)
+                        return 'METADATA READY'
+                    return self.ask(prompt)
+                started = time.monotonic()
+                self.assertEqual(self.invoke_with_public_input(ask, []), 2)
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertEqual(self.token_calls, 0)
+                self.assertTrue(all('--check-only' in args for args, _, _ in self.calls))
+                self.assertFalse((self.root / 'issuance-receipt.json').exists())
+
+    def test_public_package_binding_reads_reject_unsafe_size_permissions_and_drift(self):
+        for mode in ('permissions', 'oversized', 'read-drift'):
+            with self.subTest(mode=mode):
+                self.setUp()
+                file = self.root / 'public-binding.json'
+                file.write_bytes(b' ' * (1048577 if mode == 'oversized' else 12))
+                file.chmod(0o644 if mode == 'permissions' else 0o600)
+                if mode == 'read-drift':
+                    original = handoff.os.fstat
+                    count = 0
+                    def changed(descriptor):
+                        nonlocal count
+                        count += 1
+                        if count == 2:
+                            with file.open('ab') as stream:
+                                stream.write(b' ')
+                        return original(descriptor)
+                    with patch.object(handoff.os, 'fstat', side_effect=changed):
+                        with self.assertRaises(handoff.Hold):
+                            handoff.public_package_bytes(file)
+                else:
+                    with self.assertRaises(handoff.Hold):
+                        handoff.public_package_bytes(file)
 
     def ask(self, prompt):
         if 'APPROVE PRIVATE SETUP' in prompt:
