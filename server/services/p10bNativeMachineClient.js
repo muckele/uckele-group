@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
 import { p10bAppTokenWorkingDirectory, reserveP10bLocalReap } from './p10bHostAuthentication.js';
+import { P10bNativeRequestError } from './p10bNativeFailure.js';
 
 // No process is created until exact session approval has passed. Native code
 // consumes opaque Fly authentication; JS only receives closed public responses.
@@ -25,9 +26,15 @@ export async function openP10bNativeMachineClient({ executable, args = ['--serve
   let pending; let sequence = 0; let buffer = ''; let failed = false; let closed = false;
   let stderrBytes = 0; let exit;
   const exited = new Promise(resolve => { exit = resolve; });
-  const fail = () => {
+  const fail = (reason = 'bridge-failed') => {
     failed = true;
-    if (pending) { clearTimeout(pending.timer); pending.reject(Error('Native client failed; retain public exit diagnostics')); pending = null; }
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.reject(pending.id === 0 ? Error('Native initialization failed') : new P10bNativeRequestError({
+        code: ['bridge-timeout', 'bridge-protocol'].includes(reason) ? reason : 'bridge-failed',
+        method: pending.method, timeoutMs: pending.timeoutMs }));
+      pending = null;
+    }
     child.kill('SIGKILL');
   };
   child.once('error', fail);
@@ -46,16 +53,21 @@ export async function openP10bNativeMachineClient({ executable, args = ['--serve
         if (!current || (current.id === 0 ? frame.version !== 'p10b-native-ready-v1' || frame.ready !== true
           : frame.id !== current.id || typeof frame.ok !== 'boolean')) throw Error();
         if (current.id !== 0 && Object.keys(frame).some(k => !['id', 'ok', 'error', 'machine'].includes(k))) throw Error();
-        if (frame.error && !['request-denied', 'request-failed', 'timed-out', 'http-failed', 'output-bound', 'invalid-output'].includes(frame.error)) throw Error();
+        if (frame.error !== undefined && !['request-denied', 'request-failed', 'timed-out', 'http-failed', 'output-bound', 'invalid-output'].includes(frame.error)) throw Error();
+        if (current.id !== 0 && (frame.ok === true ? frame.error !== undefined
+          : frame.error === undefined || frame.machine !== undefined)) throw Error();
+        const failure = current.id !== 0 && frame.ok !== true ? new P10bNativeRequestError({
+          code: frame.error, method: current.method, timeoutMs: current.timeoutMs }) : null;
         clearTimeout(current.timer); pending = null;
-        if (current.id !== 0 && frame.ok !== true) current.reject(Error(`Native request ${frame.error || 'request-failed'}`));
+        if (failure) current.reject(failure);
         else current.resolve(current.id === 0 ? true : frame.machine);
-      } catch { fail(); return; }
+      } catch { fail('bridge-protocol'); return; }
     }
   });
   const send = (id, value, timeoutMs) => new Promise((resolve, reject) => {
     if (failed || closed || pending || clock() >= Date.parse(session.sessionDeadline)) { reject(Error('Native client unavailable')); return; }
-    pending = { id, resolve, reject, timer: setTimeout(fail, timeoutMs) };
+    pending = { id, resolve, reject, method: value.method, timeoutMs: value.timeoutMs,
+      timer: setTimeout(() => fail('bridge-timeout'), timeoutMs) };
     child.stdin.write(`${JSON.stringify(value)}\n`, error => { if (error) fail(); });
   });
   try { await send(0, initialization, 10000); }
@@ -75,7 +87,8 @@ export async function openP10bNativeMachineClient({ executable, args = ['--serve
     finally { clearTimeout(timer); }
   }
   return { pid: child.pid, client(method = 'GET', body, timeoutMs = 1000) {
-    if (!['GET', 'POST'].includes(method) || (method === 'POST' && (readOnly || posts >= 3))) return Promise.reject(Error('Native request denied'));
+    if (!['GET', 'POST'].includes(method) || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10000
+      || (method === 'POST' && (readOnly || posts >= 3))) return Promise.reject(Error('Native request denied'));
     if (method === 'POST') posts++;
     return send(++sequence, { id: sequence, method, timeoutMs, ...(body ? { body } : {}) }, timeoutMs + 250);
   }, reap, async close() { return reap(); }, async terminal() { return exited; } };

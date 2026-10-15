@@ -136,3 +136,23 @@ test('session closure during the pending read cannot return successful stopped v
   };
   await assert.rejects(f.control.readUpdatedStopped(client, f.baseline, 'baseline', at + 10000), /closed/);
 });
+
+test('a single stopped update has a ten-second request bound, independent of one-second metadata polls', async () => {
+  const f = fixture(); let posts = 0; let requestTimeout;
+  const api = async (method = 'GET', body, timeout = 1000) => {
+    if (method !== 'POST') return f.api(method, body);
+    posts++; requestTimeout = timeout;
+    let response; let cutoff;
+    try {
+      await new Promise((resolve, reject) => {
+        response = setTimeout(resolve, 1050);
+        cutoff = setTimeout(() => reject(Error('synthetic update exceeded its request deadline')), timeout);
+      });
+      return f.api(method, body);
+    } finally { clearTimeout(response); clearTimeout(cutoff); }
+  };
+  const updated = await f.control.guardedUpdate(api, f.baseline, f.candidate, 'demo');
+  assert.equal(updated.state, 'stopped'); assert.equal(posts, 1); assert.equal(requestTimeout, 10000);
+  await assert.rejects(f.control.guardedUpdate(api, f.candidate, f.candidate, 'demo'), /replay/);
+  assert.equal(posts, 1);
+});

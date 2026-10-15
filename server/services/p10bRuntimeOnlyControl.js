@@ -109,7 +109,9 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
     evidence.write(`p10b-runtime-only-update-${label}-intent.json`, { at: new Date(clock()).toISOString(),
       currentVersion: current.instance_id, configDigest: digest(nextConfig), skip_launch: true });
     assertTime(label === 'rollback' ? 30000 : 360000);
-    const updated = await client('POST', { config: nextConfig, skip_launch: true, current_version: current.instance_id });
+    // Metadata polls use 1s. A stopped update gets the native client's existing
+    // 10s cap; it is still a single request bounded by the original deadline.
+    const updated = await client('POST', { config: nextConfig, skip_launch: true, current_version: current.instance_id }, 10000);
     evidence.write(`p10b-runtime-only-update-${label}-response.json`, updated);
     const readbacks = [];
     try {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/superfly/fly-go/flaps"
 	"github.com/superfly/fly-go/tokens"
 	"io"
@@ -12,6 +13,114 @@ import (
 	"testing"
 	"time"
 )
+
+type contractDoer struct {
+	t        *testing.T
+	expected json.RawMessage
+	config   json.RawMessage
+	status   int
+	delay    time.Duration
+	calls    int
+}
+
+func (d *contractDoer) Do(req *http.Request) (*http.Response, error) {
+	d.calls++
+	if req.Method != "POST" || req.URL.String() != "https://api.machines.dev/v1"+endpoint || req.Header.Get("Content-Type") != "application/json" || req.GetBody != nil || req.Header.Get("Idempotency-Key") != "" || req.Header.Get("X-Idempotency-Key") != "" {
+		d.t.Fatal("SDK request violated the frozen single-update contract")
+	}
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	actual, err := canonical(raw)
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	expected, err := canonical(d.expected)
+	if err != nil {
+		d.t.Fatal(err)
+	}
+	if string(actual) != string(expected) {
+		d.t.Fatal("SDK changed the full frozen update object")
+	}
+	if d.delay > 0 {
+		timer := time.NewTimer(d.delay)
+		defer timer.Stop()
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-timer.C:
+		}
+	}
+	body := fmt.Sprintf(`{"id":"0803730bd1d7e8","region":"ewr","state":"created","instance_id":"offline-new-version","config":%s,"image_ref":{"digest":"sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc"}}`, d.config)
+	if d.status != 200 {
+		body = `{"error":"synthetic-private-server-body-canary"}`
+	}
+	return &http.Response{StatusCode: d.status, Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+func stoppedUpdateContract(t *testing.T) (json.RawMessage, json.RawMessage) {
+	t.Helper()
+	raw, err := os.ReadFile("../../test/fixtures/p10bStoppedUpdateContract.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Config         json.RawMessage `json:"config"`
+		CurrentVersion string          `json:"currentVersion"`
+	}
+	if json.Unmarshal(raw, &fixture) != nil || fixture.CurrentVersion == "" {
+		t.Fatal("public fixture invalid")
+	}
+	body, err := json.Marshal(map[string]interface{}{"config": fixture.Config, "current_version": fixture.CurrentVersion, "skip_launch": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := canonical(fixture.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body, config
+}
+func TestRetainedFullUpdateUsesOfficialSDKAndSingleBoundedRequest(t *testing.T) {
+	t.Setenv("FLY_FLAPS_BASE_URL", "https://api.machines.dev")
+	body, config := stoppedUpdateContract(t)
+	for _, timeout := range []int{1000, 10000} {
+		t.Run(fmt.Sprint(timeout), func(t *testing.T) {
+			builder, err := flaps.NewWithOptions(context.Background(), flaps.NewClientOpts{Tokens: tokens.Parse("synthetic-offline-test-only")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			doer := &contractDoer{t: t, expected: body, config: config, status: 200, delay: 1100 * time.Millisecond}
+			s := &service{builder: builder, client: doer, deadline: time.Now().Add(time.Minute), allowedConfig: map[string]bool{hash(config): true}}
+			r := s.request(context.Background(), request{ID: 1, Method: "POST", TimeoutMs: timeout, Body: body})
+			if doer.calls != 1 {
+				t.Fatal("mutation replayed")
+			}
+			if timeout == 1000 {
+				if r.OK || r.Error != "timed-out" {
+					t.Fatal("one-second update must fail on the delayed fixture")
+				}
+			} else if !r.OK {
+				t.Fatalf("bounded ten-second update failed: %s", r.Error)
+			}
+		})
+	}
+}
+func TestHTTPFailureRetainsOnlyClosedCode(t *testing.T) {
+	t.Setenv("FLY_FLAPS_BASE_URL", "https://api.machines.dev")
+	body, config := stoppedUpdateContract(t)
+	builder, err := flaps.NewWithOptions(context.Background(), flaps.NewClientOpts{Tokens: tokens.Parse("synthetic-offline-test-only")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doer := &contractDoer{t: t, expected: body, config: config, status: 422}
+	s := &service{builder: builder, client: doer, deadline: time.Now().Add(time.Minute), allowedConfig: map[string]bool{hash(config): true}}
+	r := s.request(context.Background(), request{ID: 1, Method: "POST", TimeoutMs: 10000, Body: body})
+	raw, _ := json.Marshal(r)
+	if r.Error != "http-failed" || r.OK || doer.calls != 1 || strings.Contains(string(raw), "canary") {
+		t.Fatalf("closed HTTP diagnostic missing: %s", raw)
+	}
+}
 
 type fakeBuilder struct{ calls int }
 

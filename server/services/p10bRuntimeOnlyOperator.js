@@ -4,6 +4,7 @@ import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from './p10bProvid
 import { validateP10bRuntimePacket } from './p10bQualificationHost.js';
 import { createP10bRuntimeOnlyControl, assertP10bPreparationTerminal } from './p10bRuntimeOnlyControl.js';
 import { assertP10bRecoveryAdmission } from './p10bAdmissionRecovery.js';
+import { publicP10bNativeFailure } from './p10bNativeFailure.js';
 const digest = value => sha256(stableCanonicalJson(value));
 export const P10B_RUNTIME_FLAGS = Object.freeze({ NODE_ENV: 'p10b', P10B_QUALIFICATION_RUNTIME: 'true', STORAGE_PROVIDER: 'sqlite',
   DEAL_HUNTER_CIM_PROVIDER_PROFILE: 'controlled-mailbox-v1', DEAL_HUNTER_CIM_PROVIDER_ENABLED: 'false',
@@ -193,7 +194,7 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
   evidence.write('p10b-runtime-only-operator-intent.json', { sessionDigest: digest(session), at: new Date(clock()).toISOString() });
   const control = createP10bRuntimeOnlyControl({ session, evidence, clock });
   let boundaries;
-  let result; let failure = null; let failureStage = null; let stage = 'construct-boundaries';
+  let result; let failure = null; let failureStage = null; let failureDiagnostic = null; let stage = 'construct-boundaries';
   let restored = false; let activePhase; const configs = [];
   try {
     boundaries = await createBoundaries({ session, approval });
@@ -243,7 +244,7 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       }
       previous = phase.config;
     }
-  } catch { failure = 'runtime-proof-failed'; failureStage = stage; }
+  } catch (error) { failure = 'runtime-proof-failed'; failureStage = stage; failureDiagnostic = publicP10bNativeFailure(error); }
   finally {
     if (boundaries) {
       let safeToRestore = true;
@@ -262,7 +263,8 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       try { if (await boundaries.close() !== true) failure ||= 'native-close-failed'; } catch { failure ||= 'native-close-failed'; }
     }
     evidence.write('p10b-runtime-only-session-closure.json', { closedAt: new Date(clock()).toISOString(),
-      sessionDigest: digest(session), failure, failureStage: failureStage || failure, restored, success: !failure && Boolean(result), productionReady: false, globalAutomationPaused: true });
+      sessionDigest: digest(session), failure, failureStage: failureStage || failure,
+      ...(failureDiagnostic ? { failureDiagnostic } : {}), restored, success: !failure && Boolean(result), productionReady: false, globalAutomationPaused: true });
   }
   if (failure) throw Error('No-email runtime proof failed; preserve evidence and hold');
   return { success: true, restored, preparation: result, productionReady: false, globalAutomationPaused: true };

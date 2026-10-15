@@ -22,11 +22,15 @@ jobs:
         with:
           node-version: 22
       - working-directory: tools/p10b-machine-client
-        run: go test ./... && go build -o /tmp/p10b-machine-client .
+        run: go test ./... && go build -o /tmp/p10b-machine-client . && go test -c -o /tmp/p10b-offline-update-transport .
       - name: Verify native SDK files stay in the private auth context without Machine requests
         env:
           P10B_OFFLINE_NATIVE_CLIENT: /tmp/p10b-machine-client
         run: node --test --test-name-pattern='SDK lock stays' test/p10bHostAuthentication.test.js
+      - name: Verify stopped-update control through native service and SDK with fake HTTP
+        env:
+          P10B_OFFLINE_UPDATE_TRANSPORT: /tmp/p10b-offline-update-transport
+        run: node --test test/p10bNativeUpdateTransport.test.js
       - working-directory: tools/p10b-public-client
         run: go test ./... && go build -o /tmp/p10b-public-client .
   validate:

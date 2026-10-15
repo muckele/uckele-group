@@ -3,6 +3,8 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { config as workerConfig } from './helpers/p10bQualificationFixture.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from '../server/services/p10bProviderIdentity.js';
@@ -136,6 +138,113 @@ function memoryEvidence() {
     write(name, value) { assert.equal(files.has(name), false); files.set(name, structuredClone(value)); } };
 }
 function requireExport(module, name) { assert.equal(typeof module[name], 'function', `${name} is implemented`); return module[name]; }
+
+test('invalid local native request timeouts reject before dispatch or consuming a stopped update', async () => {
+  const { openP10bNativeMachineClient } = await import('../server/services/p10bNativeMachineClient.js');
+  const s = session(); s.nativeClientSha256 = sha256(fs.readFileSync(process.execPath));
+  const approval = { version: 'p10b-no-email-approval-v1', approved: true, sessionDigest: digest(s),
+    ownerPermissionDigest: s.ownerPermissionDigest, sourceHead: s.sourceHead, hostSourceHead: s.hostSourceHead,
+    expiresAt: s.sessionDeadline, recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 };
+  const child = Object.assign(new EventEmitter(), { pid: 2147483002,
+    stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+  let dispatches = 0; let closed = false;
+  child.kill = () => { if (!closed) { closed = true; child.emit('close', 0, null); } return true; };
+  child.stdin.on('data', raw => {
+    const frame = JSON.parse(raw); if (!frame.version) dispatches++;
+    queueMicrotask(() => child.stdout.write(JSON.stringify(frame.version ? { version: 'p10b-native-ready-v1', ready: true }
+      : { id: frame.id, ok: true, machine: { id: 'offline-machine' } }) + '\n'));
+  });
+  const native = await openP10bNativeMachineClient({ executable: process.execPath, session: s, approval,
+    configs: [s.baselineConfig], recoveryVerified: true, clock: () => now,
+    environment: { PATH: '/usr/bin:/bin', HOME: '/tmp' }, spawnProcess: () => child });
+  try {
+    for (const timeout of [0, 10001, NaN, '1000', 1.5]) await assert.rejects(native.client('POST', {}, timeout));
+    assert.equal(dispatches, 0);
+    for (let i = 0; i < 3; i++) assert.equal((await native.client('POST', {}, 1000)).id, 'offline-machine');
+    await assert.rejects(native.client('POST', {}, 1000)); assert.equal(dispatches, 3);
+  } finally { assert.equal(await native.close(), true); }
+});
+
+test('native failure protocol rejects unknown codes, raw fields and contradictory success without retaining them', async t => {
+  const { openP10bNativeMachineClient } = await import('../server/services/p10bNativeMachineClient.js');
+  for (const invalid of [{ error: 'synthetic-private-canary' }, { httpStatus: 422 },
+    { body: 'synthetic-private-canary' }, { ok: true }, { error: undefined },
+    { machine: { id: 'synthetic-private-canary' } }]) {
+    await t.test(JSON.stringify(Object.keys(invalid)), async () => {
+      const s = session(); s.nativeClientSha256 = sha256(fs.readFileSync(process.execPath));
+      const approval = { ...operatorFixture().x.approval, sessionDigest: digest(s) };
+      const child = Object.assign(new EventEmitter(), { pid: 2147483003,
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+      let closed = false;
+      child.kill = () => { if (!closed) { closed = true; child.emit('close', 0, null); } return true; };
+      child.stdin.on('data', raw => {
+        const frame = JSON.parse(raw);
+        queueMicrotask(() => child.stdout.write(JSON.stringify(frame.version
+          ? { version: 'p10b-native-ready-v1', ready: true }
+          : { id: frame.id, ok: false, error: 'http-failed', ...invalid }) + '\n'));
+      });
+      const native = await openP10bNativeMachineClient({ executable: process.execPath, session: s, approval,
+        configs: [s.baselineConfig], recoveryVerified: true, clock: () => now,
+        environment: { PATH: '/usr/bin:/bin', HOME: '/tmp' }, spawnProcess: () => child });
+      try {
+        await assert.rejects(native.client('POST', {}, 1000), error => {
+          assert.deepEqual(error.publicFailure, { version: 'p10b-native-request-failure-v1',
+            code: 'bridge-protocol', method: 'POST', timeoutMs: 1000 });
+          assert.equal(JSON.stringify(error.publicFailure).includes('canary'), false); return true;
+        });
+        await assert.rejects(native.client('POST', {}, 1000), /unavailable/);
+      } finally { assert.equal(await native.close(), true); }
+    });
+  }
+});
+
+test('validated native failure crosses the actual bridge and remains in failed update closure without raw text', async t => {
+  const { openP10bNativeMachineClient } = await import('../server/services/p10bNativeMachineClient.js');
+  for (const code of ['request-denied', 'request-failed', 'timed-out', 'http-failed', 'output-bound', 'invalid-output']) {
+    await t.test(code, async () => {
+      const f = operatorFixture(); const s = structuredClone(f.x.s);
+      s.nativeClientSha256 = sha256(fs.readFileSync(process.execPath));
+      const approval = { ...f.x.approval, sessionDigest: digest(s) };
+      const child = Object.assign(new EventEmitter(), { pid: 2147483002,
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+      let closed = false;
+      child.kill = () => { if (!closed) { closed = true; child.emit('close', 0, null); } return true; };
+      child.stdin.on('data', raw => {
+        const frame = JSON.parse(raw);
+        queueMicrotask(() => child.stdout.write(JSON.stringify(frame.version
+          ? { version: 'p10b-native-ready-v1', ready: true }
+          : { id: frame.id, ok: false, error: code }) + '\n'));
+      });
+      const native = await openP10bNativeMachineClient({ executable: process.execPath, session: s, approval,
+        configs: [s.baselineConfig], recoveryVerified: true, clock: () => now,
+        environment: { PATH: '/usr/bin:/bin', HOME: '/tmp' }, spawnProcess: () => child });
+      let failure;
+      try { await native.client('POST', { config: s.baselineConfig, skip_launch: true, current_version: 'synthetic-version' }, 10000); }
+      catch (error) { failure = error; }
+      assert.equal(await native.close(), true);
+      const expected = { version: 'p10b-native-request-failure-v1', code, method: 'POST', timeoutMs: 10000 };
+      assert.deepEqual(failure.publicFailure, expected);
+      // Raw exception text is deliberately hostile: only the typed property may survive.
+      failure.message = 'synthetic-private-error-body-canary';
+      failure.stack = 'synthetic-private-stack-canary';
+      const original = f.options.createBoundaries; let posts = 0;
+      f.options.createBoundaries = async () => {
+        const boundaries = await original(); const read = boundaries.client;
+        boundaries.client = async (method = 'GET', body) => {
+          if (method === 'POST') { posts++; throw failure; }
+          return read(method, body);
+        };
+        return boundaries;
+      };
+      await assert.rejects(operator.runP10bNoEmailOperator(f.options));
+      const closure = f.evidence.read('p10b-runtime-only-session-closure.json');
+      assert.equal(closure.failureStage, 'demo-stopped-update'); assert.equal(closure.restored, true);
+      assert.deepEqual(closure.failureDiagnostic, expected); assert.equal(posts, 1);
+      assert.equal(JSON.stringify(closure).includes('canary'), false);
+      assert.equal(f.evidence.has('p10b-runtime-only-demo-start-intent.json'), false);
+    });
+  }
+});
 
 test('phase packet binds fresh paths and unchanged no-email bounds without process environment mutation', () => {
   const build = requireExport(operator, 'createP10bRuntimePhase'); const s = session();
