@@ -227,7 +227,8 @@ sys.exit(h.run_owner(root/'recipe.json',runner=runner,expected_recipe_sha256=has
         def console():
             os.setsid()
             legacy.fcntl.ioctl(0, legacy.termios.TIOCSCTTY, 0)
-        env = {'PATH': str(Path(self.node).parent) + ':/usr/bin:/bin', 'HOME': '/tmp'}
+        env = {'PATH': str(Path(self.node).parent) + ':/usr/bin:/bin', 'HOME': '/tmp',
+               'PYTHONDONTWRITEBYTECODE': '1'}
         env.update(extra_environment or {})
         proc = legacy.subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
                                       env=env, preexec_fn=console, close_fds=True)
@@ -362,6 +363,17 @@ input('SYNTHETIC_OWNER_DONE')
         self.assertEqual(code, 2)
         self.assertNotIn(b'Temporary isolated app token', output)
         self.assertEqual(before, {str(p.relative_to(self.root)): p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+
+    def test_child_imports_do_not_create_untracked_bytecode_in_source_directories(self):
+        modules = self.root / 'public-module-fixture'
+        modules.mkdir()
+        (modules / 'public_fixture.py').write_text('PUBLIC_VALUE = 1\n')
+        child = self.launch([handoff.sys.executable, '-c',
+            'import sys; sys.path.insert(0, sys.argv[1]); import public_fixture; assert public_fixture.PUBLIC_VALUE == 1',
+            str(modules)])
+        code, output = self.drain(child)
+        self.assertEqual(code, 0, output)
+        self.assertFalse((modules / '__pycache__').exists())
 
     def test_refusal_drift_and_actual_preflight_failure_do_not_cross_approval_boundary(self):
         for mode in ['public-drift', 'secret-at-review', 'preflight-failure', 'decline-session']:
