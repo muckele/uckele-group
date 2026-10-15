@@ -212,8 +212,11 @@ cleanup proof. The outer launcher also verifies its owned process group.
 Darwin's signal permission error for an
 exited unreaped leader is resolved only by its exact child wait and an independent
 group probe returning ESRCH; active children, present groups and denied probes
-hold without further signaling. Timeout,
-refusal, replay or uncertainty preserves evidence and denies success. After closed
+hold without further signaling.
+For Node-owned groups, a transient EPERM after the exact child's close permits
+only read-only probes within the existing one-second closure bound. Positive
+ESRCH is required before retiring its intent; persistent uncertainty retains it.
+Timeout, refusal, replay or uncertainty preserves evidence and denies success. After closed
 clients, the owner must manually revoke only this new matching public token ID
 under the setup/runtime approval. No automated revocation is implemented. An
 uncertain runtime may need separately approved incident handling; expiry is not

@@ -6,7 +6,11 @@ import { reserveP10bLocalReap, p10bAppTokenWorkingDirectory } from './p10bHostAu
 function absent(pid) {
   if (!Number.isSafeInteger(pid) || pid < 2) throw Error('Owned process group unavailable');
   try { process.kill(-pid, 0); return false; }
-  catch (error) { if (error.code === 'ESRCH') return true; throw Error('Owned process group uncertain'); }
+  catch (error) {
+    if (error.code === 'ESRCH') return true;
+    if (error.code === 'EPERM') return null;
+    throw Error('Owned process group uncertain');
+  }
 }
 
 // Every launched group is task-owned. Closing its immediate leader is not
@@ -30,10 +34,24 @@ export function spawnP10bOwnedProcess(executable, args, { environment, options =
   const finish = async (code, signal) => {
     if (finishing) return; finishing = true;
     try {
-      if (!absent(child.pid) && !kill()) throw Error();
+      // After this exact child's close, Darwin can briefly report EPERM while
+      // the killed group disappears. Only ESRCH proves absence. Once a probe
+      // is denied, issue no more signals; retain the existing bounded wait.
+      const probe = () => {
+        const gone = absent(child.pid);
+        if (gone === null) denied = true;
+        return gone;
+      };
+      let gone = probe();
+      if (gone === false) kill();
       const end = performance.now() + 1000;
-      while (!absent(child.pid) && performance.now() < end) await new Promise(resolve => setTimeout(resolve, 25));
-      if (!absent(child.pid)) throw Error();
+      while (gone !== true && performance.now() < end) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        if (performance.now() >= end) break;
+        gone = probe();
+        if (performance.now() >= end) throw Error();
+      }
+      if (gone !== true) throw Error();
       reservation.retire(true); entry.reaped = true;
     } catch { /* Preserve the reservation; no raw SDK/process error is public. */ }
     resolveExit({ code, signal });
