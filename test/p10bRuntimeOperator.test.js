@@ -579,6 +579,7 @@ test('slow successful final log poll cannot admit normal observer completion', a
   });
   assert.equal(f.success, false); assert.equal(f.rows.at(-1).normalCompletion, false);
   assert.ok(f.rows.some(row => row.kind === 'observer-log-read-error'));
+  assert.equal(f.rows.find(row => row.kind === 'observer-log-read-error').stage, 'completion');
 });
 
 test('later failed, malformed, incomplete and missed log polls latch failure through observer completion', async t => {
@@ -592,6 +593,11 @@ test('later failed, malformed, incomplete and missed log polls latch failure thr
     assert.equal(f.rows.at(-1).normalCompletion, false);
     assert.ok(f.nativeReaps > 0 && f.processReaps > 0);
     assert.ok(f.rows.some(row => row.kind === (failure === 'late' ? 'observer-log-missed-poll' : 'observer-log-read-error')));
+    if (failure !== 'late') {
+      const failed = f.rows.find(row => row.kind === 'observer-log-read-error');
+      assert.equal(failed.stage, failure === 'read' ? 'command' : 'framing');
+      assert.equal(failed.commandFailure, null);
+    }
     assert.equal(JSON.stringify(f.rows).includes('private-canary'), false);
   });
 });
@@ -906,4 +912,27 @@ test('guardian host CLI keeps only its exact native lease through restoration an
     if (child) { child.kill('SIGKILL'); await exited; reservation.retire(true); }
     if (context && fs.existsSync(context.environment.FLY_CONFIG_DIR)) context.cleanup({ reaped: true });
   }
+});
+
+for (const mode of ['primary-exit', 'readiness-timeout']) test(`concrete parent retains ${mode} before readiness without inventing controller-loss proof`, async t => {
+  const { createP10bNoEmailBoundaries } = await import('../server/services/p10bNoEmailBoundaries.js');
+  const x = recoveryFixture(); const evidence = memoryEvidence(); evidence.root = '/synthetic/failure-evidence';
+  const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
+    baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
+  const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
+  const child = new EventEmitter(); let terminations = 0;
+  const boundaries = await createP10bNoEmailBoundaries({ session: x.s, approval: x.approval, evidence,
+    recovery: { ...recovered, verification }, inspectRecovery: x.inspect, clock: () => now,
+    openNative: async () => { assert.fail('No native client needed for readiness race'); },
+    processes: { launch: () => ({ child, exited: mode === 'primary-exit' ? Promise.resolve({ code: 1, signal: null }) : new Promise(() => {}) }),
+      async terminate() { terminations++; return true; } } });
+  if (mode === 'readiness-timeout') t.mock.timers.enable({ apis: ['setTimeout'] });
+  const pending = boundaries.demonstrate({ phase: operator.createP10bRuntimePhase(x.s, 'demo', now), machine: x.baseline, observer: {} });
+  if (mode === 'readiness-timeout') t.mock.timers.tick(15000);
+  await assert.rejects(pending, /Demo primary exited before readiness|Demo readiness timeout/);
+  const failure = evidence.read('p10b-runtime-only-demo-controller-failure.json');
+  assert.equal(failure.reason, mode); assert.equal(failure.stage, 'await-primary-readiness');
+  assert.equal(failure.primaryExitCode, mode === 'primary-exit' ? 1 : null);
+  assert.equal(evidence.files.has('p10b-runtime-only-demo-readiness.json'), false);
+  assert.equal(terminations, 0); // Settlement retains ownership; no premature controller-loss claim.
 });

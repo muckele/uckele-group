@@ -1,7 +1,7 @@
 import { createJsonObjectFramer, startObserverCadence } from './p10bRuntimeObservation.js';
 import { createP10bObserverControls } from './p10bRuntimeObserver.js';
 import { openP10bNativeMachineClient } from './p10bNativeMachineClient.js';
-import { createP10bOperatorProcesses } from './p10bOperatorProcesses.js';
+import { createP10bOperatorProcesses, publicP10bCommandFailure } from './p10bOperatorProcesses.js';
 import { assertP10bRecoveryAdmission } from './p10bAdmissionRecovery.js';
 import { inspectP10bRecovery } from './p10bOperatorFiles.js';
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase } from './p10bRuntimeOnlyOperator.js';
@@ -22,12 +22,14 @@ export async function runP10bIndependentObserver({ session, approval, phase, mac
   processes ||= createP10bOperatorProcesses({ environment });
   const native = await openNative({ executable: nativeExecutable, session, approval, readOnly: true, configs: [phase.config], environment });
   const controls = createP10bObserverControls({ phase, machine, client: native.client, record, clock });
-  let timer; let logFailed = false; let logReads = 0;
+  let timer; let logFailed = false; let logReads = 0; let logStage = 'command';
   const seen = new Set();
   const pollLogs = async (timeoutMs = 5000) => {
     if (++logReads > 410) throw Error('Log poll bound exceeded');
+    logStage = 'command';
     const output = await processes.command(flyExecutable,
       ['logs', '--app', session.app, '--instance', session.machineId, '--json', '--no-tail'], timeoutMs);
+    logStage = 'framing';
     const framer = createJsonObjectFramer(row => {
       const safe = sanitizeP10bGuardianLog(row, phase.window);
       if (!safe) return;
@@ -40,6 +42,7 @@ export async function runP10bIndependentObserver({ session, approval, phase, mac
       }
     });
     framer.write(output); framer.finish();
+    logStage = 'completion';
   };
   try {
     const cadence = startObserverCadence(controls.tick, { setInterval: interval }); timer = cadence.timer;
@@ -60,7 +63,8 @@ export async function runP10bIndependentObserver({ session, approval, phase, mac
         await pollLogs(Math.min(700, remaining));
         if (clock() - due > 750 || clock() > end + 750) throw Error('Log observation completion late');
       }
-      catch { logFailed = true; record({ kind: 'observer-log-read-error', at: new Date(clock()).toISOString() }); }
+      catch (error) { logFailed = true; record({ kind: 'observer-log-read-error', at: new Date(clock()).toISOString(),
+        stage: logStage, commandFailure: publicP10bCommandFailure(error) }); }
       if (clock() - due > 1000) due = clock();
     }
     // Keep the independently anchored metadata cadence through one final

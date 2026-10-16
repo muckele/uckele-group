@@ -123,10 +123,20 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     const primary = processes.launch(nodeExecutable, [script('run-p10b-demo-primary.js'), path.join(evidence.root, input)],
       { stdio: ['ignore', 'ignore', 'pipe', 'ipc'], detached: true });
     controllers.push(primary);
-    let timer; let readiness;
+    let timer; let readiness; let primaryTerminal = null; let readinessFailure = 'readiness-timeout';
     try { readiness = await Promise.race([new Promise(resolve => primary.child.once('message', resolve)),
-      primary.exited.then(() => { throw Error('Demo primary exited before readiness'); }),
+      primary.exited.then(terminal => { primaryTerminal = terminal; readinessFailure = 'primary-exit';
+        throw Error('Demo primary exited before readiness'); }),
       new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Demo readiness timeout')), 15000); })]); }
+    catch (error) {
+      evidence.write('p10b-runtime-only-demo-controller-failure.json', { version: 'p10b-demo-controller-failure-v1',
+        sessionDigest: digest(session), stage: 'await-primary-readiness', reason: readinessFailure,
+        primaryExitCode: Number.isInteger(primaryTerminal?.code) && primaryTerminal.code >= 0 && primaryTerminal.code <= 255
+          ? primaryTerminal.code : null,
+        primaryExitSignal: ['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGABRT', 'SIGSEGV', 'SIGHUP'].includes(primaryTerminal?.signal)
+          ? primaryTerminal.signal : null, at: new Date(clock()).toISOString(), productionReady: false });
+      throw error;
+    }
     finally { clearTimeout(timer); }
     evidence.write('p10b-runtime-only-demo-readiness.json', readiness);
     if (readiness.sourceHead !== session.sourceHead || readiness.freshPathsVerified !== true) throw Error('Demo readiness binding failed');
