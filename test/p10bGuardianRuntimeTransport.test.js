@@ -7,6 +7,7 @@ import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from '../server/services/p10bProviderIdentity.js';
 import { createP10bRuntimePhase, runP10bNoEmailOperator } from '../server/services/p10bRuntimeOnlyOperator.js';
 import { openP10bNativeMachineClient } from '../server/services/p10bNativeMachineClient.js';
+import { publicP10bNativeFailure } from '../server/services/p10bNativeFailure.js';
 import { createP10bAppTokenContext, reserveP10bLocalReap } from '../server/services/p10bHostAuthentication.js';
 import { recoverP10bAdmissionReservation, verifyP10bAdmissionArchive } from '../server/services/p10bAdmissionRecovery.js';
 const executable = process.env.P10B_OFFLINE_GUARDIAN_TRANSPORT;
@@ -50,6 +51,52 @@ function fixture() {
     archiveDevice: '7', archiveInode: '42', attemptSha256: sha256(files.get(session.recovery.attemptPath).bytes) });
   const verification = verifyP10bAdmissionArchive({ session, recovery: recovered, inspect, verifierPid: 5011 });
   return { session, approval, baseline, recovery: { ...recovered, verification }, inspect };
+}
+// Exercise the recovery/observer bootstrap before the mutation-policy service.
+// The existing Go fixture runs the real readOnly initialization, request builder
+// and response projection; only its HTTP transport points at this local server.
+for (const mode of ['success', 'http-401', 'http-403', 'timeout', 'connection-loss', 'invalid-output']) {
+  test(`guardian read-only recovery through native service and fake HTTP: ${mode}`, { skip: !executable, timeout: 10000 }, async t => {
+    const { session, approval, baseline } = fixture(); let requests = 0;
+    const server = http.createServer((request, response) => {
+      requests++;
+      assert.equal(request.method, 'GET');
+      assert.equal(request.url, `/v1/apps/${session.app}/machines/${session.machineId}`);
+      assert.equal(request.headers.authorization, undefined);
+      if (mode === 'timeout') return;
+      if (mode === 'connection-loss') { response.destroy(); return; }
+      if (mode.startsWith('http-')) response.writeHead(Number(mode.slice(5)));
+      response.end(mode === 'success' ? JSON.stringify({ ...baseline, privateUnknownField: 'synthetic-private-response-canary' })
+        : mode === 'invalid-output' ? '[]' : 'synthetic-private-response-canary');
+    });
+    server.listen(0, '127.0.0.1'); await once(server, 'listening');
+    t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+    const context = createP10bAppTokenContext({ session, approval,
+      environment: { PATH: '/usr/bin:/bin', HOME: '/tmp', FLY_API_TOKEN: 'synthetic-readonly-input-canary' } });
+    let native;
+    try {
+      native = await openP10bNativeMachineClient({ executable, args: ['-test.run=^TestOfflineGuardianTransport$'], session, approval,
+        configs: [session.baselineConfig], readOnly: true,
+        environment: { ...context.environment, P10B_GUARDIAN_TEST_HTTP_URL: `http://127.0.0.1:${server.address().port}` } });
+      // Neither read-only permission nor its one-second GET bound is widened.
+      await assert.rejects(native.client('POST', {}, 10000));
+      await assert.rejects(native.client('GET', undefined, 1001));
+      assert.equal(requests, 0);
+      if (mode === 'success') assert.deepEqual(await native.client(), { ...baseline, events: [] });
+      else await assert.rejects(native.client(), error => {
+        assert.deepEqual(publicP10bNativeFailure(error), { version: 'p10b-native-request-failure-v1', method: 'GET', timeoutMs: 1000,
+          code: mode.startsWith('http-') ? 'http-failed' : mode === 'timeout' ? 'timed-out'
+            : mode === 'connection-loss' ? 'request-failed' : 'invalid-output' });
+        assert.equal(JSON.stringify(error).includes('canary'), false); return true;
+      });
+      assert.equal(requests, 1);
+    } finally {
+      const reaped = native ? await native.reap() : false;
+      assert.equal(reaped, true); assert.equal(context.assertReaped(), true);
+      assert.equal(context.cleanup({ reaped }), true);
+      assert.equal(fs.existsSync(context.environment.FLY_CONFIG_DIR), false);
+    }
+  });
 }
 for (const mode of ['success', 'connection-loss-after-commit', 'timeout-after-dispatch', 'wrong-wait', 'wrong-readback', 'stop-unverified', 'reap-unverified', 'restoration-loss']) {
   test(`guardian operator through native policy and official SDK uses only fake HTTP: ${mode}`, { skip: !executable, timeout: 20000 }, async t => {

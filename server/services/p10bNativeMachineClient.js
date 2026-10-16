@@ -16,6 +16,10 @@ async function openMachineClient(diagnostic, { executable, args = diagnostic ? [
   environment = { PATH: process.env.PATH, HOME: process.env.HOME } }) {
   const guardian = session?.version === 'p10b-guardian-only-session-v1';
   const guardedTransport = diagnostic || guardian;
+  // The retained native enables observation/settlement frames only for the
+  // mutation-policy service. Guardian recovery and observer GETs are readOnly
+  // and use its basic response envelope; their request limits still apply.
+  const observedTransport = diagnostic || guardian && !readOnly;
   (diagnostic ? assertP10bStoppedUpdateApproval : assertP10bNoEmailApproval)(session, approval, clock());
   if (guardian && environment.P10B_APP_TOKEN_CONTEXT !== 'p10b-app-token-context-v1') throw Error('Exact private guardian context required');
   if (diagnostic && (environment.P10B_APP_TOKEN_CONTEXT !== 'p10b-app-token-context-v1'
@@ -64,16 +68,16 @@ async function openMachineClient(diagnostic, { executable, args = diagnostic ? [
         const frame = JSON.parse(line); const current = pending;
         if (!current || (current.id === 0 ? frame.version !== (diagnostic ? 'p10b-stopped-native-ready-v1' : 'p10b-native-ready-v1') || frame.ready !== true
           : frame.id !== current.id || typeof frame.ok !== 'boolean')) throw Error();
-        if (current.id !== 0 && Object.keys(frame).some(k => !['id', 'ok', 'error', 'machine', ...(guardedTransport ? ['observation', 'settlement'] : [])].includes(k))) throw Error();
+        if (current.id !== 0 && Object.keys(frame).some(k => !['id', 'ok', 'error', 'machine', ...(observedTransport ? ['observation', 'settlement'] : [])].includes(k))) throw Error();
         if (diagnostic && current.id === 0 && Object.keys(frame).some(k => !['version', 'ready'].includes(k))) throw Error();
         if (frame.error !== undefined && !['request-denied', 'request-failed', 'timed-out', 'http-failed', 'output-bound', 'invalid-output'].includes(frame.error)) throw Error();
         if (current.id !== 0 && (frame.ok === true ? frame.error !== undefined
           : frame.error === undefined || frame.machine !== undefined || frame.settlement !== undefined)) throw Error();
-        const observation = guardedTransport && current.id !== 0 ? checkedP10bStoppedObservation(frame.observation, frame.ok ? null : frame.error) : null;
+        const observation = observedTransport && current.id !== 0 ? checkedP10bStoppedObservation(frame.observation, frame.ok ? null : frame.error) : null;
         if (guardedTransport && current.id !== 0 && frame.ok && (current.method === 'WAIT'
           ? frame.machine !== undefined || frame.settlement === undefined
           : frame.machine === undefined || frame.settlement !== undefined)) throw Error();
-        const settlement = guardedTransport && current.id !== 0 && frame.ok && current.method === 'WAIT'
+        const settlement = observedTransport && current.id !== 0 && frame.ok && current.method === 'WAIT'
           ? checkedP10bStoppedSettlement(frame.settlement, current.version) : null;
         const failure = current.id !== 0 && frame.ok !== true ? diagnostic ? new P10bStoppedUpdateRequestError({
           code: frame.error, method: current.method, timeoutMs: current.timeoutMs, observation }) : new P10bNativeRequestError({

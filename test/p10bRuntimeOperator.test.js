@@ -198,6 +198,39 @@ test('native failure protocol rejects unknown codes, raw fields and contradictor
   }
 });
 
+test('guardian mutation responses still require observations and read-only responses reject private fields', async t => {
+  const { spawn } = await import('node:child_process');
+  const { openP10bNativeMachineClient } = await import('../server/services/p10bNativeMachineClient.js');
+  const { createP10bAppTokenContext } = await import('../server/services/p10bHostAuthentication.js');
+  for (const mode of ['mutation-missing-observation', 'readonly-extra-field', 'readonly-foreign-observation']) {
+    await t.test(mode, async () => {
+      const f = operatorFixture({ guardian: true }); const s = f.options.session;
+      s.nativeClientSha256 = sha256(fs.readFileSync(process.execPath)); f.options.approval.sessionDigest = digest(s);
+      const context = createP10bAppTokenContext({ session: s, approval: f.options.approval, clock: f.options.clock,
+        environment: { PATH: '/usr/bin:/bin', HOME: '/tmp', FLY_API_TOKEN: 'synthetic-protocol-input-canary' } });
+      const code = `const rl=require('node:readline').createInterface({input:process.stdin});let first=true;
+        rl.on('line',line=>{const input=JSON.parse(line);if(first){first=false;console.log(JSON.stringify({version:'p10b-native-ready-v1',ready:true}));return;}
+        const frame={id:input.id,ok:false,error:'http-failed'};
+        ${mode === 'readonly-extra-field' ? "frame.rawBody='synthetic-private-response-canary';" : ''}
+        ${mode === 'readonly-foreign-observation' ? 'frame.observation={httpStatus:401,elapsedMs:1,dispatched:true};' : ''}
+        console.log(JSON.stringify(frame));});`;
+      let native;
+      try {
+        native = await openP10bNativeMachineClient({ executable: process.execPath, args: ['-e', code], session: s,
+          approval: f.options.approval, configs: [s.baselineConfig], readOnly: mode !== 'mutation-missing-observation',
+          recoveryVerified: true, environment: context.environment, clock: f.options.clock, spawnProcess: spawn });
+        await assert.rejects(native.client(), error => {
+          assert.equal(error.publicFailure.code, 'bridge-protocol');
+          assert.equal(JSON.stringify(error).includes('canary'), false); return true;
+        });
+      } finally {
+        assert.equal(await native?.reap(), true); assert.equal(context.assertReaped(), true);
+        assert.equal(context.cleanup({ reaped: true }), true);
+      }
+    });
+  }
+});
+
 test('validated native failure crosses the actual bridge and remains in failed update closure without raw text', async t => {
   const { openP10bNativeMachineClient } = await import('../server/services/p10bNativeMachineClient.js');
   for (const code of ['request-denied', 'request-failed', 'timed-out', 'http-failed', 'output-bound', 'invalid-output']) {
@@ -711,6 +744,45 @@ test('host CLI holds private cleanup when native initialization cannot prove rea
     openNative: async () => { throw Object.assign(Error('synthetic native failure'), { reapVerified: false }); } }));
   assert.equal(cleanupReaped, false);
   assert.equal(f.evidence.read('p10b-runtime-only-auth-closure.json').failureStage, 'recovery-native-initialization');
+});
+
+test('guardian recovery read failures retain only typed request diagnostics through CLI cleanup', async t => {
+  const { runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
+  const { P10bNativeRequestError } = await import('../server/services/p10bNativeFailure.js');
+  const { P10B_GUARDIAN_NATIVE_SHA256 } = await import('../server/services/p10bOperatorSource.js');
+  for (const code of ['http-failed', 'timed-out', 'bridge-protocol', 'bridge-timeout', 'invalid-output', null]) {
+    await t.test(code || 'untyped-private-error', async () => {
+      const root = '/synthetic/guardian-recovery-evidence';
+      const f = operatorFixture({ guardian: true, directory: path.join(os.homedir(), '.uckele-group-p10b-host'), evidenceRoot: root });
+      f.evidence.root = root; const s = f.options.session; s.nativeClientSha256 = P10B_GUARDIAN_NATIVE_SHA256;
+      f.options.approval.sessionDigest = digest(s);
+      const imageEvidence = { version: 'p10b-image-prerequisite-v1', sourceHead: s.sourceHead, imageDigest: image,
+        immutableImage: `registry.fly.io/uckele-group-p10b@${image}`, buildCount: 1, pushCount: 1,
+        registryManifestVerified: true, manifestEvidenceDigest: '8'.repeat(64), verifiedAt: s.startedAt };
+      const failure = code ? new P10bNativeRequestError({ code, method: 'GET', timeoutMs: 1000 }) : Error('synthetic-private-canary');
+      Object.defineProperty(failure, 'message', { get() { throw Error('must not inspect private message'); } });
+      Object.defineProperty(failure, 'stack', { get() { throw Error('must not inspect private stack'); } });
+      if (!code) Object.defineProperty(failure, 'publicFailure', { get() { throw Error('must not inspect untyped fields'); } });
+      let requests = 0; let reaps = 0; let cleanupReaped;
+      await assert.rejects(runP10bNoEmailSessionCli(['--execute', '--bundle', '/synthetic/bundle', '--evidence', root,
+        '--native-client', '/synthetic/native'], {
+        read: () => ({ session: s, approval: f.options.approval, imageEvidence }), clock: f.options.clock,
+        checkSource: () => {}, createEvidence: () => f.evidence,
+        createAuth: () => ({ environment: {}, cleanup({ reaped }) { cleanupReaped = reaped; return true; } }),
+        processes: { reap: async () => true, command() { throw Error('must not advance after read failure'); } },
+        openNative: async input => { assert.equal(input.readOnly, true); return {
+          async client() { requests++; throw failure; }, async reap() { reaps++; return true; } }; },
+        createBoundaries() { throw Error('must not reach mutation or start'); },
+      }));
+      const closure = f.evidence.read('p10b-runtime-only-auth-closure.json');
+      assert.deepEqual(closure.failure, code ? { version: 'p10b-native-request-failure-v1', code, method: 'GET', timeoutMs: 1000 } : null);
+      assert.equal(closure.failureStage, 'recovery-baseline-read'); assert.equal(closure.success, false);
+      assert.equal(closure.reapVerified, true); assert.equal(closure.cleanupVerified, true);
+      assert.equal(cleanupReaped, true); assert.equal(requests, 1); assert.equal(reaps, 1);
+      assert.equal(JSON.stringify([...f.evidence.files]).includes('canary'), false);
+      assert.equal(f.evidence.has('p10b-runtime-only-operator-intent.json'), false);
+    });
+  }
 });
 
 test('host CLI unresolved private descendant intent blocks restoration and retains both closure holds', async t => {

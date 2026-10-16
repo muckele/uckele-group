@@ -6,6 +6,7 @@ import { assertP10bNoEmailApproval, runP10bNoEmailOperator, validateP10bBaseline
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { recoverP10bAdmissionReservation } from './p10bAdmissionRecovery.js';
 import { openP10bNativeMachineClient } from './p10bNativeMachineClient.js';
+import { publicP10bNativeFailure } from './p10bNativeFailure.js';
 import { createP10bNoEmailBoundaries } from './p10bNoEmailBoundaries.js';
 import { createP10bOperatorProcesses } from './p10bOperatorProcesses.js';
 import { assertP10bReviewedCheckout, assertP10bNoEmailHostBinding, assertP10bFlyExecutable, P10B_RETAINED_GUEST_HEAD } from './p10bOperatorSource.js';
@@ -92,7 +93,7 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
     try { const client = await openNative({ ...options, environment: auth.environment }); natives.push(client); return client; }
     catch (error) { if (error?.reapVerified !== true) initializationUncertain = true; throw Error('Native admission failed; preserve private cleanup hold'); }
   };
-  let native; let result; let failed = false; let cleanupHeld = false; let stage = 'recovery-native-initialization';
+  let native; let result; let failed = false; let cleanupHeld = false; let failure = null; let stage = 'recovery-native-initialization';
   try {
     if (args[0] === '--execute') {
       evidence.write('p10b-recovery-verifier-input.json', { session, approval, nativeExecutable });
@@ -123,7 +124,7 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
       createBoundaries: input => createBoundaries({ ...input, evidence, recovery,
         inspectRecovery: () => inspectRecovery(session), nativeExecutable, flyExecutable, processes,
         environment: auth.environment, openNative: authenticatedNative }) });
-  } catch { failed = true; }
+  } catch (error) { failed = true; failure = publicP10bNativeFailure(error); }
   finally {
     let reaped = !initializationUncertain;
     try { if (await processes.reap() !== true) reaped = false; } catch { reaped = false; }
@@ -135,6 +136,7 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
     evidence.write('p10b-runtime-only-auth-closure.json', { sessionDigest: sha256(stableCanonicalJson(session)),
       closedAt: new Date(clock()).toISOString(), directReapVerified: reaped,
       reapVerified: reaped && cleanupVerified, cleanupVerified,
+      failure,
       failureStage: failed ? stage : (!reaped ? 'local-client-reap' : (!cleanupVerified ? 'private-auth-cleanup' : null)),
       success: !failed && Boolean(result?.success) && reaped && cleanupVerified, productionReady: false,
       ...(!cleanupVerified && auth.environment.FLY_CONFIG_DIR ? { privateAuthDirectory: auth.environment.FLY_CONFIG_DIR } : {}) });
