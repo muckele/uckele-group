@@ -36,6 +36,103 @@ class Hold(Exception):
     pass
 
 
+class DiagnosticHold(Hold):
+    def __init__(self, report):
+        self.report = checked_diagnostic_report(report)
+        super().__init__('Stopped-update diagnostic held')
+
+
+class LocalCommandTimeout(Hold):
+    pass
+
+
+DIAGNOSTIC_STEPS = set(('entry-validation recovery-native-initialization recovery-baseline-read '
+    'recovery-native-reap recovery-independent-baseline recovery-archive recovery-independent-archive '
+    'stopped-update-diagnostic native-initialization before-observation diagnostic-write diagnostic-settlement '
+    'conditional-restoration restoration-settlement mutation-settlement-unverified diagnostic-request-failed '
+    'native-reap-unverified local-client-reap private-auth-cleanup').split())
+
+
+def fallback_diagnostic_report(session_digest=None, timeout=False):
+    return {'version': 'p10b-stopped-update-operator-report-v1', 'sessionDigest': session_digest,
+        'outcome': 'held', 'failedStep': 'stopped-update-diagnostic',
+        'category': 'timeout' if timeout else 'validation-or-unclassified', 'httpStatus': None,
+        'requestMethod': None, 'dispatched': None, 'serverState': 'uncertain-after-request',
+        'lastObservedAt': None, 'restorationVerified': False, 'clientsClosed': False,
+        'privateCleanup': 'unverified', 'localClosureIssue': 'clients-unverified', 'nextAction': 'separately-approved-incident-handling',
+        'automaticRetryAllowed': False, 'automaticRecoveryAllowed': False, 'newCredentialAuthorized': False,
+        'productionReady': False, 'globalAutomationPaused': True, 'providerCalls': 0, 'emails': 0}
+
+
+def checked_diagnostic_report(value, expected_digest=None):
+    # Fail closed on arbitrary child output. No free-form text survives into the
+    # owner's console/terminal evidence; session binding is checked before emit.
+    if not isinstance(value, dict) or set(value) != set(fallback_diagnostic_report()):
+        raise Hold('Closed diagnostic report required')
+    digest = value['sessionDigest']
+    if (digest is not None and (not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest))
+            or expected_digest is not None and digest != expected_digest):
+        raise Hold('Diagnostic report session mismatch')
+    enums = {
+        'version': {'p10b-stopped-update-operator-report-v1'}, 'outcome': {'held', 'succeeded'},
+        'failedStep': DIAGNOSTIC_STEPS | {None},
+        'category': {'none', 'timeout', 'authentication-or-authorization', 'http-rejection', 'request-failure',
+                     'validation-or-unclassified', 'cleanup-unverified', 'client-closure-unverified'},
+        'requestMethod': {None, 'GET', 'POST', 'WAIT'},
+        'serverState': {'uncertain-after-request', 'unverified', 'last-observed-replacing',
+                        'last-observed-baseline-nonrunning', 'last-observed-diagnostic-nonrunning'},
+        'privateCleanup': {'not-yet-checked', 'verified', 'unverified'},
+        'localClosureIssue': {None, 'clients-unverified', 'private-cleanup-unverified'},
+        'nextAction': {'preserve-for-independent-review', 'separately-approved-incident-handling',
+                       'manually-revoke-matching-token-after-closed-clients'}}
+    try:
+        if any(value[key] not in choices for key, choices in enums.items()):
+            raise Hold('Closed diagnostic report enum required')
+    except TypeError:
+        raise Hold('Closed diagnostic report primitive required') from None
+    status = value['httpStatus']
+    if (status is not None and (type(status) is not int or not 100 <= status <= 599)
+            or value['dispatched'] is not None and type(value['dispatched']) is not bool):
+        raise Hold('Closed diagnostic status required')
+    for key in ('restorationVerified', 'clientsClosed'):
+        if type(value[key]) is not bool:
+            raise Hold('Closed diagnostic boolean required')
+    for key in ('automaticRetryAllowed', 'automaticRecoveryAllowed', 'newCredentialAuthorized', 'productionReady'):
+        if value[key] is not False:
+            raise Hold('Diagnostic report cannot grant authority')
+    if value['globalAutomationPaused'] is not True or any(type(value[key]) is not int or value[key] != 0 for key in ('providerCalls', 'emails')):
+        raise Hold('Diagnostic report scope required')
+    timestamp = value['lastObservedAt']
+    if timestamp is not None:
+        if not isinstance(timestamp, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', timestamp):
+            raise Hold('Closed diagnostic observation time required')
+        try: dt.datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except ValueError: raise Hold('Closed diagnostic observation time required') from None
+    issue = ('clients-unverified' if not value['clientsClosed'] else
+             'private-cleanup-unverified' if value['privateCleanup'] == 'unverified' else None)
+    if value['localClosureIssue'] != issue:
+        raise Hold('Diagnostic closure facts disagree')
+    succeeded = value['outcome'] == 'succeeded'
+    if succeeded:
+        if (value['failedStep'] is not None or value['category'] != 'none'
+                or not value['restorationVerified'] or not value['clientsClosed']
+                or value['privateCleanup'] != 'verified' or value['serverState'] != 'last-observed-baseline-nonrunning'
+                or value['nextAction'] != 'manually-revoke-matching-token-after-closed-clients'):
+            raise Hold('Diagnostic success facts disagree')
+    elif (value['failedStep'] is None or value['category'] == 'none'
+          or value['nextAction'] != ('separately-approved-incident-handling' if issue else 'preserve-for-independent-review')):
+        raise Hold('Diagnostic hold facts disagree')
+    if (value['restorationVerified'] and value['serverState'] != 'last-observed-baseline-nonrunning'
+            or value['serverState'].startswith('last-observed-') and timestamp is None
+            or value['serverState'] == 'unverified' and timestamp is not None
+            or status is not None and (value['requestMethod'] is None or value['dispatched'] is not True)
+            or value['requestMethod'] is None and value['dispatched'] is not None
+            or value['category'] == 'authentication-or-authorization' and status not in (401, 403)
+            or value['category'] == 'http-rejection' and (status is None or 200 <= status < 300)):
+        raise Hold('Diagnostic observation facts disagree')
+    return dict(value)
+
+
 class PublicInputHold(Hold):
     def __init__(self, field, code):
         self.field = field
@@ -583,7 +680,7 @@ def run_command(args, environment, timeout):
         while streams.get_map():
             left = end - time.monotonic()
             if left <= 0:
-                raise Hold('Reviewed local command timed out')
+                raise LocalCommandTimeout('Reviewed local command timed out')
             for key, _ in streams.select(min(0.1, left)):
                 data = os.read(key.fileobj.fileno(), 65536)
                 if not data:
@@ -597,6 +694,14 @@ def run_command(args, environment, timeout):
         settling = True
         code = settle_owned_group(child)
         if code != 0:
+            if code == 1 and len(args) > 1 and Path(args[1]) == SCRIPTS / 'run-p10b-stopped-update-diagnostic.js':
+                try:
+                    report = checked_diagnostic_report(json.loads(output)['operatorReport'])
+                    if report['outcome'] != 'held':
+                        raise Hold('Nonzero diagnostic cannot report success')
+                except (Hold, ValueError, KeyError, TypeError):
+                    raise Hold('Reviewed local command held') from None
+                raise DiagnosticHold(report)
             raise Hold('Reviewed local command held')
         return json.loads(output)
     except BaseException:
@@ -632,6 +737,8 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
     public_input_error = None
     credential_input_requested = False
     authenticated_preflight_requested = False
+    diagnostic_report = None
+    summary = None
     try:
         recipe, checked, environment = check_recipe(recipe_file, runner, expected_recipe_sha256, bootstrap)
         diagnostic = recipe.get('version') == 'p10b-owner-stopped-update-recipe-v2'
@@ -803,6 +910,13 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
         phase = 'closed'
         return 0
     except BaseException as error:
+        if phase == 'stopped-update-diagnostic':
+            expected = summary.get('sessionDigest') if isinstance(summary, dict) else None
+            diagnostic_report = fallback_diagnostic_report(expected, isinstance(error, LocalCommandTimeout))
+            if isinstance(error, DiagnosticHold) and expected is not None:
+                try: diagnostic_report = checked_diagnostic_report(error.report, expected)
+                except Hold: pass
+            emit(json.dumps({'operatorReport': diagnostic_report}, indent=2))
         if isinstance(error, PublicInputHold):
             public_input_field = error.field
             public_input_error = error.code
@@ -830,7 +944,8 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
                                  'uncertainPrivateCleanupRetained': not success, 'automaticRevocation': False,
                                  'publicInputField': public_input_field, 'publicInputError': public_input_error,
                                  'credentialInputRequested': credential_input_requested,
-                                 'authenticatedPreflightRequested': authenticated_preflight_requested})
+                                 'authenticatedPreflightRequested': authenticated_preflight_requested,
+                                 'operatorReport': diagnostic_report})
             except Exception:
                 pass  # Existing evidence is never overwritten.
         if console_closure_failed:

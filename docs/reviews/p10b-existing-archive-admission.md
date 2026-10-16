@@ -37,3 +37,23 @@ The zero-start, maximum-one-diagnostic/one-eligible-restoration POST contract,
 approval window and permanent uncertain-outcome holds remain unchanged. Setup
 and exact-session diagnostic consent are still separate. This source change
 authorizes no live operation, credential issuance, Machine start or email.
+
+## Safe owner diagnostics
+
+The stopped-update CLI now retains a closed operator report through nonzero child
+exit and local cleanup. It names the failing step, typed request method/status,
+last validated observation versus an uncertain dispatched mutation, restoration
+verification, client closure and private cleanup. HTTP 401/403 means authentication
+or authorization rejection; it does not prove token expiry or unchanged server
+state. Timeout, rejected update and restoration failure preserve the conservative
+no-retry policy. Cleanup failure after verified restoration retains both facts.
+
+Only fixed enums, bounded public status and a session-bound digest/time cross the
+owner console boundary. Raw exception text, response bodies, headers, credential
+values and private directories are excluded from that summary. Python validates
+the exact schema after positive child-group closure, then checks the sealed
+session digest before emitting/persisting it. Invalid or missing reports fall back
+to an uncertain held state. Reports grant no retry, recovery, new credential or
+cleanup authority. Next actions are preserving evidence for independent review,
+manually revoking the matching token only after closed clients, or separately
+approved incident handling when local closure/cleanup remains unverified.

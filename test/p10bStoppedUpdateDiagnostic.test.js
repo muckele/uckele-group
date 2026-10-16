@@ -224,3 +224,40 @@ test('old diagnostic consent cannot authorize the revised recovery contract', ()
   session.version = 'p10b-stopped-update-session-v1'; approval.version = 'p10b-stopped-update-approval-v1'; approval.sessionDigest = digest(session);
   assert.throws(() => contract.assertP10bStoppedUpdateApproval(session, approval));
 });
+
+for (const scenario of [
+  { step: 'diagnostic-write', method: 'POST', at: 1, code: 'timed-out', status: null, category: 'timeout' },
+  { step: 'diagnostic-write', method: 'POST', at: 1, code: 'http-failed', status: 401, category: 'authentication-or-authorization' },
+  { step: 'before-observation', method: 'GET', at: 1, code: 'http-failed', status: 403, category: 'authentication-or-authorization' },
+  { step: 'diagnostic-write', method: 'POST', at: 1, code: 'http-failed', status: 422, category: 'http-rejection' },
+  { step: 'conditional-restoration', method: 'POST', at: 2, code: 'http-failed', status: 409, category: 'http-rejection' },
+  { step: 'restoration-settlement', method: 'WAIT', at: 2, code: 'timed-out', status: null, category: 'timeout' },
+]) test(`safe owner report retains ${scenario.method}/${scenario.at}/${scenario.status ?? scenario.code} without claiming current baseline`, async () => {
+  let now = Date.now(); const { session, approval } = stoppedDiagnosticFixture(now);
+  const native = fakeBoundary(session, 'success', ms => { now += ms; }); const client = native.client;
+  let matches = 0;
+  native.client = async (method, body, timeoutMs) => {
+    if (method === scenario.method && ++matches === scenario.at) throw new contract.P10bStoppedUpdateRequestError({
+      code: scenario.code, method, timeoutMs, observation: { httpStatus: scenario.status, elapsedMs: 1, dispatched: true } });
+    return client(method, body, timeoutMs);
+  };
+  const result = await operator.runP10bStoppedUpdateDiagnostic({ session, approval, evidence: evidenceStore(),
+    createClient: async () => native, assertAdmission: () => true, clock: () => now });
+  const report = result.operatorReport;
+  assert.ok(report, 'closed safe operator summary required');
+  assert.equal(report.failedStep, scenario.step); assert.equal(report.category, scenario.category);
+  assert.equal(report.httpStatus, scenario.status); assert.equal(report.requestMethod, scenario.method);
+  assert.equal(report.serverState, scenario.method === 'GET' ? 'unverified' : 'uncertain-after-request');
+  assert.equal(report.restorationVerified, false); assert.equal(report.automaticRetryAllowed, false);
+  assert.equal(report.newCredentialAuthorized, false); assert.equal(report.automaticRecoveryAllowed, false);
+  assert.equal(result.restored, false); assert.equal(native.calls.filter(c => c.method === 'POST').length <= 2, true);
+});
+test('unknown errors expose no raw message or fake status in owner report', async () => {
+  const { session, approval } = stoppedDiagnosticFixture();
+  const result = await operator.runP10bStoppedUpdateDiagnostic({ session, approval, evidence: evidenceStore(),
+    createClient: async () => ({ client: async () => { throw Object.assign(Error('PRIVATE_RESPONSE_CANARY'), { status: 401 }); }, reap: async () => true }),
+    assertAdmission: () => true });
+  assert.ok(result.operatorReport); assert.equal(result.operatorReport.httpStatus, null);
+  assert.equal(result.operatorReport.category, 'validation-or-unclassified');
+  assert.equal(JSON.stringify(result).includes('CANARY'), false);
+});

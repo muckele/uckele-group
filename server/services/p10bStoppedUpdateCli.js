@@ -1,3 +1,4 @@
+import { p10bStoppedUpdateReport, P10bStoppedUpdateCliHold } from './p10bStoppedUpdateReport.js';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +10,7 @@ import { createP10bOperatorProcesses } from './p10bOperatorProcesses.js';
 import { assertP10bReviewedCheckout, assertP10bFlyExecutable } from './p10bOperatorSource.js';
 import { createP10bAppTokenContext } from './p10bHostAuthentication.js';
 import { assertP10bImagePrerequisite } from './p10bNoEmailSessionCli.js';
-import { assertP10bStoppedUpdateApproval, assertP10bStoppedUpdateHostBinding } from './p10bStoppedUpdateContract.js';
+import { assertP10bStoppedUpdateApproval, assertP10bStoppedUpdateHostBinding, publicP10bStoppedUpdateFailure } from './p10bStoppedUpdateContract.js';
 import { assertP10bPriorArchiveBinding } from './p10bExistingArchiveRecovery.js';
 import { runP10bStoppedUpdateDiagnostic } from './p10bStoppedUpdateDiagnostic.js';
 
@@ -43,7 +44,7 @@ export async function runP10bStoppedUpdateCli(args, { read = readP10bPublicJson,
   if (clock() < enteredAt || clock() + 40000 >= runDeadline) throw Error('Original diagnostic entry cutoff exhausted');
   const auth = createAuth({ session, approval, clock });
   const natives = []; let initializationUncertain = false; let result; let failed = false; let cleanupHeld = false;
-  let stage = 'recovery-native-initialization';
+  let stage = 'recovery-native-initialization'; let failure = null; let finalReport;
   const authenticatedNative = async readOnly => {
     if (clock() + 40000 >= runDeadline) throw Error('Diagnostic admission cutoff');
     try {
@@ -52,7 +53,7 @@ export async function runP10bStoppedUpdateCli(args, { read = readP10bPublicJson,
       natives.push(client); return client;
     } catch (error) {
       if (error?.reapVerified !== true) initializationUncertain = true;
-      throw Error('Diagnostic native admission failed');
+      throw error;
     }
   };
   try {
@@ -77,21 +78,32 @@ export async function runP10bStoppedUpdateCli(args, { read = readP10bPublicJson,
     result = await runP10bStoppedUpdateDiagnostic({ session, approval, evidence, clock, runDeadline,
       assertAdmission: () => assertP10bRecoveryAdmission({ session, recovery, inspect: () => inspectRecovery(session), now: clock(), clock }),
       createClient: () => authenticatedNative(false) });
-  } catch { failed = true; }
+  } catch (error) { failed = true; failure = publicP10bStoppedUpdateFailure(error); }
   finally {
     let reaped = !initializationUncertain;
     try { if (await processes?.reap() !== true) reaped = false; } catch { reaped = false; }
     for (const client of natives) { try { if (await client.reap() !== true) reaped = false; } catch { reaped = false; } }
+    let clientsClosed = false;
+    try { clientsClosed = reaped && auth.assertReaped() === true; } catch { /* descendant proof remains held */ }
     let cleanupVerified = false;
-    try { cleanupVerified = auth.cleanup({ reaped }) === true; } catch { /* preserve private context when reaping is uncertain */ }
-    evidence.write('p10b-stopped-update-auth-closure.json', { sessionDigest: sha256(stableCanonicalJson(session)),
-      closedAt: new Date(clock()).toISOString(), directReapVerified: reaped, reapVerified: reaped && cleanupVerified, cleanupVerified,
-      failureStage: failed ? stage : (!reaped ? 'local-client-reap' : (!cleanupVerified ? 'private-auth-cleanup' : null)),
-      success: !failed && Boolean(result?.success) && reaped && cleanupVerified, productionReady: false,
+    try { cleanupVerified = auth.cleanup({ reaped: clientsClosed }) === true; } catch { /* preserve private context when reaping is uncertain */ }
+    const failureStage = failed ? stage : (!clientsClosed ? 'local-client-reap' : (!cleanupVerified ? 'private-auth-cleanup' : result?.failureStage));
+    finalReport = p10bStoppedUpdateReport({ sessionDigest: sha256(stableCanonicalJson(session)),
+      success: !failed && Boolean(result?.success) && clientsClosed && cleanupVerified, failedStep: failureStage, failure,
+      lastObservation: result?.lastObservation, mutationUncertain: Boolean(result?.mutationUncertain) || failed && stage === 'stopped-update-diagnostic',
+      restored: Boolean(result?.restored), clientsClosed, privateCleanup: cleanupVerified ? 'verified' : 'unverified' });
+    // Preserve the request failure even when a distinct local closure/cleanup
+    // issue needs incident handling. Never substitute a cleanup category for it.
+    if (!failed && result?.operatorReport?.outcome === 'held') {
+      for (const key of ['failedStep', 'category', 'httpStatus', 'requestMethod', 'dispatched']) finalReport[key] = result.operatorReport[key];
+    }
+    evidence.write('p10b-stopped-update-auth-closure.json', { operatorReport: finalReport, sessionDigest: sha256(stableCanonicalJson(session)),
+      closedAt: new Date(clock()).toISOString(), directReapVerified: reaped, reapVerified: clientsClosed && cleanupVerified, cleanupVerified,
+      failureStage: failed ? stage : (!clientsClosed ? 'local-client-reap' : (!cleanupVerified ? 'private-auth-cleanup' : null)),
+      success: !failed && Boolean(result?.success) && clientsClosed && cleanupVerified, productionReady: false,
       ...(!cleanupVerified && auth.environment.FLY_CONFIG_DIR ? { privateAuthDirectory: auth.environment.FLY_CONFIG_DIR } : {}) });
-    cleanupHeld = !reaped || !cleanupVerified;
+    cleanupHeld = !clientsClosed || !cleanupVerified;
   }
-  if (cleanupHeld) throw Error('Private authentication cleanup held; preserve evidence');
-  if (failed) throw Error('Stopped-update diagnostic failed; preserve evidence');
-  return result;
+  if (cleanupHeld || failed) throw new P10bStoppedUpdateCliHold(finalReport);
+  return { ...result, operatorReport: finalReport };
 }

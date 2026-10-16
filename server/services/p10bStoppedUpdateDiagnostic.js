@@ -1,3 +1,4 @@
+import { p10bStoppedUpdateReport } from './p10bStoppedUpdateReport.js';
 import { performance } from 'node:perf_hooks';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { assertP10bStoppedUpdateApproval, checkedP10bStoppedObservation, checkedP10bStoppedSettlement, publicP10bStoppedUpdateFailure } from './p10bStoppedUpdateContract.js';
@@ -19,7 +20,7 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     maximumDiagnosticPosts: 1, maximumRestorationPosts: 1, maximumStarts: 0, skip_launch: true, runDeadline: new Date(runDeadline).toISOString() });
   let native; let primary = null; let restoration = null; let baselineObserved = false; let mutationSettled = false;
   let restored = false; let attempted = false; let nativeReapVerified = false; let stage = 'native-initialization';
-  let failureStage = null; let sequence = 0;
+  let failureStage = null; let sequence = 0; let failure = null; let lastObservation = null;
   const machine = value => {
     if (!value || Object.keys(value).some(k => !['id', 'region', 'state', 'instance_id', 'config', 'image_ref', 'events'].includes(k))
       || value.id !== session.machineId || value.region !== 'ewr' || !/^[A-Za-z0-9-]{1,80}$/.test(value.instance_id || '')
@@ -39,6 +40,8 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     evidence.write(`p10b-stopped-update-observation-${++sequence}.json`, { label, at: new Date(clock()).toISOString(),
       instanceId: m.instance_id, state: m.state, imageDigest: m.image_ref.digest, configDigest: digest(m.config),
       configuration: m.config, observation });
+    lastObservation = { at: new Date(clock()).toISOString(), state: m.state,
+      configurationRole: same(m.config, session.baselineConfig) ? 'baseline' : 'diagnostic' };
     if (nonrunning(m) && same(m.config, session.baselineConfig)) baselineObserved = true;
     return m;
   };
@@ -78,7 +81,8 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
       if (clock() >= end || observation.elapsedMs >= timeoutMs) throw Error('Exact acknowledged settlement required');
       evidence.write(`p10b-stopped-update-${label}-settlement.json`, { version: settlement.version, state: settlement.state, observation });
     } catch (error) {
-      evidence.write(`p10b-stopped-update-${label}-settlement-failure.json`, publicP10bStoppedUpdateFailure(error) || {
+      failure = publicP10bStoppedUpdateFailure(error);
+      evidence.write(`p10b-stopped-update-${label}-settlement-failure.json`, failure || {
         code: 'bridge-failed', method: 'WAIT', timeoutMs, observation: { httpStatus: null,
           elapsedMs: Math.max(0, Math.round(performance.now() - started)), dispatched: null } });
       throw Error('Acknowledged settlement unverified');
@@ -108,9 +112,9 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
         restored = true; mutationSettled = true;
       }
     } else if (primary.observation.dispatched === false && baselineObserved) mutationSettled = true;
-    if (!mutationSettled) failureStage = 'mutation-settlement-unverified';
-    else if (primary.code !== null) failureStage = 'diagnostic-request-failed';
-  } catch { failureStage ||= stage; }
+    if (!mutationSettled) { failureStage = stage; failure ||= restoration?.code ? restoration : primary?.code ? primary : null; }
+    else if (primary.code !== null) { failureStage = 'diagnostic-write'; failure = primary; }
+  } catch (error) { failureStage ||= stage; failure ||= publicP10bStoppedUpdateFailure(error); }
   finally {
     if (native) { try { nativeReapVerified = await native.reap() === true; } catch { nativeReapVerified = false; } }
     if (!nativeReapVerified) failureStage ||= 'native-reap-unverified';
@@ -120,6 +124,10 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     mutationUncertain: attempted && !mutationSettled, restored, nativeReapVerified, failureStage,
     success: !failureStage && restored && nativeReapVerified, maximumStarts: 0,
     qualificationAllowed: false, providerCalls: 0, emails: 0, productionReady: false, globalAutomationPaused: true };
+  result.lastObservation = lastObservation;
+  result.operatorReport = p10bStoppedUpdateReport({ sessionDigest: result.sessionDigest, success: result.success,
+    failedStep: result.failureStage, failure, lastObservation, mutationUncertain: result.mutationUncertain,
+    restored, clientsClosed: nativeReapVerified });
   evidence.write('p10b-stopped-update-closure.json', result);
   return result;
 }

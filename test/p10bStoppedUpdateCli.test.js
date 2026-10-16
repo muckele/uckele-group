@@ -147,3 +147,70 @@ test('archive change after independent proof prevents diagnostic mutation and cl
   await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options)); assert.equal(f.posts(), 0);
   assert.equal(f.evidence.read('p10b-stopped-update-auth-closure.json').cleanupVerified, true);
 });
+
+test('cleanup hold retains verified restoration and public state without private response text', async () => {
+  const f = fixture();
+  f.options.createAuth = () => ({ environment: {}, assertReaped: () => true, cleanup() { throw Error('PRIVATE_CLEANUP_CANARY'); } });
+  // Test boundary accepts no real credentials; preserve the normal synthetic client.
+  const open = f.options.openNative;
+  f.options.openNative = input => open({ ...input, environment: { FLY_API_TOKEN: 'synthetic-offline-auth-canary' } });
+  await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options), error => {
+    const report = error.operatorReport;
+    assert.equal(report.failedStep, 'private-auth-cleanup'); assert.equal(report.category, 'cleanup-unverified');
+    assert.equal(report.restorationVerified, true); assert.equal(report.serverState, 'last-observed-baseline-nonrunning');
+    assert.equal(report.privateCleanup, 'unverified'); assert.equal(report.clientsClosed, true);
+    assert.equal(report.nextAction, 'separately-approved-incident-handling');
+    assert.equal(JSON.stringify(report).includes('CANARY'), false); return true;
+  });
+  assert.equal(f.posts(), 2);
+});
+
+test('recovery GET authentication rejection survives CLI cleanup as a safe held report', async () => {
+  const { P10bStoppedUpdateRequestError } = await import('../server/services/p10bStoppedUpdateContract.js');
+  const f = fixture(); f.options.openNative = async () => ({
+    client: async () => { throw new P10bStoppedUpdateRequestError({ code: 'http-failed', method: 'GET', timeoutMs: 1000,
+      observation: { httpStatus: 401, elapsedMs: 1, dispatched: true } }); }, reap: async () => true });
+  await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options), error => {
+    assert.equal(error.operatorReport.failedStep, 'recovery-baseline-read');
+    assert.equal(error.operatorReport.category, 'authentication-or-authorization');
+    assert.equal(error.operatorReport.httpStatus, 401); assert.equal(error.operatorReport.serverState, 'unverified');
+    assert.equal(error.operatorReport.newCredentialAuthorized, false); return true;
+  });
+  assert.equal(f.posts(), 0);
+});
+
+test('original POST rejection and cleanup hold are both retained in the owner report', async () => {
+  const { P10bStoppedUpdateRequestError } = await import('../server/services/p10bStoppedUpdateContract.js');
+  const f = fixture(); const open = f.options.openNative;
+  const create = f.options.createAuth;
+  f.options.createAuth = input => { const context = create(input); return { environment: context.environment,
+    assertReaped: context.assertReaped, cleanup() { context.cleanup({ reaped: true }); throw Error('synthetic-deletion-unverified'); } }; };
+  f.options.openNative = async input => { const native = await open(input); const client = native.client;
+    native.client = (method, body, timeoutMs) => {
+      if (method === 'POST') throw new P10bStoppedUpdateRequestError({ code: 'http-failed', method, timeoutMs,
+        observation: { httpStatus: 401, elapsedMs: 1, dispatched: true } });
+      return client(method, body, timeoutMs);
+    }; return native;
+  };
+  await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options), error => {
+    const r = error.operatorReport;
+    assert.equal(r.failedStep, 'diagnostic-write'); assert.equal(r.category, 'authentication-or-authorization');
+    assert.equal(r.httpStatus, 401); assert.equal(r.requestMethod, 'POST'); assert.equal(r.dispatched, true);
+    assert.equal(r.localClosureIssue, 'private-cleanup-unverified'); assert.equal(r.privateCleanup, 'unverified'); return true;
+  });
+});
+
+test('pending descendant intent prevents claiming all clients closed even after direct reaping', async () => {
+  const { reserveP10bLocalReap } = await import('../server/services/p10bHostAuthentication.js');
+  const f = fixture(); const create = f.options.createAuth; let pending;
+  f.options.createAuth = input => { const context = create(input); pending = reserveP10bLocalReap(context.environment); return context; };
+  try {
+    await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options), error => {
+      assert.equal(error.operatorReport.clientsClosed, false);
+      assert.equal(error.operatorReport.localClosureIssue, 'clients-unverified');
+      assert.equal(error.operatorReport.nextAction, 'separately-approved-incident-handling'); return true;
+    });
+    assert.equal(f.evidence.read('p10b-stopped-update-auth-closure.json').directReapVerified, true);
+    assert.equal(f.evidence.read('p10b-stopped-update-auth-closure.json').reapVerified, false);
+  } finally { pending.retire(true); f.context().cleanup({ reaped: true }); }
+});
