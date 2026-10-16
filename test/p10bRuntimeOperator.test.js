@@ -720,6 +720,67 @@ test('retained current-phase failure reservation permits settlement and baseline
   assert.equal(await b.close(), true);
 });
 
+async function guardianSettlementBudgetFixture(t, { anomaly = 'constant', stoppedOn = Infinity, failReads = false } = {}) {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { createP10bNoEmailBoundaries } = await import('../server/services/p10bNoEmailBoundaries.js');
+  const x = recoveryFixture({ guardian: true }); const evidence = memoryEvidence(); evidence.root = '/fresh/private-evidence';
+  const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
+    baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
+  const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
+  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+  let clock = now + 10000, reads = 0, closes = 0;
+  const b = await createP10bNoEmailBoundaries({ session: x.s, approval: x.approval, evidence,
+    recovery: { ...recovered, verification }, inspectRecovery: x.inspect, clock: () => clock,
+    processes: { command: async () => JSON.stringify([x.baseline]), terminate: async () => true, reap: async () => true },
+    openNative: async () => ({ client: async (method = 'GET') => {
+      assert.equal(method, 'GET', 'Settlement may not mutate'); reads++; if (anomaly === 'backward') clock--;
+      if (reads > 441) throw Error('Settlement dispatched442');
+      if (failReads) throw Error('Synthetic failed read');
+      return { ...x.baseline, state: reads >= stoppedOn ? 'stopped' : 'started' };
+    }, close: async () => { closes++; return true; } }) });
+  async function settle() {
+    let done = false, result, error;
+    const pending = b.settle(phase);
+    pending.then(value => { result = value; done = true; }, failure => { error = failure; done = true; });
+    for (let step = 0; !done && step < 445; step++) {
+      await new Promise(setImmediate); if (!done) t.mock.timers.tick(750);
+    }
+    // The old uncapped loop must terminate so RED is a count assertion, not a hang.
+    if (!done) { clock = Date.parse(phase.window.stopAt) + 30000; t.mock.timers.tick(750); }
+    await pending.catch(() => {});
+    if (error) throw error; return result;
+  }
+  return { b, phase, evidence, settle, counts: () => ({ reads, closes }) };
+}
+
+test('guardian settlement accepts stopped read441 at the inclusive attempt limit', async t => {
+  const f = await guardianSettlementBudgetFixture(t, { stoppedOn: 441 });
+  try {
+    assert.equal(await f.settle(), true); assert.equal(f.counts().reads, 441);
+    const receipt = f.evidence.read('p10b-runtime-only-demo-settlement.json');
+    assert.equal(receipt.settlementReadAttempts, 441); assert.equal(receipt.settlementReadLimit, 441);
+    assert.equal(receipt.settlementReadBudgetExhausted, false);
+  }
+  finally { assert.equal(await f.b.close(), true); }
+});
+
+test('guardian settlement exhausted budget survives errors, clock anomalies and repeat calls', async t => {
+  for (const variant of ['constant', 'backward', 'failed-reads']) await t.test(variant, async t => {
+    const f = await guardianSettlementBudgetFixture(t, { anomaly: variant, failReads: variant === 'failed-reads' });
+    try {
+      assert.equal(await f.settle(), false);
+      assert.equal(f.counts().reads, 441);
+      const receipt = f.evidence.read('p10b-runtime-only-demo-settlement.json');
+      assert.equal(receipt.stoppedVerified, false); assert.equal(receipt.hostStopCalls, 0);
+      assert.equal(receipt.settlementReadAttempts, 441); assert.equal(receipt.settlementReadLimit, 441);
+      assert.equal(receipt.settlementReadBudgetExhausted, true);
+      // Exclusive evidence may reject replay, but it must not renew the quota.
+      await f.settle().catch(() => {}); assert.equal(f.counts().reads, 441);
+    } finally { assert.equal(await f.b.close(), true); }
+    assert.equal(f.counts().closes, 1);
+  });
+});
+
 test('mock registry evidence binds the exact immutable image and counts before any native boundary is created', async () => {
   const { assertP10bImagePrerequisite, runP10bNoEmailSessionCli } = await import('../server/services/p10bNoEmailSessionCli.js');
   const x = recoveryFixture();

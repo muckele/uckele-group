@@ -17,6 +17,7 @@ import { assertP10bFlyExecutable } from './p10bOperatorSource.js';
 const script = name => fileURLToPath(new URL(`../../scripts/${name}`, import.meta.url));
 const digest = value => sha256(stableCanonicalJson(value));
 const canonicalTime = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+const maximumGuardianSettlementReads = 441;
 export function verifyP10bPreparationObservation(rows, phase, machine, result, session) {
   const sessionDeadline = session?.sessionDeadline;
   const metadata = rows.filter(v => v.kind === 'metadata'); const last = metadata.at(-1);
@@ -68,6 +69,8 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
   processes ||= createP10bOperatorProcesses({ environment });
   const guardian = isP10bGuardianSession(session);
   let native; let posts = 0; let phaseAuthorized = false; let settlementPhase; const configs = [session.baselineConfig];
+  // Guardian-only admits one phase. Re-entering settlement cannot renew its reads.
+  let guardianSettlementReads = 0;
   const observers = []; const controllers = [];
   async function authorizePhase(phase) {
     assertP10bFrozenPhase(session, phase);
@@ -202,13 +205,17 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     const end = Math.min(Date.parse(phase.window.stopAt) + 30000, Date.parse(session.sessionDeadline) - 30000);
     let stopped = false;
     do {
+      if (guardian && guardianSettlementReads >= maximumGuardianSettlementReads) break;
+      if (guardian) guardianSettlementReads++;
       try { const machine = await client(); stopped = machine.state === 'stopped' && machine.id === session.machineId && machine.region === 'ewr'; }
       catch { /* retain uncertainty; only bounded read-only observation follows */ }
-      if (stopped) break;
+      if (stopped || (guardian && guardianSettlementReads >= maximumGuardianSettlementReads)) break;
       await new Promise(resolve => setTimeout(resolve, Math.min(750, Math.max(1, end - clock()))));
     } while (clock() < end);
     for (const observer of observers) { try { await observerRows(observer); } catch { /* failed proof never authorizes preparation */ } }
     evidence.write(`p10b-runtime-only-${phase.label}-settlement.json`, { stoppedVerified: stopped, controllersReaped, at: new Date(clock()).toISOString(),
+      ...(guardian ? { settlementReadAttempts: guardianSettlementReads, settlementReadLimit: maximumGuardianSettlementReads,
+        settlementReadBudgetExhausted: !stopped && guardianSettlementReads >= maximumGuardianSettlementReads } : {}),
       productionReady: false, providerCalls: 0, hostStopCalls: 0 });
     return stopped && controllersReaped;
   }

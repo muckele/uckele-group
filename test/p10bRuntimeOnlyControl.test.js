@@ -208,3 +208,33 @@ test('guardian wrong acknowledgement, failed WAIT or failed readback latches hol
     assert.equal(posts, 1);
   });
 });
+
+test('readback attempt100 can verify stopped without permitting attempt101', async () => {
+  const f = fixture(true); let attempts = 0;
+  const checked = await f.control.readUpdatedStopped(async () => ({ ...f.machine,
+    state: ++attempts === 100 ? 'stopped' : 'created' }), f.baseline, 'baseline', at + 10000);
+  assert.equal(checked.state, 'stopped'); assert.equal(attempts, 100);
+});
+
+test('readback cap fails closed with nonadvancing or backward clock and retains the update hold', async t => {
+  for (const anomaly of ['constant', 'backward']) await t.test(anomaly, async () => {
+    const f = fixture(true); let clock = at + 10000; let reads = 0, posts = 0;
+    const control = createP10bRuntimeOnlyControl({ session: f.session, evidence: f.evidence,
+      clock: () => clock, wait: async () => { if (anomaly === 'backward') clock--; } });
+    const api = async (method = 'GET', body) => {
+      if (method === 'WAIT') return { ok: true, state: 'created', version: body.version };
+      if (method === 'POST') { posts++; return f.api(method, body); }
+      if (!posts) return f.api(method, body);
+      if (++reads > 100) throw Error('Readback attempted101');
+      return { ...structuredClone(f.machine), state: 'created' };
+    };
+    await assert.rejects(control.guardedUpdate(api, f.baseline, f.candidate, 'demo'), /readback.*budget/i);
+    assert.equal(reads, 100); assert.equal(posts, 1); assert.equal(control.mutationUncertain(), true);
+    assert.equal(f.evidence.read('p10b-runtime-only-update-demo-readback.json').length, 100);
+    assert.equal(f.evidence.has('p10b-runtime-only-update-demo-verified.json'), false);
+    const restarted = createP10bRuntimeOnlyControl({ session: f.session, evidence: f.evidence, clock: () => clock });
+    await assert.rejects(restarted.restoreBaseline(api, f.baseline, [f.candidate]), /unacknowledged|unsettled/i);
+    await assert.rejects(restarted.guardedUpdate(api, f.baseline, f.candidate, 'demo'), /replay/);
+    assert.equal(reads, 100); assert.equal(posts, 1);
+  });
+});

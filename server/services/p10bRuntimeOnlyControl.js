@@ -3,6 +3,7 @@ import { once } from 'node:events';
 
 const digest = value => sha256(stableCanonicalJson(value));
 const machineId = '0803730bd1d7e8';
+const maximumUpdateReadbacks = 100;
 
 // An operator wrapper must check both child termination and retained evidence.
 // Printing the child's exit code alone must never turn failed prep into exit 0.
@@ -78,10 +79,13 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
   }
   async function readUpdatedStopped(client, expectedConfig, instanceId, readbackDeadline,
     { previous, onReadback = () => {} } = {}) {
+    let attempts = 0;
     do {
       assertTime();
       const remaining = readbackDeadline - clock();
       if (remaining <= 0) throw Error('Stopped update readback timed out');
+      if (attempts >= maximumUpdateReadbacks) throw Error('Stopped update readback budget exhausted');
+      attempts++;
       const checked = await client('GET', undefined, Math.min(1000, remaining));
       onReadback({ at: new Date(clock()).toISOString(), id: checked.id, state: checked.state,
         instanceId: checked.instance_id, imageDigest: checked.image_ref?.digest, configDigest: digest(checked.config || null) });
