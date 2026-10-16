@@ -348,7 +348,7 @@ test('observer accepts nanosecond platform time but discards malformed or arbitr
     bindingVerified: true, code: 0, signal: null, spawnFailed: false, guardianPid: 5001, parentPid: 5000,
     exitedAt: '2026-10-12T12:04:00.000Z', parentStartedAt: '2026-10-12T12:00:00.000Z',
     readyDigest: 'a'.repeat(64), receiptDigest: 'b'.repeat(64), startDigest: 'c'.repeat(64) };
-  const row = { instance: session().machineId, region: 'ewr', timestamp: '2026-10-12T12:04:00.334578044Z',
+  const row = { instance: phase.window.machineId, region: 'ewr', timestamp: '2026-10-12T12:04:00.334578044Z',
     message: P10B_GUARDIAN_EXIT_PREFIX + JSON.stringify(value) };
   assert.equal(sanitizeP10bGuardianLog(row, phase.window).timestamp, '2026-10-12T12:04:00.334Z');
   assert.equal(normalizeP10bPlatformTime('2026-02-30T12:00:00Z'), null);
@@ -541,32 +541,69 @@ test('unknown public package fields fail before authentication or evidence publi
   await assert.rejects(operator.runP10bNoEmailOperator(f.options));assert.equal(calls,0);assert.equal(f.evidence.files.size,0);
 });
 
-async function observerPollFixture(command = async () => '', late = false) {
+async function observerPollFixture(command = async () => '', late = false, options = {}) {
   const { runP10bIndependentObserver } = await import('../server/services/p10bIndependentObserver.js');
   const x = recoveryFixture(); const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
     baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
   const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
-  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now); let clock = now; let scheduled; let nativeReaps = 0; let processReaps = 0;
-  const rows = []; const reads = []; let metadataCalls = 0; let attached;
+  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now); let clock = now; let nativeReaps = 0; let processReaps = 0; const queue = [];
+  const wait = ms => new Promise(resolve => queue.push({ at: clock + ms + (late ? 300 : 0), resolve }));
+  const rows = []; const reads = []; let metadataCalls = 0; let attached; let attachedAt;
   const processes = { async command(file, args, timeout) {
     assert.equal(file, x.s.flyExecutable.path); assert.ok(args.includes('--no-tail'));
     assert.equal(timeout, reads.length ? 700 : 5000);
-    reads.push(clock); return command({ phase, index: reads.length, at: clock, advance(ms) { clock += ms; } }); },
-    async reap() { processReaps++; return true; } };
+    reads.push(clock); return command({ phase, index: reads.length, at: clock, wait, advance(ms) { clock += ms; } }); },
+    async reap() { processReaps++; if (options.cleanupMs) await wait(options.cleanupMs); return options.reaped !== false; } };
   const machine = { ...x.baseline, config: phase.config, image_ref: { digest: image } };
-  const success = await runP10bIndependentObserver({ session: x.s, approval: x.approval, phase, machine,
-    recovery: { ...recovered, verification }, inspectRecovery: x.inspect, record: row => rows.push(row), attached: value => { attached = value; },
-    processes, clock: () => clock, interval(tick) { scheduled = tick; return 1; }, clear: () => {},
-    async wait(ms) { const end = clock + ms + (late ? 300 : 0); while (clock + 750 <= end) { clock += 750; await scheduled(); } clock = end; },
-    async openNative(input) { assert.equal(input.readOnly, true); return { async client() { metadataCalls++; return structuredClone(machine); },
+  const run = runP10bIndependentObserver({ session: x.s, approval: x.approval, phase, machine,
+    recovery: { ...recovered, verification }, inspectRecovery: x.inspect, record: row => {
+      rows.push(row); if (row.kind === 'log-source-ready') clock += options.readyPublicationMs || 0;
+    }, attached: value => { attached = value; attachedAt = clock; },
+    processes, clock: () => clock, wait,
+    async openNative(input) { assert.equal(input.readOnly, true); return { async client(method, body, timeout) {
+      assert.equal(method, 'GET'); assert.equal(body, undefined); assert.equal(timeout, 700);
+      const index = metadataCalls++; await wait(typeof options.latency === 'function' ? options.latency(index) : (options.latency || 0));
+      return structuredClone(machine); },
       async reap() { nativeReaps++; return true; } }; } });
-  return { success, attached, metadataCalls, nativeReaps, processReaps, rows, reads, phase };
+  let done = false, success, error;
+  run.then(value => { success = value; done = true; }, failure => { error = failure; done = true; });
+  while (!done) {
+    await new Promise(setImmediate); if (done) break;
+    queue.sort((a, b) => a.at - b.at); const next = queue.shift();
+    if (!next) throw Error('Observer virtual clock stalled'); clock = Math.max(clock, next.at); next.resolve();
+  }
+  if (error && !options.expectFailure) throw error;
+  return { success, error, attached, attachedAt, metadataCalls, nativeReaps, processReaps, rows, reads, phase };
 }
+
+test('attachment rechecks actual freshness after ready publication with inclusive1000ms boundary', async () => {
+  const valid = await observerPollFixture(undefined, false, { readyPublicationMs: 1000 });
+  assert.ok(valid.attached); assert.equal(valid.success, true);
+  const invalid = await observerPollFixture(undefined, false, { readyPublicationMs: 1001, expectFailure: true });
+  assert.equal(invalid.attached, undefined); assert.ok(invalid.error);
+  assert.equal(invalid.nativeReaps, 1); assert.equal(invalid.processReaps, 1);
+});
+
+test('actual in-flight request preserves valid949ms initial metadata plus100ms initial log attachment', async () => {
+  const f = await observerPollFixture(async ({ index, wait }) => { if (index === 1) await wait(100); return ''; }, false, { latency: 949 });
+  assert.equal(f.attachedAt, now + 1049); assert.equal(f.success, true);
+  const first = f.rows.find(r => r.kind === 'metadata');
+  assert.equal(first.requestedAt, new Date(now).toISOString()); assert.equal(first.at, new Date(now + 949).toISOString());
+});
+
+test('invalid initial metadata and a known later sampling failure during initial logs never attach', async () => {
+  for (const latency of [() => 951, index => index === 0 ? 100 : 1000]) {
+    const f = await observerPollFixture(async ({ wait }) => { await wait(1500); return ''; }, false, { latency, expectFailure: true });
+    assert.ok(f.error); assert.equal(f.attached, undefined);
+    assert.ok(f.rows.some(r => r.kind === 'observer-sampling-error'));
+    assert.equal(f.nativeReaps, 1); assert.equal(f.processReaps, 1);
+  }
+});
 
 test('independent observer accepts successful empty log polls and preserves continuous metadata cadence through the final read', async () => {
   const { success, attached, metadataCalls, nativeReaps, processReaps, rows, reads, phase } = await observerPollFixture();
   assert.equal(success, true); assert.equal(attached.separateSession, true); assert.ok(metadataCalls >= 400);
-  assert.ok(nativeReaps >= 1 && processReaps >= 1); assert.equal(JSON.stringify(rows).includes('private-canary'), false);
+  assert.equal(nativeReaps, 1); assert.equal(processReaps, 1); assert.equal(JSON.stringify(rows).includes('private-canary'), false);
   assert.equal(reads[0], now); assert.equal(reads.at(-1), Date.parse(phase.window.stopAt));
   assert.ok(reads.length <= 410);
   assert.equal(rows.at(-1).kind, 'observer-finished'); assert.equal(rows.at(-1).normalCompletion, true);
@@ -610,7 +647,7 @@ test('overlapping log polls deduplicate exact guardian records but preserve dist
       bindingVerified: true, code: 0, signal: null, spawnFailed: false, guardianPid: 5001, parentPid: 5000,
       exitedAt: '2026-10-12T12:04:00.000Z', parentStartedAt: '2026-10-12T12:00:00.000Z',
       readyDigest: 'a'.repeat(64), receiptDigest: 'b'.repeat(64), startDigest: 'c'.repeat(64) };
-    const row = { instance: session().machineId, region: 'ewr', timestamp: '2026-10-12T12:04:00.334578044Z',
+    const row = { instance: phase.window.machineId, region: 'ewr', timestamp: '2026-10-12T12:04:00.334578044Z',
       message: P10B_GUARDIAN_EXIT_PREFIX + JSON.stringify(value) };
     return [row, row, { ...row, timestamp: '2026-10-12T12:04:00.334578045Z' },
       { ...row, message: 'private-canary' }].map(v => JSON.stringify(v)).join('\n');
@@ -637,7 +674,7 @@ test('failed initial log read cannot admit the first start and the operator reta
       const logs = { child, exited: new Promise(() => {}) };
       return runP10bIndependentObserver({ ...f.options, phase, machine, record: () => {},
         attached: () => { attachments++; }, interval: () => 1, clear: () => {},
-        async wait(ms) { clock += ms; },
+        async wait() {},
         processes: { launch: () => logs, async command() { throw Error('synthetic log read failed'); }, async reap() { logReaps++; return true; } },
         async openNative() { return { client: async () => structuredClone(machine),
           async reap() { nativeReaps++; return true; } }; } });

@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { verifyP10bObserverCompletion } from './p10bObserverPolicy.js';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
@@ -16,12 +17,12 @@ import { assertP10bFlyExecutable } from './p10bOperatorSource.js';
 const script = name => fileURLToPath(new URL(`../../scripts/${name}`, import.meta.url));
 const digest = value => sha256(stableCanonicalJson(value));
 const canonicalTime = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
-export function verifyP10bPreparationObservation(rows, phase, machine, result) {
+export function verifyP10bPreparationObservation(rows, phase, machine, result, session) {
+  const sessionDeadline = session?.sessionDeadline;
   const metadata = rows.filter(v => v.kind === 'metadata'); const last = metadata.at(-1);
   const logs = rows.filter(v => v.kind === 'platform-log');
   const log = logs[0]; let exit;
   try { if (log?.message.startsWith(P10B_GUARDIAN_EXIT_PREFIX)) exit = JSON.parse(log.message.slice(P10B_GUARDIAN_EXIT_PREFIX.length)); } catch { /* absent typed exit fails below */ }
-  const completions = rows.filter(v => v.kind === 'observer-finished'); const completion = completions[0];
   const normal = metadata.find(v => v.state === 'stopped' && v.events?.some(e => {
     const x = e.request?.exit_event;
     return e.type === 'exit' && e.status === 'stopped' && x?.requested_stop === false && x.restarting === false
@@ -43,8 +44,7 @@ export function verifyP10bPreparationObservation(rows, phase, machine, result) {
     || Date.parse(normal.at) > Date.parse(phase.window.stopAt)
     || metadata.length < 2 || Date.parse(metadata[0].requestedAt) > Date.parse(phase.window.issuedAt) + 60000
     || Date.parse(last.requestedAt) < Date.parse(phase.window.stopAt)
-    || completions.length !== 1 || completion.normalCompletion !== true || !canonicalTime(completion.at)
-    || Date.parse(completion.at) < Date.parse(last.at) || Date.parse(completion.at) - Date.parse(last.requestedAt) > 1000
+    || !verifyP10bObserverCompletion(rows, { window: phase.window, sessionDeadline, sessionDigest: digest(session) })
     || rows.some(v => ['observer-read-error', 'observer-missed-poll', 'observer-parse-error', 'local-reader-exit'].includes(v.kind))
     || metadata.some((v, i) => !canonicalTime(v.at) || !canonicalTime(v.requestedAt) || Date.parse(v.at) < Date.parse(v.requestedAt)
       || v.instanceId !== machine.instance_id || v.imageDigest !== phase.window.imageDigest
@@ -159,7 +159,8 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
       stage = 'observer-completion';
       const rows = await observerRows(observer);
       stage = 'guardian-proof';
-      const proof = proveP10bGuardianStop(rows, { window: phase.window, readiness, killedAt, expectedInstanceId: machine.instance_id });
+      const proof = proveP10bGuardianStop(rows, { window: phase.window, readiness, killedAt, expectedInstanceId: machine.instance_id,
+        requireV2: true, sessionDeadline: session.sessionDeadline, sessionDigest: digest(session) });
       return { ...proof, windowDigest: digest(phase.window), observerSurvived: true, primaryTerminationVerified };
     }
     catch (error) {
@@ -192,7 +193,7 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     finally { clearTimeout(timer); }
     evidence.write('p10b-runtime-only-preparation-child-exit.json', terminal);
     const result = readP10bPublicJson(`${prefix}.result.json`);
-    verifyP10bPreparationObservation(await observerRows(observer), phase, machine, result);
+    verifyP10bPreparationObservation(await observerRows(observer), phase, machine, result, session);
     return { ...terminal, result };
   }
   async function settle(phase) {

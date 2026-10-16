@@ -1,5 +1,6 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { P10B_GUARDIAN_EXIT_PREFIX } from './p10bGuardianParent.js';
+import { P10B_OBSERVER_POLICY } from './p10bObserverPolicy.js';
 const digest = value => sha256(stableCanonicalJson(value));
 const canonicalTime = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 const eventKeys = 'bindingVerified,code,exitedAt,guardianPid,parentPid,parentStartedAt,productionReady,readyDigest,receiptDigest,signal,spawnFailed,startDigest,version,windowDigest';
@@ -29,25 +30,29 @@ export function sanitizeP10bGuardianLog(row, window) {
 }
 
 export function createP10bObserverControls({ phase, machine, client, record, clock = () => Date.now() }) {
-  let busy = false; let ended = false; let attached = false; let pending;
+  let busy = false; let ended = false; let attached = false; let pending; let failed = false;
   const tick = () => {
     if (ended) return Promise.resolve();
-    if (busy) { record({ kind: 'observer-missed-poll', at: new Date(clock()).toISOString() }); return Promise.resolve(); }
+    if (busy) { failed = true; record({ kind: 'observer-missed-poll', at: new Date(clock()).toISOString() }); return Promise.resolve(); }
     busy = true; const requestedAt = new Date(clock()).toISOString();
     pending = (async () => {
       try {
         const m = await client('GET', undefined, 700);
         if (m.id !== machine.id || m.instance_id !== machine.instance_id || m.image_ref?.digest !== phase.window.imageDigest
           || m.region !== 'ewr' || digest(m.config) !== digest(phase.config)) throw Error('Observer target changed');
-        record({ kind: 'metadata', requestedAt, at: new Date(clock()).toISOString(), state: m.state,
-          imageDigest: m.image_ref.digest, instanceId: m.instance_id, events: m.events || [] });
+        const row = { kind: 'metadata', requestedAt, at: new Date(clock()).toISOString(), state: m.state,
+          imageDigest: m.image_ref.digest, instanceId: m.instance_id, events: m.events || [] };
+        const duration = Date.parse(row.at) - Date.parse(requestedAt);
+        if (duration < 0 || duration > P10B_OBSERVER_POLICY.nativeTimeoutMs + P10B_OBSERVER_POLICY.bridgeAllowanceMs) failed = true;
+        record(row);
         if (!attached && m.state === 'stopped') attached = true;
-      } catch { record({ kind: 'observer-read-error', at: new Date(clock()).toISOString() }); }
+        return row;
+      } catch { failed = true; record({ kind: 'observer-read-error', at: new Date(clock()).toISOString() }); }
       finally { busy = false; }
     })();
     return pending;
   };
-  return { tick, attached: () => attached,
+  return { tick, attached: () => attached, healthy: () => !failed,
     log(row) { const safe = sanitizeP10bGuardianLog(row, phase.window); if (safe) record(safe); },
     async finish({ normalCompletion, reap }) {
       if (ended) throw Error('Observer completion replay'); ended = true;

@@ -170,3 +170,41 @@ test('cadence reproduces the old1001ms first-request gap and removes its systema
   assert.equal(timer, 'timer'); now = 248; resolveInitial(); await initial; now = 750; await callback();
   assert.deepEqual(requests, [0, 750]);
 });
+
+async function v2Fixture(cleanupMs = 1500) {
+  const { P10B_OBSERVER_POLICY: p } = await import('../server/services/p10bObserverPolicy.js');
+  const f = fixture(); const records = f.records.filter(r => r.kind !== 'observer-finished'
+    && (r.kind !== 'metadata' || Date.parse(r.requestedAt) <= Date.parse(window.stopAt)));
+  const last = records.filter(r => r.kind === 'metadata').at(-1);
+  const sessionDeadline = new Date(at + 360000).toISOString(); const session = { sessionDeadline }; const sessionDigest = digest(session);
+  records.unshift({ kind: 'observer-policy', version: p.version, windowDigest: digest(window), sessionDigest, policyDigest: digest(p), sessionDeadline,
+    at: window.issuedAt });
+  records.push({ kind: 'observer-log-poll', requestedAt: window.stopAt, at: last.at, success: true });
+  const sample = { kind: 'observer-sampling-finished', version: p.version, windowDigest: digest(window), sessionDigest, policyDigest: digest(p), at: last.at,
+    normalCompletion: true, metadataReads: records.filter(r => r.kind === 'metadata').length, logReads: 1,
+    lastRequestedAt: last.requestedAt, lastResponseAt: last.at };
+  records.push(sample, { kind: 'observer-finished', version: p.version, windowDigest: digest(window), sessionDigest, samplingDigest: digest(sample),
+    at: new Date(Date.parse(last.at) + cleanupMs).toISOString(), normalCompletion: true, processesReaped: true, nativeReaped: true,
+    cleanupStartedAt: last.at, cleanupDeadline: new Date(Date.parse(last.at) + 3000).toISOString() });
+  return { ...f, records, sessionDeadline, session, sessionDigest };
+}
+
+test('concretev2 guardian proof requires timely sampling plus positive cleanup; legacy cannot satisfy it', async () => {
+  const f = await v2Fixture(); const options = { requireV2: true, sessionDeadline: f.sessionDeadline, sessionDigest: f.sessionDigest };
+  assert.equal((await prove(f.records, readiness, options)).success, true);
+  assert.equal((await prove(fixture().records, readiness, options)).success, false);
+  f.records.at(-1).nativeReaped = false;
+  assert.equal((await prove(f.records, readiness, options)).success, false);
+});
+
+test('concretev2 preparation admission requires both receipts bound to session expiry', async () => {
+  const { verifyP10bPreparationObservation: verify } = await import('../server/services/p10bNoEmailBoundaries.js');
+  const f = await v2Fixture(); const shutdown = { synthetic: true };
+  const row = f.records.find(r => r.kind === 'platform-log'); const event = JSON.parse(row.message.slice('P10B_GUARDIAN_CHILD_EXIT '.length));
+  event.receiptDigest = digest(shutdown); row.message = 'P10B_GUARDIAN_CHILD_EXIT ' + JSON.stringify(event);
+  const args = [{ window }, { instance_id: 'candidate-v1' }, { preparation: { guestShutdown: shutdown } }];
+  assert.equal(verify(f.records, ...args, f.session), true);
+  assert.throws(() => verify(fixture().records, ...args, f.session));
+  assert.throws(() => verify(f.records, ...args, { sessionDeadline: new Date(at + 370000).toISOString() }));
+  f.records.at(-1).processesReaped = false; assert.throws(() => verify(f.records, ...args, f.session));
+});

@@ -1,3 +1,4 @@
+import { verifyP10bObserverCompletion } from './p10bObserverPolicy.js';
 import { StringDecoder } from 'node:string_decoder';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { P10B_GUARDIAN_EXIT_PREFIX } from './p10bGuardianParent.js';
@@ -62,7 +63,7 @@ export function startObserverCadence(tick, { setInterval: interval = globalThis.
 
 // The old ambiguous init message never substitutes for this OS-reaped child
 // event. Whole-Machine code0 and continuous stopped readback are also required.
-export function proveP10bGuardianStop(records, { window, readiness, killedAt, expectedInstanceId } = {}) {
+export function proveP10bGuardianStop(records, { window, readiness, killedAt, expectedInstanceId, requireV2 = false, sessionDeadline, sessionDigest } = {}) {
   parseP10bGuestWindow(JSON.stringify(window));
   let exit = null; let log = null; let malformed = false; const matches = [];
   const guardianPid = readiness?.guardianReady?.pid;
@@ -114,12 +115,12 @@ export function proveP10bGuardianStop(records, { window, readiness, killedAt, ex
     && Date.parse(row.at) >= Date.parse(row.requestedAt) && row.imageDigest === window.imageDigest && row.instanceId === expectedInstanceId)
     && gaps.every(ms => ms >= 0 && ms <= 1000) && responseGaps.every(ms => ms >= 0 && ms <= 1000)
     && Date.parse(metadata[0]?.requestedAt) <= killedAt && Date.parse(metadata.at(-1)?.requestedAt) >= Date.parse(window.stopAt)
-    && completion && time(completion.at) && records.filter(row => row.kind === 'observer-finished').length === 1
+    && (requireV2 ? verifyP10bObserverCompletion(records, { window, sessionDeadline, sessionDigest }) : (completion && time(completion.at) && records.filter(row => row.kind === 'observer-finished').length === 1
     && Date.parse(completion.at) >= Date.parse(window.stopAt)
     && Date.parse(completion.at) >= Date.parse(metadata.at(-1)?.at)
     && Date.parse(completion.at) - Date.parse(metadata.at(-1)?.requestedAt) <= 1000
     && !records.some(row => ['observer-read-error', 'observer-missed-poll', 'observer-parse-error', 'log-attachment-failed'].includes(row.kind)
-      || (row.kind === 'local-reader-exit' && row.reader === 'logs'));
+      || (row.kind === 'local-reader-exit' && row.reader === 'logs'))));
   const unexpectedRestart = Boolean(stop && metadata.some(row => Date.parse(row.at) > Date.parse(stop.at) && row.state !== 'stopped'));
   const stopLatencyMs = exit && stop ? Date.parse(stop.at) - Date.parse(exit.exitedAt) : null;
   const success = Boolean(typeof expectedInstanceId === 'string' && expectedInstanceId.length > 0
