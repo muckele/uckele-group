@@ -936,3 +936,145 @@ for (const mode of ['primary-exit', 'readiness-timeout']) test(`concrete parent 
   assert.equal(evidence.files.has('p10b-runtime-only-demo-readiness.json'), false);
   assert.equal(terminations, 0); // Settlement retains ownership; no premature controller-loss claim.
 });
+
+for (const mode of ['start-failure', 'ssh-failure', 'invalid-json', 'ipc-async-failure',
+  'readiness-publication', 'observer-exit', 'observer-evidence-missing', 'termination-uncertain', 'wrong-primary-exit', 'primary-already-reaped']) {
+  test(`composed primary and concrete parent distinguish ${mode} without losing verified termination`, async () => {
+    const { createP10bNoEmailBoundaries } = await import('../server/services/p10bNoEmailBoundaries.js');
+    const { spawnSync } = await import('node:child_process');
+    const x = recoveryFixture(); const evidence = memoryEvidence(); evidence.root = '/synthetic/composed-demo-evidence';
+    const originalWrite = evidence.write;
+    evidence.write = (name, value) => {
+      if (mode === 'readiness-publication' && name === 'p10b-runtime-only-demo-readiness.json') throw Error('synthetic private write canary');
+      originalWrite(name, value);
+    };
+    const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
+      baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
+    const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
+    const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+    const machine = { ...x.baseline, config: phase.config };
+    const child = Object.assign(new EventEmitter(), { pid: 5012, exitCode: null, signalCode: null }); let resolveExit, terminations = 0;
+    const primary = { child, reaped: false, exited: new Promise(resolve => { resolveExit = resolve; }) };
+    let sourceResult;
+    const boundaries = await createP10bNoEmailBoundaries({ session: x.s, approval: x.approval, evidence,
+      recovery: { ...recovered, verification }, inspectRecovery: x.inspect, clock: () => now,
+      openNative: async () => assert.fail('All external native/Fly boundaries are synthetic'),
+      processes: { launch(_file, args, options) {
+        assert.equal(path.basename(args[0]), 'run-p10b-demo-primary.js'); assert.ok(options.stdio.includes('ipc'));
+        const cliMode = ['start-failure', 'ssh-failure', 'invalid-json', 'ipc-async-failure'].includes(mode) ? mode : 'success';
+        const result = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings',
+          new URL('./helpers/p10bDemoPrimaryVm.js', import.meta.url).pathname, cliMode,
+          JSON.stringify({ session: x.s, phase, machine, now })],
+        { encoding: 'utf8', timeout: 5000, env: { HOME: '/tmp', PATH: '/usr/bin:/bin' } });
+        assert.equal(result.status, 0, result.stderr); sourceResult = JSON.parse(result.stdout);
+        for (const [name, value] of Object.entries(sourceResult.records)) evidence.write(name, value);
+        queueMicrotask(() => {
+          if (sourceResult.exitCode) resolveExit({ code: sourceResult.exitCode, signal: null });
+          else {
+            child.emit('message', sourceResult.messages[0]);
+            if (mode === 'primary-already-reaped') { primary.reaped = true; resolveExit({ code: null, signal: 'SIGKILL' }); }
+          }
+        });
+        return primary;
+      }, async terminate(entry) {
+        assert.equal(entry, primary); terminations++;
+        primary.reaped = true;
+        resolveExit(mode === 'wrong-primary-exit' ? { code: 0, signal: null } : { code: null, signal: 'SIGKILL' });
+        return mode !== 'termination-uncertain';
+      } } });
+    const observer = { phase, output: '/synthetic/absent-observer-output.jsonl',
+      entry: { child: { pid: process.pid }, exited: Promise.resolve({ code: mode === 'observer-evidence-missing' ? 0 : 1, signal: null }) } };
+    await assert.rejects(boundaries.demonstrate({ phase, machine, observer }));
+    const termination = evidence.files.get('p10b-runtime-only-demo-primary-termination.json');
+    const failure = evidence.files.get('p10b-runtime-only-demo-controller-failure.json');
+    assert.ok(failure, 'The actual parent failure stage was discarded');
+    if (mode.startsWith('observer-')) {
+      assert.ok(termination, 'Verified primary termination was discarded with observer failure');
+      assert.equal(termination.primaryTerminationVerified, true); assert.equal(termination.primaryPid, 5012);
+      assert.equal(termination.sessionDigest, digest(x.s)); assert.equal(termination.windowDigest, digest(phase.window));
+      assert.equal(termination.readinessDigest, digest(sourceResult.messages[0]));
+      assert.equal(termination.signal, 'SIGKILL'); assert.equal(termination.code, null);
+      assert.equal(failure.stage, 'observer-completion'); assert.equal(terminations, 1);
+      assert.equal(evidence.has('p10b-runtime-only-demo-readiness.json'), true);
+    } else {
+      assert.equal(termination, undefined);
+      assert.equal(terminations, ['termination-uncertain', 'wrong-primary-exit'].includes(mode) ? 1 : 0);
+      assert.equal(failure.stage, mode === 'readiness-publication' ? 'publish-readiness'
+        : ['termination-uncertain', 'wrong-primary-exit', 'primary-already-reaped'].includes(mode) ? 'terminate-primary' : 'await-primary-readiness');
+    }
+    assert.equal(evidence.has('p10b-runtime-only-demo-proof.json'), false);
+    assert.equal(JSON.stringify([...evidence.files]).includes('canary'), false);
+  });
+}
+
+test('actual owned local IPC primary is OS-reaped and its termination receipt survives observer failure', async t => {
+  const { createP10bNoEmailBoundaries } = await import('../server/services/p10bNoEmailBoundaries.js');
+  const { createP10bOperatorProcesses } = await import('../server/services/p10bOperatorProcesses.js');
+  const x = recoveryFixture(); const evidence = memoryEvidence(); evidence.root = '/synthetic/owned-ipc-evidence';
+  const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
+    baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
+  const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
+  const local = createP10bOperatorProcesses({ environment: { PATH: '/usr/bin:/bin', HOME: '/tmp' } });
+  t.after(async () => { assert.equal(await local.reap(), true); });
+  const readiness = { sourceHead: x.s.sourceHead, freshPathsVerified: true };
+  let entry;
+  const boundaries = await createP10bNoEmailBoundaries({ session: x.s, approval: x.approval, evidence,
+    recovery: { ...recovered, verification }, inspectRecovery: x.inspect, clock: () => now,
+    openNative: async () => assert.fail('No native/Fly/provider client in owned IPC test'),
+    processes: { ...local, launch(_file, args, options) {
+      assert.equal(path.basename(args[0]), 'run-p10b-demo-primary.js');
+      // Replace only the external primary boundary with a task-owned Node
+      // process; production owner/group/IPC/termination wiring remains real.
+      entry = local.launch(process.execPath, ['-e',
+        'process.send(JSON.parse(process.argv[1])); setInterval(() => {}, 1000)', JSON.stringify(readiness)], options);
+      return entry;
+    } } });
+  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+  await assert.rejects(boundaries.demonstrate({ phase, machine: x.baseline, observer: { phase,
+    entry: { child: { pid: process.pid }, exited: Promise.resolve({ code: 1, signal: null }) } } }), /Observer completion failed/);
+  const receipt = evidence.read('p10b-runtime-only-demo-primary-termination.json');
+  assert.equal(receipt.primaryPid, entry.child.pid); assert.equal(receipt.primaryTerminationVerified, true);
+  assert.equal(entry.reaped, true); assert.deepEqual(await entry.exited, { code: null, signal: 'SIGKILL' });
+  assert.throws(() => process.kill(-entry.child.pid, 0), { code: 'ESRCH' });
+  assert.equal(evidence.read('p10b-runtime-only-demo-controller-failure.json').stage, 'observer-completion');
+  assert.equal(evidence.has('p10b-runtime-only-demo-proof.json'), false);
+});
+
+for (const mode of ['signal', 'code']) test(`actual owned primary ${mode} exit before close cannot claim deliberate termination`, async t => {
+  const { createP10bNoEmailBoundaries } = await import('../server/services/p10bNoEmailBoundaries.js');
+  const { createP10bOperatorProcesses } = await import('../server/services/p10bOperatorProcesses.js');
+  const x = recoveryFixture(); const evidence = memoryEvidence(); evidence.root = '/synthetic/exited-before-close';
+  const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
+    baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
+  const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
+  const local = createP10bOperatorProcesses({ environment: { PATH: '/usr/bin:/bin', HOME: '/tmp' } });
+  t.after(async () => { assert.equal(await local.reap(), true); });
+  let entry; let terminations = 0;
+  const boundaries = await createP10bNoEmailBoundaries({ session: x.s, approval: x.approval, evidence,
+    recovery: { ...recovered, verification }, inspectRecovery: x.inspect, clock: () => now,
+    openNative: async () => assert.fail('No external boundary in pre-close regression'),
+    processes: { ...local, launch(_file, _args, options) {
+      // A same-group descendant retains stderr, separating real OS exit from
+      // close/reap. Deliver synthetic readiness at that exact boundary.
+      entry = local.launch(process.execPath, ['-e',
+        `require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+          { stdio: ['ignore', 'ignore', 2] });
+        setTimeout(() => ${mode === 'signal' ? "process.kill(process.pid, 'SIGKILL')" : 'process.exit(0)'}, 100);`], options);
+      entry.child.once('exit', () => {
+        assert.equal(entry.reaped, false);
+        assert.equal(entry.child.exitCode, mode === 'code' ? 0 : null);
+        assert.equal(entry.child.signalCode, mode === 'signal' ? 'SIGKILL' : null);
+        entry.child.emit('message', { sourceHead: x.s.sourceHead, freshPathsVerified: true });
+      });
+      return entry;
+    }, async terminate(primary) { terminations++; return local.terminate(primary); } } });
+  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+  await assert.rejects(boundaries.demonstrate({ phase, machine: x.baseline, observer: { phase,
+    entry: { child: { pid: process.pid }, exited: Promise.resolve({ code: 1, signal: null }) } } }), /Live owned primary unavailable/);
+  assert.equal(terminations, 0);
+  assert.equal(evidence.has('p10b-runtime-only-demo-primary-termination.json'), false);
+  const failure = evidence.read('p10b-runtime-only-demo-controller-failure.json');
+  assert.equal(failure.stage, 'terminate-primary'); assert.equal(failure.primaryTerminationVerified, false);
+  assert.equal(failure.primaryExitCode, mode === 'code' ? 0 : null);
+  assert.equal(failure.primaryExitSignal, mode === 'signal' ? 'SIGKILL' : null);
+});

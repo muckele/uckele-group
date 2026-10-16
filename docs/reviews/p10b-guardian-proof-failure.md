@@ -19,8 +19,11 @@ receiving and checking that receipt, so deliberate controller loss was never
 proved. A generic primary exit or the parent's 15-second readiness timeout
 enters the same failed execution-proof stage. The old primary catch and command
 adapter discarded the distinguishing stage and command outcome. It is impossible
-to recover whether the original cause was command timeout, nonzero start/SSH,
-invalid JSON, native readback or another primary failure from these artifacts.
+to recover the exact start/SSH, JSON, IPC or publication failure subtype from
+these artifacts. The retained actual-start artifact follows successful native
+baseline readback, binding verification and reap, so those earlier steps were
+completed. See the subsequent readiness/termination diagnosis for that narrower
+inference and controlled reproductions; the original run still failed.
 
 Six observer log polls failed. The catch discarded whether each was a command
 failure, framing failure or completion deadline. The observer correctly latched

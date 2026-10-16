@@ -124,30 +124,54 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
       { stdio: ['ignore', 'ignore', 'pipe', 'ipc'], detached: true });
     controllers.push(primary);
     let timer; let readiness; let primaryTerminal = null; let readinessFailure = 'readiness-timeout';
-    try { readiness = await Promise.race([new Promise(resolve => primary.child.once('message', resolve)),
-      primary.exited.then(terminal => { primaryTerminal = terminal; readinessFailure = 'primary-exit';
-        throw Error('Demo primary exited before readiness'); }),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Demo readiness timeout')), 15000); })]); }
+    let stage = 'await-primary-readiness'; let terminationVerified = false;
+    try {
+      try { readiness = await Promise.race([new Promise(resolve => primary.child.once('message', resolve)),
+        primary.exited.then(terminal => { primaryTerminal = terminal; readinessFailure = 'primary-exit';
+          throw Error('Demo primary exited before readiness'); }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Demo readiness timeout')), 15000); })]); }
+      finally { clearTimeout(timer); }
+      stage = 'publish-readiness';
+      evidence.write('p10b-runtime-only-demo-readiness.json', readiness);
+      stage = 'validate-readiness';
+      if (readiness.sourceHead !== session.sourceHead || readiness.freshPathsVerified !== true) throw Error('Demo readiness binding failed');
+      stage = 'terminate-primary';
+      const primaryPid = primary.child.pid;
+      if (primary.child.exitCode !== null || primary.child.signalCode !== null) {
+        primaryTerminal = { code: primary.child.exitCode, signal: primary.child.signalCode };
+        throw Error('Live owned primary unavailable');
+      }
+      if (!Number.isSafeInteger(primaryPid) || primaryPid < 2 || primary.reaped === true || primaryTerminal !== null) {
+        throw Error('Live owned primary unavailable');
+      }
+      const killedAt = clock(); const primaryTerminationVerified = await processes.terminate(primary);
+      if (!primaryTerminationVerified) throw Error('Primary reap uncertain');
+      primaryTerminal = await primary.exited;
+      if (primaryTerminal.code !== null || primaryTerminal.signal !== 'SIGKILL') throw Error('Primary termination not verified');
+      terminationVerified = true;
+      stage = 'publish-primary-termination';
+      evidence.write('p10b-runtime-only-demo-primary-termination.json', { version: 'p10b-demo-primary-termination-v1',
+        sessionDigest: digest(session), windowDigest: digest(phase.window), readinessDigest: digest(readiness),
+        primaryPid, killedAt: new Date(killedAt).toISOString(), code: null, signal: 'SIGKILL',
+        primaryTerminationVerified: true, at: new Date(clock()).toISOString(), productionReady: false });
+      stage = 'observer-liveness';
+      try { process.kill(observer.entry.child.pid, 0); } catch { throw Error('Independent observer lost'); }
+      stage = 'observer-completion';
+      const rows = await observerRows(observer);
+      stage = 'guardian-proof';
+      const proof = proveP10bGuardianStop(rows, { window: phase.window, readiness, killedAt, expectedInstanceId: machine.instance_id });
+      return { ...proof, windowDigest: digest(phase.window), observerSurvived: true, primaryTerminationVerified };
+    }
     catch (error) {
       evidence.write('p10b-runtime-only-demo-controller-failure.json', { version: 'p10b-demo-controller-failure-v1',
-        sessionDigest: digest(session), stage: 'await-primary-readiness', reason: readinessFailure,
+        sessionDigest: digest(session), stage, reason: stage === 'await-primary-readiness' ? readinessFailure : 'post-readiness-failure',
+        primaryTerminationVerified: terminationVerified,
         primaryExitCode: Number.isInteger(primaryTerminal?.code) && primaryTerminal.code >= 0 && primaryTerminal.code <= 255
           ? primaryTerminal.code : null,
         primaryExitSignal: ['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGABRT', 'SIGSEGV', 'SIGHUP'].includes(primaryTerminal?.signal)
           ? primaryTerminal.signal : null, at: new Date(clock()).toISOString(), productionReady: false });
       throw error;
     }
-    finally { clearTimeout(timer); }
-    evidence.write('p10b-runtime-only-demo-readiness.json', readiness);
-    if (readiness.sourceHead !== session.sourceHead || readiness.freshPathsVerified !== true) throw Error('Demo readiness binding failed');
-    const killedAt = clock(); const primaryTerminationVerified = await processes.terminate(primary);
-    if (!primaryTerminationVerified) throw Error('Primary reap uncertain');
-    const terminal = await primary.exited;
-    if (!primaryTerminationVerified || terminal.code !== null || terminal.signal !== 'SIGKILL') throw Error('Primary termination not verified');
-    try { process.kill(observer.entry.child.pid, 0); } catch { throw Error('Independent observer lost'); }
-    const rows = await observerRows(observer);
-    const proof = proveP10bGuardianStop(rows, { window: phase.window, readiness, killedAt, expectedInstanceId: machine.instance_id });
-    return { ...proof, windowDigest: digest(phase.window), observerSurvived: true, primaryTerminationVerified };
   }
   async function runPreparation({ phase, observer, machine }) {
     if (guardian) throw Error('Guardian-only session cannot prepare');

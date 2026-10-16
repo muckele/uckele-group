@@ -43,8 +43,17 @@ try {
     '--machine', session.machineId, '--quiet', '--command', 'node /app/scripts/read-p10b-public-readiness.js'], 5000);
   stage = 'readiness-json';
   const readiness = JSON.parse(output);
+  stage = 'publish-primary-readiness';
+  evidence.write('p10b-runtime-only-demo-primary-readiness.json', { version: 'p10b-demo-primary-readiness-v1',
+    sessionDigest, windowDigest: sha256(stableCanonicalJson(window)), readinessDigest: sha256(stableCanonicalJson(readiness)),
+    readinessParsed: true, at: new Date().toISOString(), productionReady: false });
   stage = 'readiness-ipc';
-  process.send?.(readiness);
+  if (typeof process.send !== 'function') throw Error('Primary IPC unavailable');
+  // A failed asynchronous send otherwise emits an unhandled process error,
+  // outside this catch. The callback confirms transport submission only; the
+  // parent's separate received-readiness artifact remains required for proof.
+  await new Promise((resolve, reject) => process.send(readiness, error => error
+    ? reject(Error('Primary IPC submission failed')) : resolve()));
   setInterval(() => {}, 1000);
 } catch (error) {
   const commandFailure = publicP10bCommandFailure(error); const nativeFailure = publicP10bNativeFailure(error);
