@@ -32,6 +32,16 @@ STOPPED_UPDATE_SCOPE = (
     'and the original approval cutoff to 15 minutes. No retry, build, push, provider call, email or production change.')
 
 
+GUARDIAN_RECOVERY_POLICY = 'acknowledged-only-stopped-runtime-v1'
+GUARDIAN_SCOPE = (
+    'Exactly one inert guardian demonstration, at most one five-minute start and two stopped configuration updates including conditional restoration. '
+    'No preparation, SQLite, mailbox worker, inbound listener, provider call, email, image build or push. '
+    'The observer must be ready before start; only the owned primary process is deliberately terminated. '
+    'Restoration requires an acknowledged, settled candidate and exact stopped version/configuration after verified local reaping. '
+    'An unacknowledged or uncertain update permits no automatic restoration, retry or rearm; preserve evidence for separate recovery. '
+    'No host emergency stop or production change. The original one-hour session deadline is never renewed.')
+
+
 class Hold(Exception):
     pass
 
@@ -513,6 +523,34 @@ def ready_owner_public_issuance(recipe, checked, permission_path, ask, emit):
         emit('Entry discarded. Type the words PUBLIC RECORD READY only after staging; one correction, no new issuance.')
 
 
+
+def check_guardian_scope(value):
+    counts = {'maximumStarts': 1, 'maximumStartWindowMs': 300000, 'maximumStoppedConfigUpdates': 2,
+              'maximumLocalBuilds': 0, 'maximumImagePushes': 0}
+    if (value.get('operation') != 'guardian-only' or value.get('qualificationAllowed') is not False
+            or value.get('recoveryPolicy') != GUARDIAN_RECOVERY_POLICY
+            or any(type(value.get(key)) is not int or value[key] != count for key, count in counts.items())):
+        raise Hold('Exact guardian-only one-start authority required')
+
+
+def check_guardian_bundle(bundle, recipe):
+    session = bundle['session']
+    check_guardian_scope(session)
+    try:
+        started = dt.datetime.fromisoformat(session['startedAt'].replace('Z', '+00:00'))
+        deadline = dt.datetime.fromisoformat(session['sessionDeadline'].replace('Z', '+00:00'))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise Hold('Original guardian deadline required') from None
+    if (bundle.get('version') != 'p10b-guardian-only-bundle-v1'
+            or session.get('version') != 'p10b-guardian-only-session-v1'
+            or bundle['approval'].get('version') != 'p10b-guardian-only-approval-v1'
+            or bundle['approval'].get('approved') is not False
+            or deadline - started != dt.timedelta(hours=1)
+            or session.get('nativeClientSha256') != recipe['files']['guardianNative']['sha256']
+            or session.get('productionReady') is not False or session.get('globalAutomationPaused') is not True):
+        raise Hold('Sealed guardian-only authority changed')
+
+
 def public_session_summary(bundle, summary):
     session = bundle['session']
     return {'status': 'AWAITING_EXACT_OWNER_APPROVAL', 'sessionDigest': summary['sessionDigest'],
@@ -528,6 +566,8 @@ def public_session_summary(bundle, summary):
             **({key: session[key] for key in ('operation', 'baselineInstanceId', 'baselineObservedAt', 'diagnosticConfigDigest',
                 'nativeClientSha256', 'maximumDiagnosticPosts', 'maximumRestorationPosts', 'requestTimeoutMs',
                 'maximumObservationMs', 'maximumRunMs', 'qualificationAllowed', 'recoveryPolicy')} if session.get('version') == 'p10b-stopped-update-session-v2' else {}),
+            **({key: session[key] for key in ('operation', 'baselineInstanceId', 'baselineObservedAt',
+                'nativeClientSha256', 'qualificationAllowed', 'recoveryPolicy')} if session.get('version') == 'p10b-guardian-only-session-v1' else {}),
             'providerCalls': 0, 'emails': 0, 'runtimeApproved': False}
 
 
@@ -742,6 +782,9 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
     try:
         recipe, checked, environment = check_recipe(recipe_file, runner, expected_recipe_sha256, bootstrap)
         diagnostic = recipe.get('version') == 'p10b-owner-stopped-update-recipe-v2'
+        guardian = recipe.get('version') == 'p10b-owner-guardian-only-recipe-v1'
+        if guardian:
+            check_guardian_scope(checked)
         if diagnostic and (checked.get('operation') != 'stopped-update-diagnostic' or checked.get('maximumStarts') != 0
                            or checked.get('maximumDiagnosticPosts') != 1 or checked.get('maximumRestorationPosts') != 1
                            or checked.get('qualificationAllowed') is not False
@@ -778,6 +821,8 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
              'uncertain cleanup is retained. Manually revoke only this new matching token after closed clients.')
         if diagnostic:
             emit(STOPPED_UPDATE_SCOPE)
+        if guardian:
+            emit(GUARDIAN_SCOPE)
         phrase = 'APPROVE PRIVATE SETUP ' + checked['recipeDigest']
         if ask('Type ' + phrase + ': ') != phrase:
             raise Hold('Private setup declined')
@@ -874,23 +919,29 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
                     or session.get('maximumObservationMs') != 10000 or session.get('recoveryPolicy') != STOPPED_UPDATE_RECOVERY_POLICY
                     or session.get('maximumRunMs') != 120000 or session.get('nativeClientSha256') != recipe['files']['diagnosticNative']['sha256']):
                 raise Hold('Sealed stopped-only authority changed')
+        if guardian:
+            check_guardian_bundle(bundle, recipe)
+            if summary['sessionDeadline'] != bundle['session']['sessionDeadline']:
+                raise Hold('Guardian summary cutoff changed')
         phase = 'final-approval'
         emit(json.dumps(public_session_summary(bundle, summary) if 'ownerIssuanceDirectory' in recipe else bundle, indent=2))
         if diagnostic:
             emit('Original diagnostic approval cutoff: ' + summary['sessionDeadline'] + '. ' + STOPPED_UPDATE_SCOPE)
+        elif guardian:
+            emit('Original guardian deadline: ' + summary['sessionDeadline'] + '. ' + GUARDIAN_SCOPE)
         else:
             emit('Original one-hour deadline: ' + summary['sessionDeadline'] + '. Review these exact public facts; '
                  'remaining time is not renewed. At most two five-minute starts and three stopped updates including '
                  'restore. No host stop/retry, additional build/push, provider call, email or production change.')
-        phrase = ('APPROVE CONDITIONAL STOPPED UPDATE ' if diagnostic else 'APPROVE SESSION ') + summary['sessionDigest']
-        if ask('Type ' + phrase + (' to authorize this exact stopped-only diagnostic: ' if diagnostic else ' to authorize this exact bounded no-email runtime: ')) != phrase:
+        phrase = ('APPROVE CONDITIONAL STOPPED UPDATE ' if diagnostic else 'APPROVE ONE GUARDIAN START ' if guardian else 'APPROVE SESSION ') + summary['sessionDigest']
+        if ask('Type ' + phrase + (' to authorize this exact stopped-only diagnostic: ' if diagnostic else ' to authorize exactly one inert guardian demonstration: ' if guardian else ' to authorize this exact bounded no-email runtime: ')) != phrase:
             raise Hold('Concrete runtime declined')
-        final_approval = {'version': 'p10b-owner-final-stopped-update-approval-v2' if diagnostic else 'p10b-owner-final-approval-v1', 'approvedAt': utc_now(),
+        final_approval = {'version': 'p10b-owner-final-stopped-update-approval-v2' if diagnostic else 'p10b-owner-final-guardian-only-approval-v1' if guardian else 'p10b-owner-final-approval-v1', 'approvedAt': utc_now(),
                           'sessionDigest': summary['sessionDigest'], 'recipeDigest': checked['recipeDigest'],
                           'hostSourceHead': recipe['hostSourceHead']}
         write_exclusive(root / 'owner-final-approval.json', final_approval)
         bundle['approval']['approved'] = True
-        bundle['status'] = 'OWNER_APPROVED_STOPPED_UPDATE_DIAGNOSTIC' if diagnostic else 'OWNER_APPROVED_NO_EMAIL_SESSION'
+        bundle['status'] = 'OWNER_APPROVED_STOPPED_UPDATE_DIAGNOSTIC' if diagnostic else 'OWNER_APPROVED_GUARDIAN_ONLY_SESSION' if guardian else 'OWNER_APPROVED_NO_EMAIL_SESSION'
         write_exclusive(recipe['approvedBundlePath'], bundle)
         phase = 'stopped-update-diagnostic' if diagnostic else 'runtime'
         remaining = (dt.datetime.fromisoformat(summary['sessionDeadline'].replace('Z', '+00:00')) - dt.datetime.now(dt.timezone.utc)).total_seconds()
@@ -898,12 +949,18 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
             raise Hold('Original session has insufficient remaining time')
         result = runner([recipe['files']['node']['path'], str(SCRIPTS / ('run-p10b-stopped-update-diagnostic.js' if diagnostic else 'run-p10b-no-email-session.js')), '--execute',
                          '--bundle', recipe['approvedBundlePath'], '--evidence', recipe['evidenceDirectory'],
-                         '--native-client', recipe['files']['diagnosticNative' if diagnostic else 'native']['path']], environment, min(180, remaining + 30) if diagnostic else remaining + 60)
+                         '--native-client', recipe['files']['diagnosticNative' if diagnostic else 'guardianNative' if guardian else 'native']['path']], environment, min(180, remaining + 30) if diagnostic else remaining + 60)
         closure = read_public(Path(recipe['evidenceDirectory']) / ('p10b-stopped-update-auth-closure.json' if diagnostic else 'p10b-runtime-only-auth-closure.json'))
         if diagnostic and (result.get('operation') != 'stopped-update-diagnostic' or result.get('maximumStarts') != 0
                            or result.get('qualificationAllowed') is not False or result.get('restored') is not True
                            or result.get('mutationSettled') is not True):
             raise Hold('Stopped-only settlement not proved')
+        if guardian and (result.get('operation') != 'guardian-only' or type(result.get('maximumStarts')) is not int
+                         or result.get('maximumStarts') != 1 or result.get('qualificationAllowed') is not False
+                         or result.get('restored') is not True or result.get('mutationSettled') is not True
+                         or type(result.get('providerCalls')) is not int or result.get('providerCalls') != 0
+                         or type(result.get('emails')) is not int or result.get('emails') != 0):
+            raise Hold('Guardian-only settlement not proved')
         if result.get('success') is not True or closure.get('success') is not True or closure.get('cleanupVerified') is not True or closure.get('reapVerified') is not True or closure.get('sessionDigest') != summary['sessionDigest']:
             raise Hold('Runtime/private cleanup not proved')
         success = True

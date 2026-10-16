@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
-import { assertP10bReviewedCheckout, P10B_RETAINED_GUEST_HEAD, P10B_RETAINED_IMAGE, P10B_RETAINED_NATIVE_SHA256 } from './p10bOperatorSource.js';
+import { assertP10bReviewedCheckout, P10B_RETAINED_GUEST_HEAD, P10B_RETAINED_IMAGE, P10B_RETAINED_NATIVE_SHA256, P10B_GUARDIAN_NATIVE_SHA256 } from './p10bOperatorSource.js';
 import { P10B_PUBLIC_ENV_NAMES, P10B_RUNTIME_FLAGS, validateP10bBaselineConfig, validateP10bNoEmailSession } from './p10bRuntimeOnlyOperator.js';
 import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from './p10bProviderIdentity.js';
 import { reserveP10bLocalReap } from './p10bHostAuthentication.js';
@@ -26,7 +26,8 @@ export function boundP10bOwnerFile(binding) {
 }
 export function checkP10bOwnerRecipe(recipe, { checkSource = assertP10bReviewedCheckout, checkFile = boundP10bOwnerFile, clock = Date.now } = {}) {
   const diagnostic = recipe?.version === 'p10b-owner-stopped-update-recipe-v2';
-  if ((!diagnostic && recipe?.version !== 'p10b-owner-preparer-recipe-v1') || recipe.app !== 'uckele-group-p10b'
+  const guardian = recipe?.version === 'p10b-owner-guardian-only-recipe-v1';
+  if ((!diagnostic && !guardian && recipe?.version !== 'p10b-owner-preparer-recipe-v1') || recipe.app !== 'uckele-group-p10b'
     || recipe.machineId !== '0803730bd1d7e8' || recipe.volumeId !== 'vol_vwnkpex1k3yx9dnv'
     || recipe.guestSourceHead !== P10B_RETAINED_GUEST_HEAD || !/^[a-f0-9]{40}$/.test(recipe.hostSourceHead || '')
     || recipe.hostSourceHead === recipe.guestSourceHead || !/^[a-f0-9]{24}$/.test(recipe.nonce || '')
@@ -40,6 +41,10 @@ export function checkP10bOwnerRecipe(recipe, { checkSource = assertP10bReviewedC
   if (diagnostic) {
     if (typeof recipe.ownerIssuanceDirectory !== 'string' || recipe.files?.diagnosticNative?.sha256 !== P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256) deny('Separate reviewed diagnostic native binding required');
     checkFile(recipe.files.diagnosticNative); fs.accessSync(recipe.files.diagnosticNative.path, fs.constants.X_OK);
+  }
+  if (guardian) {
+    if (typeof recipe.ownerIssuanceDirectory !== 'string' || recipe.files?.guardianNative?.sha256 !== P10B_GUARDIAN_NATIVE_SHA256) deny('Separate reviewed guardian native binding required');
+    checkFile(recipe.files.guardianNative); fs.accessSync(recipe.files.guardianNative.path, fs.constants.X_OK);
   }
   if ('ownerIssuanceDirectory' in recipe) {
     const directory = recipe.ownerIssuanceDirectory;
@@ -58,7 +63,7 @@ export function checkP10bOwnerRecipe(recipe, { checkSource = assertP10bReviewedC
     || !/^[a-f0-9]{64}$/.test(recipe.recovery.packetDigest || '') || !/^[a-f0-9]{64}$/.test(recipe.recovery.expectedSha256 || '')
     || !canonicalTime(recipe.recovery.reservedAt) || typeof recipe.recovery.evidencePath !== 'string') deny('Frozen historical recovery recipe required');
   if ('priorArchive' in recipe.recovery) {
-    if (!diagnostic) deny('Existing archive admission is diagnostic-only');
+    if (!diagnostic && !guardian) deny('Existing archive admission requires diagnostic or guardian-only authority');
     inspectP10bPriorArchive({ ...recipe.recovery,
       attemptPath: path.join(recipe.recovery.directory, `${recipe.recovery.packetDigest}.attempt.json`) }, createP10bRecoveryFilesystem(), clock());
   }
@@ -71,6 +76,9 @@ export function checkP10bOwnerRecipe(recipe, { checkSource = assertP10bReviewedC
     ...(diagnostic ? { operation: 'stopped-update-diagnostic', maximumStarts: 0, qualificationAllowed: false,
       maximumDiagnosticPosts: 1, maximumRestorationPosts: 1, maximumLocalBuilds: 0, maximumImagePushes: 0,
       recoveryPolicy: 'acknowledged-only-nonrunning-v1' } : {}),
+    ...(guardian ? { operation: 'guardian-only', maximumStarts: 1, maximumStartWindowMs: 300000,
+      maximumStoppedConfigUpdates: 2, qualificationAllowed: false, maximumLocalBuilds: 0, maximumImagePushes: 0,
+      recoveryPolicy: 'acknowledged-only-stopped-runtime-v1' } : {}),
     ...('priorArchive' in recipe.recovery ? { admissionRecovery: 'existing-archive-read-only' } : {}),
     tokenInputRequested: false, runtimeApproved: false, productionReady: false, globalAutomationPaused: true };
 }
@@ -198,6 +206,7 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
   validateP10bOwnerPublicInputs({ recipe, receipt, permission, checkSource, checkFile, clock });
   const started = clock();
   const diagnostic = recipe.version === 'p10b-owner-stopped-update-recipe-v2';
+  const guardian = recipe.version === 'p10b-owner-guardian-only-recipe-v1';
   assertIssuance(receipt, recipe, permission, started);
   const evidence = createP10bOperatorEvidence(recipe.evidenceDirectory);
   const context = createP10bPreflightContext(environment); const commands = createCommands(context);
@@ -243,13 +252,13 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
     imageEvidence = { version: 'p10b-image-prerequisite-v1', sourceHead: recipe.guestSourceHead,
       imageDigest: P10B_RETAINED_IMAGE, immutableImage: recipe.candidateImage, buildCount: 1, pushCount: 1,
       registryManifestVerified: true, manifestEvidenceDigest: sha256(rawManifest), verifiedAt: observedAt };
-    session = { version: diagnostic ? 'p10b-stopped-update-session-v2' : 'p10b-no-email-session-v1', app: recipe.app, machineId: recipe.machineId, volumeId: recipe.volumeId,
+    session = { version: diagnostic ? 'p10b-stopped-update-session-v2' : guardian ? 'p10b-guardian-only-session-v1' : 'p10b-no-email-session-v1', app: recipe.app, machineId: recipe.machineId, volumeId: recipe.volumeId,
       sourceHead: recipe.guestSourceHead, hostSourceHead: recipe.hostSourceHead, nonce: recipe.nonce, candidateImageDigest: P10B_RETAINED_IMAGE,
       baselineImageDigest: actual.baselineImageDigest, baselineConfig: actual.baselineConfig,
       ownerPermissionDigest: digest(permission), permissionEvidenceId: `private-owner:${recipe.nonce}`, startedAt: new Date(started).toISOString(),
-      sessionDeadline: new Date(started + (diagnostic ? 900000 : 3600000)).toISOString(), maximumStarts: diagnostic ? 0 : 2, maximumStartWindowMs: diagnostic ? 0 : 300000,
-      maximumStoppedConfigUpdates: diagnostic ? 2 : 3, maximumIncrementalUsd: 1, maximumLocalBuilds: diagnostic ? 0 : 1, maximumImagePushes: diagnostic ? 0 : 1,
-      productionReady: false, globalAutomationPaused: true, nativeClientSha256: diagnostic ? recipe.files.diagnosticNative.sha256 : recipe.files.native.sha256,
+      sessionDeadline: new Date(started + (diagnostic ? 900000 : 3600000)).toISOString(), maximumStarts: diagnostic ? 0 : guardian ? 1 : 2, maximumStartWindowMs: diagnostic ? 0 : 300000,
+      maximumStoppedConfigUpdates: diagnostic || guardian ? 2 : 3, maximumIncrementalUsd: 1, maximumLocalBuilds: diagnostic || guardian ? 0 : 1, maximumImagePushes: diagnostic || guardian ? 0 : 1,
+      productionReady: false, globalAutomationPaused: true, nativeClientSha256: diagnostic ? recipe.files.diagnosticNative.sha256 : guardian ? recipe.files.guardianNative.sha256 : recipe.files.native.sha256,
       flyExecutable: structuredClone(recipe.files.fly),
       namesClientPath: recipe.files.names.path, namesClientSha256: recipe.files.names.sha256, authenticationEvidence: receipt,
       configurationEvidence: { version: 'p10b-isolated-configuration-evidence-v2', providerIdentity: P10B_PROVIDER_IDENTITY,
@@ -267,6 +276,8 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
       session.diagnosticConfig = createP10bStoppedDiagnosticConfig(session);
       session.diagnosticConfigDigest = digest(session.diagnosticConfig);
     }
+    if (guardian) Object.assign(session, { operation: 'guardian-only', qualificationAllowed: false,
+      baselineInstanceId: actual.instanceId, baselineObservedAt, recoveryPolicy: 'acknowledged-only-stopped-runtime-v1' });
     stage = 'session-seal-validation';
     if (interrupted || clock() - started >= 120000) deny('Original preflight deadline expired');
     (diagnostic ? validateP10bStoppedUpdateSession : validateP10bNoEmailSession)(session, clock()); checkSource(recipe.hostSourceHead);
@@ -285,13 +296,13 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
       closedAt: new Date(clock()).toISOString(), privateAuthDirectory: context.directory, productionReady: false, providerCalls: 0, emails: 0 });
   }
   if (failed || !reaped || !cleanupVerified) deny('Preflight held; preserve evidence and uncertain private directories');
-  const approval = { version: diagnostic ? 'p10b-stopped-update-approval-v2' : 'p10b-no-email-approval-v1', approved: false, sessionDigest: digest(session),
+  const approval = { version: diagnostic ? 'p10b-stopped-update-approval-v2' : guardian ? 'p10b-guardian-only-approval-v1' : 'p10b-no-email-approval-v1', approved: false, sessionDigest: digest(session),
     ownerPermissionDigest: session.ownerPermissionDigest, sourceHead: session.sourceHead, hostSourceHead: session.hostSourceHead,
     expiresAt: session.sessionDeadline, recoveryApproved: true, exclusiveAdmissionWriters: true, providerCalls: 0, emails: 0 };
-  fs.writeFileSync(recipe.sealedBundlePath, `${stableCanonicalJson({ version: diagnostic ? 'p10b-stopped-update-bundle-v2' : 'p10b-no-email-bundle-v1', status: 'AWAITING_EXACT_OWNER_APPROVAL', session, approval, imageEvidence })}\n`,
+  fs.writeFileSync(recipe.sealedBundlePath, `${stableCanonicalJson({ version: diagnostic ? 'p10b-stopped-update-bundle-v2' : guardian ? 'p10b-guardian-only-bundle-v1' : 'p10b-no-email-bundle-v1', status: 'AWAITING_EXACT_OWNER_APPROVAL', session, approval, imageEvidence })}\n`,
     { flag: 'wx', mode: 0o600 });
   return { status: 'AWAITING_EXACT_OWNER_APPROVAL', sessionDigest: digest(session), sessionDeadline: session.sessionDeadline,
-    ...(diagnostic ? { operation: 'stopped-update-diagnostic', recoveryPolicy: session.recoveryPolicy } : {}),
+    ...(diagnostic || guardian ? { operation: diagnostic ? 'stopped-update-diagnostic' : 'guardian-only', recoveryPolicy: session.recoveryPolicy } : {}),
     sessionCanonical: stableCanonicalJson(session),
     sealedBundlePath: recipe.sealedBundlePath, sealedBundleSha256: sha256(fs.readFileSync(recipe.sealedBundlePath)),
     privateAuthDirectory: context.directory, preflightCleanupVerified: true, runtimeApproved: false };

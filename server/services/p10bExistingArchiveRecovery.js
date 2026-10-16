@@ -7,6 +7,16 @@ const time = value => typeof value === 'string' && Number.isFinite(Date.parse(va
 const exact = (value, keys) => value && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
 const absolute = value => typeof value === 'string' && path.isAbsolute(value) && path.resolve(value) === value;
 
+// Read-only adoption is authority for one fresh bounded session only. The old
+// two-phase runtime contract cannot acquire access merely by naming an archive.
+const admitsExistingArchive = s => s.version === 'p10b-stopped-update-session-v2'
+  || (s.version === 'p10b-guardian-only-session-v1' && s.operation === 'guardian-only'
+    && s.recoveryPolicy === 'acknowledged-only-stopped-runtime-v1' && s.qualificationAllowed === false
+    && s.maximumStarts === 1 && s.maximumStartWindowMs === 300000 && s.maximumStoppedConfigUpdates === 2
+    && s.maximumLocalBuilds === 0 && s.maximumImagePushes === 0
+    && s.productionReady === false && s.globalAutomationPaused === true
+    && time(s.startedAt) && time(s.sessionDeadline) && Date.parse(s.sessionDeadline) - Date.parse(s.startedAt) === 3600000);
+
 export function assertP10bPriorArchiveBinding(e) {
   const p = e?.priorArchive;
   if (!exact(p, ['nonce', 'sessionDigest', 'intent', 'terminal', 'verification']) || !/^[a-f0-9]{24}$/.test(p.nonce || '')
@@ -86,7 +96,7 @@ export function inspectP10bPriorArchive(e, f, now = Date.now()) {
 
 export function admitP10bPriorArchive({ session, baseline, independentBaseline, filesystem: f, clock, operatorPid }) {
   const now = clock(); const e = session.recovery;
-  if (session.version !== 'p10b-stopped-update-session-v2' || e.priorArchive.sessionDigest === digest(session)
+  if (!admitsExistingArchive(session) || e.priorArchive.sessionDigest === digest(session)
     || !Number.isSafeInteger(independentBaseline.verifierPid) || independentBaseline.verifierPid < 2
     || independentBaseline.verifierPid === operatorPid) hold();
   const observed = inspectP10bPriorArchive(e, f, now);
@@ -110,7 +120,11 @@ export function admitP10bPriorArchive({ session, baseline, independentBaseline, 
 
 export function assertP10bPriorArchiveAdmission({ session, recovery, inspect, now, clock = Date.now }) {
   const { intent: i, terminal: t, verification: v } = recovery || {};
-  if (session.version !== 'p10b-stopped-update-session-v2'
+  // Guardian polls reuse the admitted proof through the original session; they
+  // still re-inspect all immutable records. The operator separately requires a
+  // fresh proof before its first intent. Diagnostic freshness stays unchanged.
+  const maximumProofAgeMs = session.version === 'p10b-guardian-only-session-v1' ? 3600000 : 120000;
+  if (!admitsExistingArchive(session)
     || !exact(i, ['version', 'sessionDigest', 'operatorPid', 'intendedAt', 'historicalProofDigest', 'originalSha256',
       'attemptSha256', 'baselineDigest', 'independentBaselineDigest', 'historicalCleanupVerified'])
     || !exact(t, ['version', 'sessionDigest', 'operatorPid', 'intentDigest', 'historicalProofDigest', 'originalSha256',
@@ -130,13 +144,13 @@ export function assertP10bPriorArchiveAdmission({ session, recovery, inspect, no
     || v.version !== 'p10b-independent-recovery-verification-v1' || v.success !== true || v.archiveSha256 !== t.originalSha256
     || ![i.intendedAt, t.verifiedAt, v.verifiedAt].every(time) || !Number.isFinite(now)
     || Date.parse(i.intendedAt) < Date.parse(session.startedAt) || i.intendedAt > t.verifiedAt || t.verifiedAt > v.verifiedAt
-    || Date.parse(v.verifiedAt) > now || now - Date.parse(v.verifiedAt) > 120000 || now >= Date.parse(session.sessionDeadline)) hold();
+    || Date.parse(v.verifiedAt) > now || now - Date.parse(v.verifiedAt) > maximumProofAgeMs || now >= Date.parse(session.sessionDeadline)) hold();
   const observed = inspect();
   if (observed.activeAbsent !== true || observed.archiveSha256 !== t.originalSha256 || observed.attemptSha256 !== i.attemptSha256
     || observed.archiveDevice !== t.archiveDevice || observed.archiveInode !== t.archiveInode
     || observed.historicalProofDigest !== i.historicalProofDigest) hold();
   const after = clock();
   if (!Number.isFinite(after) || after < now || after >= Date.parse(session.sessionDeadline)
-    || after - Date.parse(v.verifiedAt) > 120000) hold();
+    || after - Date.parse(v.verifiedAt) > maximumProofAgeMs) hold();
   return true;
 }

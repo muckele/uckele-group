@@ -30,6 +30,7 @@ type stoppedDiagnosticPolicy struct {
 	primarySettled, restoreSettled       bool
 	phaseDeadline                        time.Time
 	hold                                 bool
+	guardian, primaryReadback            bool
 }
 type stoppedSettlement struct {
 	OK      bool   `json:"ok"`
@@ -61,7 +62,11 @@ func (d *stoppedDiagnosticPolicy) writeAllowed(posts int, config, version string
 	if posts == 0 {
 		return !d.primaryAttempted && d.lastStopped && config == d.candidate && d.lastConfig == d.baseline && version == d.baselineVersion
 	}
-	return posts == 1 && !d.restoreAttempted && d.primaryVersion != "" && d.primarySettled && d.lastNonrunning && !d.phaseDeadline.IsZero() && time.Now().Before(d.phaseDeadline) && config == d.baseline && d.lastConfig == d.candidate && version == d.primaryVersion
+	settlementEligible := !d.phaseDeadline.IsZero() && time.Now().Before(d.phaseDeadline) && d.lastNonrunning
+	if d.guardian {
+		settlementEligible = d.primaryReadback && d.lastStopped
+	}
+	return posts == 1 && !d.restoreAttempted && d.primaryVersion != "" && d.primarySettled && settlementEligible && config == d.baseline && d.lastConfig == d.candidate && version == d.primaryVersion
 }
 func (d *stoppedDiagnosticPolicy) beginWrite(posts int) {
 	if posts == 0 {
@@ -81,10 +86,16 @@ func (d *stoppedDiagnosticPolicy) acknowledge(posts int, m map[string]json.RawMe
 	}
 	if posts == 1 && hash(config) == d.candidate && version != d.baselineVersion {
 		d.primaryVersion = version
+		if d.guardian {
+			d.phaseDeadline = time.Now().Add(10 * time.Second)
+		}
 		return true
 	}
 	if posts == 2 && hash(config) == d.baseline && version != d.primaryVersion && version != d.baselineVersion {
 		d.restoreVersion = version
+		if d.guardian {
+			d.phaseDeadline = time.Now().Add(10 * time.Second)
+		}
 		return true
 	}
 	return false
@@ -105,7 +116,13 @@ func (d *stoppedDiagnosticPolicy) beginWait(version string) bool {
 		d.primaryWait = true
 	}
 	d.lastAt = time.Time{}
-	d.phaseDeadline = time.Now().Add(10 * time.Second)
+	if !d.guardian {
+		d.phaseDeadline = time.Now().Add(10 * time.Second)
+	}
+	if d.phaseDeadline.IsZero() || !time.Now().Before(d.phaseDeadline) {
+		d.hold = true
+		return false
+	}
 	return true
 }
 func (d *stoppedDiagnosticPolicy) settlement(raw []byte, version string) (*stoppedSettlement, error) {
@@ -180,13 +197,21 @@ func (d *stoppedDiagnosticPolicy) observe(m map[string]json.RawMessage) bool {
 		if d.restoreAttempted {
 			wantConfig, wantVersion = d.baseline, d.restoreVersion
 		}
-		if hash(config) != wantConfig || version != wantVersion || (state != "created" && state != "stopped") {
+		stateAllowed := state == "created" || state == "stopped"
+		if d.guardian && d.primaryReadback && !d.restoreAttempted {
+			stateAllowed = map[string]bool{"created": true, "stopped": true, "starting": true, "started": true, "stopping": true}[state]
+		}
+		if hash(config) != wantConfig || version != wantVersion || !stateAllowed {
 			d.hold = true
 			return false
 		}
 	} else if hash(config) != d.baseline || version != d.baselineVersion || state != "stopped" {
 		d.hold = true
 		return false
+	}
+	if d.guardian && state == "stopped" && ((d.primarySettled && !d.restoreAttempted) || d.restoreSettled) {
+		d.primaryReadback = true
+		d.phaseDeadline = time.Time{}
 	}
 	d.lastConfig, d.lastVersion = hash(config), version
 	d.lastStopped = state == "stopped"

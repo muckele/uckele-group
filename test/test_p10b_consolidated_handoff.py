@@ -197,7 +197,7 @@ class RealComponentTTYTests(unittest.TestCase):
         self.node = legacy.shutil.which('node')
         self.helper = Path(__file__).resolve().parent / 'helpers/p10bConsolidatedPreflightFixture.mjs'
         legacy.subprocess.run([self.node, str(self.helper), '--fixture', str(self.root)] +
-                              (['--diagnostic'] if getattr(self, 'diagnostic_mode', False) else []), check=True,
+                              (['--diagnostic'] if getattr(self, 'diagnostic_mode', False) else ['--guardian'] if getattr(self, 'guardian_mode', False) else []), check=True,
                               capture_output=True, timeout=15)
         self.recipe = handoff.read_public(self.root / 'recipe.json')
         self.secret = 'fm2_SYNTHETIC_OWNER_TTY_CREDENTIAL'
@@ -210,6 +210,9 @@ def runner(args,environment,timeout):
  if mode=='--execute' and recipe['version']=='p10b-owner-stopped-update-recipe-v2':
   assert pathlib.Path(args[1]).name=='run-p10b-stopped-update-diagnostic.js'
   assert args[-1]==recipe['files']['diagnosticNative']['path']
+ if mode=='--execute' and recipe['version']=='p10b-owner-guardian-only-recipe-v1':
+  assert pathlib.Path(args[1]).name=='run-p10b-no-email-session.js'
+  assert args[-1]==recipe['files']['guardianNative']['path']
  result=h.run_command([node,helper,mode,str(root)],environment,timeout)
  return result
 sys.exit(h.run_owner(root/'recipe.json',runner=runner,expected_recipe_sha256=hashlib.sha256((root/'recipe.json').read_bytes()).hexdigest(),bootstrap=lambda _p,_s:recipe))
@@ -331,8 +334,8 @@ input('SYNTHETIC_OWNER_DONE')
                 self.assertEqual(code, 2)
                 self.assertFalse((self.root / 'sealed-session.json').exists())
             else:
-                output = self.until(child, b' to authorize this exact ')
-                prefix = b'APPROVE CONDITIONAL STOPPED UPDATE ' if getattr(self, 'diagnostic_mode', False) else b'APPROVE SESSION '
+                output = self.until(child, b' to authorize exactly one inert ' if getattr(self, 'guardian_mode', False) else b' to authorize this exact ')
+                prefix = b'APPROVE CONDITIONAL STOPPED UPDATE ' if getattr(self, 'diagnostic_mode', False) else b'APPROVE ONE GUARDIAN START ' if getattr(self, 'guardian_mode', False) else b'APPROVE SESSION '
                 self.assertIn(prefix, output)
                 session_digest = re.findall(re.escape(prefix) + rb'([a-f0-9]{64})', output)[-1]
                 sealed = handoff.read_public(self.root / 'sealed-session.json')
@@ -349,15 +352,26 @@ input('SYNTHETIC_OWNER_DONE')
                     self.assertIn(b'version-scoped settlement', output)
                     self.assertIn(b'no automatic restoration', output)
                     self.assertIn(b'separately approved recovery', output)
+                if getattr(self, 'guardian_mode', False):
+                    self.assertEqual(sealed['version'], 'p10b-guardian-only-bundle-v1')
+                    self.assertEqual(sealed['session']['version'], 'p10b-guardian-only-session-v1')
+                    self.assertEqual(sealed['session']['maximumStarts'], 1)
+                    self.assertEqual(sealed['session']['maximumStartWindowMs'], 300000)
+                    self.assertEqual(sealed['session']['maximumStoppedConfigUpdates'], 2)
+                    self.assertEqual(sealed['session']['maximumLocalBuilds'], 0)
+                    self.assertEqual(sealed['session']['maximumImagePushes'], 0)
+                    self.assertFalse(sealed['session']['qualificationAllowed'])
+                    self.assertIn(b'No preparation, SQLite, mailbox worker, inbound listener', output)
                 closure = handoff.read_public(self.root / 'runtime-evidence/p10b-owner-preflight-closure.json')
                 self.assertTrue(closure['reaped'] and closure['cleanupVerified'])
                 self.assertFalse(Path(closure['privateAuthDirectory']).exists())
                 consent = prefix + session_digest + b'\n'
                 if mode == 'decline-session': consent = b'\n'
                 if mode == 'old-diagnostic-consent': consent = b'APPROVE STOPPED UPDATE ' + session_digest + b'\n'
+                if mode == 'old-guardian-consent': consent = b'APPROVE SESSION ' + session_digest + b'\n'
                 os.write(child[1], consent)
                 code, output = self.drain(child)
-                self.assertEqual(code, 2 if mode in ('decline-session', 'old-diagnostic-consent') else 0, output[-3000:])
+                self.assertEqual(code, 2 if mode in ('decline-session', 'old-diagnostic-consent', 'old-guardian-consent') else 0, output[-3000:])
                 if mode == 'success':
                     approved = handoff.read_public(self.root / 'approved-session.json')
                     boundary = handoff.read_public(self.root / 'execution-boundary.json')

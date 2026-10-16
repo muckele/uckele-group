@@ -9,7 +9,7 @@ import { proveP10bGuardianStop } from './p10bRuntimeObservation.js';
 import { assertP10bRecoveryAdmission, assertP10bCurrentPhaseSettlement } from './p10bAdmissionRecovery.js';
 import { P10B_GUARDIAN_EXIT_PREFIX } from './p10bGuardianParent.js';
 import { sanitizeP10bGuardianLog } from './p10bRuntimeObserver.js';
-import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
+import { assertP10bNoEmailApproval, assertP10bFrozenPhase, isP10bGuardianSession } from './p10bRuntimeOnlyOperator.js';
 import { p10bInheritedAppTokenEnvironment } from './p10bHostAuthentication.js';
 import { assertP10bFlyExecutable } from './p10bOperatorSource.js';
 
@@ -66,9 +66,13 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
   if (!environment && openNative === openP10bNativeMachineClient) environment = p10bInheritedAppTokenEnvironment({ session, approval, clock });
   processes ||= createP10bOperatorProcesses({ environment });
-  let native; let posts = 0; let settlementPhase; const configs = [session.baselineConfig];
+  const guardian = isP10bGuardianSession(session);
+  let native; let posts = 0; let phaseAuthorized = false; let settlementPhase; const configs = [session.baselineConfig];
   const observers = []; const controllers = [];
   async function authorizePhase(phase) {
+    assertP10bFrozenPhase(session, phase);
+    if (guardian && (phaseAuthorized || phase.label !== 'demo')) throw Error('Guardian phase already consumed');
+    phaseAuthorized = true;
     assertP10bFlyExecutable(session, flyExecutable);
     const listed = JSON.parse(await processes.command(flyExecutable, ['machines', 'list', '--app', session.app, '--json'], 10000));
     if (!Array.isArray(listed) || listed.length !== 1 || listed[0].id !== session.machineId) throw Error('Exact sole isolated Machine required');
@@ -83,7 +87,7 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
       if (method === 'POST' && stableCanonicalJson(body?.config) !== stableCanonicalJson(session.baselineConfig)) throw Error('Settlement only permits frozen baseline restoration');
     } else assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
     if (!native) native = await openNative({ executable: nativeExecutable, session, approval, configs, recoveryVerified: true, environment });
-    if (method === 'POST') { if (++posts > 3) throw Error('Stopped update budget consumed'); }
+    if (method === 'POST') { if (++posts > (guardian ? 2 : 3)) throw Error('Stopped update budget consumed'); }
     return native.client(method, body, timeout);
   }
   async function startObserver({ phase, machine }) {
@@ -136,6 +140,7 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     return { ...proof, windowDigest: digest(phase.window), observerSurvived: true, primaryTerminationVerified };
   }
   async function runPreparation({ phase, observer, machine }) {
+    if (guardian) throw Error('Guardian-only session cannot prepare');
     const prefix = path.join(evidence.root, 'p10b-runtime-only-preparation');
     const input = 'p10b-runtime-only-prepare-primary-input.json'; evidence.write(input, { session, approval, phase, recovery });
     const entry = processes.launch(nodeExecutable, [script('run-p10b-no-email-preparation.js'),
@@ -173,6 +178,14 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     return stopped && controllersReaped;
   }
   return { authorizePhase, client, startObserver, demonstrate, runPreparation, settle,
+    restorationLease: () => native?.transportLease,
+    async reapForRestoration() {
+      if (!guardian || !native?.transportLease || await processes.reap() !== true) return false;
+      // Preserve this one stateful transport across the phase-process reap gate.
+      // Its exact owned reservation is checked separately; every other pending
+      // descendant still blocks restoration, and final cleanup requires full reap.
+      return true;
+    },
     async reap() {
       if (await processes.reap() !== true) return false;
       if (native && await native.close() !== true) return false;

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { sha256, stableCanonicalJson } from '../../server/utils/security.js';
 import { checkP10bOwnerRecipe, validateP10bOwnerPublicInputs, prepareP10bOwnerBundle,
   boundP10bOwnerFile, createP10bPreflightCommands } from '../../server/services/p10bOwnerPreflight.js';
+import { P10B_GUARDIAN_NATIVE_SHA256 } from '../../server/services/p10bOperatorSource.js';
 import { P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 } from '../../server/services/p10bStoppedUpdateContract.js';
 const [mode, root, operation] = process.argv.slice(2);
 const file = path.join(root, 'recipe.json');
@@ -36,11 +37,16 @@ if (mode === '--fixture') {
     diagnostic.files.diagnosticNative = { path: process.execPath, sha256: P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 };
     fs.writeFileSync(file, JSON.stringify(diagnostic), { mode: 0o600 });
   }
+  if (operation === '--guardian') {
+    const guardian = read('recipe.json'); guardian.version = 'p10b-owner-guardian-only-recipe-v1';
+    guardian.files.guardianNative = { path: process.execPath, sha256: P10B_GUARDIAN_NATIVE_SHA256 };
+    fs.writeFileSync(file, JSON.stringify(guardian), { mode: 0o600 });
+  }
   process.exit(0);
 }
 const recipe = read('recipe.json');
 const options = { checkSource: head => { if (head !== '2'.repeat(40)) throw Error('fixture source drift'); },
-  checkFile: item => item === recipe.files.native || item === recipe.files.diagnosticNative ? item.path : boundP10bOwnerFile(item) };
+  checkFile: item => item === recipe.files.native || item === recipe.files.diagnosticNative || item === recipe.files.guardianNative ? item.path : boundP10bOwnerFile(item) };
 let result;
 if (mode === '--check-only') result = { ...checkP10bOwnerRecipe(recipe, options), recipeFileSha256: sha256(fs.readFileSync(file)) };
 else if (mode === '--validate-input') result = validateP10bOwnerPublicInputs({ recipe, receipt: read('issuance-receipt.json'),
@@ -75,12 +81,18 @@ import { URL } from 'node:url';import path from 'node:path';fs.writeFileSync(pat
   const digest = sha256(stableCanonicalJson(approved.session));
   if (approved.approval.approved !== true || approved.approval.sessionDigest !== digest) throw Error('approval mismatch');
   write('execution-boundary.json', { sessionDigest: digest, runtimeSimulated: true, providerCalls: 0, emails: 0 });
+  const guardian = recipe.version === 'p10b-owner-guardian-only-recipe-v1';
+  if (guardian && (approved.version !== 'p10b-guardian-only-bundle-v1' || approved.session.maximumStarts !== 1
+    || approved.session.maximumStoppedConfigUpdates !== 2 || approved.session.qualificationAllowed !== false
+    || approved.session.maximumLocalBuilds !== 0 || approved.session.maximumImagePushes !== 0
+    || approved.approval.version !== 'p10b-guardian-only-approval-v1')) throw Error('wrong guardian authority');
   const diagnostic = recipe.version === 'p10b-owner-stopped-update-recipe-v2';
   if (diagnostic && (approved.session.version !== 'p10b-stopped-update-session-v2' || approved.session.maximumStarts !== 0 || approved.session.recoveryPolicy !== 'acknowledged-only-nonrunning-v1'
     || approved.approval.version !== 'p10b-stopped-update-approval-v2')) throw Error('wrong diagnostic authority');
   fs.writeFileSync(path.join(recipe.evidenceDirectory, diagnostic ? 'p10b-stopped-update-auth-closure.json' : 'p10b-runtime-only-auth-closure.json'),
     JSON.stringify({ success: true, cleanupVerified: true, reapVerified: true, sessionDigest: digest }), { mode: 0o600, flag: 'wx' });
-  result = { success: true, productionReady: false,
+  result = { success: true, productionReady: false, providerCalls: 0, emails: 0,
+    ...(guardian ? { operation: 'guardian-only', maximumStarts: 1, qualificationAllowed: false, restored: true, mutationSettled: true } : {}),
     ...(diagnostic ? { operation: 'stopped-update-diagnostic', maximumStarts: 0, qualificationAllowed: false, restored: true, mutationSettled: true } : {}) };
 } else throw Error('unknown offline mode');
 process.stdout.write(JSON.stringify(result));

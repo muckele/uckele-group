@@ -50,14 +50,15 @@ type response struct {
 	Settlement  *stoppedSettlement  `json:"settlement,omitempty"`
 }
 type service struct {
-	builder       requestBuilder
-	client        doer
-	deadline      time.Time
-	readOnly      bool
-	allowedConfig map[string]bool
-	posts, reads  int
-	source, image string
-	diagnostic    *stoppedDiagnosticPolicy
+	builder           requestBuilder
+	client            doer
+	deadline          time.Time
+	readOnly          bool
+	allowedConfig     map[string]bool
+	posts, reads      int
+	source, image     string
+	diagnostic        *stoppedDiagnosticPolicy
+	mutationUncertain bool
 }
 type initPacket struct {
 	Version          string            `json:"version"`
@@ -112,24 +113,39 @@ func initialize(raw []byte, factory func(context.Context) (requestBuilder, error
 		return nil, errors.New("native initialization denied")
 	}
 	var session struct {
-		App           string          `json:"app"`
-		Machine       string          `json:"machineId"`
-		Source        string          `json:"sourceHead"`
-		Image         string          `json:"candidateImageDigest"`
-		Started       string          `json:"startedAt"`
-		Deadline      string          `json:"sessionDeadline"`
-		Owner         string          `json:"ownerPermissionDigest"`
-		Nonce         string          `json:"nonce"`
-		Baseline      json.RawMessage `json:"baselineConfig"`
-		Version       string          `json:"version"`
-		BaselineImage string          `json:"baselineImageDigest"`
-		Starts        int             `json:"maximumStarts"`
-		Window        int             `json:"maximumStartWindowMs"`
-		Updates       int             `json:"maximumStoppedConfigUpdates"`
-		Production    bool            `json:"productionReady"`
-		Paused        bool            `json:"globalAutomationPaused"`
+		App             string          `json:"app"`
+		Machine         string          `json:"machineId"`
+		Source          string          `json:"sourceHead"`
+		Image           string          `json:"candidateImageDigest"`
+		Started         string          `json:"startedAt"`
+		Deadline        string          `json:"sessionDeadline"`
+		Owner           string          `json:"ownerPermissionDigest"`
+		Nonce           string          `json:"nonce"`
+		Baseline        json.RawMessage `json:"baselineConfig"`
+		Version         string          `json:"version"`
+		Operation       string          `json:"operation"`
+		RecoveryPolicy  string          `json:"recoveryPolicy"`
+		Volume          string          `json:"volumeId"`
+		BaselineVersion string          `json:"baselineInstanceId"`
+		Qualification   *bool           `json:"qualificationAllowed"`
+		Builds          *int            `json:"maximumLocalBuilds"`
+		Pushes          *int            `json:"maximumImagePushes"`
+		BaselineImage   string          `json:"baselineImageDigest"`
+		Starts          int             `json:"maximumStarts"`
+		Window          int             `json:"maximumStartWindowMs"`
+		Updates         int             `json:"maximumStoppedConfigUpdates"`
+		Production      *bool           `json:"productionReady"`
+		Paused          bool            `json:"globalAutomationPaused"`
 	}
-	if json.Unmarshal([]byte(p.SessionCanonical), &session) != nil || session.Version != "p10b-no-email-session-v1" || session.Starts != 2 || session.Window != 300000 || session.Updates != 3 || session.Production || !session.Paused || !frozenBaseline(session.Baseline, session.BaselineImage) || session.App != "uckele-group-p10b" || session.Machine != "0803730bd1d7e8" || !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(session.Source) || !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(session.Image) || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(session.Owner) || (!p.ReadOnly && !p.RecoveryVerified) {
+	if json.Unmarshal([]byte(p.SessionCanonical), &session) != nil {
+		return nil, errors.New("native initialization denied")
+	}
+	guardian := session.Version == "p10b-guardian-only-session-v1"
+	contractAllowed := session.Version == "p10b-no-email-session-v1" && session.Starts == 2 && session.Updates == 3
+	if guardian {
+		contractAllowed = session.Operation == "guardian-only" && session.RecoveryPolicy == "acknowledged-only-stopped-runtime-v1" && session.Volume == "vol_vwnkpex1k3yx9dnv" && session.Starts == 1 && session.Updates == 2 && session.Production != nil && uniqueStoppedObject([]byte(p.SessionCanonical)) && session.Qualification != nil && !*session.Qualification && session.Builds != nil && *session.Builds == 0 && session.Pushes != nil && *session.Pushes == 0 && regexp.MustCompile(`^[A-Za-z0-9-]{1,80}$`).MatchString(session.BaselineVersion) && stoppedBaselineHardOff(session.Baseline)
+	}
+	if !contractAllowed || session.Window != 300000 || (session.Production != nil && *session.Production) || !session.Paused || !frozenBaseline(session.Baseline, session.BaselineImage) || session.App != "uckele-group-p10b" || session.Machine != "0803730bd1d7e8" || !regexp.MustCompile(`^[a-f0-9]{40}$`).MatchString(session.Source) || !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(session.Image) || !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(session.Owner) || (!p.ReadOnly && !p.RecoveryVerified) {
 		return nil, errors.New("native initialization denied")
 	}
 	start, e1 := time.Parse(time.RFC3339Nano, session.Started)
@@ -148,13 +164,51 @@ func initialize(raw []byte, factory func(context.Context) (requestBuilder, error
 		}
 		allowed[hash(b)] = true
 	}
+	var guardianBaseline, guardianCandidate []byte
+	if guardian {
+		guardianBaseline, _ = canonical(session.Baseline)
+		if len(p.Configs) > 2 || (!p.ReadOnly && len(p.Configs) != 2) {
+			return nil, errors.New("native guardian configuration denied")
+		}
+		baselineCount, candidateCount := 0, 0
+		for _, rawConfig := range p.Configs {
+			c, _ := canonical(rawConfig)
+			if bytes.Equal(c, guardianBaseline) {
+				baselineCount++
+				continue
+			}
+			var config struct {
+				Env map[string]string `json:"env"`
+			}
+			json.Unmarshal(c, &config)
+			if config.Env["SQLITE_PATH"] != "/data/p10b-first-mailbox-watchdog-"+session.Nonce+".sqlite" {
+				return nil, errors.New("native guardian configuration denied")
+			}
+			candidateCount++
+			guardianCandidate = c
+		}
+		if baselineCount > 1 || candidateCount > 1 {
+			return nil, errors.New("native guardian configuration denied")
+		}
+		if !p.ReadOnly {
+			first, _ := canonical(p.Configs[0])
+			if baselineCount != 1 || candidateCount != 1 || !bytes.Equal(first, guardianBaseline) {
+				return nil, errors.New("native guardian configuration denied")
+			}
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	b, err := factory(ctx)
 	if err != nil {
 		return nil, errors.New("native authentication unavailable")
 	}
-	return &service{builder: b, client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect denied") }}, deadline: end, readOnly: p.ReadOnly, allowedConfig: allowed, source: session.Source, image: session.Image}, nil
+	s := &service{builder: b, client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect denied") }}, deadline: end, readOnly: p.ReadOnly, allowedConfig: allowed, source: session.Source, image: session.Image}
+	if guardian && !p.ReadOnly {
+		enableStoppedDiagnostic(s, guardianBaseline, guardianCandidate, session.BaselineVersion)
+		s.diagnostic.guardian = true
+	}
+	return s, nil
 }
 func publicConfig(raw []byte) bool {
 	var c map[string]json.RawMessage
@@ -232,6 +286,11 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 	started := time.Now()
 	observation := &requestObservation{}
 	writeAttempted := false
+	defer func() {
+		if writeAttempted && !out.OK {
+			s.mutationUncertain = true
+		}
+	}()
 	if s.diagnostic != nil {
 		defer func() {
 			observation.ElapsedMs = time.Since(started).Milliseconds()
@@ -240,7 +299,7 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 				s.diagnostic.hold = true
 			}
 		}()
-		if (r.Method == "POST" && r.TimeoutMs != 10000) || (r.Method == "GET" && r.TimeoutMs > 1000) || (r.Method == "WAIT" && (r.TimeoutMs < 1000 || r.TimeoutMs > 9000)) || s.reads >= 128 {
+		if (r.Method == "POST" && r.TimeoutMs != 10000) || (r.Method == "GET" && r.TimeoutMs > 1000) || (r.Method == "WAIT" && (r.TimeoutMs < 1000 || r.TimeoutMs > 9000)) || (!s.diagnostic.guardian && s.reads >= 128) {
 			return response{ID: r.ID, Error: "request-denied"}
 		}
 	}
@@ -258,7 +317,7 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 			CurrentVersion string          `json:"current_version"`
 			SkipLaunch     bool            `json:"skip_launch"`
 		}
-		if s.readOnly || s.posts >= 3 || (s.diagnostic != nil && !uniqueStoppedObject(r.Body)) || strict(r.Body, &body) != nil || !body.SkipLaunch || !regexp.MustCompile(`^[A-Za-z0-9-]{1,80}$`).MatchString(body.CurrentVersion) || !publicConfig(body.Config) {
+		if s.readOnly || s.mutationUncertain || s.posts >= 3 || (s.diagnostic != nil && !uniqueStoppedObject(r.Body)) || strict(r.Body, &body) != nil || !body.SkipLaunch || !regexp.MustCompile(`^[A-Za-z0-9-]{1,80}$`).MatchString(body.CurrentVersion) || !publicConfig(body.Config) {
 			return denied
 		}
 		c, err := canonical(body.Config)
@@ -272,6 +331,7 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 			s.diagnostic.beginWrite(s.posts)
 			writeAttempted = true
 		}
+		writeAttempted = true
 		s.posts++
 		in = json.RawMessage(r.Body)
 		if s.diagnostic != nil {
@@ -368,7 +428,9 @@ func (s *service) request(ctx context.Context, r request) (out response) {
 	if s.diagnostic != nil {
 		var m map[string]json.RawMessage
 		json.Unmarshal(machine, &m)
-		delete(m, "events")
+		if !s.diagnostic.guardian {
+			delete(m, "events")
+		}
 		if !stoppedImageMatches(m) || (r.Method == "POST" && !s.diagnostic.acknowledge(s.posts, m)) || (r.Method == "GET" && !s.diagnostic.observe(m)) {
 			return response{ID: r.ID, Error: "invalid-output"}
 		}

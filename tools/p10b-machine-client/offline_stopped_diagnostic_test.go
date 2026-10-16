@@ -48,7 +48,13 @@ func (t *diagnosticLoopbackHTTP) RoundTrip(request *http.Request) (*http.Respons
 	return t.client.Do(proxy)
 }
 func TestOfflineStoppedDiagnosticTransport(t *testing.T) {
-	address := os.Getenv("P10B_DIAGNOSTIC_TEST_HTTP_URL")
+	offlineLoopbackTransport(t, "P10B_DIAGNOSTIC_TEST_HTTP_URL", serveStoppedDiagnostic)
+}
+func TestOfflineGuardianTransport(t *testing.T) {
+	offlineLoopbackTransport(t, "P10B_GUARDIAN_TEST_HTTP_URL", serve)
+}
+func offlineLoopbackTransport(t *testing.T, variable string, serveSession func(io.Reader, io.Writer, func(context.Context) (requestBuilder, error)) error) {
+	address := os.Getenv(variable)
 	if address == "" {
 		t.Skip("explicit loopback fake HTTP required")
 	}
@@ -65,7 +71,7 @@ func TestOfflineStoppedDiagnosticTransport(t *testing.T) {
 	transport := &http.Transport{Proxy: nil}
 	defer transport.CloseIdleConnections()
 	http.DefaultTransport = &diagnosticLoopbackHTTP{base: address, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("offline redirect denied") }}}
-	if serveStoppedDiagnostic(io.MultiReader(strings.NewReader(first), reader), os.Stdout, func(ctx context.Context) (requestBuilder, error) {
+	if serveSession(io.MultiReader(strings.NewReader(first), reader), os.Stdout, func(ctx context.Context) (requestBuilder, error) {
 		return flaps.NewWithOptions(ctx, flaps.NewClientOpts{Tokens: tokens.Parse("synthetic-stopped-diagnostic-only")})
 	}) != nil {
 		t.Fatal("offline diagnostic held")

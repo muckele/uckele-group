@@ -44,3 +44,25 @@ renew it. Initial admission remains stopped; post-update created or stopped is
 allowed. Failed/unknown writes, failed settlement, drift or expired observation
 hold further mutation permanently. Later visibility cannot authorize recovery
 from an ambiguous request. Recovery then needs separate approval.
+
+The normal entry point also accepts `p10b-guardian-only-session-v1` with
+`operation=guardian-only` and
+`recoveryPolicy=acknowledged-only-stopped-runtime-v1`. Its immutable authority is
+one start, a five-minute window, two conditional stopped configuration updates,
+zero image builds/pushes, qualification disabled and automation paused. Starting
+is owned by the separately guarded host process, not this HTTP helper. This
+helper admits only the exact frozen baseline and derived inert watchdog config;
+the mailbox preparation config is rejected. Read-only admission/observer clients
+may receive only their exact baseline or watchdog projection.
+
+A mutating guardian client must remain the same native process through candidate
+acknowledgement, version-scoped WAIT, exact stopped readback, guest lifecycle
+observation and eligible restoration. WAIT and readback share an immutable
+ten-second deadline beginning at acknowledgement. After stopped readback, the
+settlement deadline ends; the original session deadline still bounds observation.
+Restoration requires a fresh stopped observation of the same acknowledged
+candidate version/configuration. Failed writes, settlement, version/config drift
+or premature lifecycle changes permanently hold mutation; later visibility never
+restores authority. A fresh native process cannot resume the mutation sequence.
+The guardian response retains the existing closed lifecycle-event projection.
+All modes also refuse further writes after any failed attempted POST.

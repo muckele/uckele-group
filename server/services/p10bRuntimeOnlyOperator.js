@@ -4,6 +4,7 @@ import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from './p10bProvid
 import { validateP10bRuntimePacket } from './p10bQualificationHost.js';
 import { createP10bRuntimeOnlyControl, assertP10bPreparationTerminal } from './p10bRuntimeOnlyControl.js';
 import { assertP10bRecoveryAdmission } from './p10bAdmissionRecovery.js';
+import { assertP10bPriorArchiveBinding } from './p10bExistingArchiveRecovery.js';
 import { publicP10bNativeFailure } from './p10bNativeFailure.js';
 const digest = value => sha256(stableCanonicalJson(value));
 export const P10B_RUNTIME_FLAGS = Object.freeze({ NODE_ENV: 'p10b', P10B_QUALIFICATION_RUNTIME: 'true', STORAGE_PROVIDER: 'sqlite',
@@ -62,12 +63,15 @@ export function validateP10bBaselineConfig(c, imageDigest) {
   return true;
 }
 
+export const isP10bGuardianSession = s => s?.version === 'p10b-guardian-only-session-v1';
 export function validateP10bNoEmailSession(s, now) {
+  const guardian = isP10bGuardianSession(s);
   if (!onlyKeys(s, ['version', 'app', 'machineId', 'volumeId', 'sourceHead', 'hostSourceHead', 'nonce', 'candidateImageDigest', 'baselineImageDigest',
     'baselineConfig', 'ownerPermissionDigest', 'permissionEvidenceId', 'startedAt', 'sessionDeadline', 'maximumStarts',
     'maximumStartWindowMs', 'maximumStoppedConfigUpdates', 'maximumIncrementalUsd', 'maximumLocalBuilds', 'maximumImagePushes',
     'productionReady', 'globalAutomationPaused', 'configurationEvidence', 'budget', 'recovery', 'authenticationEvidence', 'nativeClientSha256',
-    'namesClientPath', 'namesClientSha256', 'flyExecutable'])
+    'namesClientPath', 'namesClientSha256', 'flyExecutable',
+    ...(guardian ? ['operation', 'qualificationAllowed', 'recoveryPolicy', 'baselineInstanceId', 'baselineObservedAt'] : [])])
     || !onlyKeys(s.flyExecutable, ['path', 'sha256'])
     || typeof s.flyExecutable.path !== 'string' || !/^\/[A-Za-z0-9_./ -]{1,1024}$/.test(s.flyExecutable.path)
     || !/^[a-f0-9]{64}$/.test(s.flyExecutable.sha256 || '')
@@ -100,11 +104,11 @@ export function validateP10bNoEmailSession(s, now) {
     || Date.parse(s.authenticationEvidence.expiresAt) > Date.parse(s.authenticationEvidence.issuanceCompletedAt) + 7200000
     || Date.parse(s.authenticationEvidence.expiresAt) < Date.parse(s.sessionDeadline)
     || (s.recovery && !onlyKeys(s.recovery, ['directory', 'activePath', 'archivePath', 'attemptPath', 'intentPath', 'terminalPath',
-      'expectedSha256', 'version', 'packetDigest', 'evidencePath', 'reservedAt']))
+      'expectedSha256', 'version', 'packetDigest', 'evidencePath', 'reservedAt', ...(guardian ? ['priorArchive'] : [])]))
     || (s.recovery && (!/^[a-f0-9]{64}$/.test(s.recovery.packetDigest || '') || !/^[a-f0-9]{64}$/.test(s.recovery.expectedSha256 || '')
       || !Number.isFinite(Date.parse(s.recovery.reservedAt)) || new Date(s.recovery.reservedAt).toISOString() !== s.recovery.reservedAt
       || ('version' in s.recovery && s.recovery.version !== 'p10b-machine-owner-v1')))
-    || s?.version !== 'p10b-no-email-session-v1' || s.app !== 'uckele-group-p10b' || s.machineId !== '0803730bd1d7e8'
+    || (!guardian && s?.version !== 'p10b-no-email-session-v1') || s.app !== 'uckele-group-p10b' || s.machineId !== '0803730bd1d7e8'
     || ('volumeId' in s && s.volumeId !== 'vol_vwnkpex1k3yx9dnv')
     || !/^[a-f0-9]{40}$/.test(s.sourceHead || '') || !/^[a-f0-9]{40}$/.test(s.hostSourceHead || '')
     || s.hostSourceHead === s.sourceHead || !/^[a-f0-9]{24}$/.test(s.nonce || '')
@@ -115,8 +119,13 @@ export function validateP10bNoEmailSession(s, now) {
     || !/^[a-f0-9]{64}$/.test(s.namesClientSha256 || '')
     || !Number.isFinite(now) || !Number.isFinite(Date.parse(s.startedAt)) || !Number.isFinite(Date.parse(s.sessionDeadline))
     || Date.parse(s.sessionDeadline) - Date.parse(s.startedAt) !== 3600000 || now < Date.parse(s.startedAt) || now >= Date.parse(s.sessionDeadline)
-    || s.maximumStarts !== 2 || s.maximumStartWindowMs !== 300000 || s.maximumStoppedConfigUpdates !== 3
-    || s.maximumIncrementalUsd !== 1 || s.maximumLocalBuilds !== 1 || s.maximumImagePushes !== 1
+    || s.maximumStarts !== (guardian ? 1 : 2) || s.maximumStartWindowMs !== 300000 || s.maximumStoppedConfigUpdates !== (guardian ? 2 : 3)
+    || s.maximumIncrementalUsd !== 1 || s.maximumLocalBuilds !== (guardian ? 0 : 1) || s.maximumImagePushes !== (guardian ? 0 : 1)
+    || (guardian && (s.operation !== 'guardian-only' || s.qualificationAllowed !== false
+      || s.recoveryPolicy !== 'acknowledged-only-stopped-runtime-v1'
+      || !/^[A-Za-z0-9-]{1,80}$/.test(s.baselineInstanceId || '')
+      || !Number.isFinite(Date.parse(s.baselineObservedAt)) || new Date(s.baselineObservedAt).toISOString() !== s.baselineObservedAt
+      || Date.parse(s.baselineObservedAt) < Date.parse(s.startedAt) || Date.parse(s.baselineObservedAt) > now))
     || s.productionReady !== false || s.globalAutomationPaused !== true
     || s.baselineConfig?.image?.split('@')[1] !== s.baselineImageDigest
     || !s.configurationEvidence || s.configurationEvidence.version !== 'p10b-isolated-configuration-evidence-v2'
@@ -129,13 +138,14 @@ export function validateP10bNoEmailSession(s, now) {
     || !Number.isFinite(s.budget.maximumUsdPerSecond) || s.budget.maximumUsdPerSecond < 0
     || !Number.isFinite(s.budget.fixedIncrementalUsd) || s.budget.fixedIncrementalUsd < 0
     || s.budget.fixedIncrementalUsd + 600 * s.budget.maximumUsdPerSecond >= 1) throw Error('Frozen no-email session invalid');
+  if (s.recovery && 'priorArchive' in s.recovery) assertP10bPriorArchiveBinding(s.recovery);
   validateP10bBaselineConfig(s.baselineConfig, s.baselineImageDigest);
   return true;
 }
 
 export function createP10bRuntimePhase(input, label, now = Date.now()) {
   const s = structuredClone(input); validateP10bNoEmailSession(s, now);
-  if (!['demo', 'prepare'].includes(label) || now + 360000 >= Date.parse(s.sessionDeadline)) throw Error('No-email phase outside frozen bounds');
+  if (!(isP10bGuardianSession(s) ? ['demo'] : ['demo', 'prepare']).includes(label) || now + 360000 >= Date.parse(s.sessionDeadline)) throw Error('No-email phase outside frozen bounds');
   const packet = { version: 'p10b-runtime-packet-v3', operation: 'prepare', target: {
     app: s.app, machineId: s.machineId, imageDigest: s.candidateImageDigest }, sourceHead: s.sourceHead,
   databasePath: `/data/p10b-first-mailbox-${label === 'demo' ? 'watchdog' : 'nosend'}-${s.nonce}.sqlite`,
@@ -165,7 +175,7 @@ export function createP10bRuntimePhase(input, label, now = Date.now()) {
 export function assertP10bNoEmailApproval(session, approval, now) {
   validateP10bNoEmailSession(session, now);
   if (!onlyKeys(approval, ['version', 'approved', 'sessionDigest', 'ownerPermissionDigest', 'sourceHead', 'hostSourceHead', 'expiresAt',
-    'recoveryApproved', 'exclusiveAdmissionWriters', 'providerCalls', 'emails']) || approval?.version !== 'p10b-no-email-approval-v1' || approval.approved !== true
+    'recoveryApproved', 'exclusiveAdmissionWriters', 'providerCalls', 'emails']) || approval?.version !== (isP10bGuardianSession(session) ? 'p10b-guardian-only-approval-v1' : 'p10b-no-email-approval-v1') || approval.approved !== true
     || approval.sessionDigest !== digest(session) || approval.ownerPermissionDigest !== session.ownerPermissionDigest
     || approval.sourceHead !== session.sourceHead || approval.hostSourceHead !== session.hostSourceHead
     || approval.expiresAt !== session.sessionDeadline
@@ -185,12 +195,14 @@ export function assertP10bFrozenPhase(session, phase) {
 // fake authentication/Machine actions, never the real admission directory.
 export async function runP10bNoEmailOperator({ session: input, approval, evidence, recovery, inspectRecovery,
   createBoundaries, verifyPrivateReap, clock = () => Date.now() }) {
-  const session = structuredClone(input);
+  const session = structuredClone(input); const guardian = isP10bGuardianSession(session);
   assertP10bNoEmailApproval(session, approval, clock());
   if (typeof verifyPrivateReap !== 'function') throw Error('Explicit private descendant-reap gate required');
   if (evidence.has('SESSION_NOT_APPROVED') || evidence.has('p10b-runtime-only-session-closure.json')
     || evidence.has('p10b-runtime-only-operator-intent.json')) throw Error('No-email session held, closed or consumed');
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
+  if (guardian && session.recovery?.priorArchive
+    && clock() - Date.parse(recovery.verification.verifiedAt) > 120000) throw Error('Fresh guardian archive proof required before first operator intent');
   evidence.write('p10b-runtime-only-operator-intent.json', { sessionDigest: digest(session), at: new Date(clock()).toISOString() });
   const control = createP10bRuntimeOnlyControl({ session, evidence, clock });
   let boundaries;
@@ -199,9 +211,9 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
   try {
     boundaries = await createBoundaries({ session, approval });
     let previous = session.baselineConfig;
-    for (const label of ['demo', 'prepare']) {
+    for (const label of (guardian ? ['demo'] : ['demo', 'prepare'])) {
       stage = `${label}-planning`;
-      control.assertTime(label === 'demo' ? 660000 : 360000);
+      control.assertTime(label === 'demo' && !guardian ? 660000 : 360000);
       assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
       const phase = createP10bRuntimePhase(session, label, clock()); configs.push(phase.config);
       activePhase = phase;
@@ -229,6 +241,7 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
           || proof.normalMachineExit !== true || proof.observerContinuous !== true || proof.unexpectedRestart !== false
           || proof.exitRecordCount !== 1) throw Error('Fresh guardian demonstration failed');
         evidence.write('p10b-runtime-only-demo-proof.json', proof);
+        if (guardian) result = { guardianProof: proof };
       } else {
         const terminal = await boundaries.runPreparation({ phase, observer, machine });
         assertP10bPreparationTerminal(terminal);
@@ -250,10 +263,10 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       let safeToRestore = true;
       try { if (activePhase && boundaries.settle && await boundaries.settle(activePhase) !== true) { safeToRestore = false; failure ||= 'stop-settlement-unverified'; } }
       catch { safeToRestore = false; failure ||= 'stop-settlement-unverified'; }
-      try { if (await boundaries.reap() !== true) { safeToRestore = false; failure ||= 'local-reap-failed'; } }
+      try { if (await (guardian && boundaries.reapForRestoration ? boundaries.reapForRestoration() : boundaries.reap()) !== true) { safeToRestore = false; failure ||= 'local-reap-failed'; } }
       catch { safeToRestore = false; failure ||= 'local-reap-failed'; }
       if (safeToRestore) {
-        try { if (await verifyPrivateReap() !== true) { safeToRestore = false; failure ||= 'descendant-reap-unverified'; } }
+        try { if (await verifyPrivateReap(guardian ? boundaries.restorationLease?.() : undefined) !== true) { safeToRestore = false; failure ||= 'descendant-reap-unverified'; } }
         catch { safeToRestore = false; failure ||= 'descendant-reap-unverified'; }
       }
       if (safeToRestore) {
@@ -263,9 +276,11 @@ export async function runP10bNoEmailOperator({ session: input, approval, evidenc
       try { if (await boundaries.close() !== true) failure ||= 'native-close-failed'; } catch { failure ||= 'native-close-failed'; }
     }
     evidence.write('p10b-runtime-only-session-closure.json', { closedAt: new Date(clock()).toISOString(),
-      sessionDigest: digest(session), failure, failureStage: failureStage || failure,
+      sessionDigest: digest(session), mutationUncertain: control.mutationUncertain(), mutationSettled: !control.mutationUncertain(),
+      ...(guardian ? { operation: 'guardian-only', maximumStarts: 1, qualificationAllowed: false, providerCalls: 0, emails: 0 } : {}), failure, failureStage: failureStage || failure,
       ...(failureDiagnostic ? { failureDiagnostic } : {}), restored, success: !failure && Boolean(result), productionReady: false, globalAutomationPaused: true });
   }
   if (failure) throw Error('No-email runtime proof failed; preserve evidence and hold');
-  return { success: true, restored, preparation: result, productionReady: false, globalAutomationPaused: true };
+  return { success: true, restored, ...(guardian ? { operation: 'guardian-only', maximumStarts: 1, qualificationAllowed: false,
+    mutationSettled: !control.mutationUncertain(), providerCalls: 0, emails: 0, ...result } : { preparation: result }), productionReady: false, globalAutomationPaused: true };
 }

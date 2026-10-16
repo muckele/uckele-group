@@ -6,6 +6,7 @@ import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase } from './p10bRuntimeOnlyOperator.js';
 export const P10B_RETAINED_GUEST_HEAD = 'c4944a46ac362cdcd002e077d5533b4b0843b1d0';
 export const P10B_RETAINED_IMAGE = 'sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc';
+export const P10B_GUARDIAN_NATIVE_SHA256 = 'cf6db6a84f6d2b8e091784af4f8f67bdb07786368bf6447a8655a50e9a6b240f';
 export const P10B_RETAINED_NATIVE_SHA256 = 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088';
 export function assertP10bFlyExecutable(session, executable = session?.flyExecutable?.path) {
   const binding = session?.flyExecutable;
@@ -27,7 +28,7 @@ export function assertP10bReviewedCheckout(sourceHead) {
 }
 export function assertP10bNoEmailHostBinding(session, checkSource = assertP10bReviewedCheckout) {
   if (session.sourceHead !== P10B_RETAINED_GUEST_HEAD || session.candidateImageDigest !== P10B_RETAINED_IMAGE
-    || session.nativeClientSha256 !== P10B_RETAINED_NATIVE_SHA256
+    || session.nativeClientSha256 !== (session.version === 'p10b-guardian-only-session-v1' ? P10B_GUARDIAN_NATIVE_SHA256 : P10B_RETAINED_NATIVE_SHA256)
     || !/^[a-f0-9]{40}$/.test(session.hostSourceHead || '') || session.hostSourceHead === session.sourceHead) {
     throw Error('Exact retained guest/image/native and separate host revision required');
   }

@@ -8,13 +8,15 @@ import { p10bGuestFreshPathInventory, p10bGuestPaths } from '../server/services/
 import { demonstrateOfflineGuardianLoss, offlineDemoWindow } from './helpers/p10bRuntimeOnlyFixture.js';
 
 const at = Date.parse('2026-10-10T12:00:00.000Z');
-function fixture() {
+function fixture(guardian = false) {
   let now = at; let reads = 0, updates = 0, version = 0; const records = new Map(); const queue = [];
   const session = { app: 'uckele-group-p10b', machineId: '0803730bd1d7e8',
     startedAt: new Date(at).toISOString(), sessionDeadline: new Date(at + 3600000).toISOString(),
     maximumStarts: 2, maximumStartWindowMs: 300000, maximumIncrementalUsd: 1, maximumStoppedConfigUpdates: 3,
     productionReady: false, globalAutomationPaused: true, ownerPermissionDigest: 'f'.repeat(64),
     candidateImageDigest: `sha256:${'a'.repeat(64)}`, baselineImageDigest: `sha256:${'b'.repeat(64)}` };
+  if (guardian) Object.assign(session, { version: 'p10b-guardian-only-session-v1', operation: 'guardian-only',
+    qualificationAllowed: false, baselineInstanceId: 'baseline', recoveryPolicy: 'acknowledged-only-stopped-runtime-v1', maximumStarts: 1, maximumStoppedConfigUpdates: 2, maximumLocalBuilds: 0, maximumImagePushes: 0 });
   const baseline = { image: `registry.fly.io/uckele-group@${session.baselineImageDigest}`, env: { paused: 'true' },
     restart: { policy: 'no' }, guest: { memory_mb: 512, cpus: 1, cpu_kind: 'shared' },
     mounts: [{ volume: 'vol_vwnkpex1k3yx9dnv', path: '/data' }],
@@ -155,4 +157,54 @@ test('a single stopped update has a ten-second request bound, independent of one
   assert.equal(updated.state, 'stopped'); assert.equal(posts, 1); assert.equal(requestTimeout, 10000);
   await assert.rejects(f.control.guardedUpdate(api, f.candidate, f.candidate, 'demo'), /replay/);
   assert.equal(posts, 1);
+});
+
+
+test('unacknowledged update forbids automatic restoration even when a later GET would show the exact candidate', async () => {
+  const f = fixture(); let posts = 0;
+  const api = async (method = 'GET', body) => {
+    const result = await f.api(method, body);
+    if (method === 'POST' && ++posts === 1) throw Error('timeout after dispatch');
+    return result;
+  };
+  await assert.rejects(f.control.guardedUpdate(api, f.baseline, f.candidate, 'demo'), /timeout/);
+  await assert.rejects(f.control.restoreBaseline(api, f.baseline, [f.candidate]), /unacknowledged|unsettled/i);
+  assert.equal(posts, 1); assert.deepEqual(f.machine.config, f.candidate);
+  const restarted = createP10bRuntimeOnlyControl({ session: f.session, evidence: f.evidence, clock: () => at });
+  await assert.rejects(restarted.restoreBaseline(api, f.baseline, [f.candidate]), /unacknowledged|unsettled/i);
+  assert.equal(posts, 1);
+});
+
+test('guardian-only update requires acknowledged version WAIT before exact stopped readback and caps two updates', async () => {
+  const f = fixture(true); const waits = [];
+  const api = async (method = 'GET', body, timeout) => {
+    if (method === 'WAIT') { waits.push({ body, timeout }); return { ok: true, state: 'stopped', version: body.version }; }
+    return f.api(method, body);
+  };
+  await f.control.guardedUpdate(api, f.baseline, f.candidate, 'demo');
+  assert.deepEqual(waits, [{ body: { version: 'next-1' }, timeout: 9000 }]);
+  await assert.rejects(f.control.guardedUpdate(api, f.candidate, f.candidate, 'prepare'), /not admitted/);
+  await f.control.restoreBaseline(api, f.baseline, [f.candidate]);
+  assert.equal(f.updates, 2); assert.equal(waits.length, 2); assert.deepEqual(f.machine.config, f.baseline);
+});
+
+test('guardian wrong acknowledgement, failed WAIT or failed readback latches hold before restoration or start', async t => {
+  for (const failure of ['missing-ack', 'same-ack', 'wrong-config', 'wait', 'readback']) await t.test(failure, async () => {
+    const f = fixture(true); let posts = 0;
+    const api = async (method = 'GET', body) => {
+      if (method === 'WAIT') { if (failure === 'wait') throw Error('timeout'); return { ok: true, state: 'stopped', version: body.version }; }
+      const value = await f.api(method, body);
+      if (method === 'POST') {
+        posts++;
+        if (failure === 'missing-ack') delete value.instance_id;
+        if (failure === 'same-ack') value.instance_id = 'baseline';
+        if (failure === 'wrong-config') value.config.env.paused = 'changed';
+      } else if (posts && failure === 'readback') value.instance_id = 'unknown';
+      return value;
+    };
+    await assert.rejects(f.control.guardedUpdate(api, f.baseline, f.candidate, 'demo'));
+    await assert.rejects(f.control.restoreBaseline(api, f.baseline, [f.candidate]), /unacknowledged|unsettled/i);
+    assert.throws(() => f.control.assertWindow({ issuedAt: new Date(at).toISOString(), stopAt: new Date(at + 300000).toISOString() }), /unacknowledged|unsettled/i);
+    assert.equal(posts, 1);
+  });
 });

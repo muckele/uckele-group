@@ -5,7 +5,7 @@ const codes = new Set(['request-denied', 'request-failed', 'timed-out', 'http-fa
 function checked(value) {
   if (!value || Object.keys(value).some(k => !['version', 'code', 'method', 'timeoutMs'].includes(k))
     || value.version !== 'p10b-native-request-failure-v1' || !codes.has(value.code)
-    || !['GET', 'POST'].includes(value.method) || !Number.isInteger(value.timeoutMs)
+    || !['GET', 'POST', 'WAIT'].includes(value.method) || !Number.isInteger(value.timeoutMs)
     || value.timeoutMs < 1 || value.timeoutMs > 10000) {
     throw Error('Invalid public native failure');
   }

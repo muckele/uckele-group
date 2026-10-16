@@ -1,9 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { sha256, stableCanonicalJson } from '../utils/security.js';
+const sessionDigest = session => sha256(stableCanonicalJson(session));
 import { randomUUID } from 'node:crypto';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
 import { assertP10bStoppedUpdateApproval } from './p10bStoppedUpdateContract.js';
+const transportLeases = new WeakMap();
 const assertCredentialApproval = (session, approval, now) => session?.version === 'p10b-stopped-update-session-v2'
   ? assertP10bStoppedUpdateApproval(session, approval, now) : assertP10bNoEmailApproval(session, approval, now);
 
@@ -54,7 +57,13 @@ export function reserveP10bLocalReap(environment = {}) {
     syncDirectory(directory);
   } catch { throw Error('Private local-reap reservation unverified'); }
   let retired = false;
-  return { retire(verified) {
+  return { transportLease(child, sessionDigest) {
+    if (retired || !Number.isSafeInteger(child?.pid) || child.pid < 2
+      || !/^[a-f0-9]{64}$/.test(sessionDigest || '')) throw Error('Owned native transport lease unavailable');
+    const lease = Object.freeze({}); const state = { file, directory, original, sessionDigest, ownerPid: process.pid, child, live: true };
+    child.once('close', () => { state.live = false; }); child.once('error', () => { state.live = false; });
+    transportLeases.set(lease, state); return lease;
+  }, retire(verified) {
     if (retired || verified !== true) return;
     try {
       privateDirectory(directory);
@@ -74,7 +83,21 @@ export function createP10bAppTokenContext({ session, approval, clock = () => Dat
   const original = privateDirectory(directory);
   env.FLY_CONFIG_DIR = directory;
   let closed = false;
-  const context = { assertReaped() {
+  const context = { assertPhaseReaped(lease) {
+    try {
+      const state = transportLeases.get(lease); const current = privateDirectory(directory);
+      if (session.version !== 'p10b-guardian-only-session-v1' || !state || !state.live || state.ownerPid !== process.pid
+        || state.directory !== directory || state.sessionDigest !== (sessionDigest(session))
+        || current.ino !== original.ino || current.dev !== original.dev
+        || fs.readdirSync(directory).some(name => name.startsWith('.p10b-reap-') && name !== path.basename(state.file))) throw Error();
+      const stat = fs.lstatSync(state.file, { bigint: true });
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n
+        || ['ino', 'dev', 'uid', 'mode', 'size', 'mtimeNs', 'ctimeNs'].some(key => stat[key] !== state.original[key])) throw Error();
+      process.kill(state.child.pid, 0);
+      if (!state.live) throw Error();
+      return true;
+    } catch { throw Error('Private phase descendant-reap proof unavailable'); }
+  }, assertReaped() {
     try {
       const current = privateDirectory(directory);
       if (current.ino !== original.ino || current.dev !== original.dev

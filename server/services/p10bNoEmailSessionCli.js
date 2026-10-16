@@ -2,13 +2,14 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readP10bPublicJson, createP10bOperatorEvidence, createP10bRecoveryFilesystem, inspectP10bRecovery } from './p10bOperatorFiles.js';
-import { assertP10bNoEmailApproval, runP10bNoEmailOperator, validateP10bBaselineConfig } from './p10bRuntimeOnlyOperator.js';
+import { assertP10bNoEmailApproval, runP10bNoEmailOperator, validateP10bBaselineConfig, isP10bGuardianSession } from './p10bRuntimeOnlyOperator.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { recoverP10bAdmissionReservation } from './p10bAdmissionRecovery.js';
 import { openP10bNativeMachineClient } from './p10bNativeMachineClient.js';
 import { createP10bNoEmailBoundaries } from './p10bNoEmailBoundaries.js';
 import { createP10bOperatorProcesses } from './p10bOperatorProcesses.js';
 import { assertP10bReviewedCheckout, assertP10bNoEmailHostBinding, assertP10bFlyExecutable, P10B_RETAINED_GUEST_HEAD } from './p10bOperatorSource.js';
+import { assertP10bPriorArchiveBinding } from './p10bExistingArchiveRecovery.js';
 import { createP10bAppTokenContext } from './p10bHostAuthentication.js';
 
 export function assertP10bImagePrerequisite(session, image, now = Date.now()) {
@@ -66,6 +67,7 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
   if (args.length !== 7 || !['--execute', '--run'].includes(args[0]) || args[1] !== '--bundle'
     || args[3] !== '--evidence' || args[5] !== '--native-client') throw Error('Expected --execute|--run --bundle FILE --evidence DIR --native-client FILE');
   const { session, approval, imageEvidence, status } = read(args[2]);
+  const guardian = isP10bGuardianSession(session);
   if (status === 'SESSION_NOT_APPROVED') throw Error('Session is held');
   assertP10bNoEmailApproval(session, approval, clock()); assertP10bImagePrerequisite(session, imageEvidence, clock());
   assertP10bNoEmailHostBinding(session, checkSource);
@@ -77,9 +79,11 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
   const e = session.recovery;
   if (e?.directory !== directory || e.activePath !== path.join(directory, `${session.machineId}.active.json`)
     || e.attemptPath !== path.join(directory, `${e.packetDigest}.attempt.json`)
-    || e.archivePath !== path.join(directory, `${session.machineId}.active.json.archived-uncertain-${session.nonce}.json`)
+    || (!e.priorArchive && e.archivePath !== path.join(directory, `${session.machineId}.active.json.archived-uncertain-${session.nonce}.json`))
+    || (e.priorArchive && !guardian)
     || e.intentPath !== path.join(evidence.root, 'p10b-recovery-intent.json')
     || e.terminalPath !== path.join(evidence.root, 'p10b-recovery-terminal.json')) throw Error('Frozen recovery paths required');
+  if (e.priorArchive) assertP10bPriorArchiveBinding(e);
   const verifier = fileURLToPath(new URL('../../scripts/run-p10b-admission-verifier.js', import.meta.url));
   const auth = createAuth({ session, approval, clock });
   processes ||= createP10bOperatorProcesses({ environment: auth.environment });
@@ -112,9 +116,9 @@ export async function runP10bNoEmailSessionCli(args, { read = readP10bPublicJson
     stage = 'runtime-operator';
     result = await runP10bNoEmailOperator({ session, approval, evidence, recovery,
       inspectRecovery: () => inspectRecovery(session), clock,
-      verifyPrivateReap() {
+      verifyPrivateReap(transportLease) {
         if (initializationUncertain) throw Error('Native descendant reaping uncertain');
-        return auth.assertReaped();
+        return guardian ? auth.assertPhaseReaped(transportLease) : auth.assertReaped();
       },
       createBoundaries: input => createBoundaries({ ...input, evidence, recovery,
         inspectRecovery: () => inspectRecovery(session), nativeExecutable, flyExecutable, processes,

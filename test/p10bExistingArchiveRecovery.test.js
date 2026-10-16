@@ -10,6 +10,124 @@ import { existingArchiveFixture, materializeExistingArchive } from './helpers/p1
 
 const recover = f => recoverP10bAdmissionReservation({ ...f, clock: () => f.now });
 const inspect = f => inspectP10bRecovery(f.session, f.filesystem);
+const guardianFixture = () => {
+  const f = existingArchiveFixture();
+  Object.assign(f.session, { version: 'p10b-guardian-only-session-v1', operation: 'guardian-only',
+    recoveryPolicy: 'acknowledged-only-stopped-runtime-v1',
+    maximumStarts: 1, maximumStartWindowMs: 300000, maximumStoppedConfigUpdates: 2,
+    maximumLocalBuilds: 0, maximumImagePushes: 0,
+    sessionDeadline: new Date(f.now + 3600000).toISOString() });
+  f.approval.sessionDigest = f.digest(f.session);
+  return f;
+};
+const verify = (f, recovery) => verifyP10bAdmissionArchive({ session: f.session, recovery,
+  inspect: () => inspect(f), verifierPid: process.pid + 200, now: f.now });
+
+test('guardian-only archive admission preserves all historical bytes and requires its own independent proof', () => {
+  const f = guardianFixture(); const recovery = recover(f);
+  assert.equal(recovery.terminal.archivePreserved, true);
+  assert.equal(recovery.terminal.historicalCleanupVerified, false);
+  assert.equal(recovery.intent.sessionDigest, f.digest(f.session));
+  assert.throws(() => assertP10bRecoveryAdmission({ session: f.session, recovery, inspect: () => inspect(f), now: f.now }));
+  recovery.verification = verify(f, recovery);
+  assert.equal(assertP10bRecoveryAdmission({ session: f.session, recovery, inspect: () => inspect(f), now: f.now }), true);
+  assert.deepEqual(f.writes, [f.session.recovery.intentPath, f.session.recovery.terminalPath]);
+  for (const row of f.original) assert.equal(f.filesystem.read(row.path), row.bytes);
+  assert.equal(f.filesystem.exists(f.session.recovery.activePath), false);
+  assert.throws(() => recover(f));
+});
+
+test('guardian archive admission rejects broader authority before writing fresh evidence', async t => {
+  const cases = {
+    legacy: f => { f.session.version = 'p10b-no-email-session-v1'; },
+    operation: f => { f.session.operation = 'prepare'; },
+    policy: f => { f.session.recoveryPolicy = 'legacy'; },
+    qualification: f => { f.session.qualificationAllowed = true; },
+    starts: f => { f.session.maximumStarts = 2; },
+    window: f => { f.session.maximumStartWindowMs = 300001; },
+    updates: f => { f.session.maximumStoppedConfigUpdates = 3; },
+    builds: f => { f.session.maximumLocalBuilds = 1; },
+    pushes: f => { f.session.maximumImagePushes = 1; },
+    production: f => { f.session.productionReady = true; },
+    automation: f => { f.session.globalAutomationPaused = false; },
+    deadline: f => { f.session.sessionDeadline = new Date(f.now + 3600001).toISOString(); }
+  };
+  for (const [name, mutate] of Object.entries(cases)) await t.test(name, () => {
+    const f = guardianFixture(); mutate(f); f.approval.sessionDigest = f.digest(f.session);
+    assert.throws(() => recover(f)); assert.equal(f.writes.length, 0);
+  });
+});
+
+test('guardian archive proof refuses cross-session replay, stale verification and archive or active conflicts', async t => {
+  const cases = {
+    'session-replay': f => { f.session.nonce = 'f'.repeat(24); },
+    'expired-proof': f => { f.now += 3600001; },
+    'changed-archive': f => { f.files.get(f.session.recovery.archivePath).bytes += ' '; },
+    'active-conflict': f => { f.files.set(f.session.recovery.activePath, { regular: true, bytes: '{}' }); },
+    'same-verifier': (f, recovery) => {
+      recovery.verification.verifierPid = recovery.terminal.operatorPid;
+    }
+  };
+  for (const [name, mutate] of Object.entries(cases)) await t.test(name, () => {
+    const f = guardianFixture(); const recovery = recover(f); recovery.verification = verify(f, recovery);
+    mutate(f, recovery);
+    assert.throws(() => assertP10bRecoveryAdmission({ session: f.session, recovery, inspect: () => inspect(f), now: f.now }));
+    for (const row of f.original) if (name !== 'changed-archive' || row.path !== f.session.recovery.archivePath)
+      assert.equal(f.filesystem.read(row.path), row.bytes);
+  });
+});
+
+test('guardian admission remains valid during its original session only with current coherent archive inspection', () => {
+  const f = guardianFixture(); const recovery = recover(f); recovery.verification = verify(f, recovery);
+  const admittedAt = f.now;
+  f.now += 300000;
+  let inspections = 0;
+  const assertCurrent = () => assertP10bRecoveryAdmission({ session: f.session, recovery, now: f.now,
+    clock: () => f.now, inspect: () => { inspections++; return inspect(f); } });
+  assert.equal(assertCurrent(), true);
+  assert.equal(inspections, 1);
+  assert.equal(recovery.verification.verifiedAt, new Date(admittedAt).toISOString());
+  f.files.get(f.session.recovery.archivePath).bytes += ' ';
+  assert.throws(assertCurrent);
+  f.files.get(f.session.recovery.archivePath).bytes = f.original[0].bytes;
+  f.now = Date.parse(f.session.sessionDeadline);
+  assert.throws(assertCurrent);
+});
+
+test('diagnostic archive proof still expires after two minutes within its unchanged session deadline', () => {
+  const f = existingArchiveFixture(); const recovery = recover(f); recovery.verification = verify(f, recovery);
+  f.now += 120001;
+  assert.throws(() => assertP10bRecoveryAdmission({ session: f.session, recovery, now: f.now,
+    clock: () => f.now, inspect: () => inspect(f) }));
+});
+
+test('guardian archive admission requires fresh matching stopped baseline and separate observing process', async t => {
+  const cases = {
+    'missing-owner-approval': f => { f.approval.approved = false; },
+    'missing-exclusive-writers': f => { f.approval.exclusiveAdmissionWriters = false; },
+    'baseline-running': f => { f.baseline.state = 'started'; },
+    'baseline-mismatch': f => { f.independentBaseline.machineDigest = 'f'.repeat(64); },
+    'baseline-stale': f => { f.independentBaseline.observedAt = new Date(f.now - 30001).toISOString(); },
+    'same-process-baseline': f => { f.independentBaseline.verifierPid = process.pid; }
+  };
+  for (const [name, mutate] of Object.entries(cases)) await t.test(name, () => {
+    const f = guardianFixture(); mutate(f);
+    assert.throws(() => recover(f)); assert.deepEqual(f.writes, []);
+    for (const row of f.original) assert.equal(f.filesystem.read(row.path), row.bytes);
+  });
+});
+
+test('guardian proof cannot be promoted to legacy or prepare authority by rehashing its current-session links', () => {
+  for (const broaden of [s => { s.version = 'p10b-no-email-session-v1'; }, s => { s.operation = 'prepare'; }]) {
+    const f = guardianFixture(); const recovery = recover(f); recovery.verification = verify(f, recovery);
+    broaden(f.session);
+    recovery.intent.sessionDigest = recovery.terminal.sessionDigest = recovery.verification.sessionDigest = f.digest(f.session);
+    recovery.terminal.intentDigest = f.digest(recovery.intent);
+    recovery.verification.terminalDigest = f.digest(recovery.terminal);
+    assert.throws(() => assertP10bRecoveryAdmission({ session: f.session, recovery, inspect: () => inspect(f), now: f.now }));
+  }
+});
+
 test('existing preserved archive admits a new session through fresh independent read-only proof', () => {
   const f = existingArchiveFixture();
   const recovery = recover(f);

@@ -38,11 +38,16 @@ export async function awaitP10bPreparationChild({ child, readResult, onExit } = 
 // Importing this module performs no authentication, I/O or external operation.
 export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => Date.now(),
   wait = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  const guardian = session?.version === 'p10b-guardian-only-session-v1';
+  const labels = guardian ? ['demo', 'rollback'] : ['demo', 'prepare', 'rollback'];
   const start = Date.parse(session?.startedAt); const deadline = Date.parse(session?.sessionDeadline);
   if (session?.app !== 'uckele-group-p10b' || session.machineId !== machineId
     || !Number.isFinite(start) || !Number.isFinite(deadline) || deadline - start > 3600000 || deadline <= start
-    || session.maximumStarts !== 2 || session.maximumStartWindowMs !== 300000 || session.maximumIncrementalUsd !== 1
-    || session.maximumStoppedConfigUpdates !== 3 || session.productionReady !== false || session.globalAutomationPaused !== true
+    || session.maximumStarts !== (guardian ? 1 : 2) || session.maximumStartWindowMs !== 300000 || session.maximumIncrementalUsd !== 1
+    || session.maximumStoppedConfigUpdates !== (guardian ? 2 : 3)
+    || (guardian && (session.operation !== 'guardian-only' || session.qualificationAllowed !== false
+      || session.maximumLocalBuilds !== 0 || session.maximumImagePushes !== 0
+      || session.recoveryPolicy !== 'acknowledged-only-stopped-runtime-v1')) || session.productionReady !== false || session.globalAutomationPaused !== true
     || !/^[a-f0-9]{64}$/.test(session.ownerPermissionDigest || '')
     || !/^sha256:[a-f0-9]{64}$/.test(session.candidateImageDigest || '')
     || !/^sha256:[a-f0-9]{64}$/.test(session.baselineImageDigest || '')) throw Error('Frozen runtime session invalid');
@@ -51,6 +56,13 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
     if (!Number.isFinite(now) || !Number.isFinite(reserve) || reserve < 0
       || now < start || now + reserve >= deadline) throw Error('Frozen session cutoff');
   }
+  function mutationUncertain() {
+    return ['demo', 'prepare', 'rollback'].some(label => evidence.has(`p10b-runtime-only-update-${label}-intent.json`)
+      && !evidence.has(`p10b-runtime-only-update-${label}-verified.json`));
+  }
+  function assertMutationSettled() {
+    if (mutationUncertain()) throw Error('Unacknowledged or unsettled update; replay and automatic restoration forbidden');
+  }
   function assertStopped(machine, expectedConfig) {
     const expectedDigest = expectedConfig.image?.split('@')[1];
     if (machine.id !== machineId || machine.state !== 'stopped' || machine.region !== 'ewr' || !machine.instance_id
@@ -58,6 +70,7 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
       || (expectedDigest && machine.image_ref?.digest !== expectedDigest)) throw Error('Exact stopped full configuration changed');
   }
   function assertWindow(window, now = clock()) {
+    assertMutationSettled();
     assertTime(330000, now);
     if (Date.parse(window.issuedAt) > now || now - Date.parse(window.issuedAt) > 60000
       || Date.parse(window.stopAt) - Date.parse(window.issuedAt) !== 300000
@@ -92,12 +105,14 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
   }
   async function guardedUpdate(client, expectedConfig, nextConfig, label) {
     assertTime(label === 'rollback' ? 30000 : 360000);
-    if (!['demo', 'prepare', 'rollback'].includes(label)) throw Error('Update not admitted');
-    const used = ['demo', 'prepare', 'rollback'].filter(value => evidence.has(`p10b-runtime-only-update-${value}-intent.json`));
-    if (used.includes(label) || used.length >= 3) throw Error('Update replay forbidden');
+    if (!labels.includes(label)) throw Error('Update not admitted');
+    const used = labels.filter(value => evidence.has(`p10b-runtime-only-update-${value}-intent.json`));
+    if (used.includes(label) || used.length >= labels.length) throw Error('Update replay forbidden');
     if (label === 'prepare' && (!evidence.has('p10b-runtime-only-demo-proof.json')
       || evidence.read('p10b-runtime-only-demo-proof.json')?.success !== true)) throw Error('Guardian timing proof required');
+    assertMutationSettled();
     const current = await client(); assertStopped(current, expectedConfig);
+    if (guardian && label === 'demo' && current.instance_id !== session.baselineInstanceId) throw Error('Frozen baseline instance changed');
     assertTime(label === 'rollback' ? 30000 : 360000);
     if (nextConfig.restart?.policy !== 'no' || nextConfig.guest?.memory_mb !== 512 || nextConfig.guest?.cpus !== 1
       || nextConfig.guest?.cpu_kind !== 'shared' || nextConfig.mounts?.length !== 1
@@ -113,15 +128,27 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
     // 10s cap; it is still a single request bounded by the original deadline.
     const updated = await client('POST', { config: nextConfig, skip_launch: true, current_version: current.instance_id }, 10000);
     evidence.write(`p10b-runtime-only-update-${label}-response.json`, updated);
+    if (!/^[A-Za-z0-9-]{1,80}$/.test(updated?.instance_id || '') || updated.instance_id === current.instance_id
+      || updated.id !== machineId || updated.region !== 'ewr' || !['created', 'stopped'].includes(updated.state)
+      || stableCanonicalJson(updated.config) !== stableCanonicalJson(nextConfig)
+      || updated.image_ref?.digest !== nextConfig.image?.split('@')[1]) throw Error('Stopped update acknowledgement invalid');
+    const settlementDeadline = Math.min(clock() + 10000, deadline);
+    if (guardian) {
+      const settlement = await client('WAIT', { version: updated.instance_id }, 9000);
+      evidence.write(`p10b-runtime-only-update-${label}-settlement.json`, settlement);
+      if (settlement?.ok !== true || !['created', 'stopped'].includes(settlement.state) || settlement.version !== updated.instance_id
+        || clock() >= settlementDeadline) throw Error('Acknowledged stopped update settlement failed');
+    }
     const readbacks = [];
     try {
-      const checked = await readUpdatedStopped(client, nextConfig, updated.instance_id, Math.min(clock() + 10000, deadline),
+      const checked = await readUpdatedStopped(client, nextConfig, updated.instance_id, settlementDeadline,
         { previous: current, onReadback: value => readbacks.push(value) });
       evidence.write(`p10b-runtime-only-update-${label}-verified.json`, checked);
       return checked;
     } finally { evidence.write(`p10b-runtime-only-update-${label}-readback.json`, readbacks); }
   }
   async function restoreBaseline(client, baselineConfig, knownConfigs) {
+    assertMutationSettled();
     assertTime(30000);
     const current = await client();
     assertTime(30000);
@@ -140,5 +167,5 @@ export function createP10bRuntimeOnlyControl({ session, evidence, clock = () => 
     evidence.write('p10b-runtime-only-restored.json', restored);
     return restored;
   }
-  return { assertTime, assertStopped, assertWindow, readUpdatedStopped, guardedUpdate, restoreBaseline };
+  return { assertTime, assertStopped, assertWindow, assertMutationSettled, mutationUncertain, readUpdatedStopped, guardedUpdate, restoreBaseline };
 }

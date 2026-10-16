@@ -14,7 +14,10 @@ export const openP10bStoppedUpdateClient = options => openMachineClient(true, op
 async function openMachineClient(diagnostic, { executable, args = diagnostic ? ['--serve-stopped-update-diagnostic'] : ['--serve'], session, approval,
   configs, readOnly = false, recoveryVerified = false, spawnProcess = spawn, clock = () => Date.now(),
   environment = { PATH: process.env.PATH, HOME: process.env.HOME } }) {
+  const guardian = session?.version === 'p10b-guardian-only-session-v1';
+  const guardedTransport = diagnostic || guardian;
   (diagnostic ? assertP10bStoppedUpdateApproval : assertP10bNoEmailApproval)(session, approval, clock());
+  if (guardian && environment.P10B_APP_TOKEN_CONTEXT !== 'p10b-app-token-context-v1') throw Error('Exact private guardian context required');
   if (diagnostic && (environment.P10B_APP_TOKEN_CONTEXT !== 'p10b-app-token-context-v1'
     || stableCanonicalJson(configs) !== stableCanonicalJson([session.baselineConfig, session.diagnosticConfig]))) throw Error('Exact private stopped-only context required');
   if (!readOnly && recoveryVerified !== true) throw Error('Recovery gate must precede native mutation client');
@@ -61,23 +64,23 @@ async function openMachineClient(diagnostic, { executable, args = diagnostic ? [
         const frame = JSON.parse(line); const current = pending;
         if (!current || (current.id === 0 ? frame.version !== (diagnostic ? 'p10b-stopped-native-ready-v1' : 'p10b-native-ready-v1') || frame.ready !== true
           : frame.id !== current.id || typeof frame.ok !== 'boolean')) throw Error();
-        if (current.id !== 0 && Object.keys(frame).some(k => !['id', 'ok', 'error', 'machine', ...(diagnostic ? ['observation', 'settlement'] : [])].includes(k))) throw Error();
+        if (current.id !== 0 && Object.keys(frame).some(k => !['id', 'ok', 'error', 'machine', ...(guardedTransport ? ['observation', 'settlement'] : [])].includes(k))) throw Error();
         if (diagnostic && current.id === 0 && Object.keys(frame).some(k => !['version', 'ready'].includes(k))) throw Error();
         if (frame.error !== undefined && !['request-denied', 'request-failed', 'timed-out', 'http-failed', 'output-bound', 'invalid-output'].includes(frame.error)) throw Error();
         if (current.id !== 0 && (frame.ok === true ? frame.error !== undefined
           : frame.error === undefined || frame.machine !== undefined || frame.settlement !== undefined)) throw Error();
-        const observation = diagnostic && current.id !== 0 ? checkedP10bStoppedObservation(frame.observation, frame.ok ? null : frame.error) : null;
-        if (diagnostic && current.id !== 0 && frame.ok && (current.method === 'WAIT'
+        const observation = guardedTransport && current.id !== 0 ? checkedP10bStoppedObservation(frame.observation, frame.ok ? null : frame.error) : null;
+        if (guardedTransport && current.id !== 0 && frame.ok && (current.method === 'WAIT'
           ? frame.machine !== undefined || frame.settlement === undefined
           : frame.machine === undefined || frame.settlement !== undefined)) throw Error();
-        const settlement = diagnostic && current.id !== 0 && frame.ok && current.method === 'WAIT'
+        const settlement = guardedTransport && current.id !== 0 && frame.ok && current.method === 'WAIT'
           ? checkedP10bStoppedSettlement(frame.settlement, current.version) : null;
         const failure = current.id !== 0 && frame.ok !== true ? diagnostic ? new P10bStoppedUpdateRequestError({
           code: frame.error, method: current.method, timeoutMs: current.timeoutMs, observation }) : new P10bNativeRequestError({
           code: frame.error, method: current.method, timeoutMs: current.timeoutMs }) : null;
         clearTimeout(current.timer); pending = null;
         if (failure) current.reject(failure);
-        else current.resolve(current.id === 0 ? true : diagnostic ? { ...(settlement ? { settlement } : { machine: frame.machine }), observation } : frame.machine);
+        else current.resolve(current.id === 0 ? true : diagnostic ? { ...(settlement ? { settlement } : { machine: frame.machine }), observation } : guardian && settlement ? settlement : frame.machine);
       } catch { fail('bridge-protocol'); return; }
     }
   });
@@ -103,10 +106,11 @@ async function openMachineClient(diagnostic, { executable, args = diagnostic ? [
     }
     finally { clearTimeout(timer); }
   }
-  return { pid: child.pid, client(method = 'GET', body, timeoutMs = 1000) {
-    if (!(diagnostic ? ['GET', 'POST', 'WAIT'] : ['GET', 'POST']).includes(method) || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10000
-      || (method === 'POST' && (readOnly || posts >= (diagnostic ? 2 : 3)))
-      || (diagnostic && (method === 'POST' ? timeoutMs !== 10000 : method === 'WAIT'
+  const transportLease = guardian && !readOnly ? reservation.transportLease(child, sha256(canonical)) : undefined;
+  return { pid: child.pid, transportLease, client(method = 'GET', body, timeoutMs = 1000) {
+    if (!(guardedTransport ? ['GET', 'POST', 'WAIT'] : ['GET', 'POST']).includes(method) || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10000
+      || (method === 'POST' && (readOnly || posts >= (guardedTransport ? 2 : 3)))
+      || (guardedTransport && (method === 'POST' ? timeoutMs !== 10000 : method === 'WAIT'
         ? timeoutMs < 1000 || timeoutMs > 9000 || !body || Object.keys(body).join(',') !== 'version' || !/^[A-Za-z0-9-]{1,80}$/.test(body.version || '')
         : timeoutMs > 1000))) return Promise.reject(diagnostic
         ? new P10bStoppedUpdateRequestError({ code: 'request-denied', method: ['GET', 'POST', 'WAIT'].includes(method) ? method : 'GET',

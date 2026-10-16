@@ -240,3 +240,46 @@ test('consolidated receipt location is bound statically without creating an issu
     assert.throws(() => preflight.checkP10bOwnerRecipe(f.recipe, f.options));
   }
 });
+
+test('guardian-only preflight preserves historical archive and seals one inert start without build or preparation authority', async t => {
+  const f = existingArchiveDiagnostic(t);
+  f.recipe.version = 'p10b-owner-guardian-only-recipe-v1';
+  delete f.recipe.files.diagnosticNative;
+  const source = await import('../server/services/p10bOperatorSource.js');
+  f.recipe.files.guardianNative = { path: process.execPath, sha256: source.P10B_GUARDIAN_NATIVE_SHA256 || 'f'.repeat(64) };
+  const originalCheck = f.options.checkFile;
+  f.options.checkFile = item => item === f.recipe.files.guardianNative ? item.path : originalCheck(item);
+  f.permission.recipeDigest = digest(f.recipe);
+  const archivedBytes = fs.readFileSync(f.recipe.recovery.archivePath);
+  const checked = preflight.checkP10bOwnerRecipe(f.recipe, f.options);
+  assert.equal(checked.operation, 'guardian-only'); assert.equal(checked.maximumStarts, 1);
+  assert.equal(checked.maximumLocalBuilds, 0); assert.equal(checked.maximumImagePushes, 0);
+  assert.equal(checked.maximumStoppedConfigUpdates, 2); assert.equal(checked.qualificationAllowed, false);
+  assert.equal(checked.recoveryPolicy, 'acknowledged-only-stopped-runtime-v1');
+  const result = await preflight.prepareP10bOwnerBundle({ ...f, ...f.options });
+  const bundle = JSON.parse(fs.readFileSync(result.sealedBundlePath));
+  assert.equal(bundle.version, 'p10b-guardian-only-bundle-v1');
+  assert.equal(bundle.approval.version, 'p10b-guardian-only-approval-v1'); assert.equal(bundle.approval.approved, false);
+  const s = bundle.session;
+  assert.equal(s.version, 'p10b-guardian-only-session-v1'); assert.equal(s.operation, 'guardian-only');
+  assert.equal(s.maximumStarts, 1); assert.equal(s.maximumStartWindowMs, 300000); assert.equal(s.maximumStoppedConfigUpdates, 2);
+  assert.equal(s.maximumLocalBuilds, 0); assert.equal(s.maximumImagePushes, 0); assert.equal(s.qualificationAllowed, false);
+  assert.equal(s.recoveryPolicy, 'acknowledged-only-stopped-runtime-v1');
+  assert.equal(s.nativeClientSha256, f.recipe.files.guardianNative.sha256);
+  assert.equal(s.baselineInstanceId, f.machine.instance_id); assert.ok(s.baselineObservedAt);
+  assert.equal(Date.parse(s.sessionDeadline) - Date.parse(s.startedAt), 3600000);
+  assert.equal(bundle.imageEvidence.buildCount, 1); assert.equal(bundle.imageEvidence.pushCount, 1);
+  assert.deepEqual(fs.readFileSync(f.recipe.recovery.archivePath), archivedBytes);
+  assert.deepEqual(s.recovery.priorArchive, f.recipe.recovery.priorArchive);
+  assert.equal(result.operation, 'guardian-only'); assert.equal(fs.existsSync(result.privateAuthDirectory), false);
+  assert.equal(f.commands.some(c => c.args.some(a => ['start', 'update', 'build', 'push'].includes(a))), false);
+});
+
+test('guardian-only recipe refuses absent or legacy guardian binary before private commands', async t => {
+  for (const mode of ['absent', 'legacy']) await t.test(mode, t => {
+    const f = existingArchiveDiagnostic(t); f.recipe.version = 'p10b-owner-guardian-only-recipe-v1';
+    if (mode === 'legacy') f.recipe.files.guardianNative = f.recipe.files.native;
+    assert.throws(() => preflight.checkP10bOwnerRecipe(f.recipe, f.options));
+    assert.equal(f.commands.length, 0); assert.equal(fs.readdirSync(f.recipe.evidenceDirectory).length, 0);
+  });
+});

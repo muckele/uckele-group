@@ -320,3 +320,36 @@ test('native adapter rejects accidental credential output while its initializati
   try { await assert.rejects(client.client('GET', undefined, 100), error => !String(error).includes(canary)); }
   finally { assert.equal(await client.reap(), true); }
 });
+
+
+function guardianFixture() {
+  const f = fixture(); Object.assign(f.session, { version: 'p10b-guardian-only-session-v1', operation: 'guardian-only',
+    qualificationAllowed: false, recoveryPolicy: 'acknowledged-only-stopped-runtime-v1', maximumStarts: 1,
+    maximumStoppedConfigUpdates: 2, maximumLocalBuilds: 0, maximumImagePushes: 0,
+    baselineInstanceId: 'baseline-version', baselineObservedAt: new Date(now).toISOString() });
+  f.approval.version = 'p10b-guardian-only-approval-v1'; f.approval.sessionDigest = digest(f.session); return f;
+}
+test('guardian phase reap admits only its exact live direct native lease; final cleanup still requires full reap', async () => {
+  const { spawn } = await import('node:child_process'); const { once } = await import('node:events');
+  const f = guardianFixture(); const context = auth.createP10bAppTokenContext({ ...f, environment: { FLY_API_TOKEN: canary } });
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'ignore' });
+  const exited = once(child, 'close'); const reservation = auth.reserveP10bLocalReap(context.environment);
+  try {
+    const lease = reservation.transportLease(child, digest(f.session));
+    assert.throws(() => context.assertReaped()); assert.throws(() => context.cleanup({ reaped: true }));
+    assert.equal(context.assertPhaseReaped(lease), true);
+    assert.throws(() => context.assertPhaseReaped({}), /reap/i);
+    const other = auth.reserveP10bLocalReap(context.environment);
+    assert.throws(() => context.assertPhaseReaped(lease), /reap/i);
+    other.retire(true); assert.equal(context.assertPhaseReaped(lease), true);
+    const g = guardianFixture(); g.session.nonce = 'a'.repeat(24);
+    g.session.authenticationEvidence.tokenName = `p10b-runtime-no-email-${g.session.nonce}`; g.approval.sessionDigest = digest(g.session);
+    const otherContext = auth.createP10bAppTokenContext({ ...g, environment: { FLY_API_TOKEN: canary } });
+    try { assert.throws(() => otherContext.assertPhaseReaped(lease)); } finally { otherContext.cleanup({ reaped: true }); }
+    child.kill('SIGKILL'); await exited;
+    assert.throws(() => context.assertPhaseReaped(lease));
+    reservation.retire(true); assert.equal(context.assertReaped(), true); context.cleanup({ reaped: true });
+  } finally {
+    child.kill('SIGKILL'); await exited; reservation.retire(true); context.cleanup({ reaped: true });
+  }
+});
