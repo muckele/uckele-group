@@ -6,12 +6,13 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 } from '../server/services/p10bStoppedUpdateContract.js';
+import { materializeExistingArchive } from './helpers/p10bExistingArchiveFixture.js';
 const preflight = await import('../server/services/p10bOwnerPreflight.js').catch(() => ({}));
 const digest = value => sha256(stableCanonicalJson(value));
 const baseline = JSON.parse(fs.readFileSync(new URL('./fixtures/p10bObservedBaselineShape.json', import.meta.url)));
 const manifest = fs.readFileSync(new URL('./fixtures/p10bRetainedCandidateManifest.json', import.meta.url), 'utf8');
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-preparer-fixture-'));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-preparer-fixture-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const evidence = path.join(root, 'runtime-evidence'); fs.mkdirSync(evidence, { mode: 0o700 });
   const bind = file => ({ path: file, sha256: sha256(fs.readFileSync(file)) });
@@ -59,6 +60,40 @@ function fixture(t) {
         return result; }; return runner; }, environment: { FLY_API_TOKEN: 'offline-opaque-input' } };
   return { root, recipe, receipt, permission, machine, commands, runner, options };
 }
+function existingArchiveDiagnostic(t) {
+  const f = fixture(t); f.recipe.version = 'p10b-owner-stopped-update-recipe-v2';
+  f.recipe.ownerIssuanceDirectory = path.join(f.root, 'owner-public-issuance');
+  f.recipe.files.diagnosticNative = { path: process.execPath, sha256: P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 };
+  f.recipe.recovery = materializeExistingArchive(f.root);
+  delete f.recipe.recovery.intentPath; delete f.recipe.recovery.terminalPath;
+  const check = f.options.checkFile;
+  f.options.checkFile = item => item === f.recipe.files.diagnosticNative ? item.path : check(item);
+  f.permission.recipeDigest = digest(f.recipe); return f;
+}
+test('existing-archive diagnostic static check verifies local provenance before credentials and seals exact old archive path', async t => {
+  const f = existingArchiveDiagnostic(t);
+  assert.equal(preflight.checkP10bOwnerRecipe(f.recipe, f.options).admissionRecovery, 'existing-archive-read-only');
+  const result = await preflight.prepareP10bOwnerBundle({ ...f, ...f.options });
+  const bundle = JSON.parse(fs.readFileSync(result.sealedBundlePath));
+  assert.deepEqual(bundle.session.recovery.priorArchive, f.recipe.recovery.priorArchive);
+  assert.equal(bundle.session.recovery.archivePath, f.recipe.recovery.archivePath);
+  assert.equal(bundle.approval.approved, false);
+});
+test('legacy recipes reject existing-archive admission and local drift holds before private setup', async t => {
+  await t.test('legacy', t => {
+    const f = existingArchiveDiagnostic(t); f.recipe.version = 'p10b-owner-preparer-recipe-v1';
+    assert.throws(() => preflight.checkP10bOwnerRecipe(f.recipe, f.options));
+  });
+  for (const mode of ['active', 'dangling-symlink', 'receipt-bytes', 'archive-inode']) await t.test(mode, t => {
+    const f = existingArchiveDiagnostic(t); const r = f.recipe.recovery;
+    if (mode === 'active') fs.writeFileSync(r.activePath, '{}', { mode: 0o600 });
+    if (mode === 'dangling-symlink') fs.symlinkSync(path.join(f.root, 'absent'), r.activePath);
+    if (mode === 'receipt-bytes') fs.appendFileSync(r.priorArchive.intent.path, ' ');
+    if (mode === 'archive-inode') { const bytes = fs.readFileSync(r.archivePath); fs.renameSync(r.archivePath, `${r.archivePath}.preserved`); fs.writeFileSync(r.archivePath, bytes, { mode: 0o600 }); }
+    assert.throws(() => preflight.checkP10bOwnerRecipe(f.recipe, f.options));
+    assert.equal(f.commands.length, 0); assert.equal(fs.readdirSync(f.recipe.evidenceDirectory).length, 0);
+  });
+});
 test('preparer seals actual bounded public facts with original clock and no manufactured final approval', async t => {
   assert.equal(typeof preflight.prepareP10bOwnerBundle, 'function');
   const f = fixture(t); const result = await preflight.prepareP10bOwnerBundle({ ...f, ...f.options });

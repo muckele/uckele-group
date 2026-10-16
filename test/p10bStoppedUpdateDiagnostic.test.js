@@ -84,6 +84,17 @@ test('stopped-only consent rejects qualification, starts, retry, wrong targets a
   const { session, approval } = stoppedDiagnosticFixture(); approval.version = 'p10b-no-email-approval-v1';
   assert.throws(() => contract.assertP10bStoppedUpdateApproval(session, approval, Date.now()));
 });
+test('slow final admission cannot dispatch beyond the original cutoff or consume its restoration reserve', async () => {
+  for (const delay of [85000, 125000]) {
+    let now = Date.now(); const { session, approval } = stoppedDiagnosticFixture(now);
+    const evidence = evidenceStore(); const native = fakeBoundary(session, 'success', ms => { now += ms; });
+    let checks = 0;
+    const result = await operator.runP10bStoppedUpdateDiagnostic({ session, approval, evidence,
+      createClient: async () => native, clock: () => now, assertAdmission() { if (++checks === 5) now += delay; return true; } });
+    assert.equal(result.success, false); assert.equal(native.calls.filter(call => call.method === 'POST').length, 0);
+    assert.equal(result.nativeReapVerified, true);
+  }
+});
 test('diagnostic failures retain only typed status/elapsed/dispatch facts', () => {
   assert.equal(typeof contract.P10bStoppedUpdateRequestError, 'function');
   const facts = { code: 'http-failed', method: 'POST', timeoutMs: 10000,

@@ -9,6 +9,8 @@ import { verifyP10bAdmissionArchive } from '../server/services/p10bAdmissionReco
 import { runP10bStoppedUpdateCli } from '../server/services/p10bStoppedUpdateCli.js';
 import { P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256 } from '../server/services/p10bStoppedUpdateContract.js';
 import { stoppedDiagnosticFixture, diagnosticDigest as digest } from './helpers/p10bStoppedDiagnosticFixture.js';
+import { existingArchiveFixture } from './helpers/p10bExistingArchiveFixture.js';
+import { inspectP10bRecovery } from '../server/services/p10bOperatorFiles.js';
 function fixture() {
   let now = Date.now(); const { session, approval } = stoppedDiagnosticFixture(now); const root = '/synthetic/stopped-evidence';
   const records = new Map(); const files = new Map(); const directory = path.join(os.homedir(), '.uckele-group-p10b-host');
@@ -65,7 +67,7 @@ function fixture() {
       }, async reap() { return true; } };
     } };
   return { options, args: ['--execute', '--bundle', '/synthetic/bundle', '--evidence', root, '--native-client', '/synthetic/native'],
-    bundle, records, files, evidence, contexts: () => contexts, context: () => context, posts: () => posts, advance: ms => { now += ms; } };
+    bundle, records, files, evidence, contexts: () => contexts, context: () => context, posts: () => posts, now: () => now, advance: ms => { now += ms; } };
 }
 test('diagnostic CLI integrates positive independent recovery, zero-start controller and private cleanup', async () => {
   const f = fixture(); const result = await runP10bStoppedUpdateCli(f.args, f.options);
@@ -108,4 +110,40 @@ test('CLI entry cutoff includes slow source and executable admission before cred
   const f = fixture(); f.options.checkSource = () => { f.advance(150000); };
   await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options));
   assert.equal(f.contexts(), 0); assert.equal(f.posts(), 0);
+});
+function existingArchiveCli() {
+  const f = fixture(); const old = existingArchiveFixture(f.now(), os.homedir());
+  const r = old.session.recovery;
+  r.intentPath = `${f.evidence.root}/p10b-recovery-intent.json`; r.terminalPath = `${f.evidence.root}/p10b-recovery-terminal.json`;
+  f.bundle.session.recovery = r; f.bundle.approval.sessionDigest = digest(f.bundle.session);
+  f.options.read = file => file === '/synthetic/bundle' ? f.bundle : JSON.parse(old.filesystem.read(file));
+  f.options.recoveryFilesystem = () => old.filesystem;
+  f.options.inspectRecovery = () => inspectP10bRecovery(f.bundle.session, old.filesystem);
+  f.options.processes.command = async (_executable, args) => {
+    if (args[1] === '--baseline') f.evidence.write('p10b-recovery-independent-baseline.json', {
+      machineDigest: digest({ ...old.baseline, instance_id: f.bundle.session.baselineInstanceId }),
+      independent: true, observedAt: new Date(f.now()).toISOString(), verifierPid: process.pid + 100 });
+    else f.evidence.write('p10b-recovery-independent-verification.json', verifyP10bAdmissionArchive({ session: f.bundle.session,
+      recovery: { intent: JSON.parse(old.filesystem.read(r.intentPath)), terminal: JSON.parse(old.filesystem.read(r.terminalPath)) },
+      inspect: f.options.inspectRecovery, verifierPid: process.pid + 100, now: f.now() }));
+  };
+  return { f, old };
+}
+test('diagnostic CLI completes from a preserved archive with fresh proof and no admission-directory writes', async () => {
+  const { f, old } = existingArchiveCli();
+  const result = await runP10bStoppedUpdateCli(f.args, f.options);
+  assert.equal(result.success, true); assert.equal(result.restored, true); assert.equal(f.posts(), 2);
+  assert.equal(f.evidence.read('p10b-stopped-update-auth-closure.json').cleanupVerified, true);
+  for (const row of old.original) assert.equal(old.filesystem.read(row.path), row.bytes);
+  assert.deepEqual(old.writes, [f.bundle.session.recovery.intentPath, f.bundle.session.recovery.terminalPath]);
+  await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options)); assert.equal(f.contexts(), 1);
+});
+test('archive change after independent proof prevents diagnostic mutation and closes the private context', async () => {
+  const { f, old } = existingArchiveCli(); const command = f.options.processes.command;
+  f.options.processes.command = async (...args) => {
+    await command(...args);
+    if (args[1][1] === '--archive') old.files.get(f.bundle.session.recovery.priorArchive.intent.path).bytes += ' ';
+  };
+  await assert.rejects(runP10bStoppedUpdateCli(f.args, f.options)); assert.equal(f.posts(), 0);
+  assert.equal(f.evidence.read('p10b-stopped-update-auth-closure.json').cleanupVerified, true);
 });

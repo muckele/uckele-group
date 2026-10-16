@@ -660,8 +660,11 @@ def run_owner(recipe_file, runner=run_command, ask=None, token_input=hidden_toke
              'oneUsdIsBillingCap', 'retainedStorageContinues')}, indent=2))
         emit('Existing 1 GB volume remains charged while stopped. Actual rootfs GB is unknown; separate registry '
              'charges remain unverified. Historical snapshot count zero has not been rechecked. No new storage/capacity.')
+        recovery_scope = ('exclusive admission writers and read-only verification of the preserved historical archive; '
+                          'no historical rewrite or rearchival. ' if 'priorArchive' in recipe.get('recovery', {}) else
+                          'exclusive historical archival recovery. ')
         emit('This requires separate owner approval for private app-token setup, fixed-target read-only '
-             'preflight and exclusive historical archival recovery. '
+             'preflight and ' + recovery_scope
              + ('Final stopped-update-only approval follows sealed facts. ' if diagnostic else 'Final runtime approval follows sealed facts. ') +
              'No provider calls/email, no auth renewal. The $1 operational budget is not a billing cap; '
              'retained storage continues. Temporary 0700 Fly/Docker disk state may contain credentials; '

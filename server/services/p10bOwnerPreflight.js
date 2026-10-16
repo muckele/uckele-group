@@ -7,7 +7,8 @@ import { assertP10bReviewedCheckout, P10B_RETAINED_GUEST_HEAD, P10B_RETAINED_IMA
 import { P10B_PUBLIC_ENV_NAMES, P10B_RUNTIME_FLAGS, validateP10bBaselineConfig, validateP10bNoEmailSession } from './p10bRuntimeOnlyOperator.js';
 import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from './p10bProviderIdentity.js';
 import { reserveP10bLocalReap } from './p10bHostAuthentication.js';
-import { createP10bOperatorEvidence } from './p10bOperatorFiles.js';
+import { createP10bOperatorEvidence, createP10bRecoveryFilesystem } from './p10bOperatorFiles.js';
+import { inspectP10bPriorArchive } from './p10bExistingArchiveRecovery.js';
 import { P10B_STOPPED_DIAGNOSTIC_NATIVE_SHA256, createP10bStoppedDiagnosticConfig, validateP10bStoppedUpdateSession } from './p10bStoppedUpdateContract.js';
 const digest = value => sha256(stableCanonicalJson(value));
 const deny = message => { throw Error(message); };
@@ -56,6 +57,11 @@ export function checkP10bOwnerRecipe(recipe, { checkSource = assertP10bReviewedC
     || recipe.recovery.activePath !== path.join(recipe.recovery.directory, `${recipe.machineId}.active.json`)
     || !/^[a-f0-9]{64}$/.test(recipe.recovery.packetDigest || '') || !/^[a-f0-9]{64}$/.test(recipe.recovery.expectedSha256 || '')
     || !canonicalTime(recipe.recovery.reservedAt) || typeof recipe.recovery.evidencePath !== 'string') deny('Frozen historical recovery recipe required');
+  if ('priorArchive' in recipe.recovery) {
+    if (!diagnostic) deny('Existing archive admission is diagnostic-only');
+    inspectP10bPriorArchive({ ...recipe.recovery,
+      attemptPath: path.join(recipe.recovery.directory, `${recipe.recovery.packetDigest}.attempt.json`) }, createP10bRecoveryFilesystem(), clock());
+  }
   const price = JSON.parse(fs.readFileSync(recipe.files.price.path, 'utf8'));
   if (!Number.isFinite(Date.parse(price.observedAt)) || Date.parse(price.observedAt) > clock()
     || clock() - Date.parse(price.observedAt) > 86400000 || price.source !== 'https://docs.fly.io/about/pricing'
@@ -65,6 +71,7 @@ export function checkP10bOwnerRecipe(recipe, { checkSource = assertP10bReviewedC
     ...(diagnostic ? { operation: 'stopped-update-diagnostic', maximumStarts: 0, qualificationAllowed: false,
       maximumDiagnosticPosts: 1, maximumRestorationPosts: 1, maximumLocalBuilds: 0, maximumImagePushes: 0,
       recoveryPolicy: 'acknowledged-only-nonrunning-v1' } : {}),
+    ...('priorArchive' in recipe.recovery ? { admissionRecovery: 'existing-archive-read-only' } : {}),
     tokenInputRequested: false, runtimeApproved: false, productionReady: false, globalAutomationPaused: true };
 }
 export function projectP10bStoppedBaseline(rows, namesOnly = false) {
@@ -249,7 +256,8 @@ export async function prepareP10bOwnerBundle({ recipe, receipt, permission, envi
         providerIdentityDigest: p10bProviderIdentityDigest(P10B_PROVIDER_IDENTITY), flySecretMetadataDigest: digest(names), verifiedAt: observedAt },
       budget: { priceEvidenceDigest: recipe.files.price.sha256, maximumUsdPerSecond: 0.000002, fixedIncrementalUsd: 0.8 },
       recovery: { ...recipe.recovery, attemptPath: path.join(recipe.recovery.directory, `${recipe.recovery.packetDigest}.attempt.json`),
-        archivePath: path.join(recipe.recovery.directory, `${recipe.machineId}.active.json.archived-uncertain-${recipe.nonce}.json`),
+        archivePath: 'priorArchive' in recipe.recovery ? recipe.recovery.archivePath
+          : path.join(recipe.recovery.directory, `${recipe.machineId}.active.json.archived-uncertain-${recipe.nonce}.json`),
         intentPath: path.join(recipe.evidenceDirectory, 'p10b-recovery-intent.json'), terminalPath: path.join(recipe.evidenceDirectory, 'p10b-recovery-terminal.json') } };
     if (diagnostic) {
       Object.assign(session, { operation: 'stopped-update-diagnostic', baselineInstanceId: actual.instanceId,

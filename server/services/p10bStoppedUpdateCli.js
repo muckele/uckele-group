@@ -10,6 +10,7 @@ import { assertP10bReviewedCheckout, assertP10bFlyExecutable } from './p10bOpera
 import { createP10bAppTokenContext } from './p10bHostAuthentication.js';
 import { assertP10bImagePrerequisite } from './p10bNoEmailSessionCli.js';
 import { assertP10bStoppedUpdateApproval, assertP10bStoppedUpdateHostBinding } from './p10bStoppedUpdateContract.js';
+import { assertP10bPriorArchiveBinding } from './p10bExistingArchiveRecovery.js';
 import { runP10bStoppedUpdateDiagnostic } from './p10bStoppedUpdateDiagnostic.js';
 
 // There is deliberately no --run recovery bypass or qualification continuation.
@@ -34,9 +35,10 @@ export async function runP10bStoppedUpdateCli(args, { read = readP10bPublicJson,
   const e = session.recovery;
   if (e?.directory !== directory || e.activePath !== path.join(directory, `${session.machineId}.active.json`)
     || e.attemptPath !== path.join(directory, `${e.packetDigest}.attempt.json`)
-    || e.archivePath !== path.join(directory, `${session.machineId}.active.json.archived-uncertain-${session.nonce}.json`)
+    || (!('priorArchive' in e) && e.archivePath !== path.join(directory, `${session.machineId}.active.json.archived-uncertain-${session.nonce}.json`))
     || e.intentPath !== path.join(evidence.root, 'p10b-recovery-intent.json')
     || e.terminalPath !== path.join(evidence.root, 'p10b-recovery-terminal.json')) throw Error('Frozen recovery paths required');
+  if ('priorArchive' in e) assertP10bPriorArchiveBinding(e);
   const verifier = fileURLToPath(new URL('../../scripts/run-p10b-admission-verifier.js', import.meta.url));
   if (clock() < enteredAt || clock() + 40000 >= runDeadline) throw Error('Original diagnostic entry cutoff exhausted');
   const auth = createAuth({ session, approval, clock });
@@ -73,7 +75,7 @@ export async function runP10bStoppedUpdateCli(args, { read = readP10bPublicJson,
       verification: evidence.read('p10b-recovery-independent-verification.json') };
     stage = 'stopped-update-diagnostic';
     result = await runP10bStoppedUpdateDiagnostic({ session, approval, evidence, clock, runDeadline,
-      assertAdmission: () => assertP10bRecoveryAdmission({ session, recovery, inspect: () => inspectRecovery(session), now: clock() }),
+      assertAdmission: () => assertP10bRecoveryAdmission({ session, recovery, inspect: () => inspectRecovery(session), now: clock(), clock }),
       createClient: () => authenticatedNative(false) });
   } catch { failed = true; }
   finally {

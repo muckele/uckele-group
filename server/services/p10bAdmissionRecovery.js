@@ -1,10 +1,12 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { admitP10bPriorArchive, assertP10bPriorArchiveAdmission } from './p10bExistingArchiveRecovery.js';
 const digest = value => sha256(stableCanonicalJson(value));
 const deny = () => { throw Error('Independent admission recovery proof required'); };
 
 // Positive gate precedes construction of every authenticated boundary. A
 // missing active entry alone never releases a pending/crashed recovery.
-export function assertP10bRecoveryAdmission({ session, recovery, inspect, now = Date.now() }) {
+export function assertP10bRecoveryAdmission({ session, recovery, inspect, now = Date.now(), clock }) {
+  if (session.recovery && 'priorArchive' in session.recovery) return assertP10bPriorArchiveAdmission({ session, recovery, inspect, now, clock });
   const { intent, terminal, verification } = recovery || {};
   if (!Number.isFinite(now) || !intent || !terminal || !verification
     || intent.version !== 'p10b-admission-recovery-intent-v1' || intent.sessionDigest !== digest(session)
@@ -63,6 +65,7 @@ export function recoverP10bAdmissionReservation({ session, approval, baseline, i
     || !Number.isFinite(Date.parse(independentBaseline.observedAt))
     || now - Date.parse(independentBaseline.observedAt) > 30000 || now < Date.parse(independentBaseline.observedAt)
     || !Number.isSafeInteger(operatorPid) || operatorPid < 2) deny();
+  if ('priorArchive' in expected) return admitP10bPriorArchive({ session, baseline, independentBaseline, filesystem: f, clock, operatorPid });
   const directory = f.statDirectory(expected.directory);
   if (!directory.ownerControlled || directory.symlink) deny();
   const bytes = f.read(expected.activePath); const record = JSON.parse(bytes);

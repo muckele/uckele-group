@@ -3,6 +3,7 @@ import { validateP10bBaselineConfig, P10B_RUNTIME_FLAGS } from './p10bRuntimeOnl
 import { p10bGuestWindow, P10B_GUEST_PROCESSES } from './p10bGuestShutdown.js';
 import { P10B_PROVIDER_IDENTITY, p10bProviderIdentityDigest } from './p10bProviderIdentity.js';
 import { assertP10bReviewedCheckout, P10B_RETAINED_GUEST_HEAD, P10B_RETAINED_IMAGE } from './p10bOperatorSource.js';
+import { assertP10bPriorArchiveBinding } from './p10bExistingArchiveRecovery.js';
 const digest = value => sha256(stableCanonicalJson(value));
 const only = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).every(key => keys.includes(key));
@@ -81,7 +82,7 @@ export function validateP10bStoppedUpdateSession(s, now = Date.now()) {
     || !only(s.flyExecutable, ['path', 'sha256']) || typeof s.flyExecutable.path !== 'string' || !s.flyExecutable.path.startsWith('/')
     || !hex(s.flyExecutable.sha256) || typeof s.namesClientPath !== 'string' || !s.namesClientPath.startsWith('/') || !hex(s.namesClientSha256)
     || (s.recovery && (!only(s.recovery, ['directory', 'activePath', 'archivePath', 'attemptPath', 'intentPath', 'terminalPath',
-      'expectedSha256', 'version', 'packetDigest', 'evidencePath', 'reservedAt']) || !hex(s.recovery.packetDigest)
+      'expectedSha256', 'version', 'packetDigest', 'evidencePath', 'reservedAt', 'priorArchive']) || !hex(s.recovery.packetDigest)
       || !hex(s.recovery.expectedSha256) || !date(s.recovery.reservedAt)
       || ('version' in s.recovery && s.recovery.version !== 'p10b-machine-owner-v1')
       || ['directory', 'activePath', 'archivePath', 'attemptPath', 'intentPath', 'terminalPath', 'evidencePath']
@@ -90,6 +91,7 @@ export function validateP10bStoppedUpdateSession(s, now = Date.now()) {
     || stableCanonicalJson(s.diagnosticConfig) !== stableCanonicalJson(createP10bStoppedDiagnosticConfig(s))) {
     throw Error('Exact zero-start diagnostic session required');
   }
+  if (s.recovery && 'priorArchive' in s.recovery) assertP10bPriorArchiveBinding(s.recovery);
   validateP10bBaselineConfig(s.baselineConfig, s.baselineImageDigest);
   for (const [name, value] of Object.entries(P10B_RUNTIME_FLAGS)) {
     if (name !== 'P10B_QUALIFICATION_RUNTIME' && s.baselineConfig.env[name] !== value) throw Error('Frozen baseline hard-off or sender identity drift');

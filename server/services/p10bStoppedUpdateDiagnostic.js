@@ -28,7 +28,7 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
       || value.image_ref?.digest !== value.config.image.split('@')[1]) throw Error('Diagnostic public Machine drift');
     return value;
   };
-  const admit = () => { if (assertAdmission() !== true) throw Error('Diagnostic admission withdrawn'); };
+  const admit = () => { if (assertAdmission() !== true) throw Error('Diagnostic admission withdrawn'); requireTime(); };
   const observe = async (label, end = runDeadline) => {
     requireTime(); admit();
     if (clock() >= end) throw Error('Observation cutoff reached');
@@ -43,10 +43,10 @@ export async function runP10bStoppedUpdateDiagnostic({ session, approval, eviden
     return m;
   };
   const write = async (config, current, label) => {
-    requireTime(label === 'diagnostic' ? 40000 : 20000); admit();
+    admit(); requireTime(label === 'diagnostic' ? 40000 : 20000);
     evidence.write(`p10b-stopped-update-${label}-intent.json`, { at: new Date(clock()).toISOString(),
       currentVersion: current.instance_id, configDigest: digest(config), skip_launch: true, timeoutMs: 10000 });
-    requireTime(label === 'diagnostic' ? 40000 : 20000); admit();
+    admit(); requireTime(label === 'diagnostic' ? 40000 : 20000);
     const start = performance.now(); const startedAt = clock();
     let outcome;
     try {
