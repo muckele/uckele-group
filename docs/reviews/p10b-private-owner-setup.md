@@ -169,24 +169,25 @@ group. Cleanup waits for positive absence of the entire group, including an SDK
 agent whose immediate CLI leader has exited. A denied probe, surviving group or
 uncertain nested controller keeps its pending intent and private directory.
 
-The observer currently establishes log readiness with one normally completed
-bounded `logs --json --no-tail` command for the exact app and Machine. The pinned
-Fly CLI 0.4.87 skips NATS in this mode, but its polling loop does not return on
-an empty HTTP batch: it waits and retries until a nonempty batch or failure.
-Retryable errors can also issue multiple requests inside one command. It returns
-only the first nonempty batch and does not follow its returned cursor. Thus this
-is neither an exactly-one-request snapshot nor an empty-buffer readiness check.
-The 410-command cap does not count underlying HTTP attempts. See the
-[source-backed log design review](p10b-log-acquisition-design-review.md).
-Subsequent nonoverlapping commands run every 750 ms through the observation
-cutoff. The first has a five-second bound; subsequent commands have a 700 ms
-elapsed bound, including owned launch and completion, plus checked observer
-completion deadlines. Failed reads, malformed framing or missed polls latch
-failure. Empty stdout from a killed command never proves a successful empty read. Only closed-schema public guardian records survive; exact repeated
-records are deduplicated using the original provider timestamp precision so
-distinct records cannot collapse into one apparent proof. Machine metadata and
-the final unique guardian/whole-Machine exit proof remain independently required.
+The observer establishes log readiness through the reviewed native log-only
+`--serve-logs` mode. Each operation makes one GET to the fixed isolated app and
+Machine log endpoint. An explicit HTTP 200 `data:[]` completes successfully;
+failed, killed, malformed or late reads cannot become empty success. There is
+no CLI polling, retry wrapper, redirect, proxy, cursor follow or fallback. The
+first request has a five-second total bridge bound; subsequent requests have a
+700 ms total bound including IPC and validation, at 750 ms cadence. The existing
+410-operation cap now also bounds HTTP dispatches. A failure is terminal.
 
+Metadata runs in its own native process. Only closed public guardian events
+bound to the exact window, Machine and region cross log IPC. Original provider
+timestamp precision is preserved for deduplication; application text, cursors,
+headers and raw errors are discarded inside the native reader. The 128 unique
+record cap and independent metadata/whole-Machine exit proof remain required.
+Both readers and owned processes enter parallel cleanup within the existing
+three-second shared bound. Partial initialization, cancellation or uncertain
+reaping keeps completion false and retains the private authentication hold.
+See the [single-request contract](p10b-single-request-log-reader.md) and the
+[historical source analysis](p10b-log-acquisition-design-review.md).
 Public failure receipts record fixed recovery/runtime stage names. Raw SDK
 errors, authentication material and arbitrary application logs remain excluded.
 Offline constructor tests and a synthetic external-boundary owner-command

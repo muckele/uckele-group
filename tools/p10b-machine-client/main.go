@@ -653,6 +653,13 @@ func serve(input io.Reader, output io.Writer, factory func(context.Context) (req
 	return scanner.Err()
 }
 func runNativeMain() {
+	if len(os.Args) == 2 && os.Args[1] == "--serve-logs" {
+		if runLogsMain() != nil {
+			fmt.Fprintln(os.Stderr, "Native log client failed; retain public diagnostics.")
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) != 2 || os.Args[1] != "--serve" {
 		fmt.Fprintln(os.Stderr, "Native client requires explicit approved session.")
 		os.Exit(1)

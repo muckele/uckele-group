@@ -1,7 +1,7 @@
-import { createJsonObjectFramer } from './p10bRuntimeObservation.js';
 import { createP10bObserverControls } from './p10bRuntimeObserver.js';
-import { openP10bNativeMachineClient } from './p10bNativeMachineClient.js';
-import { createP10bOperatorProcesses, publicP10bCommandFailure } from './p10bOperatorProcesses.js';
+import { openP10bNativeMachineClient, openP10bNativeLogClient } from './p10bNativeMachineClient.js';
+import { createP10bOperatorProcesses } from './p10bOperatorProcesses.js';
+import { publicP10bNativeLogFailure } from './p10bNativeFailure.js';
 import { assertP10bRecoveryAdmission } from './p10bAdmissionRecovery.js';
 import { inspectP10bRecovery } from './p10bOperatorFiles.js';
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase } from './p10bRuntimeOnlyOperator.js';
@@ -21,7 +21,7 @@ function waitForObserver(ms, signal) {
 }
 
 export async function runP10bIndependentObserver({ session, approval, phase, machine, nativeExecutable, recovery,
-  flyExecutable = session?.flyExecutable?.path, openNative = openP10bNativeMachineClient,
+  flyExecutable = session?.flyExecutable?.path, openNative = openP10bNativeMachineClient, openLogs = openP10bNativeLogClient,
   processes, environment, record, attached = () => {},
   clock = () => Date.now(),
   monotonicClock = () => performance.now(), signal,
@@ -42,42 +42,61 @@ export async function runP10bIndependentObserver({ session, approval, phase, mac
   assertP10bNoEmailApproval(session, approval, clock()); assertP10bFrozenPhase(session, phase);
   assertP10bFlyExecutable(session, flyExecutable);
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
-  if (!environment && openNative === openP10bNativeMachineClient) environment = p10bInheritedAppTokenEnvironment({ session, approval, clock });
+  if (!environment && (openNative === openP10bNativeMachineClient || openLogs === openP10bNativeLogClient)) environment = p10bInheritedAppTokenEnvironment({ session, approval, clock });
   processes ||= createP10bOperatorProcesses({ environment });
-  const native = await openNative({ executable: nativeExecutable, session, approval, readOnly: true, configs: [phase.config], environment });
+  const native = await openNative({ executable: nativeExecutable, session, approval, readOnly: true, configs: [phase.config], environment, signal });
   const rows = []; const publish = row => { record(row); rows.push(row); };
   const controls = createP10bObserverControls({ phase, machine, client: native.client, record: publish, clock });
-  const cleanup = createP10bObserverCleanup({ processes, native, clock, sessionDeadline: session.sessionDeadline, window: phase.window });
-  let sampler; let logFailed = false; let logReads = 0; let logStage = 'command';
+  let logs; let logInitializationReaped = true; let reapBatch;
+  const reapAll = () => {
+    if (!reapBatch) {
+      // Start every owned reap before awaiting any one reader. One hanging or
+      // throwing child cannot prevent the other from entering bounded cleanup.
+      const readers = [native, ...(logs ? [logs] : [])];
+      reapBatch = Promise.allSettled([Promise.resolve().then(() => processes.reap()),
+        ...readers.map(reader => Promise.resolve().then(() => reader.reap()))]).then(results => ({
+        processesReaped: results[0].status === 'fulfilled' && results[0].value === true,
+        nativeReaped: logInitializationReaped && results.slice(1).every(result => result.status === 'fulfilled' && result.value === true),
+      }));
+    }
+    return reapBatch;
+  };
+  // Scope cleanup before starting the second reader. Its initialization must
+  // settle before final cleanup snapshots ownership, including cancellation.
+  const cleanup = createP10bObserverCleanup({ processes: { async reap() { return (await reapAll()).processesReaped; } },
+    native: { async reap() { return (await reapAll()).nativeReaped; } }, clock,
+    sessionDeadline: session.sessionDeadline, window: phase.window });
+  let sampler; let logFailed = false; let logReads = 0; let logStage = 'native-initialization';
   const seen = new Set();
   const stopSampling = () => { sampler?.abort(); waitController.abort(); };
-  const cancel = () => { stopSampling(); void processes.reap().catch(() => {}); };
+  const cancel = () => { stopSampling(); };
   signal?.addEventListener('abort', cancel, { once: true });
+  const reportLogFailure = error => publish({ kind: 'observer-log-read-error', at: new Date(clock()).toISOString(),
+    stage: logStage, nativeFailure: publicP10bNativeLogFailure(error) });
   const pollLogs = async (timeoutMs = 5000) => {
-    if (++logReads > 410) throw Error('Log poll bound exceeded');
+    if (++logReads > P10B_OBSERVER_POLICY.maximumLogReads) throw Error('Log poll bound exceeded');
     const requestedAt = new Date(clock()).toISOString(); let success = false;
     try {
       assertActive();
-      logStage = 'command';
+      logStage = 'native-read';
       const timeout = Math.min(timeoutMs, Math.floor(logRemaining()));
       if (timeout < 1) throw Error('Log observation deadline expired');
-      const output = await processes.command(flyExecutable,
-        ['logs', '--app', session.app, '--instance', session.machineId, '--json', '--no-tail'],
-        timeout);
+      const output = await logs.client('GET', undefined, timeout);
       assertActive();
-      logStage = 'framing';
-      const framer = createJsonObjectFramer(row => {
+      logStage = 'validation';
+      if (!Array.isArray(output) || output.length > 128) throw Error('Invalid public log response');
+      for (const row of output) {
+        if (!row || Object.keys(row).sort().join(',') !== 'instance,message,region,timestamp') throw Error('Invalid public log row');
         const safe = sanitizeP10bGuardianLog(row, phase.window);
-        if (!safe) return;
+        if (!safe) throw Error('Invalid public guardian log');
         // Preserve original provider timestamp precision when deduplicating.
         // Only admitted public guardian fields are hashed, never app log text.
-        const key = sha256(stableCanonicalJson({ ...safe, timestamp: row.timestamp ?? row.time }));
+        const key = sha256(stableCanonicalJson({ ...safe, timestamp: row.timestamp }));
         if (!seen.has(key)) {
           if (seen.size >= 128) throw Error('Guardian log record bound exceeded');
           seen.add(key); controls.log(row);
         }
-      });
-      framer.write(output); framer.finish();
+      }
       logStage = 'completion';
       success = true;
     } finally { publish({ kind: 'observer-log-poll', requestedAt, at: new Date(clock()).toISOString(), success }); }
@@ -89,7 +108,17 @@ export async function runP10bIndependentObserver({ session, approval, phase, mac
     sampler = startP10bMetadataSampling({ window: phase.window, sessionDeadline: session.sessionDeadline,
       tick: () => { assertActive(); return controls.tick(); }, record: publish, clock, wait: boundedWait });
     if (!await sampler.initial) throw Error('Independent observer initial metadata sample failed');
-    await pollLogs();
+    try {
+      assertActive(); logInitializationReaped = false;
+      logs = await openLogs({ executable: nativeExecutable, session, approval, readOnly: true, configs: [phase.config], environment, signal });
+      logInitializationReaped = true;
+      assertActive();
+      if (!sampler.healthy() || !controls.healthy() || !controls.attached()) throw Error('Initial metadata changed during log initialization');
+      await pollLogs();
+    } catch (error) {
+      if (!logs) logInitializationReaped = Object.getOwnPropertyDescriptor(error ?? {}, 'reapVerified')?.value === true;
+      logFailed = true; reportLogFailure(error); throw error;
+    }
     if (!sampler.healthy() || !controls.healthy() || !controls.attached()) throw Error('Independent observer initial stopped observation failed');
     publish({ kind: 'log-source-ready', mode: 'bounded-read-only-poll', at: new Date(clock()).toISOString() });
     if (!sampler.healthy() || !controls.healthy()) throw Error('Independent observer attachment became stale');
@@ -101,7 +130,7 @@ export async function runP10bIndependentObserver({ session, approval, phase, mac
     while (clock() < end) {
       if (signal?.aborted || logRemaining() <= 0 || logReads >= P10B_OBSERVER_POLICY.maximumLogReads) {
         logFailed = true; stopSampling();
-        publish({ kind: 'observer-log-read-error', at: new Date(clock()).toISOString(), stage: 'lifetime', commandFailure: null }); break;
+        publish({ kind: 'observer-log-read-error', at: new Date(clock()).toISOString(), stage: 'lifetime', nativeFailure: null }); break;
       }
       due = Math.min(due + 750, end);
       await boundedWait(Math.min(Math.max(1, due - clock()), Math.max(1, logRemaining())));
@@ -112,9 +141,7 @@ export async function runP10bIndependentObserver({ session, approval, phase, mac
         await pollLogs(Math.min(700, Math.floor(left)));
         if (clock() - due > 750 || clock() > end + 750) throw Error('Log observation completion late');
       }
-      catch (error) { logFailed = true; publish({ kind: 'observer-log-read-error', at: new Date(clock()).toISOString(),
-        stage: logStage, commandFailure: publicP10bCommandFailure(error) });
-        if (signal?.aborted || publicP10bCommandFailure(error)?.clientsReaped === false) { stopSampling(); break; } }
+      catch (error) { logFailed = true; reportLogFailure(error); stopSampling(); break; }
       if (clock() - due > 1000) due = clock();
     }
     const samplingResult = await sampler.done;

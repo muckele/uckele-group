@@ -45,6 +45,11 @@ jobs:
         env:
           P10B_OFFLINE_GUARDIAN_TRANSPORT: /tmp/p10b-offline-update-transport
         run: node --test test/p10bGuardianRuntimeTransport.test.js
+      - name: Verify single-request log reader, SDK and independent metadata with fake HTTP
+        env:
+          P10B_OFFLINE_LOG_TRANSPORT: /tmp/p10b-offline-update-transport
+          P10B_OFFLINE_NATIVE_CLIENT: /tmp/p10b-machine-client
+        run: test -x "$P10B_OFFLINE_LOG_TRANSPORT" && node --test test/p10bNativeLogTransport.test.js
       - working-directory: tools/p10b-public-client
         run: go test ./... && go build -o /tmp/p10b-public-client .
   validate:

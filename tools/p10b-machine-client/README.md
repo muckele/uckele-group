@@ -12,7 +12,8 @@ opaque token and a fake HTTP client. They never call `loadClient`, authenticate,
 contact Fly, or inspect the normal credential store. Module versions and checksums
 are pinned in go.mod/go.sum.
 
-The binary's only entry point is `--serve`. It first receives a bounded exact
+The default binary admits `--serve` for Machine control and `--serve-logs` for
+the separately owned log-only reader. The Machine mode first receives a bounded exact
 public-session initialization packet on stdin, then closed JSON request frames.
 Normal Fly config and its official SDK retain opaque authentication inside this
 native process. The parent never receives authorization headers or token strings.
@@ -66,3 +67,28 @@ or premature lifecycle changes permanently hold mutation; later visibility never
 restores authority. A fresh native process cannot resume the mutation sequence.
 The guardian response retains the existing closed lifecycle-event projection.
 All modes also refuse further writes after any failed attempted POST.
+
+## Single-request log reader
+
+The `--serve-logs` mode has distinct closed init/ready/request/response schemas.
+It reuses pure session/config validation with a no-op Machine factory, then
+constructs the official `fly.Transport` directly from opaque inherited input.
+The SDK's `WithAuthorizationHeader(...BubblegumHeader())` selects the same log
+audience as upstream GetAppLogs. It does not call the retrying GetAppLogs helper,
+load normal config, refresh/discharge credentials, start an agent or emit metrics.
+
+Each valid request makes exactly one fixed-target HTTP GET. HTTP/1 only, fresh
+connections, no proxy/compression/redirect/SDK retry, 16 KiB response headers and
+128 KiB body/output limits are explicit. Only status 200 with an explicit data
+array can succeed. The cursor is discarded. Only the exact public guardian event
+schema survives projection. Original timestamp bytes retain nanosecond precision.
+Failures are terminal and carry fixed codes plus closed status/elapsed/dispatch
+facts. Request, original session and stopAt+750 deadlines use wall and monotonic
+limits; stdin EOF/signals cancel active reads. No failed read means empty success.
+
+Offline tests exercise real restricted HTTP transport using owned local TLS,
+synthetic SDK input, real stdio, cancellation, replay/limits and independent
+metadata. Test-only arbitrary loopback routing is never linked into production.
+The independently reviewed native artifact must be rebuilt/pinned before a new
+exact host session can use this mode; old binaries fail closed. No live operation
+or new owner package is authorized by this code change.

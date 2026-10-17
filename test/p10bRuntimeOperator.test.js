@@ -541,18 +541,15 @@ test('unknown public package fields fail before authentication or evidence publi
   await assert.rejects(operator.runP10bNoEmailOperator(f.options));assert.equal(calls,0);assert.equal(f.evidence.files.size,0);
 });
 
-async function observerPollFixture(command = async () => '', late = false, options = {}) {
+async function observerPollFixture(readLogs = async () => [], late = false, options = {}) {
   const { runP10bIndependentObserver } = await import('../server/services/p10bIndependentObserver.js');
   const x = recoveryFixture(); const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
     baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
   const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
-  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now); let clock = now + (options.startOffsetMs || 0); let nativeReaps = 0; let processReaps = 0; const queue = [];
+  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now); let clock = now + (options.startOffsetMs || 0); let nativeReaps = 0; let logReaps = 0; let processReaps = 0; const queue = [];
   const wait = ms => new Promise(resolve => queue.push({ at: clock + ms + (late ? 300 : 0), resolve }));
-  const rows = []; const reads = []; let metadataCalls = 0; let attached; let attachedAt;
-  const processes = { async command(file, args, timeout) {
-    assert.equal(file, x.s.flyExecutable.path); assert.ok(args.includes('--no-tail'));
-    assert.equal(timeout, reads.length ? 700 : 5000);
-    reads.push(clock); return command({ phase, index: reads.length, at: clock, wait, advance(ms) { clock += ms; } }); },
+  const rows = []; const reads = []; let metadataCalls = 0; let logOpens = 0; let attached; let attachedAt;
+  const processes = { async command() { assert.fail('Observer must not invoke the Fly CLI'); },
     async reap() { processReaps++; if (options.cleanupMs) await wait(options.cleanupMs); return options.reaped !== false; } };
   const machine = { ...x.baseline, config: phase.config, image_ref: { digest: image } };
   const run = runP10bIndependentObserver({ session: x.s, approval: x.approval, phase, machine,
@@ -561,12 +558,29 @@ async function observerPollFixture(command = async () => '', late = false, optio
     }, attached: value => { attached = value; attachedAt = clock; options.onAttach?.(); },
     processes, clock: () => options.freezeWall && attached ? now : clock,
     monotonicClock: () => clock - now, signal: options.signal, wait,
+    async openLogs(input) {
+      logOpens++; options.onLogInitialization?.();
+      if (options.logInitializationMs) await wait(options.logInitializationMs);
+      assert.equal(input.readOnly, true); assert.deepEqual(input.configs, [phase.config]);
+      assert.equal(input.signal, options.signal);
+      if (options.logInitializationFailure) throw options.logInitializationFailure;
+      return { async client(method, body, timeout) {
+        assert.equal(method, 'GET'); assert.equal(body, undefined);
+        assert.equal(timeout, reads.length ? 700 : 5000);
+        reads.push(clock);
+        return readLogs({ phase, index: reads.length, at: clock, wait, advance(ms) { clock += ms; } });
+      }, async reap() {
+        logReaps++; if (options.logCleanupMs) await wait(options.logCleanupMs); if (options.logReapFailure) throw Error('synthetic private cleanup error');
+        return options.logReaped !== false;
+      } };
+    },
     async openNative(input) { assert.equal(input.readOnly, true); return { async client(method, body, timeout) {
       assert.equal(method, 'GET'); assert.equal(body, undefined); assert.equal(timeout, 700);
       const index = metadataCalls++; await wait(typeof options.latency === 'function' ? options.latency(index) : (options.latency || 0));
       if (options.metadataFailureAt === index + 1) throw options.metadataFailure;
       return structuredClone(machine); },
-      async reap() { nativeReaps++; return true; } }; } });
+      async reap() { nativeReaps++; if (options.nativeCleanupMs) await wait(options.nativeCleanupMs);
+        if (options.nativeReapFailure) throw Error('synthetic private metadata cleanup error'); return options.nativeReaped !== false; } }; } });
   let done = false, success, error;
   run.then(value => { success = value; done = true; }, failure => { error = failure; done = true; });
   let steps = 0;
@@ -577,8 +591,87 @@ async function observerPollFixture(command = async () => '', late = false, optio
     if (!next) throw Error('Observer virtual clock stalled'); clock = Math.max(clock, next.at); next.resolve();
   }
   if (error && !options.expectFailure) throw error;
-  return { success, error, attached, attachedAt, metadataCalls, nativeReaps, processReaps, rows, reads, phase };
+  return { success, error, attached, attachedAt, metadataCalls, logOpens, nativeReaps, logReaps, processReaps, rows, reads, phase };
 }
+
+test('log initialization failure reaps the already open metadata reader', async () => {
+  const failure = Object.assign(Error('synthetic log init failure'), { reapVerified: true });
+  const f = await observerPollFixture(undefined, false, { logInitializationFailure: failure, expectFailure: true });
+  assert.ok(f.error); assert.equal(f.logOpens, 1); assert.equal(f.reads.length, 0); assert.equal(f.nativeReaps, 1);
+  assert.equal(f.logReaps, 0); assert.equal(f.processReaps, 1); assert.equal(f.attached, undefined);
+});
+
+for (const kind of ['false', 'throw']) test(`log cleanup ${kind} cannot publish aggregate native reaping`, async () => {
+  const f = await observerPollFixture(undefined, false, { logReaped: kind !== 'false', logReapFailure: kind === 'throw' });
+  assert.equal(f.success, false); assert.equal(f.nativeReaps, 1); assert.equal(f.logReaps, 1);
+  assert.equal(f.rows.at(-1).nativeReaped, false); assert.equal(f.rows.at(-1).normalCompletion, false);
+});
+
+test('both native reaps and process cleanup run in parallel inside the existing three-second bound', async () => {
+  const f = await observerPollFixture(undefined, false, { nativeCleanupMs: 2700, logCleanupMs: 2700, cleanupMs: 2700 });
+  assert.equal(f.success, true); assert.equal(f.nativeReaps, 1); assert.equal(f.logReaps, 1); assert.equal(f.processReaps, 1);
+  const finished = f.rows.at(-1);
+  assert.equal(Date.parse(finished.at) - Date.parse(finished.cleanupStartedAt), 2700);
+  assert.equal(finished.nativeReaped, true); assert.equal(finished.processesReaped, true);
+});
+
+for (const kind of ['false', 'throw']) test(`metadata cleanup ${kind} still attempts log-reader cleanup`, async () => {
+  const f = await observerPollFixture(undefined, false, { nativeReaped: kind !== 'false', nativeReapFailure: kind === 'throw' });
+  assert.equal(f.success, false); assert.equal(f.nativeReaps, 1); assert.equal(f.logReaps, 1);
+  assert.equal(f.rows.at(-1).nativeReaped, false);
+});
+
+test('cancellation during log initialization reaps a late reader without dispatching any log request', async () => {
+  const controller = new AbortController();
+  const f = await observerPollFixture(undefined, false, { signal: controller.signal,
+    onLogInitialization: () => controller.abort(), logInitializationMs: 50, expectFailure: true });
+  assert.ok(f.error); assert.equal(f.logOpens, 1); assert.equal(f.reads.length, 0);
+  assert.equal(f.nativeReaps, 1); assert.equal(f.logReaps, 1); assert.equal(f.attached, undefined);
+});
+
+test('metadata failure during log initialization prevents the first log request', async () => {
+  const f = await observerPollFixture(undefined, false, { latency: 100, metadataFailureAt: 2,
+    metadataFailure: Error('synthetic metadata fault'), logInitializationMs: 2000, expectFailure: true });
+  assert.ok(f.error); assert.equal(f.logOpens, 1); assert.equal(f.reads.length, 0);
+  assert.equal(f.nativeReaps, 1); assert.equal(f.logReaps, 1); assert.equal(f.attached, undefined);
+});
+
+test('cancellation during an active log read cannot publish success or dispatch again', async () => {
+  const controller = new AbortController();
+  const f = await observerPollFixture(async ({ index, wait }) => {
+    if (index === 2) { controller.abort(); await wait(50); } return [];
+  }, false, { signal: controller.signal });
+  assert.equal(f.success, false); assert.equal(f.reads.length, 2); assert.equal(f.logOpens, 1);
+  assert.equal(f.nativeReaps, 1); assert.equal(f.logReaps, 1);
+  assert.equal(f.rows.at(-1).normalCompletion, false);
+});
+
+test('slow native log reads do not serialize continuous metadata acquisition', async () => {
+  const f = await observerPollFixture(async ({ wait }) => { await wait(600); return []; }, false, { latency: 100 });
+  assert.equal(f.success, true); assert.ok(f.metadataCalls > 2000); assert.ok(f.reads.length > 390);
+  assert.equal(f.nativeReaps, 1); assert.equal(f.logReaps, 1);
+  const metadata = f.rows.filter(row => row.kind === 'metadata');
+  assert.ok(metadata.slice(1).every((row, i) => Date.parse(row.requestedAt) - Date.parse(metadata[i].requestedAt) <= 1000));
+});
+
+test('native log failures retain only dedicated closed facts and never retry the reader', async () => {
+  const { P10bNativeLogRequestError } = await import('../server/services/p10bNativeFailure.js');
+  const error = new P10bNativeLogRequestError({ code: 'http-failed', timeoutMs: 700, httpStatus: 503, elapsedMs: 100, dispatched: true });
+  error.message = 'private-canary';
+  const f = await observerPollFixture(async ({ index }) => { if (index === 2) throw error; return []; });
+  assert.equal(f.success, false); assert.equal(f.reads.length, 2); assert.equal(f.logOpens, 1);
+  assert.deepEqual(f.rows.find(row => row.kind === 'observer-log-read-error').nativeFailure,
+    { version: 'p10b-native-log-failure-v1', code: 'http-failed', timeoutMs: 700, httpStatus: 503, elapsedMs: 100, dispatched: true });
+  assert.equal(JSON.stringify(f.rows).includes('private-canary'), false);
+});
+
+test('an invalid public log row fails revalidation without retaining its message', async () => {
+  const f = await observerPollFixture(async ({ index, phase }) => index === 1 ? []
+    : [{ timestamp: phase.window.issuedAt, instance: phase.window.machineId, region: 'ewr', message: 'private-canary' }]);
+  assert.equal(f.success, false); assert.equal(f.reads.length, 2);
+  assert.equal(f.rows.find(row => row.kind === 'observer-log-read-error').stage, 'validation');
+  assert.equal(JSON.stringify(f.rows).includes('private-canary'), false);
+});
 
 test('observer wall rollback cannot outlive the original elapsed lifetime or spin past log quota', async () => {
   const f = await observerPollFixture(undefined, false, { freezeWall: true });
@@ -587,10 +680,9 @@ test('observer wall rollback cannot outlive the original elapsed lifetime or spi
   assert.equal(f.rows.at(-1).normalCompletion, false);
 });
 
-test('unreaped log command ends further polling and cannot admit observer proof', async () => {
-  const { P10bOperatorCommandError } = await import('../server/services/p10bOperatorProcesses.js');
+test('failed native log read ends further polling and cannot admit observer proof', async () => {
   const f = await observerPollFixture(async ({ index }) => {
-    if (index === 2) throw new P10bOperatorCommandError('timed-out', 700, null, false); return '';
+    if (index === 2) throw Error('private-canary'); return [];
   });
   assert.equal(f.success, false); assert.equal(f.reads.length, 2);
   assert.equal(f.processReaps, 1); assert.equal(f.nativeReaps, 1);
@@ -618,7 +710,8 @@ test('real observer waits release promptly on cancellation after wall-clock roll
       recovery: { ...recovered, verification }, inspectRecovery: x.inspect, record: row => rows.push(row),
       clock: () => now - (rollback ? 60000 : 0), signal: controller.signal,
       attached() { rollback = true; timer = setTimeout(() => controller.abort(), 20); },
-      processes: { async command() { calls++; return ''; }, async reap() { reaps++; return true; } },
+      processes: { async command() { assert.fail('No observer CLI calls'); }, async reap() { reaps++; return true; } },
+      async openLogs() { return { async client() { calls++; return []; }, async reap() { return true; } }; },
       async openNative() { return { async client() { return structuredClone(machine); },
         async reap() { nativeReaps++; return true; } }; } });
     assert.equal(success, false);
@@ -637,7 +730,7 @@ for (const code of ['request-failed', 'http-failed', 'invalid-output']) test(`me
   assert.equal(f.rows.at(-1).normalCompletion, false); assert.equal(f.metadataCalls, 29);
 });
 
-test('sanitized October17 timing replay stays failed and stops polling at the first unverified command reap', async () => {
+test('sanitized October17 timing replay stays failed and stops at the first native log fault', async () => {
   const timing = JSON.parse(fs.readFileSync(new URL('./fixtures/p10bOct17PublicTimings.json', import.meta.url)));
   const { P10bOperatorCommandError } = await import('../server/services/p10bOperatorProcesses.js');
   assert.equal(timing.metadataElapsedMs.length, 28); assert.equal(timing.logTimeoutPolls.length, 38);
@@ -646,12 +739,12 @@ test('sanitized October17 timing replay stays failed and stops polling at the fi
     await wait(timing.logElapsedMs[index - 1]);
     if (timing.logTimeoutPolls.includes(index)) throw new P10bOperatorCommandError('timed-out', 700, null,
       !timing.logUnreapedPolls.includes(index));
-    return '';
+    return [];
   }, false, { startOffsetMs: timing.observerStartOffsetMs,
     latency: i => timing.metadataElapsedMs[i] || 0, metadataFailureAt: 29,
     metadataFailure: Error('Unclassified historical metadata fault') });
   assert.equal(f.success, false);
-  assert.equal(f.reads.length, timing.logUnreapedPolls[0]);
+  assert.equal(f.reads.length, timing.logTimeoutPolls[0]);
   assert.equal(f.rows.find(r => r.kind === 'observer-read-error').nativeFailure, null);
   assert.equal(f.rows.at(-1).normalCompletion, false);
 });
@@ -665,7 +758,7 @@ test('attachment rechecks actual freshness after ready publication with inclusiv
 });
 
 test('actual in-flight request preserves valid949ms initial metadata plus100ms initial log attachment', async () => {
-  const f = await observerPollFixture(async ({ index, wait }) => { if (index === 1) await wait(100); return ''; }, false, { latency: 949 });
+  const f = await observerPollFixture(async ({ index, wait }) => { if (index === 1) await wait(100); return []; }, false, { latency: 949 });
   assert.equal(f.attachedAt, now + 1049); assert.equal(f.success, true);
   const first = f.rows.find(r => r.kind === 'metadata');
   assert.equal(first.requestedAt, new Date(now).toISOString()); assert.equal(first.at, new Date(now + 949).toISOString());
@@ -673,7 +766,7 @@ test('actual in-flight request preserves valid949ms initial metadata plus100ms i
 
 test('invalid initial metadata and a known later sampling failure during initial logs never attach', async () => {
   for (const latency of [() => 951, index => index === 0 ? 100 : 1000]) {
-    const f = await observerPollFixture(async ({ wait }) => { await wait(1500); return ''; }, false, { latency, expectFailure: true });
+    const f = await observerPollFixture(async ({ wait }) => { await wait(1500); return []; }, false, { latency, expectFailure: true });
     assert.ok(f.error); assert.equal(f.attached, undefined);
     assert.ok(f.rows.some(r => r.kind === 'observer-sampling-error'));
     assert.equal(f.nativeReaps, 1); assert.equal(f.processReaps, 1);
@@ -681,9 +774,9 @@ test('invalid initial metadata and a known later sampling failure during initial
 });
 
 test('independent observer accepts successful empty log polls and preserves continuous metadata cadence through the final read', async () => {
-  const { success, attached, metadataCalls, nativeReaps, processReaps, rows, reads, phase } = await observerPollFixture();
-  assert.equal(success, true); assert.equal(attached.separateSession, true); assert.ok(metadataCalls >= 400);
-  assert.equal(nativeReaps, 1); assert.equal(processReaps, 1); assert.equal(JSON.stringify(rows).includes('private-canary'), false);
+  const { success, attached, metadataCalls, logOpens, nativeReaps, logReaps, processReaps, rows, reads, phase } = await observerPollFixture();
+  assert.equal(success, true); assert.equal(logOpens, 1); assert.equal(attached.separateSession, true); assert.ok(metadataCalls >= 400);
+  assert.equal(nativeReaps, 1); assert.equal(logReaps, 1); assert.equal(processReaps, 1); assert.equal(JSON.stringify(rows).includes('private-canary'), false);
   assert.equal(reads[0], now); assert.equal(reads.at(-1), Date.parse(phase.window.stopAt));
   assert.ok(reads.length <= 410);
   assert.equal(rows.at(-1).kind, 'observer-finished'); assert.equal(rows.at(-1).normalCompletion, true);
@@ -692,7 +785,7 @@ test('independent observer accepts successful empty log polls and preserves cont
 test('slow successful final log poll cannot admit normal observer completion', async () => {
   const f = await observerPollFixture(async ({ phase, at, advance }) => {
     if (at === Date.parse(phase.window.stopAt)) advance(751);
-    return '';
+    return [];
   });
   assert.equal(f.success, false); assert.equal(f.rows.at(-1).normalCompletion, false);
   assert.ok(f.rows.some(row => row.kind === 'observer-log-read-error'));
@@ -702,9 +795,9 @@ test('slow successful final log poll cannot admit normal observer completion', a
 test('later failed, malformed, incomplete and missed log polls latch failure through observer completion', async t => {
   for (const failure of ['read', 'malformed', 'incomplete', 'late']) await t.test(failure, async () => {
     const f = await observerPollFixture(async ({ index }) => {
-      if (index !== 2) return '';
+      if (index !== 2) return [];
       if (failure === 'read') throw Error('private-canary');
-      return failure === 'malformed' ? '{"broken":}' : failure === 'incomplete' ? '{"broken":' : '';
+      return failure === 'malformed' ? {} : failure === 'incomplete' ? [null] : [];
     }, failure === 'late');
     assert.equal(f.success, false); assert.equal(f.attached.separateSession, true);
     assert.equal(f.rows.at(-1).normalCompletion, false);
@@ -712,8 +805,8 @@ test('later failed, malformed, incomplete and missed log polls latch failure thr
     assert.ok(f.rows.some(row => row.kind === (failure === 'late' ? 'observer-log-missed-poll' : 'observer-log-read-error')));
     if (failure !== 'late') {
       const failed = f.rows.find(row => row.kind === 'observer-log-read-error');
-      assert.equal(failed.stage, failure === 'read' ? 'command' : 'framing');
-      assert.equal(failed.commandFailure, null);
+      assert.equal(failed.stage, failure === 'read' ? 'native-read' : 'validation');
+      assert.equal(failed.nativeFailure, null);
     }
     assert.equal(JSON.stringify(f.rows).includes('private-canary'), false);
   });
@@ -722,15 +815,14 @@ test('later failed, malformed, incomplete and missed log polls latch failure thr
 test('overlapping log polls deduplicate exact guardian records but preserve distinct provider nanoseconds', async () => {
   const { P10B_GUARDIAN_EXIT_PREFIX } = await import('../server/services/p10bGuardianParent.js');
   const f = await observerPollFixture(async ({ phase, index }) => {
-    if (index < 2) return '';
+    if (index < 2) return [];
     const value = { version: 'p10b-guardian-child-exit-v1', windowDigest: digest(phase.window), productionReady: false,
       bindingVerified: true, code: 0, signal: null, spawnFailed: false, guardianPid: 5001, parentPid: 5000,
       exitedAt: '2026-10-12T12:04:00.000Z', parentStartedAt: '2026-10-12T12:00:00.000Z',
       readyDigest: 'a'.repeat(64), receiptDigest: 'b'.repeat(64), startDigest: 'c'.repeat(64) };
     const row = { instance: phase.window.machineId, region: 'ewr', timestamp: '2026-10-12T12:04:00.334578044Z',
       message: P10B_GUARDIAN_EXIT_PREFIX + JSON.stringify(value) };
-    return [row, row, { ...row, timestamp: '2026-10-12T12:04:00.334578045Z' },
-      { ...row, message: 'private-canary' }].map(v => JSON.stringify(v)).join('\n');
+    return [row, row, { ...row, timestamp: '2026-10-12T12:04:00.334578045Z' }];
   });
   const logs = f.rows.filter(row => row.kind === 'platform-log');
   assert.equal(f.success, true); assert.equal(logs.length, 2);
@@ -755,7 +847,8 @@ test('failed initial log read cannot admit the first start and the operator reta
       return runP10bIndependentObserver({ ...f.options, phase, machine, record: () => {},
         attached: () => { attachments++; }, interval: () => 1, clear: () => {},
         async wait() {},
-        processes: { launch: () => logs, async command() { throw Error('synthetic log read failed'); }, async reap() { logReaps++; return true; } },
+        processes: { launch: () => logs, async command() { assert.fail('No observer CLI calls'); }, async reap() { return true; } },
+        async openLogs() { return { async client() { throw Error('synthetic log read failed'); }, async reap() { logReaps++; return true; } }; },
         async openNative() { return { client: async () => structuredClone(machine),
           async reap() { nativeReaps++; return true; } }; } });
     };

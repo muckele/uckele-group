@@ -1,4 +1,5 @@
 import { performance } from 'node:perf_hooks';
+export { openP10bNativeLogClient } from './p10bNativeLogClient.js';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
