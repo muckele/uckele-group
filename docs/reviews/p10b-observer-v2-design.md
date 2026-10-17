@@ -41,6 +41,10 @@ cap; rate-limit acceptability and actual cost remain future live prerequisites.
 Log polling retains its existing750ms cadence, first5000ms/steady700ms command
 budgets,410-read and128-record caps, framing and sticky failure guards. Metadata
 and logs collect concurrently; no busy-loop or unbounded replacement stream.
+The later [pinned CLI investigation](p10b-log-acquisition-design-review.md)
+clarifies that one no-tail command can internally repeat empty reads/retry
+errors; its command cap is not an HTTP-attempt cap. Successful-empty command
+fixtures model the abstract boundary, not actual CLI empty-response behavior.
 Abort/drain sampling before cleanup on attachment/publication failure.
 
 ## Versioned finalization and admission

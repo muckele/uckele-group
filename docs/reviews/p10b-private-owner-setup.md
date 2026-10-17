@@ -169,14 +169,20 @@ group. Cleanup waits for positive absence of the entire group, including an SDK
 agent whose immediate CLI leader has exited. A denied probe, surviving group or
 uncertain nested controller keeps its pending intent and private directory.
 
-The observer establishes log readiness with one successful bounded
-`logs --json --no-tail` read for the exact app and Machine. An empty buffer is a
-valid completed read before start. This uses the pinned SDK's finite polling
-path; it makes no claim that a streaming subscription has attached. Subsequent
-nonoverlapping reads run every 750 ms through the observation cutoff. The first
-read has a five-second bound; subsequent reads have a 700 ms bound and a checked
-completion deadline, including the final read. Failed reads, malformed framing or missed polls latch
-failure. Only closed-schema public guardian records survive; exact repeated
+The observer currently establishes log readiness with one normally completed
+bounded `logs --json --no-tail` command for the exact app and Machine. The pinned
+Fly CLI 0.4.87 skips NATS in this mode, but its polling loop does not return on
+an empty HTTP batch: it waits and retries until a nonempty batch or failure.
+Retryable errors can also issue multiple requests inside one command. It returns
+only the first nonempty batch and does not follow its returned cursor. Thus this
+is neither an exactly-one-request snapshot nor an empty-buffer readiness check.
+The 410-command cap does not count underlying HTTP attempts. See the
+[source-backed log design review](p10b-log-acquisition-design-review.md).
+Subsequent nonoverlapping commands run every 750 ms through the observation
+cutoff. The first has a five-second bound; subsequent commands have a 700 ms
+elapsed bound, including owned launch and completion, plus checked observer
+completion deadlines. Failed reads, malformed framing or missed polls latch
+failure. Empty stdout from a killed command never proves a successful empty read. Only closed-schema public guardian records survive; exact repeated
 records are deduplicated using the original provider timestamp precision so
 distinct records cannot collapse into one apparent proof. Machine metadata and
 the final unique guardian/whole-Machine exit proof remain independently required.

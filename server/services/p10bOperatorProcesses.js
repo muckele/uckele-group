@@ -39,10 +39,13 @@ export function createP10bOperatorProcesses({ spawnProcess = spawn,
     finally { if (!reaped) admissionClosed = true; }
   }
   async function command(executable, args, timeoutMs = 10000) {
+    // Owned launch/reservation and completion checks consume this same elapsed
+    // budget. A queued close cannot beat an already overdue timer callback.
+    const deadline = performance.now() + timeoutMs;
     const entry = launch(executable, args); let bytes = 0; let failure = null; const chunks = [];
     let timedOut;
     const cutoff = new Promise(resolve => { timedOut = resolve; });
-    const timer = setTimeout(() => { failure ||= 'timed-out'; void terminate(entry).then(() => timedOut(null)); }, timeoutMs);
+    const timer = setTimeout(() => { failure ||= 'timed-out'; void terminate(entry).then(() => timedOut(null)); }, Math.max(0, Math.ceil(deadline - performance.now())));
     for (const stream of [entry.child.stdout, entry.child.stderr]) stream.on('data', chunk => {
       bytes += chunk.length;
       if (bytes > 131072) { failure ||= 'output-bound'; void terminate(entry); }
@@ -51,6 +54,7 @@ export function createP10bOperatorProcesses({ spawnProcess = spawn,
     const result = await Promise.race([entry.exited, cutoff]); clearTimeout(timer);
     const output = Buffer.concat(chunks).toString('utf8');
     if (environment.FLY_API_TOKEN && output.includes(environment.FLY_API_TOKEN)) failure ||= 'private-output';
+    if (performance.now() >= deadline) failure ||= 'timed-out';
     if (failure || !result || !entry.reaped || result.code !== 0 || result.signal !== null) {
       throw new P10bOperatorCommandError(failure || 'command-failed', timeoutMs, result, entry.reaped);
     }
