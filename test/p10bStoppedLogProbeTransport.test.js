@@ -9,6 +9,35 @@ import { createP10bStoppedLogProbeTokenContext } from '../server/services/p10bHo
 import { stoppedLogProbeFixture } from './helpers/p10bStoppedLogProbeFixture.js';
 import { runP10bStoppedLogProbe } from '../server/services/p10bStoppedLogProbe.js';
 import { openP10bNativeStoppedLogProbeClient } from '../server/services/p10bNativeStoppedLogProbeClient.js';
+function assertPrivateProbeHousekeeping(root) {
+  const allowed = process.platform === 'darwin' ? ['Library', 'Library/Caches', 'Library/Caches/goimports'] : ['.cache', '.cache/goimports'];
+  let markers = 0;
+  function walk(directory) {
+    for (const name of fs.readdirSync(directory)) {
+      const file = path.join(directory, name); const stat = fs.lstatSync(file);
+      assert.equal(stat.isSymbolicLink(), false); assert.equal(stat.uid, process.getuid());
+      if (stat.isDirectory()) {
+        assert.equal(allowed.includes(path.relative(root, file)), true);
+        // Validate before descending: recursive readdir follows symlinks.
+        walk(file);
+      } else {
+        assert.equal(stat.isFile() && stat.nlink === 1 && (stat.mode & 0o777) === 0o600 && directory === root
+          && name.startsWith('.p10b-reap-') && name.endsWith('.pending'), true);
+        markers++;
+      }
+    }
+  }
+  walk(root); assert.equal(markers, 1);
+}
+test('private-housekeeping inspection rejects a directory symlink before enumerating its target', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-probe-housekeeping-')); const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-probe-owned-outside-'));
+  t.after(() => { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); });
+  fs.symlinkSync(outside, path.join(root, process.platform === 'darwin' ? 'Library' : '.cache'));
+  const read = fs.readdirSync; const visited = [];
+  fs.readdirSync = directory => { visited.push(directory); return read(directory); };
+  try { assert.throws(() => assertPrivateProbeHousekeeping(root)); } finally { fs.readdirSync = read; }
+  assert.deepEqual(visited, [root]);
+});
 const executable = process.env.P10B_OFFLINE_STOPPED_LOG_PROBE;
 for (const mode of ['empty', 'private-only', 'before-target', 'before-region', 'before-started', 'before-instance', 'before-image', 'before-config',
   'after-instance', 'after-config', 'machine-error', 'machine-duplicate', 'first-http', 'steady-http', 'first-error', 'first-errors',
@@ -53,7 +82,7 @@ for (const mode of ['empty', 'private-only', 'before-target', 'before-region', '
   });
 }
 
-test('dedicated production probe initialization is memory-only with zero requests or normal-home files', {
+test('dedicated production probe initialization confines empty-cache housekeeping with zero requests', {
   skip: !process.env.P10B_OFFLINE_STOPPED_LOG_PROBE_CLIENT, timeout: 15000,
 }, async t => {
   const binary = process.env.P10B_OFFLINE_STOPPED_LOG_PROBE_CLIENT;
@@ -65,7 +94,7 @@ test('dedicated production probe initialization is memory-only with zero request
   try {
     native = await openP10bNativeStoppedLogProbeClient({ ...f, executable: binary, environment: context.environment });
     assert.equal(context.environment.HOME, context.environment.FLY_CONFIG_DIR);
-    assert.equal(fs.readdirSync(context.environment.FLY_CONFIG_DIR).every(name => name.startsWith('.p10b-reap-')), true);
+    assertPrivateProbeHousekeeping(context.environment.FLY_CONFIG_DIR);
     // No step call: initialization has no admitted Machine/log request.
   } catch (error) { reaped = error.reapVerified === true; throw error; }
   finally { if (native) reaped = await native.reap(); assert.equal(reaped, true); context.cleanup({ reaped }); }

@@ -15,7 +15,10 @@ its 27-second cutoff. Approval preparation cannot renew the execution budget.
 An opaque app credential is accepted only after durable nonce consumption. It
 is kept in memory in an empty owner-only (0700) private context; no normal account
 configuration, keychain, token creation/refresh/discharge or CLI is used.
-Credential creation remains a separately approved future setup action.
+The pinned transitive goimports initializer can create empty platform cache
+directories inside this isolated HOME; no cache files or normal-home state are
+used. Positive owned reap precedes removal of this private context. Credential
+creation remains a separately approved future setup action.
 
 The owned native process performs exactly:
 
