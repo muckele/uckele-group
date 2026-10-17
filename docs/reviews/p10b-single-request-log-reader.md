@@ -82,3 +82,15 @@ owner package and grants no email authority.
 Historical evidence and former native artifacts remain preserved. New native
 pins are bound separately after independent source review and an offline build
 from frozen clean source; no old session or artifact is silently reused.
+
+The reviewed darwin/arm64 default executable SHA256 is
+`f0f100c036ac133232e26f771cd609a4bd188eacc0e700c2fee55a4ef7cf3d09`, built twice identically
+with Go 1.26.9, CGO disabled, `-trimpath -buildvcs=true -ldflags=-buildid=` from
+clean source `891ae0825ec633087b311734e4d7c1bfa1e30750`. Embedded metadata states
+that revision and `vcs.modified=false`. Both builds denied all networking and
+normal-home reads, with cached module trees verified against go.sum. The native
+source is unchanged by this pin-only follow-up. Legacy and guardian session
+versions share the new default executable checksum while retaining distinct
+admission/operation limits; the separate stopped-diagnostic pin remains unchanged.
+Old artifacts, sessions and evidence remain preserved. No operational recipe or
+owner approval packet was generated.

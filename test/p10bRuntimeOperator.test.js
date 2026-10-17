@@ -24,7 +24,7 @@ function session() {
     sourceHead: 'c4944a46ac362cdcd002e077d5533b4b0843b1d0', hostSourceHead: '2'.repeat(40), nonce: 'c'.repeat(24), candidateImageDigest: image,
     baselineImageDigest: config.image.split('@')[1], baselineConfig: config,
     ownerPermissionDigest: 'd'.repeat(64), permissionEvidenceId: 'owner:offline-stub',
-    nativeClientSha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088',
+    nativeClientSha256: 'f0f100c036ac133232e26f771cd609a4bd188eacc0e700c2fee55a4ef7cf3d09',
     flyExecutable: { path: process.execPath, sha256: sha256(fs.readFileSync(process.execPath)) },
     namesClientPath: '/offline/names-client', namesClientSha256: 'a'.repeat(64),
     startedAt: new Date(now).toISOString(), sessionDeadline: new Date(now + 3600000).toISOString(),

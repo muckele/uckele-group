@@ -24,8 +24,10 @@ bundle, evidence or native-helper paths.
 
 Guest commit remains `c4944a46ac362cdcd002e077d5533b4b0843b1d0`; image remains
 `registry.fly.io/uckele-group-p10b@sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc`.
-The retained Machine helper remains SHA256
-`de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088`.
+The reviewed default Machine/log helper is now SHA256
+`f0f100c036ac133232e26f771cd609a4bd188eacc0e700c2fee55a4ef7cf3d09` from clean source
+`891ae0825ec633087b311734e4d7c1bfa1e30750`. The former helper SHA256
+`de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088` remains preserved and cannot serve the new log mode.
 The new read-only public client is independently bound by path and SHA256 in the
 recipe and session. It does not replace the Machine mutation helper.
 

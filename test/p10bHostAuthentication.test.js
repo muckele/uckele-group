@@ -18,7 +18,7 @@ function fixture() {
   const session = { version: 'p10b-no-email-session-v1', app: 'uckele-group-p10b', machineId: '0803730bd1d7e8',
     volumeId: 'vol_vwnkpex1k3yx9dnv', sourceHead: 'c4944a46ac362cdcd002e077d5533b4b0843b1d0', hostSourceHead: '2'.repeat(40),
     candidateImageDigest: 'sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc',
-    nativeClientSha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088',
+    nativeClientSha256: 'f0f100c036ac133232e26f771cd609a4bd188eacc0e700c2fee55a4ef7cf3d09',
     flyExecutable: { path: process.execPath, sha256: sha256(fs.readFileSync(process.execPath)) },
     namesClientPath: '/offline/names-client', namesClientSha256: 'a'.repeat(64),
     baselineImageDigest: baselineConfig.image.split('@')[1], baselineConfig, nonce: 'c'.repeat(24),
@@ -121,6 +121,16 @@ test('host binding rejects stale host checkout and changed retained guest/image/
   for (const key of ['sourceHead', 'candidateImageDigest', 'nativeClientSha256', 'hostSourceHead']) {
     const s = structuredClone(session); s[key] = key === 'hostSourceHead' ? s.sourceHead : '0'.repeat(s[key].length);
     assert.throws(() => bind(s, () => { throw Error('must reject identity first'); }));
+  }
+});
+test('new log-capable native pin rejects both preserved incompatible artifacts before source or authentication', () => {
+  for (const [version, nativeClientSha256] of [
+    ['p10b-no-email-session-v1', 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088'],
+    ['p10b-guardian-only-session-v1', 'c9b01bbfc76886c3fabaa465d5d2ab8579ca11589c6b604584bb0c85eacfcbb1'],
+  ]) {
+    const s = { ...fixture().session, version, nativeClientSha256 }; let sourceChecks = 0;
+    assert.throws(() => source.assertP10bNoEmailHostBinding(s, () => { sourceChecks++; }));
+    assert.equal(sourceChecks, 0);
   }
 });
 

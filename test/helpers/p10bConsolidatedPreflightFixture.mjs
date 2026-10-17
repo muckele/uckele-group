@@ -28,7 +28,7 @@ if (mode === '--fixture') {
     ownerIssuanceDirectory: path.join(root, 'owner-public-issuance'),
     sealedBundlePath: path.join(root, 'sealed-session.json'), approvedBundlePath: path.join(root, 'approved-session.json'),
     files: { node: binary, python: binary, fly: binary, docker: binary, buildx: binary, names: binary, probe: binary,
-      native: { path: process.execPath, sha256: 'de28af1f823644d0eb4f4cd025b74791b2e041a660cd061cafc67c7175c0b088' },
+      native: { path: process.execPath, sha256: 'f0f100c036ac133232e26f771cd609a4bd188eacc0e700c2fee55a4ef7cf3d09' },
       price: { path: path.join(root, 'price.json'), sha256: sha256(fs.readFileSync(path.join(root, 'price.json'))) } },
     recovery: { directory: path.join(root, '.uckele-group-p10b-host'), activePath: path.join(root, '.uckele-group-p10b-host/0803730bd1d7e8.active.json'),
       packetDigest: 'a'.repeat(64), expectedSha256: 'b'.repeat(64), reservedAt: '2026-10-10T07:12:20.821Z', evidencePath: '/offline/historical-evidence' } });
