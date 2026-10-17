@@ -1025,7 +1025,9 @@ for (const mode of ['primary-exit', 'readiness-timeout']) test(`concrete parent 
     processes: { launch: () => ({ child, exited: mode === 'primary-exit' ? Promise.resolve({ code: 1, signal: null }) : new Promise(() => {}) }),
       async terminate() { terminations++; return true; } } });
   if (mode === 'readiness-timeout') t.mock.timers.enable({ apis: ['setTimeout'] });
-  const pending = boundaries.demonstrate({ phase: operator.createP10bRuntimePhase(x.s, 'demo', now), machine: x.baseline, observer: {} });
+  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+  evidence.write('p10b-runtime-only-demo-start-intent.json', { at: new Date(now).toISOString(), window: phase.window });
+  const pending = boundaries.demonstrate({ phase, machine: x.baseline, observer: {} });
   if (mode === 'readiness-timeout') t.mock.timers.tick(15000);
   await assert.rejects(pending, /Demo primary exited before readiness|Demo readiness timeout/);
   const failure = evidence.read('p10b-runtime-only-demo-controller-failure.json');
@@ -1050,6 +1052,7 @@ for (const mode of ['start-failure', 'ssh-failure', 'invalid-json', 'ipc-async-f
       baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
     const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
     const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+    evidence.write('p10b-runtime-only-demo-start-intent.json', { at: new Date(now).toISOString(), window: phase.window });
     const machine = { ...x.baseline, config: phase.config };
     const child = Object.assign(new EventEmitter(), { pid: 5012, exitCode: null, signalCode: null }); let resolveExit, terminations = 0;
     const primary = { child, reaped: false, exited: new Promise(resolve => { resolveExit = resolve; }) };
@@ -1062,7 +1065,7 @@ for (const mode of ['start-failure', 'ssh-failure', 'invalid-json', 'ipc-async-f
         const cliMode = ['start-failure', 'ssh-failure', 'invalid-json', 'ipc-async-failure'].includes(mode) ? mode : 'success';
         const result = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings',
           new URL('./helpers/p10bDemoPrimaryVm.js', import.meta.url).pathname, cliMode,
-          JSON.stringify({ session: x.s, phase, machine, now })],
+          JSON.stringify({ session: x.s, phase, machine, now, intent: evidence.read('p10b-runtime-only-demo-start-intent.json') })],
         { encoding: 'utf8', timeout: 5000, env: { HOME: '/tmp', PATH: '/usr/bin:/bin' } });
         assert.equal(result.status, 0, result.stderr); sourceResult = JSON.parse(result.stdout);
         for (const [name, value] of Object.entries(sourceResult.records)) evidence.write(name, value);
@@ -1128,6 +1131,7 @@ test('actual owned local IPC primary is OS-reaped and its termination receipt su
       return entry;
     } } });
   const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+  evidence.write('p10b-runtime-only-demo-start-intent.json', { at: new Date(now).toISOString(), window: phase.window });
   await assert.rejects(boundaries.demonstrate({ phase, machine: x.baseline, observer: { phase,
     entry: { child: { pid: process.pid }, exited: Promise.resolve({ code: 1, signal: null }) } } }), /Observer completion failed/);
   const receipt = evidence.read('p10b-runtime-only-demo-primary-termination.json');
@@ -1167,6 +1171,7 @@ for (const mode of ['signal', 'code']) test(`actual owned primary ${mode} exit b
       return entry;
     }, async terminate(primary) { terminations++; return local.terminate(primary); } } });
   const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+  evidence.write('p10b-runtime-only-demo-start-intent.json', { at: new Date(now).toISOString(), window: phase.window });
   await assert.rejects(boundaries.demonstrate({ phase, machine: x.baseline, observer: { phase,
     entry: { child: { pid: process.pid }, exited: Promise.resolve({ code: 1, signal: null }) } } }), /Live owned primary unavailable/);
   assert.equal(terminations, 0);
@@ -1175,4 +1180,85 @@ for (const mode of ['signal', 'code']) test(`actual owned primary ${mode} exit b
   assert.equal(failure.stage, 'terminate-primary'); assert.equal(failure.primaryTerminationVerified, false);
   assert.equal(failure.primaryExitCode, mode === 'code' ? 0 : null);
   assert.equal(failure.primaryExitSignal, mode === 'signal' ? 'SIGKILL' : null);
+});
+
+async function readinessParent({ time, launch, write } = {}) {
+  const { createP10bNoEmailBoundaries } = await import('../server/services/p10bNoEmailBoundaries.js');
+  const x = recoveryFixture(); const evidence = memoryEvidence(); evidence.root = '/synthetic/absolute-readiness';
+  const recovered = recovery.recoverP10bAdmissionReservation({ session: x.s, approval: x.approval,
+    baseline: x.baseline, independentBaseline: x.independentBaseline, filesystem: x.filesystem, clock: () => now, operatorPid: 5010 });
+  const verification = recovery.verifyP10bAdmissionArchive({ session: x.s, recovery: recovered, inspect: x.inspect, verifierPid: 5011, now });
+  const phase = operator.createP10bRuntimePhase(x.s, 'demo', now);
+  const child = Object.assign(new EventEmitter(), { pid: 5012, exitCode: null, signalCode: null });
+  let resolveExit, launches = 0, terminations = 0;
+  const primary = { child, exited: new Promise(resolve => { resolveExit = resolve; }) };
+  const boundaries = await createP10bNoEmailBoundaries({ session: x.s, approval: x.approval, evidence,
+    recovery: { ...recovered, verification }, inspectRecovery: x.inspect, clock: () => time?.value ?? now,
+    monotonicClock: () => time?.elapsed ?? 0,
+    openNative: async () => assert.fail('No native client in readiness deadline tests'),
+    processes: { launch() { launches++; launch?.(child); return primary; },
+      async terminate() { terminations++; resolveExit({ code: null, signal: 'SIGKILL' }); return true; } } });
+  evidence.write('p10b-runtime-only-demo-start-intent.json', { at: new Date(now).toISOString(), window: phase.window });
+  if (write) { const original = evidence.write; evidence.write = (name, value) => { original(name, value); write(name); }; }
+  return { boundaries, evidence, child, phase, x, counts: () => ({ launches, terminations }),
+    demonstrate: () => boundaries.demonstrate({ phase, machine: x.baseline, observer: { phase,
+      entry: { child: { pid: process.pid }, exited: Promise.resolve({ code: 1, signal: null }) } } }) };
+}
+
+for (const delay of [14999, 15000, 15001]) test(`concrete parent admits readiness only before exact deadline: ${delay}ms`, async () => {
+  const time = { value: now }; const f = await readinessParent({ time });
+  const pending = f.demonstrate(); time.value = now + delay;
+  // Message delivered before an overdue timer callback must still fail closed.
+  f.child.emit('message', { sourceHead: f.x.s.sourceHead, freshPathsVerified: true });
+  await assert.rejects(pending, delay < 15000 ? /Observer completion failed/ : /Demo readiness timeout/);
+  assert.equal(f.evidence.has('p10b-runtime-only-demo-readiness.json'), delay < 15000);
+  assert.equal(f.evidence.has('p10b-runtime-only-demo-primary-termination.json'), delay < 15000);
+  assert.deepEqual(f.counts(), { launches: 1, terminations: delay < 15000 ? 1 : 0 });
+});
+
+test('parent publication crossing deadline cannot claim deliberate primary termination', async () => {
+  const time = { value: now }; const f = await readinessParent({ time,
+    write: name => { if (name === 'p10b-runtime-only-demo-readiness.json') time.value = now + 15000; } });
+  const pending = f.demonstrate(); f.child.emit('message', { sourceHead: f.x.s.sourceHead, freshPathsVerified: true });
+  await assert.rejects(pending, /Demo readiness timeout/);
+  assert.equal(f.evidence.has('p10b-runtime-only-demo-primary-termination.json'), false);
+  assert.deepEqual(f.counts(), { launches: 1, terminations: 0 });
+});
+
+test('parent timer uses intent remainder before launch and cannot renew after wall-clock rollback', async t => {
+  const time = { value: now }; const f = await readinessParent({ time,
+    launch: () => { t.mock.timers.tick(5000); time.value = now - 1000; } });
+  time.value = now + 4000; t.mock.timers.enable({ apis: ['setTimeout'] });
+  const pending = f.demonstrate(); const rejected = assert.rejects(pending, /Demo readiness timeout/);
+  t.mock.timers.tick(5999); await Promise.resolve();
+  assert.equal(f.evidence.has('p10b-runtime-only-demo-controller-failure.json'), false);
+  t.mock.timers.tick(1); await rejected;
+  assert.deepEqual(f.counts(), { launches: 1, terminations: 0 });
+});
+
+test('stalled launch and wall-clock rollback cannot admit queued readiness ahead of overdue timer', async () => {
+  const time = { value: now, elapsed: 0 }; const f = await readinessParent({ time,
+    launch: child => { time.elapsed = 15000; time.value = now - 1000;
+      queueMicrotask(() => child.emit('message', { sourceHead: f.x.s.sourceHead, freshPathsVerified: true })); } });
+  await assert.rejects(f.demonstrate(), /Demo readiness timeout/);
+  assert.equal(f.evidence.has('p10b-runtime-only-demo-readiness.json'), false);
+  assert.deepEqual(f.counts(), { launches: 1, terminations: 0 });
+});
+
+for (const kind of ['missing', 'extra', 'future', 'stale', 'window-mismatch']) test(`parent rejects ${kind} intent before launching`, async () => {
+  const f = await readinessParent(); const name = 'p10b-runtime-only-demo-start-intent.json'; const intent = f.evidence.read(name);
+  if (kind === 'missing') f.evidence.files.delete(name);
+  if (kind === 'extra') intent.extra = true;
+  if (kind === 'future') intent.at = new Date(now + 1).toISOString();
+  if (kind === 'stale') intent.at = new Date(now - 15000).toISOString();
+  if (kind === 'window-mismatch') intent.window = { ...intent.window, stopAt: new Date(now + 299999).toISOString() };
+  if (kind !== 'missing') f.evidence.files.set(name, intent);
+  await assert.rejects(f.demonstrate()); assert.deepEqual(f.counts(), { launches: 0, terminations: 0 });
+});
+
+test('parent input publication exhausting readiness budget cannot launch primary', async () => {
+  const time = { value: now }; const f = await readinessParent({ time,
+    write: name => { if (name === 'p10b-runtime-only-demo-primary-input.json') time.value = now + 15000; } });
+  await assert.rejects(f.demonstrate(), /Demo readiness timeout/);
+  assert.deepEqual(f.counts(), { launches: 0, terminations: 0 });
 });

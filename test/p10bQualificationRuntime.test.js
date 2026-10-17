@@ -864,6 +864,10 @@ test('concrete parent-based no-send demo and preparation restore stopped baselin
   // injected email responses, not authority granted by the no-send sequence.
   machine.config=structuredClone(prepareConfig);machine.image_ref.digest=`sha256:${'a'.repeat(64)}`;
   const r = prepare.preparation;
+  // Synthetic initial scheduling can advance a weekend preparation to Monday.
+  // This separately stubbed qualification supplies fresh configuration facts
+  // at its own clock; the production24h freshness gate remains unchanged.
+  evidence.verifiedAt = r.preparedAt;
   evidence.flySecretMetadataDigest = digest(secrets);
   packet.configurationEvidenceDigest = digest(evidence);
   const manifest = { version: P10B_QUALIFICATION_VERSION, runtime: {

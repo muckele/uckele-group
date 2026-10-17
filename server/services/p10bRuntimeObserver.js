@@ -1,6 +1,7 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { P10B_GUARDIAN_EXIT_PREFIX } from './p10bGuardianParent.js';
 import { P10B_OBSERVER_POLICY } from './p10bObserverPolicy.js';
+import { publicP10bNativeFailure } from './p10bNativeFailure.js';
 const digest = value => sha256(stableCanonicalJson(value));
 const canonicalTime = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 const eventKeys = 'bindingVerified,code,exitedAt,guardianPid,parentPid,parentStartedAt,productionReady,readyDigest,receiptDigest,signal,spawnFailed,startDigest,version,windowDigest';
@@ -47,7 +48,8 @@ export function createP10bObserverControls({ phase, machine, client, record, clo
         record(row);
         if (!attached && m.state === 'stopped') attached = true;
         return row;
-      } catch { failed = true; record({ kind: 'observer-read-error', at: new Date(clock()).toISOString() }); }
+      } catch (error) { failed = true; record({ kind: 'observer-read-error', at: new Date(clock()).toISOString(),
+        nativeFailure: publicP10bNativeFailure(error) }); }
       finally { busy = false; }
     })();
     return pending;

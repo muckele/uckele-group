@@ -8,6 +8,7 @@ import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { publicP10bNativeFailure } from '../server/services/p10bNativeFailure.js';
 import { assertP10bNoEmailHostBinding, assertP10bFlyExecutable } from '../server/services/p10bOperatorSource.js';
 import { p10bInheritedAppTokenEnvironment } from '../server/services/p10bHostAuthentication.js';
+import { createP10bDemoReadinessBudget, P10B_DEMO_READINESS_RESERVE_MS } from '../server/services/p10bDemoReadiness.js';
 let processes; let evidence; let sessionDigest; let nativeReapVerified = null;
 let stage = 'input-admission';
 try {
@@ -22,6 +23,8 @@ try {
   if (evidence.has('SESSION_NOT_APPROVED') || evidence.has('p10b-runtime-only-session-closure.json')) throw Error();
   assertP10bRecoveryAdmission({ session, recovery, inspect: () => inspectP10bRecovery(session) });
   const window = phase.window;
+  const readinessRemaining = createP10bDemoReadinessBudget(evidence.read('p10b-runtime-only-demo-start-intent.json'), phase,
+    { clock: () => Date.now(), monotonicClock: () => performance.now() });
   if (Date.now() < Date.parse(window.issuedAt) || Date.now() - Date.parse(window.issuedAt) > 60000
     || Date.parse(window.stopAt) - Date.now() < 240000) throw Error();
   const environment = p10bInheritedAppTokenEnvironment({ session, approval });
@@ -37,23 +40,34 @@ try {
   evidence.write('p10b-runtime-only-demo-actual-start.json', { at: new Date().toISOString(), instanceId: checked.instance_id });
   if (Date.now() - Date.parse(window.issuedAt) > 60000 || Date.parse(window.stopAt) - Date.now() < 240000) throw Error();
   stage = 'machine-start-command';
-  await processes.command(flyExecutable, ['machine', 'start', session.machineId, '--app', session.app], 10000);
+  await processes.command(flyExecutable, ['machine', 'start', session.machineId, '--app', session.app],
+    Math.min(10000, readinessRemaining(P10B_DEMO_READINESS_RESERVE_MS)));
   stage = 'readiness-command';
   const output = await processes.command(flyExecutable, ['ssh', 'console', '--app', session.app,
-    '--machine', session.machineId, '--quiet', '--command', 'node /app/scripts/read-p10b-public-readiness.js'], 5000);
+    '--machine', session.machineId, '--quiet', '--command', 'node /app/scripts/read-p10b-public-readiness.js'],
+    readinessRemaining(P10B_DEMO_READINESS_RESERVE_MS));
   stage = 'readiness-json';
+  readinessRemaining();
   const readiness = JSON.parse(output);
   stage = 'publish-primary-readiness';
+  readinessRemaining();
   evidence.write('p10b-runtime-only-demo-primary-readiness.json', { version: 'p10b-demo-primary-readiness-v1',
     sessionDigest, windowDigest: sha256(stableCanonicalJson(window)), readinessDigest: sha256(stableCanonicalJson(readiness)),
     readinessParsed: true, at: new Date().toISOString(), productionReady: false });
   stage = 'readiness-ipc';
+  const ipcTimeout = Math.min(500, readinessRemaining());
   if (typeof process.send !== 'function') throw Error('Primary IPC unavailable');
   // A failed asynchronous send otherwise emits an unhandled process error,
   // outside this catch. The callback confirms transport submission only; the
   // parent's separate received-readiness artifact remains required for proof.
-  await new Promise((resolve, reject) => process.send(readiness, error => error
-    ? reject(Error('Primary IPC submission failed')) : resolve()));
+  let ipcTimer;
+  try {
+    await new Promise((resolve, reject) => {
+      ipcTimer = setTimeout(() => reject(Error('Primary IPC submission timed out')), ipcTimeout);
+      process.send(readiness, error => error ? reject(Error('Primary IPC submission failed')) : resolve());
+    });
+  } finally { clearTimeout(ipcTimer); }
+  readinessRemaining();
   setInterval(() => {}, 1000);
 } catch (error) {
   const commandFailure = publicP10bCommandFailure(error); const nativeFailure = publicP10bNativeFailure(error);

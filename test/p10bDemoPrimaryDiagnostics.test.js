@@ -24,20 +24,95 @@ for (const [mode, stage] of Object.entries(modes)) test(`actual demo primary CLI
   assert.equal(result.calls.filter(c => c.operation === 'machine').length, mode.startsWith('native') ? 0 : 1);
 });
 
-test('actual demo primary success still sends readiness after one start with unchanged command budgets', () => {
+test('actual demo primary success sends readiness after one start within the common budget', () => {
   const child = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings',
     new URL('./helpers/p10bDemoPrimaryVm.js', import.meta.url).pathname, 'success'],
   { encoding: 'utf8', timeout: 5000, env: { PATH: '/usr/bin:/bin', HOME: '/tmp' } });
   assert.equal(child.status, 0, child.stderr); const result = JSON.parse(child.stdout);
   assert.equal(result.exitCode, 0); assert.equal(result.reaps, 0); assert.equal(result.messages.length, 1);
   assert.equal(result.messages[0].freshPathsVerified, true);
-  assert.deepEqual(result.calls, [{ operation: 'machine', timeout: 10000 }, { operation: 'ssh', timeout: 5000 }]);
+  assert.deepEqual(result.calls, [{ operation: 'machine', timeout: 10000 }, { operation: 'ssh', timeout: 13000 }]);
   assert.equal(result.records['p10b-runtime-only-demo-primary-failure.json'], undefined);
   const parsed = result.records['p10b-runtime-only-demo-primary-readiness.json'];
   assert.ok(parsed, 'Parsed-readiness checkpoint was discarded');
   assert.equal(parsed.version, 'p10b-demo-primary-readiness-v1');
   assert.equal(parsed.productionReady, false); assert.equal(parsed.readinessParsed, true);
   assert.match(parsed.readinessDigest, /^[a-f0-9]{64}$/);
+});
+
+function primary(overrides) {
+  const child = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings',
+    new URL('./helpers/p10bDemoPrimaryVm.js', import.meta.url).pathname, 'success', JSON.stringify(overrides)],
+  { encoding: 'utf8', timeout: 5000, env: { PATH: '/usr/bin:/bin', HOME: '/tmp' } });
+  assert.equal(child.status, 0, child.stderr); return JSON.parse(child.stdout);
+}
+
+test('readiness taking six seconds uses remaining existing time after two-second start, without retry', () => {
+  const r = primary({ startMs: 2000, sshMs: 6000 });
+  assert.equal(r.exitCode, 0); assert.equal(r.messages.length, 1);
+  assert.deepEqual(r.calls, [{ operation: 'machine', timeout: 10000 }, { operation: 'ssh', timeout: 11000 }]);
+});
+
+test('launch, initialization and start time all reduce SSH remainder and preserve two-second cleanup/publication reserve', () => {
+  const r = primary({ launchDelayMs: 1000, initializationMs: 2000, startMs: 3000, sshMs: 6000 });
+  assert.equal(r.exitCode, 0); assert.equal(r.messages.length, 1);
+  assert.deepEqual(r.calls, [{ operation: 'machine', timeout: 10000 }, { operation: 'ssh', timeout: 7000 }]);
+});
+
+for (const reaped of [true, false]) test(`readiness command exhausting remainder fails with cleanup verified=${reaped}, no retry`, () => {
+  const r = primary({ startMs: 2000, sshMs: 11001, reaped });
+  assert.equal(r.exitCode, 1); assert.equal(r.reaps, 1); assert.deepEqual(r.messages, []);
+  const f = r.records['p10b-runtime-only-demo-primary-failure.json'];
+  assert.equal(f.stage, 'readiness-command'); assert.equal(f.commandFailure.reason, 'timed-out');
+  assert.equal(f.commandFailure.timeoutMs, 11000); assert.equal(f.clientsReaped, reaped);
+  assert.equal(f.commandFailure.clientsReaped, reaped); assert.equal(r.calls.length, 2);
+});
+
+for (const values of [{ sshMs: 15000, ignoreTimeout: true }, { sshMs: 12000, publicationMs: 3000 }]) {
+  test(`late command/publication at the common cutoff cannot submit IPC: ${JSON.stringify(values)}`, () => {
+    const r = primary(values); assert.equal(r.exitCode, 1); assert.deepEqual(r.messages, []);
+    assert.equal(r.calls.filter(c => c.operation === 'machine').length, 1);
+  });
+}
+
+for (const kind of ['missing', 'extra', 'malformed', 'future', 'stale', 'window-mismatch']) {
+  test(`invalid ${kind} immutable intent fails before any start command`, () => {
+    const now = Date.parse('2026-10-17T18:00:00.000Z');
+    const window = { issuedAt: new Date(now - 1000).toISOString(), stopAt: new Date(now + 299000).toISOString() };
+    let intent = { at: new Date(now).toISOString(), window };
+    if (kind === 'missing') intent = null;
+    if (kind === 'extra') intent.extra = true;
+    if (kind === 'malformed') intent.at = '2026-10-17T18:00:00Z';
+    if (kind === 'future') intent.at = new Date(now + 1).toISOString();
+    if (kind === 'stale') intent.at = new Date(now - 15000).toISOString();
+    if (kind === 'window-mismatch') intent.window = { ...window, stopAt: new Date(now + 299001).toISOString() };
+    const r = primary({ now, intent }); assert.equal(r.exitCode, 1); assert.deepEqual(r.calls, []); assert.deepEqual(r.messages, []);
+  });
+}
+
+test('initialization exhausting command reserve cannot start a Machine', () => {
+  const r = primary({ initializationMs: 13000 });
+  assert.equal(r.exitCode, 1); assert.deepEqual(r.calls, []);
+});
+
+test('primary monotonic cutoff rejects a late command even when wall clock rolls back', () => {
+  const r = primary({ sshMs: 15000, wallRollbackMs: 10000, ignoreTimeout: true });
+  assert.equal(r.exitCode, 1); assert.deepEqual(r.messages, []); assert.equal(r.calls.length, 2);
+});
+
+test('primary cannot succeed after IPC callback crosses the immutable cutoff', () => {
+  const r = primary({ sshMs: 12000, ipcMs: 3000 });
+  assert.equal(r.exitCode, 1); assert.equal(r.reaps, 1); assert.equal(r.unhandledIpcErrors, 0);
+  assert.equal(r.records['p10b-runtime-only-demo-primary-failure.json'].stage, 'readiness-ipc');
+});
+
+test('unacknowledged primary IPC fails within its bounded publication allowance', () => {
+  const child = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings',
+    new URL('./helpers/p10bDemoPrimaryVm.js', import.meta.url).pathname, 'ipc-no-callback'],
+  { encoding: 'utf8', timeout: 5000, env: { PATH: '/usr/bin:/bin', HOME: '/tmp' } });
+  assert.equal(child.status, 0, child.stderr); const r = JSON.parse(child.stdout);
+  assert.equal(r.exitCode, 1); assert.equal(r.reaps, 1); assert.equal(r.unhandledIpcErrors, 0);
+  assert.equal(r.records['p10b-runtime-only-demo-primary-failure.json'].stage, 'readiness-ipc');
 });
 
 for (const mode of ['no-callback', 'callback']) test(`actual Node closed IPC ${mode} demonstrates asynchronous failure outside try/catch`, async t => {

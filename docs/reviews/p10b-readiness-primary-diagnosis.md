@@ -63,10 +63,13 @@ Neither new receipt is accepted as standalone guardian proof. Evidence
 publication failure remains fail-closed; unavailable storage cannot be repaired
 or retrospectively reconstructed by another receipt.
 
-There is still one start, the same10000ms start/5000ms SSH/15000ms parent readiness
-budgets, the same native and process reap guards, independent observer and
-strict inclusive1000ms measurement limit. No guest, native artifact, image,
-operation permission, restoration or qualification gate changes.
+At that revision there was still one start, with10000ms start/5000ms SSH/15000ms
+parent readiness budgets, the same native and process reap guards, independent
+observer and strict inclusive1000ms measurement limit. The subsequent
+[October17 budget correction](p10b-readiness-budget-correction.md) replaces the
+inner fixed SSH allowance with the remainder of the existing absolute15s gate.
+No guest, native artifact, image, operation permission, restoration or
+qualification gate changes.
 
 ## Timing recommendation
 

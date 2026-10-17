@@ -13,6 +13,7 @@ import { sanitizeP10bGuardianLog } from './p10bRuntimeObserver.js';
 import { assertP10bNoEmailApproval, assertP10bFrozenPhase, isP10bGuardianSession } from './p10bRuntimeOnlyOperator.js';
 import { p10bInheritedAppTokenEnvironment } from './p10bHostAuthentication.js';
 import { assertP10bFlyExecutable } from './p10bOperatorSource.js';
+import { createP10bDemoReadinessBudget } from './p10bDemoReadiness.js';
 
 const script = name => fileURLToPath(new URL(`../../scripts/${name}`, import.meta.url));
 const digest = value => sha256(stableCanonicalJson(value));
@@ -61,7 +62,7 @@ export function verifyP10bPreparationObservation(rows, phase, machine, result, s
 // recovery gate and exact session approval have both passed.
 export async function createP10bNoEmailBoundaries({ session, approval, evidence, recovery, inspectRecovery,
   nativeExecutable, flyExecutable = session?.flyExecutable?.path, nodeExecutable = process.execPath,
-  processes, environment, openNative = openP10bNativeMachineClient, clock = () => Date.now() }) {
+  processes, environment, openNative = openP10bNativeMachineClient, clock = () => Date.now(), monotonicClock = () => performance.now() }) {
   assertP10bNoEmailApproval(session, approval, clock());
   assertP10bFlyExecutable(session, flyExecutable);
   assertP10bRecoveryAdmission({ session, recovery, inspect: inspectRecovery, now: clock() });
@@ -121,22 +122,33 @@ export async function createP10bNoEmailBoundaries({ session, approval, evidence,
     } finally { clearTimeout(timer); }
   }
   async function demonstrate({ phase, observer, machine }) {
+    const readinessRemaining = createP10bDemoReadinessBudget(evidence.read('p10b-runtime-only-demo-start-intent.json'), phase,
+      { clock, monotonicClock });
     const input = 'p10b-runtime-only-demo-primary-input.json'; evidence.write(input, { session, approval, phase, recovery, flyExecutable,
       nativeExecutable, machine });
-    const primary = processes.launch(nodeExecutable, [script('run-p10b-demo-primary.js'), path.join(evidence.root, input)],
-      { stdio: ['ignore', 'ignore', 'pipe', 'ipc'], detached: true });
-    controllers.push(primary);
-    let timer; let readiness; let primaryTerminal = null; let readinessFailure = 'readiness-timeout';
+    let primary; let timer; let readiness; let primaryTerminal = null; let readinessFailure = 'readiness-timeout';
     let stage = 'await-primary-readiness'; let terminationVerified = false;
     try {
-      try { readiness = await Promise.race([new Promise(resolve => primary.child.once('message', resolve)),
+      try {
+        // Schedule once before launch. Later wall-clock rollback cannot renew
+        // this timer, and launch itself consumes the same readiness allowance.
+        const left = readinessRemaining();
+        const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Demo readiness timeout')), left); });
+        primary = processes.launch(nodeExecutable, [script('run-p10b-demo-primary.js'), path.join(evidence.root, input)],
+          { stdio: ['ignore', 'ignore', 'pipe', 'ipc'], detached: true });
+        controllers.push(primary);
+        readiness = await Promise.race([new Promise(resolve => primary.child.once('message', resolve)),
         primary.exited.then(terminal => { primaryTerminal = terminal; readinessFailure = 'primary-exit';
           throw Error('Demo primary exited before readiness'); }),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Demo readiness timeout')), 15000); })]); }
+        timeout]);
+        // A queued message can beat an overdue timer callback. Receipt must
+        // still precede the immutable deadline, including cutoff equality.
+        readinessRemaining(); }
       finally { clearTimeout(timer); }
       stage = 'publish-readiness';
       evidence.write('p10b-runtime-only-demo-readiness.json', readiness);
       stage = 'validate-readiness';
+      readinessRemaining();
       if (readiness.sourceHead !== session.sourceHead || readiness.freshPathsVerified !== true) throw Error('Demo readiness binding failed');
       stage = 'terminate-primary';
       const primaryPid = primary.child.pid;

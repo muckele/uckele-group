@@ -10,30 +10,40 @@ import { P10bOperatorCommandError, publicP10bCommandFailure } from '../../server
 import { P10bNativeRequestError, publicP10bNativeFailure } from '../../server/services/p10bNativeFailure.js';
 const mode = process.argv[2]; const source = new URL('../../scripts/run-p10b-demo-primary.js', import.meta.url);
 const override = process.argv[3] ? JSON.parse(process.argv[3]) : {};
-const now = Date.now(); const session = override.session || { sourceHead: 'a'.repeat(40), machineId: '0803730bd1d7e8', app: 'uckele-group-p10b' };
+const now = override.now ?? Date.now(); let currentTime = now + (override.launchDelayMs || 0);
+let elapsedTime = 0;
+const advance = ms => { currentTime += ms; elapsedTime += ms; };
+const session = override.session || { sourceHead: 'a'.repeat(40), machineId: '0803730bd1d7e8', app: 'uckele-group-p10b' };
 const machine = override.machine || { state: 'stopped', instance_id: 'synthetic-version', config: { synthetic: true } };
 const phase = override.phase || { label: 'demo', config: machine.config, window: { issuedAt: new Date(now - 1000).toISOString(), stopAt: new Date(now + 299000).toISOString() } };
 const records = {}; const calls = []; const messages = []; let reaps = 0; let stderr = '';
+const intent = Object.hasOwn(override, 'intent') ? override.intent : { at: new Date(now).toISOString(), window: phase.window };
 const input = { session, approval: {}, phase, recovery: {}, machine, flyExecutable: '/synthetic/fly', nativeExecutable: '/synthetic/native' };
 const processes = { async command(_file, args, timeout) {
   calls.push({ operation: args[0], timeout });
   if (args[0] === 'machine') {
+    advance(override.startMs || 0);
     if (mode === 'start-failure') throw new P10bOperatorCommandError('timed-out', timeout, { code: null, signal: 'SIGKILL' }, true);
     return '';
   }
+  const elapsed = override.sshMs || 0; advance(elapsed);
+  currentTime -= override.wallRollbackMs || 0;
+  if (elapsed > timeout && !override.ignoreTimeout) throw new P10bOperatorCommandError('timed-out', timeout, { code: null, signal: 'SIGKILL' }, override.reaped !== false);
   if (mode === 'ssh-failure') throw new P10bOperatorCommandError('command-failed', timeout, { code: 17, signal: null }, true);
   return mode === 'invalid-json' ? 'synthetic-private-json-canary' : JSON.stringify({ sourceHead: session.sourceHead, freshPathsVerified: true });
-}, async reap() { reaps++; return true; } };
+}, async reap() { reaps++; return override.reaped !== false; } };
 const modules = {
   './p10bOperatorProcesses.js': { createP10bOperatorProcesses: () => processes, publicP10bCommandFailure },
   './p10bOperatorFiles.js': { readP10bPublicJson: () => input, inspectP10bRecovery: () => ({}),
-    createP10bOperatorEvidence: () => ({ has: n => Object.hasOwn(records, n), write(n, v) {
+    createP10bOperatorEvidence: () => ({ read: () => intent, has: n => Object.hasOwn(records, n), write(n, v) {
       if (mode === 'readiness-checkpoint-publication' && n === 'p10b-runtime-only-demo-primary-readiness.json') throw Error('synthetic private write canary');
       if (Object.hasOwn(records, n)) throw Error(); records[n] = v;
+      if (n === 'p10b-runtime-only-demo-primary-readiness.json') advance(override.publicationMs || 0);
     } }) },
   './p10bAdmissionRecovery.js': { assertP10bRecoveryAdmission: () => {} },
   './p10bRuntimeOnlyOperator.js': { assertP10bNoEmailApproval: () => {}, assertP10bFrozenPhase: () => {} },
   './p10bNativeMachineClient.js': { openP10bNativeMachineClient: async () => ({ async client() {
+    advance(override.initializationMs || 0);
     if (mode === 'native-failure') throw new P10bNativeRequestError({ code: 'timed-out', method: 'GET', timeoutMs: 1000 });
     return machine;
   }, async reap() { return mode !== 'native-reap'; } }) },
@@ -50,23 +60,28 @@ const localProcess = Object.assign(new EventEmitter(), { argv: ['node', fileURLT
         if (callback) callback(error); else localProcess.emit('error', error); });
       return false;
     }
-    messages.push(value); if (callback) queueMicrotask(() => callback(null)); return true;
+    messages.push(value);
+    if (mode === 'ipc-no-callback') return false;
+    advance(override.ipcMs || 0);
+    if (callback) queueMicrotask(() => callback(null)); return true;
   }, stderr: { write: v => { stderr += v; } }, exitCode: 0 });
 // The real process would exit on the unhandled error. Retain that outcome for
 // inspection without allowing the harness to replace the CLI's missing catch.
 localProcess.on('error', () => { unhandledIpcErrors++; localProcess.exitCode = 1; });
 if (mode === 'ipc-missing') localProcess.send = undefined;
-const ClockDate = override.now === undefined ? Date : class extends Date {
-  constructor(...args) { super(...(args.length ? args : [override.now])); }
-  static now() { return override.now; }
+const ClockDate = class extends Date {
+  constructor(...args) { super(...(args.length ? args : [currentTime])); }
+  static now() { return currentTime; }
 };
 // JSON.parse and the real canonical-JSON validator must share a realm, as
 // they do in the production CLI; VM-only prototype identities are not input.
-const context = vm.createContext({ process: localProcess, Date: ClockDate, JSON, setInterval() {}, console });
+const context = vm.createContext({ process: localProcess, Date: ClockDate, performance: { now: () => elapsedTime },
+  JSON, setInterval() {}, setTimeout, clearTimeout, console });
 const code = new vm.SourceTextModule(fs.readFileSync(source, 'utf8'), { context, identifier: source.href });
 await code.link(async specifier => {
   const filename = path.basename(specifier);
-  const exports = specifier === 'node:path' ? { default: path } : modules['./' + filename];
+  const exports = specifier === 'node:path' ? { default: path } : filename === 'p10bDemoReadiness.js'
+    ? await import('../../server/services/p10bDemoReadiness.js') : modules['./' + filename];
   if (!exports) throw Error('Unstubbed external boundary: ' + specifier);
   return new vm.SyntheticModule(Object.keys(exports), function () { for (const [name, value] of Object.entries(exports)) this.setExport(name, value); }, { context });
 });
