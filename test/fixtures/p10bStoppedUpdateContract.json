@@ -1,0 +1,180 @@
+{
+  "version": "p10b-offline-stopped-update-contract-v1",
+  "provenance": "Public frozen configuration and update intent from consumed 2026-10-15 attempt; no credential, auth setup or live lookup.",
+  "baseline": {
+    "dns": {},
+    "env": {
+      "ADMIN_ALLOW_PASSWORD_AUTH": "false",
+      "ADMIN_AUTH_MODE": "password",
+      "ANALYTICS_ENABLED": "false",
+      "BACKUP_ENABLED": "false",
+      "DEAL_HUNTER_CIM_AUTOMATION_PAUSED": "true",
+      "DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED": "false",
+      "DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED": "false",
+      "DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS": "mathew@uckelegroup.com",
+      "DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL": "P10B Sender <sender@p10b-e2e.uckelegroup.com>",
+      "DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN": "p10b-e2e.uckelegroup.com",
+      "DEAL_HUNTER_CIM_MAILBOX_REPLY_TO": "replies@p10b-e2e.uckelegroup.com",
+      "DEAL_HUNTER_CIM_OUTREACH_PAUSED": "true",
+      "DEAL_HUNTER_CIM_PROVIDER_ENABLED": "false",
+      "DEAL_HUNTER_CIM_PROVIDER_PROFILE": "controlled-mailbox-v1",
+      "DEAL_HUNTER_DAILY_EMAIL_ENABLED": "false",
+      "DELIVERY_PROVIDER": "console",
+      "FOLLOW_UP_AI_ENABLED": "false",
+      "FOLLOW_UP_EMAIL_ENABLED": "false",
+      "NODE_ENV": "p10b",
+      "OUTBOUND_HTTP_TIMEOUT_MS": "10000",
+      "PORT": "8787",
+      "PUBLIC_SITE_URL": "https://uckele-group-p10b.fly.dev",
+      "SECURE_DOCUMENTS_STORAGE_DIR": "/data/secure-documents",
+      "SQLITE_PATH": "/data/p10b-controlled.sqlite",
+      "STORAGE_PROVIDER": "sqlite"
+    },
+    "guest": {
+      "cpu_kind": "shared",
+      "cpus": 1,
+      "memory_mb": 512
+    },
+    "image": "registry.fly.io/uckele-group:deployment-01M4E3SP6F492FH9RZ2F9M8EQ7@sha256:24e681ab519b1a083c5f1081ba8a85a677aabcc42125df5937172feca255e629",
+    "init": {},
+    "metadata": {
+      "purpose": "p10b-controlled-mailbox-no-send",
+      "release": "v134"
+    },
+    "mounts": [
+      {
+        "encrypted": true,
+        "name": "uckele_group_p10b_data",
+        "path": "/data",
+        "size_gb": 1,
+        "volume": "vol_vwnkpex1k3yx9dnv"
+      }
+    ],
+    "restart": {
+      "policy": "no"
+    },
+    "services": [
+      {
+        "autostart": false,
+        "autostop": false,
+        "force_instance_key": null,
+        "internal_port": 8787,
+        "ports": [
+          {
+            "handlers": [
+              "http"
+            ],
+            "port": 80
+          },
+          {
+            "handlers": [
+              "http",
+              "tls"
+            ],
+            "port": 443
+          }
+        ],
+        "protocol": "tcp"
+      }
+    ]
+  },
+  "config": {
+    "dns": {},
+    "env": {
+      "ADMIN_ALLOW_PASSWORD_AUTH": "false",
+      "ADMIN_AUTH_MODE": "password",
+      "ANALYTICS_ENABLED": "false",
+      "BACKUP_ENABLED": "false",
+      "DEAL_HUNTER_CIM_AUTOMATION_PAUSED": "true",
+      "DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED": "false",
+      "DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED": "false",
+      "DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS": "mathew@uckelegroup.com",
+      "DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL": "P10B Sender <sender@p10b-e2e.uckelegroup.com>",
+      "DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN": "p10b-e2e.uckelegroup.com",
+      "DEAL_HUNTER_CIM_MAILBOX_REPLY_TO": "replies@p10b-e2e.uckelegroup.com",
+      "DEAL_HUNTER_CIM_OUTREACH_PAUSED": "true",
+      "DEAL_HUNTER_CIM_PROVIDER_ENABLED": "false",
+      "DEAL_HUNTER_CIM_PROVIDER_PROFILE": "controlled-mailbox-v1",
+      "DEAL_HUNTER_DAILY_EMAIL_ENABLED": "false",
+      "DELIVERY_PROVIDER": "console",
+      "FOLLOW_UP_AI_ENABLED": "false",
+      "FOLLOW_UP_EMAIL_ENABLED": "false",
+      "NODE_ENV": "p10b",
+      "OUTBOUND_HTTP_TIMEOUT_MS": "10000",
+      "P10B_GUEST_WINDOW": "{\"app\":\"uckele-group-p10b\",\"closureGraceMs\":30000,\"databasePath\":\"/data/p10b-first-mailbox-watchdog-103e41746bf89e7e2dec9c5d.sqlite\",\"imageDigest\":\"sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc\",\"issuedAt\":\"2026-10-15T19:36:38.557Z\",\"machineId\":\"0803730bd1d7e8\",\"phase\":\"prepare\",\"runBinding\":\"3ad7e2d515d1140d1a1c09974a09682518ba404083d3ebdaeee53eac37d2205b\",\"sourceHead\":\"c4944a46ac362cdcd002e077d5533b4b0843b1d0\",\"stopAt\":\"2026-10-15T19:41:38.557Z\",\"stopReserveMs\":30000,\"version\":\"p10b-guest-window-v1\"}",
+      "P10B_QUALIFICATION_PHASE": "prepare",
+      "P10B_QUALIFICATION_RUNTIME": "true",
+      "PORT": "8787",
+      "PUBLIC_SITE_URL": "https://uckele-group-p10b.fly.dev",
+      "SECURE_DOCUMENTS_STORAGE_DIR": "/data/secure-documents",
+      "SQLITE_PATH": "/data/p10b-first-mailbox-watchdog-103e41746bf89e7e2dec9c5d.sqlite",
+      "STORAGE_PROVIDER": "sqlite"
+    },
+    "guest": {
+      "cpu_kind": "shared",
+      "cpus": 1,
+      "memory_mb": 512
+    },
+    "image": "registry.fly.io/uckele-group-p10b@sha256:50bc9c9ea37207586f347134e62de15aa21641920d3db50b67e99a4916989bfc",
+    "init": {},
+    "metadata": {
+      "purpose": "p10b-controlled-mailbox-no-send",
+      "release": "v134"
+    },
+    "mounts": [
+      {
+        "encrypted": true,
+        "name": "uckele_group_p10b_data",
+        "path": "/data",
+        "size_gb": 1,
+        "volume": "vol_vwnkpex1k3yx9dnv"
+      }
+    ],
+    "processes": [
+      {
+        "exec": [
+          "node",
+          "-e",
+          "setInterval(() => {}, 2147483647)"
+        ],
+        "ignore_app_secrets": true
+      },
+      {
+        "exec": [
+          "node",
+          "scripts/run-p10b-guest-guardian-parent.js"
+        ],
+        "ignore_app_secrets": true
+      }
+    ],
+    "restart": {
+      "policy": "no"
+    },
+    "services": [
+      {
+        "autostart": false,
+        "autostop": false,
+        "force_instance_key": null,
+        "internal_port": 8787,
+        "ports": [
+          {
+            "handlers": [
+              "http"
+            ],
+            "port": 80
+          },
+          {
+            "handlers": [
+              "http",
+              "tls"
+            ],
+            "port": 443
+          }
+        ],
+        "protocol": "tcp"
+      }
+    ]
+  },
+  "currentVersion": "01M4JAT6MH4TYR585NEJ7BKSP8",
+  "configDigest": "60dfcd996550350164e9303c507b91e6bd2171f2609140d09033ef5122203779"
+}

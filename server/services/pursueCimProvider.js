@@ -256,7 +256,7 @@ function normalizedAddresses(value, name) {
   return [...candidate];
 }
 
-function immutableTransmissionBinding(transmission, providerProfile = '') {
+export function immutableTransmissionBinding(transmission, providerProfile = '') {
   const binding = {
     transmissionId: requiredEvidenceText(transmission?.id, 'transmission.id', 240),
     payloadDigest: requiredEvidenceText(transmission?.payload_digest,
@@ -456,7 +456,7 @@ export async function reconcileCimProviderTransmission({
     providerIdentities: distinctIds.length > 1 ? candidates : [],
     actor,
     now: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
-    cadence: outcome === 'accepted'
+    cadence: outcome === 'accepted' && transmission.state !== 'accepted'
       ? await acceptedCadence(storage, transmission.id, exactEvidence.observedAt,
         configOverride) : null,
   });

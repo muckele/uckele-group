@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { getCimProviderDeliveryConfig, getConfig } from '../config.js';
+import { getCimProviderDeliveryConfig, getCimProviderReconciliationConfig, getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { fetchWithTimeout } from '../utils/http.js';
+import { isP10bQualificationRuntime, qualificationInboundCommand } from './p10bRuntime.js';
 import { commitCrmActivityMutation } from './activity.js';
 import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
@@ -666,7 +667,7 @@ function receivedEmailUrl(emailId, suffix = '') {
   return `https://api.resend.com/emails/receiving/${id}${suffix}`;
 }
 
-async function readBoundedJson(response, maxBytes) {
+async function readBoundedJson(response, maxBytes, signal) {
   const declaredLength = Number(response.headers?.get?.('content-length') || 0);
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     throw new Error('Resend received-email response exceeded the allowed size.');
@@ -676,6 +677,8 @@ async function readBoundedJson(response, maxBytes) {
     const reader = response.body.getReader();
     const chunks = [];
     let totalBytes = 0;
+    const abort = () => { void reader.cancel().catch(() => {}); };
+    signal?.addEventListener('abort', abort, { once: true });
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -688,6 +691,7 @@ async function readBoundedJson(response, maxBytes) {
         chunks.push(value);
       }
     } finally {
+      signal?.removeEventListener('abort', abort);
       reader.releaseLock?.();
     }
     const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
@@ -710,8 +714,27 @@ async function readBoundedJson(response, maxBytes) {
 }
 
 async function fetchReceivedEmail(emailId, { config = getConfig(), fetcher = fetchWithTimeout } = {}) {
+  const controlled = config.dealHunter?.cimProvider?.mode === 'controlled-mailbox';
+  if (controlled) config = { ...config, delivery: { ...config.delivery,
+    resendApiKey: getCimProviderReconciliationConfig(config).apiKey } };
   if (!config.delivery.resendApiKey) throw new Error('Resend content retrieval is not configured.');
   const request = async (url, maxBytes) => {
+    if (isP10bQualificationRuntime(config)) {
+      const controller = new AbortController();
+      let timer;
+      try {
+        return await Promise.race([(async () => {
+          const response = await fetcher(url, { method: 'GET', signal: controller.signal,
+            timeoutMs: config.server.outboundRequestTimeoutMs,
+            headers: { Authorization: `Bearer ${config.delivery.resendApiKey}`, Accept: 'application/json' } });
+          if (controller.signal.aborted || !response.ok) throw new Error('Isolated inbound read failed');
+          return readBoundedJson(response, Math.min(65536, maxBytes), controller.signal);
+        })(), new Promise((resolve, reject) => {
+          timer = setTimeout(() => { controller.abort(); reject(new Error('Isolated inbound read timed out')); },
+            Math.min(10000, config.server.outboundRequestTimeoutMs));
+        })]);
+      } finally { clearTimeout(timer); controller.abort(); }
+    }
     const response = await fetcher(url, {
       method: 'GET',
       timeoutMs: config.server.outboundRequestTimeoutMs,
@@ -722,7 +745,13 @@ async function fetchReceivedEmail(emailId, { config = getConfig(), fetcher = fet
     return readBoundedJson(response, maxBytes);
   };
   const email = await request(receivedEmailUrl(emailId), maxReceivedEmailResponseBytes);
+  if (controlled && email.attachments != null && !Array.isArray(email.attachments)) {
+    throw new Error('Malformed controlled attachment metadata');
+  }
   let attachments = Array.isArray(email.attachments) ? email.attachments : [];
+  if (controlled && attachments.length > 0) {
+    throw new Error('Controlled qualification does not retrieve attachments');
+  }
   if (attachments.length > 0) {
     try {
       const attachmentResult = await request(receivedEmailUrl(emailId, '/attachments'), maxReceivedAttachmentResponseBytes);
@@ -815,11 +844,10 @@ async function markCimResponded(storage, request, communication) {
   return mutation.record;
 }
 
-async function updateInboundContent(storage, communication, received) {
+async function updateInboundContent(storage, communication, received, now = new Date().toISOString(), qualificationGuard) {
   const email = received.email || {};
   const headers = normalizeHeaders(email.headers);
   const plainText = text(email.text || htmlToPlainText(email.html), maxBodyTextLength);
-  const now = new Date().toISOString();
   const messageId = normalizeMessageId(headers['message-id'] || headers.message_id);
   const inReplyTo = normalizeMessageId(headers['in-reply-to'] || headers.in_reply_to);
   const references = normalizeReferences(headers.references);
@@ -832,6 +860,7 @@ async function updateInboundContent(storage, communication, received) {
     }
   }
   const updates = {
+    ...(qualificationGuard ? { qualificationGuard } : {}),
     submission_id: communication.submission_id,
     deal_key: communication.deal_key,
     cim_request_id: communication.cim_request_id,
@@ -988,12 +1017,58 @@ async function resolveAndAssignInboundCommunication({ storage, communication, re
 }
 
 export async function ingestResendReceivedEmail({ event, storage = getStorage(), fetcher,
-  configOverride } = {}) {
+  configOverride, now, clock = () => new Date() } = {}) {
+  const config = configOverride || getConfig();
+  const isolated = isP10bQualificationRuntime(config);
+  const current = () => new Date(clock()).toISOString();
+  const guarded = isolated ? qualificationInboundCommand(event, config, current()) : null;
+  if (isolated && (!guarded || !(await storage.readCimQualificationInboundAuthority?.(guarded))?.allowed)) {
+    return { ok: false, accepted: false, error: 'Isolated inbound permission is unavailable.' };
+  }
   const metadata = objectValue(event?.metadata);
   const providerMessageId = compactText(metadata.resendEmailId || event?.message_id, 240);
   if (!providerMessageId) return { ok: false, accepted: false, error: 'Received email ID is missing.' };
 
   const recipients = normalizeCommunicationAddresses(metadata.to);
+  if (isolated) {
+    // Qualification requires only exact signed evidence and one content read.
+    // Each write checks authority in the same SQLite transaction. Ordinary CRM
+    // assignment/follow-up/request mutations must not survive this window.
+    let communication = await storage.getCrmCommunicationByProviderMessage?.('resend', providerMessageId, 'inbound');
+    if (!communication) {
+      communication = await storage.insertCrmCommunication({
+        ...inboundCommunicationFromWebhook(event, { submissionId: null, request: null }),
+        qualificationGuard: { ...guarded, now: current() },
+      });
+    }
+    if (communication.content_state === 'complete') return { ok: true, accepted: true, replayed: true, communication };
+    const claim = await storage.claimCimQualificationInboundRead?.({ ...guarded,
+      communicationId: communication.id, now: current() });
+    if (!claim?.claimed) return { ok: true, accepted: true, replayed: true, communication };
+    const qualificationGuard = { ...guarded, authorizationId: claim.authorizationId };
+    try {
+      const received = await fetchReceivedEmail(providerMessageId, {
+        config: getCimProviderDeliveryConfig(config), fetcher });
+      if (received.email.id !== providerMessageId
+        || extractEmail(received.email.from) !== guarded.from
+        || JSON.stringify(received.email.to) !== JSON.stringify(guarded.to)
+        || (received.email.cc?.length || received.email.bcc?.length)) {
+        throw new Error('Isolated retrieved message binding changed');
+      }
+      const updated = await updateInboundContent(storage, communication, received, current(),
+        { ...qualificationGuard, now: current() });
+      return { ok: true, accepted: true, communication: updated };
+    } catch {
+      try {
+        communication = await storage.updateCrmCommunication(communication.id, {
+          qualificationGuard: { ...qualificationGuard, now: current() }, content_state: 'failed',
+          content_attempt_count: 1, content_next_attempt_at: null,
+          content_last_error: 'Isolated inbound retrieval failed; no retry permitted.', updated_at: current(),
+        });
+      } catch { /* Closed authority cannot write even failure metadata. */ }
+      return { ok: false, accepted: true, communication, error: 'Isolated inbound retrieval failed.' };
+    }
+  }
   const assignment = await resolveInboundAssignment(storage, {
     recipients,
     fromAddress: metadata.fromEmail || event.recipient_email,
@@ -1038,7 +1113,7 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
     assignment.submissionId = resolved.assignment.submissionId;
     assignment.request = resolved.assignment.request;
     assignment.method = resolved.assignment.method;
-    const updated = await updateInboundContent(storage, communication, received);
+    const updated = await updateInboundContent(storage, communication, received, now);
     await applyObviousInboundOptOut(storage, updated);
     await markCimResponded(storage, assignment.request, updated);
     return { ok: true, accepted: true, communication: updated };
@@ -1050,6 +1125,9 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
 
 export async function retryPendingInboundIngestion({ storage = getStorage(), limit = 25,
   now = new Date(), fetcher, configOverride } = {}) {
+  if (isP10bQualificationRuntime(configOverride || getConfig())) {
+    return { reviewed: 0, completed: 0, failed: 0, results: [] };
+  }
   const dueBefore = now.toISOString();
   const pending = storage.claimCrmCommunicationsPendingIngestion
     ? await storage.claimCrmCommunicationsPendingIngestion({

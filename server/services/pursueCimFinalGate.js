@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto';
+import { P10B_QUALIFICATION_WRITER, assertQualificationHardOff,
+  validateQualificationContract, registerQualificationGate } from './p10bQualificationContract.js';
 
 import {
   CONTROLLED_CIM_LIMITED_SMOKE_PROFILE,
@@ -248,6 +250,7 @@ export async function authorizePreparedCimTransmission({
   readCurrentAuthority = readCurrentCimAuthority,
   readProviderReadiness = defaultProviderReadiness,
   configOverride,
+  qualification,
 } = {}) {
   if (!storage?.readCimFinalGateContext || !storage?.authorizeCimProviderPending) {
     throw new Error('CIM final-gate storage authority is unavailable');
@@ -349,11 +352,33 @@ export async function authorizePreparedCimTransmission({
     }
     return failure('unknown_policy_version');
   }
-  const readinessInput = await readProviderReadiness({ storage, providerProfile, now: gateInstant,
-    context });
-  const readiness = readinessInput?.authorityDigest && typeof readinessInput.ready === 'boolean'
-    ? readinessInput
-    : normalizeCimProviderReadiness(readinessInput, { providerProfile, now: gateInstant });
+  let readiness;
+  if (writerPath === P10B_QUALIFICATION_WRITER) {
+    if (storage.provider !== 'sqlite' || !qualification?.observe || !qualification?.clock) {
+      return failure('provider_readiness_unavailable');
+    }
+    try {
+      assertQualificationHardOff(config);
+      qualification.assertActive();
+      const observed = await qualification.observe();
+      qualification.assertActive();
+      const check = validateQualificationContract({ ...qualification, observed,
+        now: gateInstant, ...context });
+      if (!check.valid || !validateQualificationContract({ ...qualification, observed,
+        now: instant(qualification.clock()), ...context }).valid) {
+        return failure('provider_readiness_unavailable');
+      }
+      readiness = { version: 'p10b-qualification-permission-v1',
+        manifest: qualification.manifest, reviewedDigest: qualification.reviewedDigest, observed };
+    } catch { return failure('provider_readiness_unavailable'); }
+  } else {
+    if (qualification) return failure('provider_readiness_unavailable');
+    const readinessInput = await readProviderReadiness({ storage, providerProfile, now: gateInstant,
+      context });
+    readiness = readinessInput?.authorityDigest && typeof readinessInput.ready === 'boolean'
+      ? readinessInput
+      : normalizeCimProviderReadiness(readinessInput, { providerProfile, now: gateInstant });
+  }
   const members = [];
   for (const member of context.members) {
     const opportunityId = member.opportunity?.opportunity_id ?? member.membership?.opportunity_id;
@@ -434,5 +459,10 @@ export async function authorizePreparedCimTransmission({
     || Number(outcome.transmission?.invocation_authority_count) !== 1) {
     return failure('authorization_outcome_unknown', true);
   }
-  return { ...outcome, reconciliationOnly: false, boundaryNonce };
+  const result = { ...outcome, reconciliationOnly: false, boundaryNonce };
+  if (writerPath === P10B_QUALIFICATION_WRITER) {
+    qualification.assertActive();
+    registerQualificationGate(result, qualification);
+  }
+  return result;
 }

@@ -9,11 +9,55 @@ permissions:
   contents: read
 
 jobs:
+  native-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.9'
+          cache-dependency-path: tools/p10b-machine-client/go.sum
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - working-directory: tools/p10b-machine-client
+        run: go test ./... && go test -tags p10b_stopped_diagnostic ./... && go build -o /tmp/p10b-machine-client . && go build -tags p10b_stopped_diagnostic -o /tmp/p10b-stopped-update-client . && go test -c -o /tmp/p10b-offline-update-transport .
+      - name: Verify native SDK files stay in the private auth context without Machine requests
+        env:
+          P10B_OFFLINE_NATIVE_CLIENT: /tmp/p10b-machine-client
+        run: node --test --test-name-pattern='SDK lock stays' test/p10bHostAuthentication.test.js
+      - name: Verify stopped-update control through native service and SDK with fake HTTP
+        env:
+          P10B_OFFLINE_UPDATE_TRANSPORT: /tmp/p10b-offline-update-transport
+        run: node --test test/p10bNativeUpdateTransport.test.js
+      - name: Verify zero-start diagnostic, SDK timeouts and late remote acceptance with fake HTTP
+        env:
+          P10B_OFFLINE_STOPPED_DIAGNOSTIC: /tmp/p10b-offline-update-transport
+        run: node --test test/p10bStoppedDiagnosticTransport.test.js
+      - name: Verify guardian-only one-start operator, native policy and SDK with fake HTTP
+        env:
+          P10B_OFFLINE_GUARDIAN_TRANSPORT: /tmp/p10b-offline-update-transport
+        run: node --test test/p10bGuardianRuntimeTransport.test.js
+      - working-directory: tools/p10b-public-client
+        run: go test ./... && go build -o /tmp/p10b-public-client .
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -21,6 +65,11 @@ jobs:
       - run: npm ci
       - run: npm audit --omit=dev
       - run: npm run lint
+      - run: python3 -B test/test_p10b_owner_handoff.py
+      - run: python3 -B test/test_p10b_consolidated_handoff.py
+      - run: python3 -B test/test_p10b_stopped_update_handoff.py
+      - run: python3 -B test/test_p10b_diagnostic_report.py
+      - run: python3 -B test/test_p10b_guardian_handoff.py
       - run: npm test
       - run: npm run test:ui
       - run: npm run build
