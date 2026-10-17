@@ -5,6 +5,7 @@ import { sha256, stableCanonicalJson } from '../utils/security.js';
 const sessionDigest = session => sha256(stableCanonicalJson(session));
 import { randomUUID } from 'node:crypto';
 import { assertP10bNoEmailApproval } from './p10bRuntimeOnlyOperator.js';
+import { assertP10bStoppedLogProbeApproval } from './p10bStoppedLogProbeContract.js';
 import { assertP10bStoppedUpdateApproval } from './p10bStoppedUpdateContract.js';
 const transportLeases = new WeakMap();
 const assertCredentialApproval = (session, approval, now) => session?.version === 'p10b-stopped-update-session-v2'
@@ -77,11 +78,19 @@ export function reserveP10bLocalReap(environment = {}) {
 
 export function createP10bAppTokenContext({ session, approval, clock = () => Date.now(), environment = process.env }) {
   assertCredentialApproval(session, approval, clock());
+  return allocatePrivateAppTokenContext(session, environment);
+}
+export function createP10bStoppedLogProbeTokenContext({ probe, approval, clock = Date.now, environment = process.env }) {
+  assertP10bStoppedLogProbeApproval(probe, approval, clock());
+  return allocatePrivateAppTokenContext(probe, { PATH: '/usr/bin:/bin', FLY_API_TOKEN: environment.FLY_API_TOKEN }, true);
+}
+function allocatePrivateAppTokenContext(session, environment, privateHome = false) {
   // Validate input before allocating anything, and ignore any owner's config dir.
   const env = privateEnvironment(environment, undefined);
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'p10b-app-auth-'));
   const original = privateDirectory(directory);
   env.FLY_CONFIG_DIR = directory;
+  if (privateHome) env.HOME = directory;
   let closed = false;
   const context = { assertPhaseReaped(lease) {
     try {

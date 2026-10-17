@@ -76,6 +76,8 @@ type logService struct {
 	now          func() time.Time
 	elapsed      func() time.Duration
 	lifetime     time.Duration
+	// Native-only projection override; no initialization packet can select it.
+	project func([]byte, string) ([]publicLog, error)
 }
 
 func initializeLogs(raw []byte, factory func(context.Context) (doer, error)) (*logService, error) {
@@ -258,7 +260,11 @@ func (s *logService) request(ctx context.Context, r logRequest) (out logResponse
 		out.Error = "timed-out"
 		return
 	}
-	logs, err := projectLogBody(raw, s.windowDigest)
+	project := projectLogBody
+	if s.project != nil {
+		project = s.project
+	}
+	logs, err := project(raw, s.windowDigest)
 	if err != nil {
 		out.Error = "invalid-output"
 		return

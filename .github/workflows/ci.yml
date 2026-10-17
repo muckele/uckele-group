@@ -28,7 +28,7 @@ jobs:
         with:
           node-version: 22
       - working-directory: tools/p10b-machine-client
-        run: go test ./... && go test -tags p10b_stopped_diagnostic ./... && go build -o /tmp/p10b-machine-client . && go build -tags p10b_stopped_diagnostic -o /tmp/p10b-stopped-update-client . && go test -c -o /tmp/p10b-offline-update-transport .
+        run: go test ./... && go test -tags p10b_stopped_diagnostic ./... && go test -tags p10b_stopped_log_probe ./... && go build -o /tmp/p10b-machine-client . && go build -tags p10b_stopped_diagnostic -o /tmp/p10b-stopped-update-client . && go build -tags p10b_stopped_log_probe -o /tmp/p10b-stopped-log-probe-client . && go test -c -o /tmp/p10b-offline-update-transport .
       - name: Verify native SDK files stay in the private auth context without Machine requests
         env:
           P10B_OFFLINE_NATIVE_CLIENT: /tmp/p10b-machine-client
@@ -50,6 +50,11 @@ jobs:
           P10B_OFFLINE_LOG_TRANSPORT: /tmp/p10b-offline-update-transport
           P10B_OFFLINE_NATIVE_CLIENT: /tmp/p10b-machine-client
         run: test -x "$P10B_OFFLINE_LOG_TRANSPORT" && node --test test/p10bNativeLogTransport.test.js
+      - name: Verify zero-start zero-update stopped log probe through native SDK and fake HTTP
+        env:
+          P10B_OFFLINE_STOPPED_LOG_PROBE: /tmp/p10b-offline-update-transport
+          P10B_OFFLINE_STOPPED_LOG_PROBE_CLIENT: /tmp/p10b-stopped-log-probe-client
+        run: test -x "$P10B_OFFLINE_STOPPED_LOG_PROBE" && node --test test/p10bStoppedLogProbeTransport.test.js
       - working-directory: tools/p10b-public-client
         run: go test ./... && go build -o /tmp/p10b-public-client .
   validate:
