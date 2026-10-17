@@ -706,17 +706,26 @@ def settle_owned_group(child):
 
 def run_command(args, environment, timeout):
     # No shell; only reviewed Node entrypoints. Bound all output and wall time.
-    child = subprocess.Popen(args, env=environment, cwd=SCRIPTS.parent,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, start_new_session=True)
-    streams = selectors.DefaultSelector()
-    streams.register(child.stdout, selectors.EVENT_READ, 'stdout')
-    streams.register(child.stderr, selectors.EVENT_READ, 'stderr')
-    output = bytearray()
-    total = 0
-    end = time.monotonic() + timeout
+    termination = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, termination)
+    child = None
+    streams = None
     settling = False
     try:
+        # Single-threaded owner entrypoint: defer termination until the returned
+        # child and every stream are owned by this try/finally. Restore the
+        # child's original mask before exec so graceful termination still works.
+        child = subprocess.Popen(args, env=environment, cwd=SCRIPTS.parent,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, start_new_session=True,
+                                 preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask))
+        streams = selectors.DefaultSelector()
+        streams.register(child.stdout, selectors.EVENT_READ, 'stdout')
+        streams.register(child.stderr, selectors.EVENT_READ, 'stderr')
+        output = bytearray()
+        total = 0
+        end = time.monotonic() + timeout
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         while streams.get_map():
             left = end - time.monotonic()
             if left <= 0:
@@ -731,6 +740,7 @@ def run_command(args, environment, timeout):
                     raise Hold('Reviewed local output bound exceeded')
                 if key.data == 'stdout':
                     output.extend(data)
+        signal.pthread_sigmask(signal.SIG_BLOCK, termination)
         settling = True
         code = settle_owned_group(child)
         if code != 0:
@@ -745,14 +755,24 @@ def run_command(args, environment, timeout):
             raise Hold('Reviewed local command held')
         return json.loads(output)
     except BaseException:
-        if not settling:
+        # A repeated interrupt cannot abandon bounded owned-group settlement.
+        signal.pthread_sigmask(signal.SIG_BLOCK, termination)
+        if child is not None and not settling:
             settling = True
             settle_owned_group(child)
         raise
     finally:
-        streams.close()
-        child.stdout.close()
-        child.stderr.close()
+        signal.pthread_sigmask(signal.SIG_BLOCK, termination)
+        try:
+            if streams is not None:
+                streams.close()
+            if child is not None:
+                try:
+                    child.stdout.close()
+                finally:
+                    child.stderr.close()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def check_recipe(file, runner=run_command, expected_recipe_sha256=None, bootstrap=bootstrap_recipe):

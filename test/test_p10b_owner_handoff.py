@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 import tempfile
@@ -1142,6 +1143,22 @@ print('SAFE_SIGNAL_END',flush=True)
                             os.kill(int(pid_path.read_text()), 9)
                         except ProcessLookupError:
                             pass
+
+
+class LauncherCancellationTests(unittest.TestCase):
+    def test_actual_signals_cannot_abandon_spawn_bookkeeping_or_interrupt_group_cleanup(self):
+        probe = Path(__file__).parent / 'helpers/p10bOwnerCancellationProbe.py'
+        result = subprocess.run([sys.executable, '-B', str(probe), str(SOURCE)],
+                                capture_output=True, text=True, timeout=15,
+                                env={'PATH': '/usr/bin:/bin', 'HOME': '/tmp'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        facts = json.loads(result.stdout)
+        for case in facts['results']:
+            with self.subTest(case=case['mode']):
+                self.assertTrue(case['held'])
+                self.assertFalse(case['ownedChildStillRunning'])
+                self.assertFalse(case['ownedGroupStillPresent'])
+        self.assertEqual(facts['ordinaryChildMask']['blocked'], [])
 
 
 if __name__ == '__main__':

@@ -23,14 +23,20 @@ export function publicP10bCommandFailure(error) {
 export function createP10bOperatorProcesses({ spawnProcess = spawn,
   environment = { PATH: process.env.PATH, HOME: process.env.HOME, FLY_NO_UPDATE_CHECK: '1' } } = {}) {
   const active = new Set();
-  let retirementUncertain = false;
+  let retirementUncertain = false; let admissionClosed = false;
   function launch(executable, args, options = {}) {
-    const entry = spawnP10bOwnedProcess(executable, args, { environment, options, spawnProcess }); active.add(entry);
-    entry.exited.then(() => { if (!entry.reaped) retirementUncertain = true; active.delete(entry); });
+    if (admissionClosed) throw Error('Owned process retirement uncertain');
+    let entry;
+    try { entry = spawnP10bOwnedProcess(executable, args, { environment, options, spawnProcess }); }
+    catch { admissionClosed = true; retirementUncertain = true; throw Error('Owned process launch unverified'); }
+    active.add(entry);
+    entry.exited.then(() => { if (!entry.reaped) { admissionClosed = true; retirementUncertain = true; } active.delete(entry); });
     return entry;
   }
   async function terminate(entry) {
-    return entry.terminate();
+    let reaped = false;
+    try { reaped = await entry.terminate() === true; return reaped; }
+    finally { if (!reaped) admissionClosed = true; }
   }
   async function command(executable, args, timeoutMs = 10000) {
     const entry = launch(executable, args); let bytes = 0; let failure = null; const chunks = [];

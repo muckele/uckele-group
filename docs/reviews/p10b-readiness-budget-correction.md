@@ -6,7 +6,7 @@ The one-shot guardian demonstration at host revision
 failed. Its primary retained a `readiness-command` timeout at 5000 ms with
 command clients reaped. The observer retained 28 successful metadata samples
 before a metadata-read/sampling failure and finished abnormally. It also
-recorded 38 log-read errors. Neither underlying external cause is known.
+recorded 38 command-stage log-read timeouts at 700 ms. The underlying SSH/log transport causes and the discarded metadata error category remain unknown.
 Continuous coverage, normal whole-Machine exit and timed convergence remain
 unproved. Increasing an inner allowance does not prove that this attempt
 would have succeeded.
