@@ -29,8 +29,23 @@ Plan: `docs/superpowers/plans/2026-10-18-fl05-backend-owner-walkthrough.md`.
 - [x] Establish roadmap acceptance and preserve the separate mailbox approval gate.
 - [x] RED/GREEN environment-isolation tests and fresh local fixture runner.
 - [x] Complete bounded backend-connected desktop/mobile/viewer checks and preserve observations.
-  - Canonical restore is **FAILED**: CRM Restore leaves the canonical Pass in force.
-    Full FL02/FL05 release acceptance remains blocked on the separate lifecycle slice.
-- [ ] Run applicable checks and resolve independent review findings.
-- [ ] Commit, push, open a separate draft PR and verify exact-head hosted CI.
+  - Original canonical restore assertion **FAILED** and was preserved for FL02.
+    The separate FL02 slice below promotes it to a required passing regression.
+- [x] Run applicable checks and resolve independent review findings.
+- [x] Commit, push, open draft PR77 and verify exact-head hosted CI on
+  `6d28a05a258f46dbee72c1ce8b155e56d6fcd125` (run `39171279872`).
 - [ ] Human owner-reviewed walkthrough/adoption acceptance (separate, still pending).
+
+# FL-02 coherent CRM/canonical restore
+
+Plan: `docs/superpowers/plans/2026-10-18-fl02-coherent-restore.md`.
+
+- [x] Preserve service/browser RED evidence and establish roadmap restore contract.
+- [x] Implement one atomic restore primitive in SQLite and PostgreSQL source,
+  reconciling exact retained identity and preserving stopped outreach/history.
+- [x] Pass local focused lifecycle, rollback, authorization, repeat/identity,
+  UI and backend-connected browser regressions.
+- [ ] Complete independent final review, commit/push a separate stacked draft PR,
+  and verify exact-head CI including actual fresh/upgrade PostgreSQL and races.
+  Docker is unresponsive locally; enabled PostgreSQL checks remain required CI.
+- [ ] Human owner adoption and release acceptance (no merge/deploy/live send).

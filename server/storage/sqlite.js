@@ -33,6 +33,7 @@ import { normalizeDealHunterListingIdentity } from '../services/dealHunterListin
 import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersession.js';
 import { buildFreshInboxAreas, classifyFreshInboxCandidate } from '../services/dealHunterFreshInboxPolicy.js';
 import { createPursueCimSqliteTransitions } from './pursueCimSqliteTransitions.js';
+import { restoreCrmLifecycleInTransaction } from './crmRestoreSqlite.js';
 
 function cimSafetyDigest(...parts) {
   const framed = parts.map((part) => {
@@ -7856,7 +7857,7 @@ export function createSqliteStorage(config, options = {}) {
       assertCrmSubmissionWritableInTransaction(activity.submission_id);
     }
 
-    const mutatedSubmissionId = operation === 'update_submission'
+    const mutatedSubmissionId = ['update_submission', 'restore_submission'].includes(operation)
       ? payload.id
       : operation === 'archive_submission'
         ? payload.id || payload.submissionId
@@ -7882,6 +7883,11 @@ export function createSqliteStorage(config, options = {}) {
       }
       insertSubmissionStatement.run(serializeSubmission(payload.submission));
       record = payload.submission;
+    } else if (operation === 'restore_submission') {
+      const result = restoreCrmLifecycleInTransaction(database, payload, activity);
+      if (!result.applied) return result;
+      record = normalizeSubmissionRow(result.record);
+      activity = { ...activity, opportunity_id: result.opportunityId, metadata: result.metadata };
     } else if (operation === 'update_submission') {
       if (Object.hasOwn(payload.values || {}, 'deal_hunter_opportunity_id')) {
         throw new Error('Canonical CRM linkage must use the atomic Deal Hunter link primitive.');

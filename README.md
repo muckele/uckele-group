@@ -206,11 +206,14 @@ is performed by the runner. External Google font links are removed from fixture
 HTML so rendering uses offline fallback fonts.
 
 The walkthrough is local synthetic evidence, not owner-pilot or release acceptance.
-Its retained `knownGaps` include FL02's split restore behavior: CRM Restore returns
-the CRM record to review with outreach stopped, while canonical Pass remains in
-force. Coherent canonical/CRM restoration needs a separate lifecycle transaction
-with current authority checks, retained decision history/caps, and no outreach
-revival. No deploy, mailbox qualification or live-send approval is implied.
+It now requires CRM Restore to clear the exact linked canonical Pass atomically,
+retain decision history and return the lead to All active after reload. Outreach
+stays stopped. The original failing scenario is preserved as historical evidence;
+the runner no longer reports that failure as an accepted `knownGaps` result.
+PostgreSQL fresh/upgrade and concurrent identity-writer parity are required CI
+checks, using a disposable network-isolated container. No project database
+migration is applied by these tests. Human owner adoption, deployment, mailbox
+qualification and live-send approval remain separate gates.
 
 ## Privacy and security notes
 

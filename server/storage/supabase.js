@@ -783,6 +783,7 @@ function normalizeAtomicMutationResult(operation, data) {
   const normalizers = {
     insert_submission: normalizeSubmissionRow,
     update_submission: normalizeSubmissionRow,
+    restore_submission: normalizeSubmissionRow,
     insert_secure_upload_request: normalizeUploadRequestRow,
     finalize_secure_document_upload: normalizeUploadRequestRow,
     update_secure_upload_request: normalizeUploadRequestRow,
@@ -1847,12 +1848,13 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const usesLifecycleSubmissionFields = operation === 'update_submission'
         && lifecycleSubmissionFields.some((field) => Object.hasOwn(payload?.values || {}, field));
       const isSubmissionInsert = operation === 'insert_submission';
-      const rpcName = isSubmissionInsert
+      const isRestore = operation === 'restore_submission';
+      const rpcName = isRestore ? 'restore_archived_submission_with_crm_activity' : isSubmissionInsert
         ? 'insert_submission_with_crm_activity'
         : communicationsOperations.has(operation) || usesLifecycleSubmissionFields
           ? 'mutate_communications_with_crm_activity'
           : 'mutate_with_crm_activity';
-      const rpcPayload = isSubmissionInsert
+      const rpcPayload = isSubmissionInsert || isRestore
         ? { p_payload: payload || {}, p_activity: activity }
         : { p_operation: operation, p_payload: payload || {}, p_activity: activity };
       const { data, error } = await client.rpc(rpcName, rpcPayload);
