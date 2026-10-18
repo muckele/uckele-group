@@ -10,10 +10,11 @@ import { stopOwnedProcessGroup } from './fl05-owned-process.js';
 
 const cwd = fileURLToPath(new URL('..', import.meta.url));
 const args = process.argv.slice(2);
-if (args.length > 1 || (args.length === 1 && args[0] !== '--volume')) {
-  throw new Error('FL05 accepts only the optional --volume verification mode.');
+if (args.length > 1 || (args.length === 1 && !['--volume', '--browser-volume'].includes(args[0]))) {
+  throw new Error('FL05 accepts only --volume or --browser-volume verification mode.');
 }
-const volume = args[0] === '--volume';
+const mode = args[0] === '--volume' ? 'volume' : args[0] === '--browser-volume' ? 'browser-volume' : 'owner-walkthrough';
+const testFile = { volume: 'volume.test.js', 'browser-volume': 'browser-volume.test.js', 'owner-walkthrough': 'owner-flow.test.js' }[mode];
 if (!fs.existsSync(path.join(cwd, 'dist', 'index.html'))) {
   throw new Error('Run npm run build before the FL05 walkthrough.');
 }
@@ -23,7 +24,7 @@ if (disk.bavail * disk.bsize < 11 * 1024 ** 3) throw new Error('FL05 requires 11
 for (const name of ['home', 'tmp']) fs.mkdirSync(path.join(root, name), { mode: 0o700 });
 fs.writeFileSync(path.join(root, '.fl05-owned-fixture'), 'synthetic-local-only', { mode: 0o600 });
 fs.writeFileSync(path.join(root, 'source-identity.json'), JSON.stringify({
-  verification: volume ? 'volume' : 'owner-walkthrough',
+  verification: mode,
   head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim(),
   status: execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8' }).trim(),
   diffSha256: createHash('sha256').update(execFileSync('git', ['diff', 'HEAD'], { cwd })).digest('hex'),
@@ -31,11 +32,12 @@ fs.writeFileSync(path.join(root, 'source-identity.json'), JSON.stringify({
   sourceFiles: Object.fromEntries([
     'scripts/run-fl05-owner-walkthrough.js', 'scripts/fl05-fixture-environment.js', 'scripts/fl05-owned-process.js',
     'test-owner-flow/fixture.js', 'test-owner-flow/network-guard.js', 'test-owner-flow/owner-flow.test.js', 'test-owner-flow/volume.test.js',
-    'src/components/admin/OpportunityDrawer.jsx',
+    'test-owner-flow/browser-volume.test.js', 'test-owner-flow/growth-fixture.js',
+    'server/services/dealHunterTriage.js', 'src/components/admin/AcquisitionInbox.jsx', 'src/components/admin/OpportunityDrawer.jsx',
   ].map((name) => [name, createHash('sha256').update(fs.readFileSync(path.join(cwd, name))).digest('hex')])),
 }, null, 2));
 console.log(`FL05 evidence directory: ${root}`);
-const child = spawn(process.execPath, ['--test', '--test-concurrency=1', volume ? 'test-owner-flow/volume.test.js' : 'test-owner-flow/owner-flow.test.js'], {
+const child = spawn(process.execPath, ['--test', '--test-concurrency=1', `test-owner-flow/${testFile}`], {
   cwd, stdio: 'inherit', detached: true, env: fixtureEnvironment(root, chromium.executablePath()),
 });
 let browserPid, stopping;

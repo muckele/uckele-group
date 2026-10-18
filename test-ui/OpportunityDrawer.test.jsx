@@ -362,6 +362,25 @@ describe('Opportunity drawer', () => {
     expect(screen.getByRole('dialog')).toHaveClass('h-full');
   });
 
+  test('historical archive read-only view exposes retained evidence and no mutation controls despite supplied callbacks', () => {
+    const mutation = vi.fn();
+    const detail = detailFixture({ archivedReadOnly: true });
+    detail.opportunity.dismissed = true;
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture()} cimReleaseReadOnly detail={detail}
+      onAction={mutation} onSaveFact={mutation} onBrokerMaterialsPrepare={mutation}
+      onBrokerMaterialsApprove={mutation} onBrokerMaterialsCheckStatus={mutation}
+      onCimReleaseStop={mutation} onFollowUpApprove={mutation} onFollowUpPrepare={mutation}
+      onFollowUpStart={mutation} onFollowUpStop={mutation} onFollowUpCheckStatus={mutation}
+      onClose={vi.fn()} readOnly />);
+    expect(screen.getByRole('status')).toHaveTextContent('Historical archive view. This retained score is not current');
+    expect(screen.getByText('Previously passed.', { exact: false })).toBeVisible();
+    expect(screen.getByText('Persisted CIM subject')).toBeVisible();
+    expect(screen.queryAllByRole('textbox')).toHaveLength(0);
+    // Historical evidence still permits navigation/copy; no mutation entry is present.
+    expect(screen.queryByRole('button', { name: /^(Pursue |Watch |Pass |Save verified fact|Mark reviewed|Prepare |Approve |Start |Stop )/ })).toBeNull();
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
   test('renders only persisted canary release evidence and one explicit stop control', () => {
     const onCimReleaseStop = vi.fn();
     render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()}

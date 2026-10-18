@@ -41,3 +41,4 @@ jobs:
       - run: npm run test:browser
       - run: npm run test:owner-flow
       - run: npm run test:owner-volume
+      - run: npm run test:browser-volume

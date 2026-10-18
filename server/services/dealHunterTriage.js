@@ -841,9 +841,28 @@ export async function getTriageOpportunityDetail({
   ) {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
-  const [currentOpportunity, score] = await Promise.all([
+  const [currentOpportunity, currentScore] = await Promise.all([
     storage.getCurrentDealHunterOpportunity(id), storage.getCurrentDealHunterOpportunityScore(id),
   ]);
+  let score = currentScore;
+  let archivedDispositions = null;
+  // Archive search intentionally survives source/current-score eligibility loss.
+  // Admit its retained evidence only for the exact active canonical Pass, never
+  // as current action authority or as a fallback for unarchived/superseded rows.
+  if (currentOpportunity?.opportunity_id === id && !score
+    && typeof storage.getDealHunterOpportunityScore === 'function'
+    && typeof storage.listDealHunterDispositions === 'function') {
+    const retained = await storage.getDealHunterOpportunityScore(id);
+    if (retained?.opportunity_id === id && typeof retained.deal_key === 'string' && retained.deal_key) {
+      const rows = (await storage.listDealHunterDispositions({ dealKeys: [retained.deal_key], limit: 20 }))
+        .filter((row) => row.deal_key === retained.deal_key);
+      if (currentDetailDisposition(rows).state === 'dismissed'
+        && rows.every((row) => !row.submission_id || row.submission_id === currentOpportunity.primary_submission_id)) {
+        score = retained;
+        archivedDispositions = rows;
+      }
+    }
+  }
   if (!currentOpportunity || !score) return { ok: false, status: 404, error: 'No current score has been recorded for this opportunity.' };
   const evidence = await storage.listDealHunterScoreEvidence?.(id, { limit: 500 }) || [];
 
@@ -873,7 +892,7 @@ export async function getTriageOpportunityDetail({
     currentOpportunity.primary_submission_id && storage.listCrmActivityEvents
       ? storage.listCrmActivityEvents({ submissionId: currentOpportunity.primary_submission_id, limit: 100 })
       : [],
-    storage.listDealHunterDispositions?.({ dealKeys: [score.deal_key], limit: 20 }) || [],
+    archivedDispositions ?? (storage.listDealHunterDispositions?.({ dealKeys: [score.deal_key], limit: 20 }) || []),
     currentOpportunity.primary_submission_id && storage.listCrmCommunications
       ? storage.listCrmCommunications({ submissionId: currentOpportunity.primary_submission_id, page: 1, pageSize: 100 })
       : { rows: [] },
@@ -941,6 +960,7 @@ export async function getTriageOpportunityDetail({
   return {
     ok: true,
     status: 200,
+    ...(archivedDispositions ? { archivedReadOnly: true } : {}),
     opportunity,
     brokerMaterials,
     pursueCimReleaseAvailable: Boolean(pursueCimDiscovery?.decision

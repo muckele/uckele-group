@@ -225,6 +225,16 @@ CI timing thresholds or production claims. The imported CSV is retained with
 scoring explicitly deferred when required sources are unavailable; this check
 does not claim a complete importer/reimport lifecycle or PostgreSQL volume parity.
 
+`npm run test:browser-volume` renders the same 1000-current/5000-archive fixture in
+Chromium at desktop and narrow viewports. It verifies pagination/search, bounded
+responses and DOM rows, lazy detail reads, real scrolling, dialog focus and Escape
+recovery, and read-only historical archive detail after current-score eligibility
+is lost. It records ten samples per repeated search/detail/page action, long tasks
+and renderer heap/DOM observations. Input-to-verified-render includes assertion
+polling and two animation frames; it is not standardized INP, production p95,
+mobile-device performance or leak proof. Screenshots/trace, network sizes and
+protected-state checks are retained in the runner's evidence directory.
+
 ## Privacy and security notes
 
 - Do not commit `.env`, database files, uploaded documents, backup bundles, session secrets, provider credentials, or exported CRM data.
