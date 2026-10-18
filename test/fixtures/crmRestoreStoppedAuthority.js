@@ -53,7 +53,7 @@ export function stoppedRestoreAuthoritySql(submissionId, opportunityId) {
         'Synthetic offline authority only','synthetic',2,1,'synthetic',${at},${at});
     INSERT INTO email_suppressions
       (id,normalized_email,reason,source,created_at,created_by,metadata)
-      VALUES ('11111111-4444-4444-8444-111111111111','broker@example.test','unsubscribed',
+      VALUES ('11111111-4444-4444-8444-111111111111','broker@example.test','explicit-opt-out',
         'synthetic-fixture',${at},'fixture-owner','{"optOutEvidence":"retained"}');
   `;
 }
