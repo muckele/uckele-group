@@ -7,7 +7,7 @@ import Database from 'better-sqlite3';
 
 import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
 import { buildManualFollowUpCommunicationId } from '../server/services/dealHunterManualFollowUpPolicy.js';
-import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
+import { getTriageOpportunityDetail, setTriageOperatorDecision } from '../server/services/dealHunterTriage.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 
@@ -1459,6 +1459,56 @@ test('detail keeps date-like and ZIP-plus-four legacy broker_contact generic and
   );
   assert.equal(detail.effectiveFacts.broker_phone, undefined);
   assert.equal(detail.missingCriticalFields.includes('broker_phone'), true);
+});
+
+test('archived detail remains available as explicit read-only history after current-score eligibility is lost', async (t) => {
+  const { storage, opportunityId, sqlitePath } = await detailStorage(t);
+  await storage.upsertDealHunterDisposition({ id: 'retained-archive-pass', deal_key: `deal-${opportunityId}`,
+    submission_id: 'submission-detail', disposition: 'dismissed', reason: 'Retained exact reason',
+    note: 'Retained historical archive detail', created_at: '2026-08-30T10:00:00.000Z',
+    updated_at: '2026-08-30T10:00:00.000Z', dismissed_at: '2026-08-30T10:00:00.000Z',
+    created_by: 'owner', updated_by: 'owner', metadata: {} });
+  const db = new Database(sqlitePath); t.after(() => db.close());
+  db.prepare('UPDATE deal_hunter_opportunity_scores SET current_triage_eligible=0 WHERE opportunity_id=?').run(opportunityId);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore(opportunityId), null);
+  const before = db.serialize();
+  const result = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.equal(result.ok, true);
+  assert.equal(result.archivedReadOnly, true);
+  assert.equal(result.opportunity.dismissed, true);
+  assert.equal(result.score.fitScore, 81);
+  assert.equal(result.history.dispositions[0].note, 'Retained historical archive detail');
+  assert.deepEqual(db.serialize(), before, 'Historical detail is a read and never restores eligibility');
+  assert.equal((await setTriageOperatorDecision({ opportunityId, priority: 'high', note: 'Forbidden historical edit',
+    markReviewed: true, storage, getCachedSourceHealth: null })).status, 404);
+  assert.deepEqual(db.serialize(), before, 'Historical read access does not grant current-score mutation authority');
+  const retained = await storage.getDealHunterOpportunityScore(opportunityId);
+  for (const [kind, override] of [
+    ['foreign retained id', { getDealHunterOpportunityScore: async () => ({ ...retained, opportunity_id: 'foreign-opportunity' }) }],
+    ['foreign retained key', { getDealHunterOpportunityScore: async () => ({ ...retained, deal_key: 'foreign-key' }) }],
+    ['foreign disposition key', { listDealHunterDispositions: async () => [{ deal_key: 'foreign-key', disposition: 'dismissed' }] }],
+  ]) {
+    const hostile = new Proxy(storage, { get(target, property) {
+      if (override[property]) return override[property];
+      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    assert.equal((await getTriageOpportunityDetail({ opportunityId, storage: hostile })).status, 404, kind);
+    assert.deepEqual(db.serialize(), before, `${kind} does not change protected state`);
+  }
+  for (const mutation of [
+    "UPDATE deal_hunter_dispositions SET disposition='restored'",
+    "UPDATE deal_hunter_dispositions SET disposition='dismissed',submission_id='foreign-crm'",
+  ]) {
+    db.exec(mutation);
+    assert.equal((await getTriageOpportunityDetail({ opportunityId, storage })).status, 404);
+  }
+});
+
+test('ineligible unarchived detail is not admitted through historical score fallback', async (t) => {
+  const { storage, opportunityId, sqlitePath } = await detailStorage(t);
+  const db = new Database(sqlitePath); t.after(() => db.close());
+  db.prepare('UPDATE deal_hunter_opportunity_scores SET current_triage_eligible=0 WHERE opportunity_id=?').run(opportunityId);
+  assert.equal((await getTriageOpportunityDetail({ opportunityId, storage })).status, 404);
 });
 
 test('consolidated detail rejects a superseded opportunity even when its historical facts and score remain', async (t) => {

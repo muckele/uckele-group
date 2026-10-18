@@ -61,5 +61,25 @@ Plan: `docs/superpowers/plans/2026-10-18-fl05-volume-acceptance.md`.
 - [x] Verify full 1000-row HTTP CSV acceptance and explicit deferred scoring.
 - [x] Measure 1000 current projection rows / 5000 historical archives locally,
   bounded responses/pagination, RSS and query shape; protected state unchanged.
-- [ ] Complete independent review and exact-head CI of the reproducible check.
+- [x] Complete independent review and exact-head CI `39175755574` on PR79
+  `d79ee6d300e3b617cd1e51fe826e678806e77dc0`.
 - [ ] Human owner timing/adoption and deployed/live acceptance (separate gates).
+
+# FL-05 rendered growth-volume acceptance
+
+Plan: `docs/superpowers/plans/2026-10-18-fl05-rendered-volume.md`.
+
+- [x] Preserve the observed archived-detail 404 and focused service RED evidence.
+- [x] Add a narrow read-only historical projection; retain current-score action
+  authority, exact canonical identity, disposition and CRM binding requirements.
+- [x] Add real growth-fixture browser search/detail/page/focus/scroll and bounded
+  network proof, hostile identity denials and archived read-only drawer coverage.
+- [ ] Complete final independent review, full regressions and literal-head CI.
+- [ ] Human owner-reviewed adoption/effort and authorized release acceptance.
+
+Finite acceptance: this closes the identified rendered-volume engineering gate
+when its final checks pass. No measured failure currently calls for a new index,
+architecture or broader device/store benchmark. Those are optional expansion.
+Human owner adoption remains MVP-required; this automated synthetic journey does
+not establish that acceptance or certify all 66 roadmap scenarios. Release and
+fully live CIM acceptance retain their separate authorization/provider gates.
