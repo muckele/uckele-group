@@ -6,6 +6,47 @@ at baseline `e104102152d3656bd5df5b7a455f350fb98f037b`, followed by corrections
 and independent patch review. It grants no live authority. Production remains
 unready, qualification remains disallowed and global automation remains paused.
 
+## Current offline handoff — October 18, 2026
+
+UG engineering has resumed at the original Mac paths; no repository/worktree
+migration occurred. PR76 remains an open draft. The runtime/probe implementation
+head is `3ccfcec562e1278811c35741b83a67b7ea181cb8`. Fresh GitHub queries
+reconfirmed [CI39071965198](https://github.com/muckele/uckele-group/actions/runs/39071965198)
+as successful, including both literal-source-commit assertions. This is a
+reconfirmation of that recorded run, not a newly executed live test.
+
+The later reviewed [stopped-log probe](../p10b-stopped-log-probe.md) implements
+the read-only transport path proposed by the historical review below. It has
+its own approval and native executable, exactly two baseline GETs and two log
+GETs, zero starts/updates, and an original 30-second aggregate bound. All log
+text is discarded. Its implementation and artifact reviews are complete; it
+has not been run against Fly. The historical failed attempt remains failed.
+
+On October 18, a bounded fresh offline regression at that implementation head
+passed **224 tests, zero failures/skips**, using the preserved reviewed native
+artifacts, synthetic inputs, owned localhost boundaries and an isolated
+environment without inherited credentials. Coverage includes probe authority,
+replay/deadline/cleanup, concrete qualification runtime, inbound restrictions,
+observer failures and guest shutdown. The original native artifact hashes were
+rechecked; no native rebuild or new operational package was needed. The
+internal disk was above the existing 11 GiB floor before testing. Storage work
+remains paused; these results do not authorize cleanup or migration.
+
+The smallest unfinished mailbox gate is a **separately approved live stopped
+read-only probe**, with current public baseline/access bindings and a fresh,
+bounded private credential/approval. The old live token is expired and must
+not be reused. Do not generate a replacement token or an expiring operational
+package under the current engineering authorization. Probe success cannot
+approve a start, runtime/preparation window, provider call or email. The later
+runtime and one-email gates remain separate, with the frozen sender/recipient
+below and all readiness/automation hard-offs retained.
+
+MVP-FL-05's integrated synthetic owner walkthrough and owner acceptance are
+separate roadmap evidence levels; mailbox safety tests do not establish owner
+pilot completion, deployed behavior or live material receipt. No new feature,
+permission, deployment, production change or live operation is part of this
+handoff correction.
+
 ## Proven failure, contributors and unknowns
 
 The original host was `fa8b1f4a2fa8b05f9f9c3c66e18210cb384e477e`;
@@ -91,7 +132,7 @@ Offline tests use only owned synthetic processes, SQLite fixtures and localhost
 servers, with external network denied. Native CI complements those tests; no
 single fixture proves the real provider lifecycle.
 
-## Remaining decision before any live proposal
+## Historical remaining decision at this review point
 
 Offline code safety and deterministic integration can be verified, but the
 next live attempt cannot be predicted to pass. The 38 log timeouts still need
