@@ -1,0 +1,57 @@
+{
+  "version": "p10b-historical-public-archive-fixture-v1",
+  "historicalOnly": true,
+  "networkCalls": 0,
+  "records": [
+    {
+      "path": "/Users/Matt/.uckele-group-p10b-host/0803730bd1d7e8.active.json.archived-uncertain-103e41746bf89e7e2dec9c5d.json",
+      "sha256": "d8db5f5624548885285327591e2b6259588d9d7333a0e85cda40960047a73043",
+      "device": 16777229,
+      "inode": 177000950,
+      "owner": 501,
+      "size": 311,
+      "mode": 384,
+      "bytes": "{\"version\":\"p10b-machine-owner-v1\",\"packetDigest\":\"df7051b7cd424d9d70e924591130149f3932208414055511f201d8db5bcc12e8\",\"evidencePath\":\"/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-runtime-attempt-4-f15f7d596089/runtime-harness/p10b-runtime-only-preparation\",\"reservedAt\":\"2026-10-10T07:12:20.821Z\"}"
+    },
+    {
+      "path": "/Users/Matt/.uckele-group-p10b-host/df7051b7cd424d9d70e924591130149f3932208414055511f201d8db5bcc12e8.attempt.json",
+      "sha256": "1dd15a6ad44cfc2cc9470934b3566584b6bc19897b4572fa952861e7b958074d",
+      "device": 16777229,
+      "inode": 177000949,
+      "owner": 501,
+      "size": 237,
+      "mode": 384,
+      "bytes": "{\"packetDigest\":\"df7051b7cd424d9d70e924591130149f3932208414055511f201d8db5bcc12e8\",\"evidencePath\":\"/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-runtime-attempt-4-f15f7d596089/runtime-harness/p10b-runtime-only-preparation\"}"
+    },
+    {
+      "path": "/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-package-88159cf-released-20261015T1747Z/runtime-evidence/p10b-recovery-intent.json",
+      "sha256": "429489c38eba2ba5f1e35652b672e6bf62c076f41064a36eae679deab9dbf976",
+      "device": 16777229,
+      "inode": 183715499,
+      "owner": 501,
+      "size": 571,
+      "mode": 384,
+      "bytes": "{\"attemptSha256\":\"1dd15a6ad44cfc2cc9470934b3566584b6bc19897b4572fa952861e7b958074d\",\"baselineDigest\":\"7a79a29ec6185c8ab3c469a185add04f5c8a3070d8d1d22c90551736b943ae1e\",\"historicalCleanupVerified\":false,\"independentBaselineDigest\":\"16480aef180f4b9ea5c813aa6635426534a9a4046270f604ded4ecf52b589f1d\",\"intendedAt\":\"2026-10-15T19:36:38.412Z\",\"operatorPid\":90789,\"originalSha256\":\"d8db5f5624548885285327591e2b6259588d9d7333a0e85cda40960047a73043\",\"sessionDigest\":\"c4cd3dadb684dda434e84d7557a53e5f7231dc84be93cf55e8e2c690c09a62ab\",\"version\":\"p10b-admission-recovery-intent-v1\"}\n"
+    },
+    {
+      "path": "/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-package-88159cf-released-20261015T1747Z/runtime-evidence/p10b-recovery-terminal.json",
+      "sha256": "14a3336f8aed1aba801698045a1d7a9b00b82b282f49b64819706e5766bc4667",
+      "device": 16777229,
+      "inode": 183715502,
+      "owner": 501,
+      "size": 697,
+      "mode": 384,
+      "bytes": "{\"activePath\":\"/Users/Matt/.uckele-group-p10b-host/0803730bd1d7e8.active.json\",\"activeRetired\":true,\"archiveDevice\":\"16777229\",\"archiveInode\":\"177000950\",\"archivePath\":\"/Users/Matt/.uckele-group-p10b-host/0803730bd1d7e8.active.json.archived-uncertain-103e41746bf89e7e2dec9c5d.json\",\"historicalCleanupVerified\":false,\"intentDigest\":\"c91bcc87d87147d83a800fbe37121572becf644158ce8686f99c87e64eddb7e6\",\"operatorPid\":90789,\"originalSha256\":\"d8db5f5624548885285327591e2b6259588d9d7333a0e85cda40960047a73043\",\"productionReady\":false,\"retiredAt\":\"2026-10-15T19:36:38.423Z\",\"sessionDigest\":\"c4cd3dadb684dda434e84d7557a53e5f7231dc84be93cf55e8e2c690c09a62ab\",\"version\":\"p10b-admission-recovery-terminal-v1\"}\n"
+    },
+    {
+      "path": "/Users/Matt/Documents/Codex/2026-10-09/task-2/evidence/p10b-owner-package-88159cf-released-20261015T1747Z/runtime-evidence/p10b-recovery-independent-verification.json",
+      "sha256": "1e6132356be0de282607fb766d8a2dd6f35eba44b2c2a7e47c921d7275db5a92",
+      "device": 16777229,
+      "inode": 183715505,
+      "owner": 501,
+      "size": 381,
+      "mode": 384,
+      "bytes": "{\"archiveSha256\":\"d8db5f5624548885285327591e2b6259588d9d7333a0e85cda40960047a73043\",\"sessionDigest\":\"c4cd3dadb684dda434e84d7557a53e5f7231dc84be93cf55e8e2c690c09a62ab\",\"success\":true,\"terminalDigest\":\"4e3e7f24f930469af92b0369ea4bf41edfd4fbc023883b5412f673e18e94ee81\",\"verifiedAt\":\"2026-10-15T19:36:38.505Z\",\"verifierPid\":90797,\"version\":\"p10b-independent-recovery-verification-v1\"}\n"
+    }
+  ]
+}

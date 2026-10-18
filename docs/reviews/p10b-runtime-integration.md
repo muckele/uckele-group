@@ -1,0 +1,92 @@
+# P10B runtime integration — offline scope
+
+This change supplies the previously missing executable host/worker and isolated ingress path on PR76. It has been exercised with fake Fly and email boundaries and real local child processes/SQLite. It authorizes no image build, deployment, Machine start, provider request, email, live record, production change or merge. `productionReady=false` and all global automation/sending hard-offs remain mandatory.
+
+The only runtime target is app `uckele-group-p10b`, Machine `0803730bd1d7e8`, region `ewr`, volume `vol_vwnkpex1k3yx9dnv` mounted at `/data`, one shared CPU/512 MiB, restart `no`, and service autostart false. The frozen sender remains `P10B Sender <sender@p10b-e2e.uckelegroup.com>` and eventual recipient remains `mathew@uckelegroup.com`.
+
+## Executable integration and ordering
+
+After separate future authority and fully frozen packet review, the entry point is:
+
+```sh
+node scripts/run-p10b-first-mailbox.js --packet <reviewed-packet.json> --evidence-prefix <retained-prefix>
+```
+
+Importing the modules contacts nothing. The command requires the exact clean source commit, a reviewed packet and an exclusive host reservation before starting. The concrete adapter uses the existing Fly CLI/SSH boundary; it never builds or updates an image and never forwards a Fly credential into the Machine. The immutable image contains its source head via the Docker build argument `P10B_SOURCE_HEAD`.
+
+The host validates sole Machine identity, immutable image, resource/service/volume configuration, explicit hard-offs, public runtime digest and nonsecret staged-key metadata digest. `STORAGE_PROVIDER=sqlite` is mandatory. It sends one packet over bounded JSON-lines on authenticated SSH stdio to `scripts/run-p10b-qualification-worker.js`. The worker validates actual runtime/source and stable database inode/path identity; the host never copies or mounts the live database.
+
+Preparation uses a fresh absent database/WAL/SHM path and retained one-start markers, requires zero preexisting business/provider history, and invokes the existing synthetic preparation authorities once. It performs zero provider calls. The worker closes its connection, asks the main listener to drain and close its cached SQLite handle, then writes and exports the preparation receipt. The independent guest guard closes execution authority and verifies listener/SQLite closure, validates the preserved candidate handoff and exits. The host verifies stopped state before declaring preparation successful. Failed starts/markers/receipts are retained without overwrite or retry.
+
+Qualification requires the actual retained preparation, actual alias/transmission/payload/review identities, one qualify-start marker and one worker marker. The existing injected executor performs one outbound POST, one sent-mail reconciliation GET, signed delivery/reply verification and one exact inbound-content GET. It closes durable authorization/capability authority and restores pause/hard-offs before closing its SQLite connection. A local `SIGUSR2` handoff drains the existing listener and closes its SQLite connection. The independent guest guard confirms permission, listener and worker SQLite closure, validates the preserved candidate handoff, then publishes an immutable final receipt. The worker exports its pre-stop candidate and flushes the channel before indicating export completion. The guardian child exits normally. Its secret-free parent reaps that actual OS exit, publishes the exact child PID/status and fresh record hashes, then exits normally so Fly init stops the Machine. Only after stopped state and local control-process reaping are verified does the host promote the candidate into the expiring lifecycle artifact. Failure/timeout/uncertainty never promotes a candidate.
+
+The ingress drain adds no external route or listener. Isolated HTTP admits only availability and, in the qualify phase, the existing signed webhook. Public/admin/contact/upload/analytics mutations and preparation-phase webhooks are unavailable. Isolated startup skips auth/document cleanup and every scheduler, including backups and inbound retries. Ordinary production paths remain unchanged.
+
+## Replay, lateness, bounds and retention
+
+A fixed host state directory `~/.uckele-group-p10b-host` is shared by executable invocations. Exclusive per-packet attempts prevent changing the evidence prefix to replay a packet. The exact-Machine active reservation rejects another process before any Machine mutation. Verified closure renames the active reservation into retained closed evidence; uncertainty or host crash retains the active reservation. Recovery never deletes this record automatically. An interrupted start is explicitly `startUncertain=true`, even if a later read reports stopped, because killing a local client cannot cancel an already-issued remote mutation.
+
+The guest guard's single exit promise arbitrates requested closure, absolute cutoff, startup failure and cleanup errors. A durable run latch refuses replay. The host's single verification promise cancels/reaps local control commands and observes the exact image/Machine stopped state; it issues no competing Fly stop request. An early host failure waits through the original guest cutoff. Uncertain cleanup/read/reap retains admission and cannot release proof. The independent stop budget is at most30 seconds even if execution permission has already expired. Preparation reserves30 seconds for closure and30 for stop inside its five-minute window. Qualification uses the unextended manifest deadline/maximum runtime, reserves the same closure/stop budget and caps the total permission window at15 minutes. Conservative maximum spend must fit $0.90 before start, leaving $0.10 within the $1 cap for remaining control/read costs; price assumptions must be owner-reviewed and current.
+
+SQLite admits only a signed delivery for the outbound provider identity or an exact owner reply to the prepared alias while durable qualification authority remains current. It atomically claims the sole inbound-content attempt. Replay, a new process/connection, failed content, unrelated messages, attachments, background retries and late asynchronous work cannot obtain another GET. Placeholder/event/terminal/content writes recheck authority in their SQLite transaction. Ordinary CRM delivery/request/follow-up mutation is skipped for isolated ingress. Fetched inbound identity/envelope is compared with the signed event. Complete inbound response bodies are time-bounded, aborted on expiry and capped at64 KiB; no attachment endpoint is read.
+
+All records, markers and host receipts are retained. No schema migration, live deletion, production readiness promotion or automation unpause is added.
+
+## Offline evidence and review
+
+The inherited checkout and all its uncommitted code were preserved unchanged. The active implementation is a separate local checkout at `/Users/Matt/Documents/Codex/2026-10-09/task-2/uckele-group`; the original patch, untracked files and reports are retained under the sibling `evidence` directory.
+
+The tests exercise actual worker processes and the concrete CLI adapter against a local fake executable, including fresh no-send preparation followed by qualification. They verify permission/listener/database closure before stop and artifact emission, exact sender, one POST, replay refusal, early failure, corrupt frames/candidate, timeout, cancelled/late start and SSH work, one-shot stop, unknown stop/reap, missing/duplicate/failed drain acknowledgments, fixed target, wrong inbound identity/alias/sender/attachments, failed/hung/oversized content and delayed post-closure writes. Local listener tests require sandbox permission to bind loopback; that is software-test evidence only.
+
+Independent reviewer `/root/runtime_review` reproduced the original gaps and reviewed the corrections. Final exact-patch approval and test results are recorded in the implementation status report and PR. Historical readiness reports are not completion evidence for this integration.
+
+## Approved guest watchdog and remaining live gates
+
+No approved live packet or image/database/provider-identity/configuration/price/permission digest is currently frozen. Separate approval must cover image build/push and stopped-image/configuration update, then a bounded no-send fresh preparation window. Keep the fresh path and actual prepared identities, payload, alias, image and receipt for a subsequent separately approved one-email window. No preparation approval automatically grants sending authority. The owner reply and actual provider lifecycle remain unperformed.
+
+The owner approved the guest-owned fixed-deadline approach for code and offline tests. Machine **top-level** `config.processes` must be exactly:
+
+```json
+[
+  {"exec":["node","server/index.js"]},
+  {"exec":["node","scripts/run-p10b-guest-guardian-parent.js"],"ignore_app_secrets":true}
+]
+```
+
+This is one Machine with two processes, not another Fly process group or resource. The configured parent launches the original guardian entry as its child with only the three public runtime bindings in its environment. The guard reads only the public `P10B_GUEST_WINDOW` and nonsecret image source marker, never Fly/provider credentials. Packet version `p10b-runtime-packet-v3` requires `guest` with canonical `issuedAt`, absolute `stopAt`, `closureGraceMs` and `stopReserveMs`. Production CLI reserves30 seconds each. Public window/phase/run identity is included in the runtime configuration digest and startup/listener/worker markers. Preparation lasts at most five minutes; qualification ends at the earlier manifest expiry or issuedAt plus maximumRuntimeMs (at most15 minutes). The cutoff is frozen **before start**, never at SSH attachment. Readiness requires both the living matching parent and guardian child before startup/storage access. The exclusive parent-start and child-exit records are added to the freshness inventory for both phases and unused paths. Late boot, dead/missing guard and retained run markers fail closed.
+
+The guard uses wall time plus a monotonic bound so clock rollback cannot renew the window. It closes permission/activation authority and restores pause, drains ingress, checks worker SQLite closure, retains candidate and closure facts, validates handoff, then exits. Preparation retains the reviewed setup chain while admitting no execution grant. Failed cleanup, corrupt/missing handoff or timeout retains uncertainty; an acknowledgment alone cannot release an artifact. A hard timer never waits for the host, SSH, listener or handoff beyond the cutoff. Host/Mac/network loss while the guest remains operational is covered. A stalled parent, synchronous filesystem write/fsync, guest kernel or Fly init is outside the approved operational guarantee. The parent has no independent stop timer, signal, provider authority or retry; the guardian retains the existing fixed deadline and sole closure/exit arbitration. After actual child exit, log flushing is capped at250 ms inside the original stop reserve. Failed spawn, binding, schema, status or flush exits the parent with code1 and cannot qualify timing proof. No newly provisioned observer, resource or credential is required.
+
+Before any one-email window, a **separately approved zero-provider timing demonstration** must measure configured process exit to actual stopped-state convergence and retained cleanup evidence on the exact isolated Machine. Offline tests cannot establish Fly's real platform timing. Its prepared, unexecuted protocol is [p10b-zero-provider-shutdown-demonstration.md](p10b-zero-provider-shutdown-demonstration.md). No Machine configuration, start, image build/push or demonstration has been performed under this approval. All actual image/packet/domain/key/provider-identity/price/owner-permission values still require separate review and authority. The new process layout requires separate future approval: the smallest design decision is to insert this secret-free reaping parent around the existing guardian. The previously built direct-guardian image cannot supply the new provenance and must not be reused for a new demonstration.
+
+## Offline guardian-exit provenance correction
+
+The earlier attempt remains failed and closed. Fly init logged `Main child exited normally with code: 0` without the exiting PID; the peer SIGTERM PID did not identify the guardian. Pretty-printed JSON objects were also discarded by the line parser. The new operator proof consumes complete bounded JSON objects, requires exactly one parent-reaped record tied to the fresh parent/start/ready/window/source/image/Machine bindings, then requires a normal whole-Machine exit and continuous exact-instance stopped readback. Duplicate/conflicting records, requested stop, abnormal exit, OOM, restart or observer uncertainty fail closed. The convergence gate remains30 seconds and the fixed cutoff remains unchanged.
+
+The1001 ms first-request gap was248 ms for the initial read,750 ms for a timer installed afterward, and approximately3 ms scheduling overhead. It exceeded the1000 ms gate by1 ms. The cadence now begins before the initial asynchronous read. Both request and response gaps must still be at most1000 ms; the correction cannot guarantee scheduling or rescue the old attempt.
+
+The operator update/rollback helpers are extracted into a boundary-injected module with no I/O at import. The local full-sequence fixture uses actual parent/guardian/controller OS processes, byte-fragmented pretty JSON transport, a synthetic Machine API including created-to-stopped readback, real local worker/SQLite/ingress preparation and exact stopped baseline restoration. Its short process windows test ordering and convergence; separate virtual-time tests retain the exact five-minute/sixty-minute gates. All external boundaries are stubs. Failed demonstration refuses preparation and still restores the known stopped baseline. The held operator proposal contains `SESSION_NOT_APPROVED`, so it cannot consume authentication or open a runtime session.
+
+## Offline diagnosis after the closed no-email preparation attempt
+
+The October 10 no-email attempt retained a successful independent guardian demonstration and a failed preparation. Its CLI returned code 1, before worker registration or preparation export. The host's early `stopUncertain` did not change shutdown ownership: the guardian continued to its frozen cutoff and independently stopped the Machine. Later stopped-state evidence does not promote that failed preparation or remove its cleanup uncertainty. The executed operator copy, all failed evidence and the active host reservation remain preserved.
+
+The saved image completes server startup, real worker execution, SQLite preparation, ingress closure and guardian handoff offline with synthetic configuration and networking disabled. Removing runtime configuration only from the worker reproduces pre-registration failure. This contrast does not establish the lost live exception; missing configuration, bootstrap failure and transport failure must be distinguished by future evidence.
+
+Two routine defects were established independently. Initial local reaping and all stopped-state polling shared one catch, so a single reap/read failure ended verification before the frozen cutoff. A 1-second host read bound also conflicted with the concrete command's 10-second bound. Reaping uncertainty now remains separate from stopped-state observations. Sequential reads share the original deadline, pass their actual remaining timeout to the adapter, abort/reap failed local reads before retrying and pace their 2048-read limit across the complete interval. Validated guest handoff retains the shorter stop reserve. There is no host stop command, extra start, renewed permission window or artifact release on uncertainty.
+
+Worker failures now retain a closed vocabulary of phases and reasons before cleanup can consume the window. Bootstrap loading/default configuration and concrete command exits/timeouts also produce bounded sanitized provenance. Exception messages, stacks, stderr and environment values are never exported. Invalid remote diagnostics fail closed; unsupported OS signals cannot throw from failure handling.
+
+The executed operator also printed child code 1 and returned code 0. A future reviewed wrapper must use the shared completion path, which retains the child exit, waits for stdio closure and requires the actual successful preparation/cleanup/stopped receipt:
+
+```js
+await awaitP10bPreparationChild({
+  child,
+  onExit: terminal => retainChildExit(terminal),
+  readResult: () => readRetainedHostResult(),
+});
+```
+
+The held corrected operator copy uses this path. Actual local child/operator tests cover failed child exits and failed retained results. The full preparation/restoration fixture continues to use real local SQLite, server/worker/guardian processes and stubbed external boundaries.
+
+No new live window is opened by these corrections. The smallest next proof is a separately authorized zero-provider preparation using an image bound to the final reviewed source, a fresh packet/database/evidence path, exact stopped configuration and current public configuration/provider/price metadata. The preserved uncertain host reservation requires a separately reviewed recovery decision before any new admission; no automatic deletion or rearming is added. Any one-email qualification still needs separate owner approval. `productionReady=false` and global automation paused remain mandatory.

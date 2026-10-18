@@ -5,8 +5,11 @@ import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
 import { deriveAcceptedCimCadence } from '../services/pursueCimCadence.js';
 import { cimFollowUpCapacityWindow } from '../services/pursueCimFollowUpCapacity.js';
+import { P10B_QUALIFICATION_WRITER, qualificationReason,
+  validateQualificationContract } from '../services/p10bQualificationContract.js';
 
 const cimWriterCapabilities = new Map([
+  [P10B_QUALIFICATION_WRITER, 'fl04b-initial'],
   ['pursue-cim-initial', 'fl04b-initial'],
   ['pursue-cim-autopilot-initial', 'fl04b-initial'],
   ['pursue-cim-follow-up', 'fl04c-followup'],
@@ -14,6 +17,62 @@ const cimWriterCapabilities = new Map([
   ['pursue-cim-batch', 'fl04c-batch'],
   ['pursue-cim-autopilot-batch', 'fl04c-batch'],
 ]);
+
+function qualificationBound(database, qualification, { transmission, authorization, now }) {
+  if (!transmission || !qualification
+    || database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions').get().count !== 1
+    || database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_live_provider_authorizations
+      WHERE writer_path = ?`).get(P10B_QUALIFICATION_WRITER).count > 1) return false;
+  const communication = database.prepare('SELECT * FROM crm_communications WHERE id = ?')
+    .get(transmission.communication_id);
+  const activation = currentActivationChain(database, 'fl04b-initial', now);
+  const enrollment = activation ? database.prepare(`SELECT * FROM deal_hunter_cim_capability_activations
+    WHERE id = ?`).get(activation.prerequisite_activation_id) : null;
+  if (activation?.prerequisite_evidence_hash !== qualification.manifest?.ownerPermissionDigest
+    || enrollment?.prerequisite_evidence_hash !== qualification.manifest?.ownerPermissionDigest) return false;
+  return Boolean(communication && validateQualificationContract({ ...qualification,
+    transmission, communication, authorization, now }).valid);
+}
+
+function qualificationInboundAuthority(database, command) {
+  try {
+    const now = requiredInstant(command.now);
+    const authorizations = database.prepare(`SELECT * FROM deal_hunter_cim_live_provider_authorizations
+      WHERE writer_path=?`).all(P10B_QUALIFICATION_WRITER);
+    const authorization = authorizations[0];
+    const transmission = authorization && database.prepare(`SELECT * FROM deal_hunter_cim_transmissions
+      WHERE id=?`).get(authorization.transmission_id);
+    const pause = database.prepare("SELECT * FROM deal_hunter_cim_safety_settings WHERE id='global'").get();
+    const from = 'P10B Sender <sender@p10b-e2e.uckelegroup.com>';
+    const owner = 'mathew@uckelegroup.com';
+    if (authorizations.length !== 1 || !authorization.consumed_at || authorization.withdrawn_at
+      || authorization.provider_profile !== 'controlled-mailbox-v1'
+      || authorization.maximum_calls !== 1 || authorization.issued_at > now || authorization.expires_at <= now
+      || !/^p10b-first-mailbox-qualification-v2:[0-9a-f]{64}$/.test(authorization.reason || '')
+      || currentActivationChain(database, 'fl04b-initial', now)?.id !== authorization.activation_id
+      || pause?.outreach_paused !== 1 || transmission?.state !== 'accepted'
+      || transmission.provider !== 'resend' || transmission.invocation_authority_count !== 1
+      || transmission.payload_digest !== authorization.payload_digest || transmission.from_address !== from
+      || stableCanonicalJson(JSON.parse(transmission.to_addresses)) !== stableCanonicalJson([owner])
+      || transmission.cc_addresses !== '[]' || transmission.bcc_addresses !== '[]'
+      || !/^cim-[a-z0-9-]{1,32}@p10b-e2e\.uckelegroup\.com$/.test(transmission.reply_to_address)
+      || database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions').get().count !== 1
+      || (command.authorizationId && command.authorizationId !== authorization.id)) return { allowed: false };
+    if (command.type === 'email.delivered') {
+      return { allowed: command.from === from && command.providerMessageId === transmission.provider_message_id
+        && stableCanonicalJson(command.to) === stableCanonicalJson([owner]), authorizationId: authorization.id };
+    }
+    if (command.type !== 'email.received' || command.from !== owner
+      || stableCanonicalJson(command.to) !== stableCanonicalJson([transmission.reply_to_address])) return { allowed: false };
+    const attempts = database.prepare(`SELECT * FROM crm_communications
+      WHERE direction='inbound' AND content_attempt_count>0`).all();
+    if (attempts.length > 1 || (attempts.length === 1
+      && (attempts[0].provider !== 'resend' || attempts[0].provider_message_id !== command.providerMessageId
+        || (command.providerEventId && attempts[0].source_event_id !== command.providerEventId)
+        || (command.communicationId && attempts[0].id !== command.communicationId)))) return { allowed: false };
+    return { allowed: true, authorizationId: authorization.id, attempted: attempts.length === 1 };
+  } catch { return { allowed: false }; }
+}
 const pursueCimContainmentFindingCodes = new Set([
   'duplicate_provider_identity', 'missing_durable_authority', 'multiple_active_campaigns',
   'duplicate_accepted_touch', 'active_identity_ambiguity', 'unexpected_legacy_invocation',
@@ -504,6 +563,27 @@ export function createPursueCimSqliteTransitions(database, {
         transmission: candidate.transmission, campaignIds, touchIds,
         candidateConversations: [] };
     },
+    async readCimQualificationTerminalEvidence({ conversationId, providerEventId } = {}) {
+      if (!conversationId || !providerEventId) return null;
+      return database.prepare(`SELECT * FROM deal_hunter_cim_terminal_events
+        WHERE scope = 'conversation' AND scope_id = ? AND evidence_id = ?
+          AND reason_code = 'reply_received' ORDER BY revision DESC LIMIT 1`)
+        .get(requiredText(conversationId, 'conversationId'), requiredText(providerEventId, 'providerEventId')) ?? null;
+    },
+    readCimQualificationInboundAuthority(command) {
+      return qualificationInboundAuthority(database, command);
+    },
+    async claimCimQualificationInboundRead(command) {
+      return database.transaction(() => {
+        const authority = qualificationInboundAuthority(database, command);
+        if (!authority.allowed || authority.attempted) return { claimed: false };
+        const result = database.prepare(`UPDATE crm_communications SET content_attempt_count=1,
+          content_next_attempt_at=NULL WHERE id=? AND direction='inbound' AND provider='resend'
+          AND provider_message_id=? AND source_event_id=? AND content_attempt_count=0`)
+          .run(command.communicationId, command.providerMessageId, command.providerEventId);
+        return { claimed: result.changes === 1, authorizationId: authority.authorizationId };
+      }).immediate();
+    },
     async readCimCadenceContext({ transmissionId } = {}) {
       return cadenceContext(database, requiredText(transmissionId, 'transmissionId'));
     },
@@ -992,7 +1072,10 @@ export function createPursueCimSqliteTransitions(database, {
         return { membership, touch, campaign, decision, enrollment, opportunity,
           timezone, crmOwnership, crmSubmission };
       });
-      return { transmission, conversation, authorization, activation, safety,
+      const qualificationChainCurrent = authorization?.writer_path === P10B_QUALIFICATION_WRITER
+        && currentActivationChain(database, 'fl04b-initial', requiredInstant(command.now
+          ?? new Date().toISOString()))?.id === authorization.activation_id;
+      return { transmission, conversation, authorization, activation, safety, qualificationChainCurrent,
         globalAuthorityRevision, communication, outbox, members };
     },
     async enterCimProviderSeam(command) {
@@ -1065,7 +1148,11 @@ export function createPursueCimSqliteTransitions(database, {
         if (transmission.provider_seam_entered_at) {
           return { entered: false, alreadyEntered: true, unauthorized: false };
         }
-        if (!pause || pause.outreach_paused !== 0 || transmission.row_version !== expectedRowVersion) {
+        const qualification = writerPath === P10B_QUALIFICATION_WRITER;
+        if (!pause || pause.outreach_paused !== (qualification ? 1 : 0)
+          || (qualification && !qualificationBound(database, command.qualification,
+            { transmission, authorization, now }))
+          || transmission.row_version !== expectedRowVersion) {
           return { entered: false, alreadyEntered: false, unauthorized: true };
         }
         const changed = database.prepare(`
@@ -1195,7 +1282,10 @@ export function createPursueCimSqliteTransitions(database, {
           return blocked('lifecycle_conflict');
         }
         const readiness = authoritySnapshot.readiness;
-        if (!authorityDigestMatches(readiness) || readiness.ready !== true
+        const qualification = writerPath === P10B_QUALIFICATION_WRITER;
+        if (qualification ? readiness?.version !== 'p10b-qualification-permission-v1'
+          || !qualificationBound(database, readiness, { transmission, now })
+          : !authorityDigestMatches(readiness) || readiness.ready !== true
           || readiness.version !== 'cim-provider-readiness-v1'
           || readiness.providerProfile !== providerProfile
           || Date.parse(readiness.expiresAt) <= Date.parse(now)) {
@@ -1211,7 +1301,7 @@ export function createPursueCimSqliteTransitions(database, {
         const pause = database.prepare(`
           SELECT outreach_paused FROM deal_hunter_cim_safety_settings WHERE id = 'global'
         `).get();
-        if (!pause || pause.outreach_paused !== 0) return blocked('central_pause');
+        if (!pause || pause.outreach_paused !== (qualification ? 1 : 0)) return blocked('central_pause');
         const authorization = database.prepare(`
           SELECT * FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?
         `).get(authorizationId);
@@ -1224,6 +1314,8 @@ export function createPursueCimSqliteTransitions(database, {
           || Date.parse(authorization.expires_at) <= Date.parse(now)) {
           return blocked('live_authorization_invalid');
         }
+        if (qualification && !qualificationBound(database, readiness,
+          { transmission, authorization, now })) return blocked('live_authorization_invalid');
         if (authoritySnapshot.authorization?.id !== authorization.id
           || authoritySnapshot.authorization?.activation_id !== authorization.activation_id
           || authoritySnapshot.authorization?.payload_digest !== authorization.payload_digest
@@ -1622,7 +1714,9 @@ export function createPursueCimSqliteTransitions(database, {
             && existing.writer_path === writerPath && existing.transmission_id === transmissionId
             && existing.payload_digest === payloadDigest
             && existing.recipient_authority_digest === recipientAuthorityDigest
-            && existing.provider_profile === providerProfile && existing.expires_at === expiresAt;
+            && existing.provider_profile === providerProfile && existing.expires_at === expiresAt
+            && (writerPath !== P10B_QUALIFICATION_WRITER
+              || (existing.reason === reason && existing.actor === actor && existing.issued_at === now));
           return outcome({ replay, conflict: !replay }, existing);
         }
         const current = database.prepare(`
@@ -1642,6 +1736,14 @@ export function createPursueCimSqliteTransitions(database, {
         if (!transmission || transmission.state !== 'prepared'
           || transmission.payload_digest !== payloadDigest) {
           return outcome({ blockedReason: 'transmission_invalid' });
+        }
+        if (writerPath === P10B_QUALIFICATION_WRITER
+          && (capability !== 'fl04b-initial' || providerProfile !== 'controlled-mailbox-v1'
+            || reason !== qualificationReason(command.qualification?.manifest)
+            || command.qualification?.manifest?.issuedAt !== now
+            || command.qualification?.manifest?.expiresAt !== expiresAt
+            || !qualificationBound(database, command.qualification, { transmission, now }))) {
+          return outcome({ blockedReason: 'live_authorization_invalid' });
         }
         const members = database.prepare(`
           SELECT c.recipient_fingerprint, t.kind
@@ -2747,6 +2849,9 @@ export function createPursueCimSqliteTransitions(database, {
         cancelledTouchIds = []) => ({ applied: false, replay: false, conflict: false,
         ...flags, campaignRevision, conversationRevision, cancelledTouchIds });
       return database.transaction(() => {
+        if (command.qualificationGuard && !qualificationInboundAuthority(database, command.qualificationGuard).allowed) {
+          throw new Error('Qualification inbound terminal permission closed');
+        }
         const existing = database.prepare('SELECT * FROM deal_hunter_cim_terminal_events WHERE id = ?').get(eventId);
         if (existing) {
           const replay = existing.scope === scope && existing.scope_id === scopeId

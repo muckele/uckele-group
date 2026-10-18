@@ -7,6 +7,7 @@ ARG VITE_PUBLIC_CONTACT_EMAIL=mathew@uckelegroup.com
 ARG VITE_PUBLIC_CONTACT_PHONE=914.361.9153
 ARG VITE_PUBLIC_LINKEDIN_URL=https://www.linkedin.com/in/mathew-uckele
 ARG VITE_TURNSTILE_SITE_KEY=
+ARG P10B_SOURCE_HEAD=
 
 ENV VITE_PUBLIC_SITE_URL=$VITE_PUBLIC_SITE_URL
 ENV VITE_PUBLIC_CONTACT_EMAIL=$VITE_PUBLIC_CONTACT_EMAIL
@@ -22,7 +23,8 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
-RUN npm run build && npm prune --omit=dev
+RUN npm run build && npm prune --omit=dev \
+  && printf '%s' "$P10B_SOURCE_HEAD" > /app/p10b-source-head.txt
 
 FROM node:22-bookworm-slim AS runtime
 
@@ -36,6 +38,7 @@ COPY --from=build /app/server ./server
 COPY --from=build /app/shared ./shared
 COPY --from=build /app/scripts ./scripts
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/p10b-source-head.txt ./p10b-source-head.txt
 
 EXPOSE 8787
 

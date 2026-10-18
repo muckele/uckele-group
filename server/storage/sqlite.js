@@ -7990,6 +7990,10 @@ export function createSqliteStorage(config, options = {}) {
       deleteSecureDocumentStatement.run(payload.id);
       record = existing;
     } else if (operation === 'insert_email_event') {
+      if (payload.event?.qualificationGuard
+        && !cimTransitions.readCimQualificationInboundAuthority(payload.event.qualificationGuard).allowed) {
+        throw new Error('Qualification inbound event permission closed');
+      }
       const result = insertEmailEventStatement.run(serializeEmailEvent(payload.event));
 
       if (result.changes === 0) {
@@ -9238,13 +9242,17 @@ export function createSqliteStorage(config, options = {}) {
     },
 
     async insertEmailEvent(event) {
-      const result = insertEmailEventStatement.run(serializeEmailEvent(event));
-
-      if (result.changes === 0 && event.event_key) {
-        return normalizeEmailEventRow(getEmailEventByKeyStatement.get(event.event_key));
-      }
-
-      return event;
+      return database.transaction(() => {
+        if (event.qualificationGuard
+          && !cimTransitions.readCimQualificationInboundAuthority(event.qualificationGuard).allowed) {
+          throw new Error('Qualification inbound event permission closed');
+        }
+        const result = insertEmailEventStatement.run(serializeEmailEvent(event));
+        if (result.changes === 0 && event.event_key) {
+          return normalizeEmailEventRow(getEmailEventByKeyStatement.get(event.event_key));
+        }
+        return event;
+      }).immediate();
     },
 
     async listEmailEvents({ submissionId = '', recipientEmail = '', source = '', limit = 100 } = {}) {
@@ -9412,6 +9420,14 @@ export function createSqliteStorage(config, options = {}) {
     async insertCrmCommunication(communication = {}) {
       const serialized = serializeCrmCommunication(communication);
       return database.transaction(() => {
+        if (communication.qualificationGuard) {
+          const guard = communication.qualificationGuard;
+          if (!cimTransitions.readCimQualificationInboundAuthority(guard).allowed
+            || serialized.provider_message_id !== guard.providerMessageId
+            || serialized.source_event_id !== guard.providerEventId || serialized.direction !== 'inbound') {
+            throw new Error('Qualification inbound placeholder permission closed');
+          }
+        }
         if (serialized.submission_id) assertCrmSubmissionWritableInTransaction(serialized.submission_id);
         const result = insertCrmCommunicationStatement.run(serialized);
         if (result.changes === 0) return getExistingCrmCommunication(serialized);
@@ -9444,6 +9460,11 @@ export function createSqliteStorage(config, options = {}) {
         'metadata',
       ];
       return database.transaction(() => {
+        if (values.qualificationGuard) {
+          const guard = cimTransitions.readCimQualificationInboundAuthority({
+            ...values.qualificationGuard, communicationId: id });
+          if (!guard.allowed || !guard.attempted) throw new Error('Qualification inbound permission closed');
+        }
         const current = database.prepare('SELECT submission_id FROM crm_communications WHERE id = ? LIMIT 1').get(id);
         const existingSubmissionId = String(current?.submission_id || '').trim();
         const targetSubmissionId = Object.hasOwn(values, 'submission_id')
