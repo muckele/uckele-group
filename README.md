@@ -215,6 +215,16 @@ checks, using a disposable network-isolated container. No project database
 migration is applied by these tests. Human owner adoption, deployment, mailbox
 qualification and live-send approval remain separate gates.
 
+`npm run test:owner-volume` reuses that isolated runner without launching a
+browser. It verifies an authenticated 1000-row CSV upload and over-limit rejection,
+then measures queue/detail/archive HTTP reads with 1000 synthetic current projection
+rows and 5000 historical ineligible archives. Its evidence directory contains
+30-sample latency observations, response sizes, RSS, representative archive query
+plan and protected-state checks. Timings are observations rather than absolute
+CI timing thresholds or production claims. The imported CSV is retained with
+scoring explicitly deferred when required sources are unavailable; this check
+does not claim a complete importer/reimport lifecycle or PostgreSQL volume parity.
+
 ## Privacy and security notes
 
 - Do not commit `.env`, database files, uploaded documents, backup bundles, session secrets, provider credentials, or exported CRM data.

@@ -45,7 +45,21 @@ Plan: `docs/superpowers/plans/2026-10-18-fl02-coherent-restore.md`.
   reconciling exact retained identity and preserving stopped outreach/history.
 - [x] Pass local focused lifecycle, rollback, authorization, repeat/identity,
   UI and backend-connected browser regressions.
-- [ ] Complete independent final review, commit/push a separate stacked draft PR,
-  and verify exact-head CI including actual fresh/upgrade PostgreSQL and races.
-  Docker is unresponsive locally; enabled PostgreSQL checks remain required CI.
+- [x] Complete independent final review, commit/push draft PR78 and verify
+  exact-head CI `39174077100` on `4ef46d29452a99f553c48202102e9396a777a184`,
+  including actual fresh/upgrade PostgreSQL, concurrent writer and stale snapshot.
+- [x] Rerun FL05 backend/browser journey on PR78; canonical Restore, reload,
+  All active visibility and absence from Passed pass. No source/runtime gap remains
+  in that regression. Human acceptance below remains separate.
 - [ ] Human owner adoption and release acceptance (no merge/deploy/live send).
+
+# FL-05 representative volume acceptance (FL-T65)
+
+Plan: `docs/superpowers/plans/2026-10-18-fl05-volume-acceptance.md`.
+
+- [x] Identify eight-opportunity fixture limitation after PR78 acceptance rerun.
+- [x] Verify full 1000-row HTTP CSV acceptance and explicit deferred scoring.
+- [x] Measure 1000 current projection rows / 5000 historical archives locally,
+  bounded responses/pagination, RSS and query shape; protected state unchanged.
+- [ ] Complete independent review and exact-head CI of the reproducible check.
+- [ ] Human owner timing/adoption and deployed/live acceptance (separate gates).
