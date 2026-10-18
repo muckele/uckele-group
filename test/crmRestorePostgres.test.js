@@ -139,7 +139,7 @@ test('FL02 PostgreSQL fresh/upgrade restore is atomic, authorized and retains st
     assert.equal(after.events.length, 1);
     assert.deepEqual(after.protected, before.protected, 'No permission, suppression, cap or campaign change');
     for (const mutation of [
-      "UPDATE public.contact_submissions SET deal_hunter_opportunity_id='missing-canonical';",
+      `UPDATE public.contact_submissions SET metadata=metadata || '{"dealHunter":{"opportunityId":"missing-canonical"}}'::jsonb;`,
       `UPDATE public.contact_submissions SET metadata=metadata || '{"dealHunter":{"dealKey":"unknown"}}'::jsonb;`,
       `UPDATE public.contact_submissions SET metadata=metadata || '{"dealHunter":{"dealKey":17}}'::jsonb;`,
       `INSERT INTO public.deal_hunter_opportunities
