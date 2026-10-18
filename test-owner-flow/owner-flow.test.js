@@ -28,7 +28,7 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
   const browser = await chromium.connect(browserServer.wsEndpoint());
   t.after(() => browser.close());
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, serviceWorkers: 'block' });
-  const external = [], errors = [], timings = [], knownGaps = [];
+  const external = [], errors = [], timings = [];
   await context.route('**/*', (route) => {
     if (new URL(route.request().url()).origin === fixture.origin) return route.continue();
     external.push(route.request().url());
@@ -128,16 +128,16 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     await expect(page.getByRole('button', { name: 'Archive Lead', exact: true })).toBeVisible();
     const restored = fixture.db.prepare('SELECT status, follow_up_state, next_action_at FROM contact_submissions WHERE id = ?').get('crm-low');
     assert.deepEqual(restored, { status: 'review', follow_up_state: 'completed', next_action_at: null });
-    // FL02's existing CRM restore and canonical disposition restore are separate
-    // contracts. Record the gap without claiming that CRM Restore revives Inbox.
-    if ((await detail('low')).opportunity.dismissed) knownGaps.push({
-      code: 'fl02_crm_restore_leaves_canonical_pass',
-      observed: 'CRM status is review with outreach stopped; canonical disposition remains dismissed.',
-      required: 'A separate lifecycle slice must define coherent restore under current canonical authority, retaining history and outreach caps.',
-    });
+    assert.equal((await detail('low')).opportunity.dismissed, false,
+      'CRM Restore must atomically clear the exact linked canonical Pass');
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`${fixture.origin}/admin/deal-hunter`);
+    await page.getByRole('button', { name: 'All active', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Open Synthetic New Low Fit', exact: true })).toBeVisible();
+    await page.getByRole('tab', { name: 'Passed', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Open Synthetic New Low Fit', exact: true })).toHaveCount(0);
+    await page.getByRole('tab', { name: 'Fresh-first Inbox', exact: true }).click();
     await page.getByRole('button', { name: 'All active', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Open Synthetic Unknown Age', exact: true })).toBeVisible();
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'Mobile must not overflow horizontally');
@@ -175,7 +175,7 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
   } finally {
     await page.screenshot({ path: path.join(fixture.root, 'last-state.png') }).catch(() => {});
     fs.writeFileSync(path.join(fixture.root, 'observations.json'), JSON.stringify({
-      timings, external, errors, knownGaps, blockedNetwork: fixture.blockedNetwork, requests: fixture.requests,
+      timings, external, errors, blockedNetwork: fixture.blockedNetwork, requests: fixture.requests,
       environment: 'local synthetic backend; Chromium; no deployed or owner-pilot acceptance',
     }, null, 2));
     await context.tracing.stop({ path: path.join(fixture.root, 'trace.zip') });

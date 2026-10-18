@@ -445,7 +445,8 @@ test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
 test('FL04C PostgreSQL capacity migration is additive, atomic, retained, and exact in fresh schema', () => {
   const migration = fs.readFileSync(fl04cCapacityMigrationPath, 'utf8').trim();
   const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8').trim();
-  assert.equal(schema.endsWith(migration), true);
+  const restoreMarker = '-- FL02 restore-for-review only.';
+  assert.equal(schema.slice(0, schema.indexOf(restoreMarker)).trim().endsWith(migration), true);
   assert.match(migration, /create table if not exists public\.deal_hunter_cim_capacity_reservations/);
   assert.doesNotMatch(migration, /drop table|truncate table/i);
   assert.match(migration, /clock_timestamp\(\)/);
