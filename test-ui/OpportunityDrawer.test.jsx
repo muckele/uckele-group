@@ -472,6 +472,22 @@ describe('Opportunity drawer', () => {
     expect(disclosure).toHaveFocus();
   });
 
+  test('recovers keyboard focus after a pending decision disabled the focused control', () => {
+    const onClose = vi.fn();
+    const focusGuardRef = { current: true };
+    const { rerender } = render(<OpportunityDrawer detail={detailFixture()} focusGuardRef={focusGuardRef} onClose={onClose} pending />);
+    document.body.tabIndex = -1;
+    document.body.focus();
+    expect(document.body).toHaveFocus();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+    rerender(<OpportunityDrawer detail={detailFixture()} focusGuardRef={focusGuardRef} onClose={onClose} pending={false} />);
+    expect(screen.getByRole('button', { name: 'Close opportunity detail' })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    document.body.removeAttribute('tabindex');
+  });
+
   test('lets Escape close an active contact selector before a later Escape closes the drawer', () => {
     const onClose = vi.fn();
     render(<OpportunityDrawer brokerMaterialsState={{ preparation: brokerPreparation() }} detail={detailFixture()} onBrokerMaterialsPrepare={vi.fn()} onClose={onClose} />);

@@ -194,6 +194,24 @@ For the CRM follow-up rollout, provider receiving setup, compliance review, moni
 
 GitHub Actions installs dependencies, audits production dependencies, lints, runs backend and UI tests, builds the production application, installs Chromium, and runs Playwright smoke tests. New storage behavior should have provider-parity coverage where practical, and security-sensitive workflows should include integration tests that exercise the HTTP boundary.
 
+`npm run build && npm run test:owner-flow` runs the FL05 backend-connected synthetic
+walkthrough with the already installed Playwright Chromium. It uses real local
+authentication/routes and a new SQLite fixture, private temporary HOME, paused
+automation, and denied external network boundaries. It never starts workers or
+uses an existing database. The runner prints its evidence directory, including
+screenshots, trace, source/build identity, timings and verified process cleanup.
+Browser plugin not available: this workflow uses regular Playwright. It requires
+POSIX process groups and at least 11 GiB free disk space; no dependency installation
+is performed by the runner. External Google font links are removed from fixture
+HTML so rendering uses offline fallback fonts.
+
+The walkthrough is local synthetic evidence, not owner-pilot or release acceptance.
+Its retained `knownGaps` include FL02's split restore behavior: CRM Restore returns
+the CRM record to review with outreach stopped, while canonical Pass remains in
+force. Coherent canonical/CRM restoration needs a separate lifecycle transaction
+with current authority checks, retained decision history/caps, and no outreach
+revival. No deploy, mailbox qualification or live-send approval is implied.
+
 ## Privacy and security notes
 
 - Do not commit `.env`, database files, uploaded documents, backup bundles, session secrets, provider credentials, or exported CRM data.

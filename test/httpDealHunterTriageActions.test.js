@@ -397,6 +397,25 @@ test('P4A generic triage edits never grant Pursue or Watch authority', async () 
   });
 });
 
+test('owner Pass preserves the exact bounded reason across detail, archive search and replay', async () => {
+  const { opportunityId } = await seedCurrentOpportunity('opp-fl05-exact-pass');
+  const reason = 'Owner review: outside buy box';
+  const command = ownerActionPayload('pass', { reason, note: 'Exact FL05 retained note' });
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const post = (body) => fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(body),
+    });
+    assert.equal((await post(command)).status, 200);
+    const detailResponse = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}`, { headers: { Cookie: cookie } });
+    assert.equal((await detailResponse.json()).opportunity.dismissedReason, reason);
+    const archiveResponse = await fetch(`${origin}/api/admin/deal-hunter/triage?view=dismissed&search=${encodeURIComponent(reason)}`, { headers: { Cookie: cookie } });
+    assert.deepEqual((await archiveResponse.json()).rows.map((row) => row.opportunityId), [opportunityId]);
+    assert.equal((await (await post(command)).json()).replay, true);
+    assert.equal((await post({ ...command, reason: 'Different bounded reason' })).status, 409);
+  });
+});
+
 test('P4A owner command applies Pursue once, replays, conflicts, and never allocates outreach', async () => {
   const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-p4a-pursue');
   const command = { action: 'pursue', idempotencyKey: 'a953b1f1-e128-408f-8265-2e49a16ba43c',

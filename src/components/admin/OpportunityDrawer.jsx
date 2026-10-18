@@ -225,6 +225,15 @@ export default function OpportunityDrawer({
   useLayoutEffect(() => {
     closeButtonRef.current?.focus();
   }, [opportunity?.opportunityId]);
+  useLayoutEffect(() => {
+    // A disabled decision button can move native browser focus to the body.
+    // Restore modal keyboard access once the mutation settles, while preserving
+    // an input or disclosure that is still focused inside the drawer.
+    const dialog = dialogRef.current;
+    if (!pending && focusGuardRef?.current && dialog && !dialog.contains(document.activeElement)) {
+      closeButtonRef.current?.focus();
+    }
+  }, [pending, focusGuardRef]);
   function handleDialogKeyDown(event) {
     if (event.key === 'Escape' && !pending) {
       event.preventDefault();

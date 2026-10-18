@@ -1133,7 +1133,9 @@ export async function recordAcquisitionOwnerCommand({
   }
   const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
   if (sourceGate) return sourceGate;
-  const normalizedReason = action === 'pass' ? normalizeDealHunterDispositionReason(reason) : null;
+  // The owner command accepts bounded free text. Legacy disposition-category
+  // normalization would erase distinct reasons and collapse replay authority.
+  const normalizedReason = action === 'pass' ? reason.trim() : null;
   if (action === 'pass' && !normalizedReason) {
     return { ok: false, status: 400, error: 'A disposition reason is required.' };
   }
