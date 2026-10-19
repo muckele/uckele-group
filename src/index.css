@@ -721,3 +721,9 @@ textarea {
     transform: none;
   }
 }
+
+/* Give the acquisition queue room for evidence, financials and decisions. */
+.admin-workspace-shell.admin-inbox-shell,
+.admin-page-header.admin-inbox-shell {
+  max-width: 110rem;
+}

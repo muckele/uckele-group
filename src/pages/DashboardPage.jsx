@@ -3556,7 +3556,7 @@ export default function DashboardPage() {
         title={`${pageMeta.title} | Uckele Group Admin`}
       />
 
-      <section className="admin-page-header">
+      <section className={`admin-page-header${activeSection === 'deal-hunter' && !showDealHunterOperations ? ' admin-inbox-shell' : ''}`}>
         <Reveal className="admin-page-header-card">
           <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between" data-admin-tour="page-guidance">
             <div className="min-w-0">
@@ -3648,7 +3648,7 @@ export default function DashboardPage() {
         </Reveal>
       </section>
 
-      <section className="admin-workspace-shell mt-5 pb-8">
+      <section className={`admin-workspace-shell mt-5 pb-8${activeSection === 'deal-hunter' && !showDealHunterOperations ? ' admin-inbox-shell' : ''}`}>
         <div className="admin-workspace-grid">
           <AdminSectionNav activeSection={activeSection} isReadOnly={isReadOnly} />
 
