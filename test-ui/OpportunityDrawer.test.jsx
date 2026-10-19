@@ -562,8 +562,8 @@ describe('Opportunity drawer', () => {
 });
 
 
-test('financial editing requires context, preserves decimals and does not assume verification or SDE', () => {
-  const onSaveFact = vi.fn();
+test('financial editing requires context, preserves decimals and does not assume verification or SDE', async () => {
+  const onSaveFact = vi.fn().mockResolvedValue({ saved: true, refreshed: true });
   render(<OpportunityDrawer detail={detailFixture()} onClose={vi.fn()} onSaveFact={onSaveFact} />);
   fireEvent.change(screen.getByLabelText('Verified fact field'), { target: { value: 'annual_profit' } });
   expect(screen.getByLabelText('Financial metric')).toHaveValue('unknown');
@@ -578,6 +578,7 @@ test('financial editing requires context, preserves decimals and does not assume
   const saved = onSaveFact.mock.calls[0][0];
   expect(JSON.parse(saved.value)).toEqual({ version: 1, amount: '-125.55', currency: 'CAD', metric: 'ebitda', period: 'annual', evidenceSource: 'Owner supplied 2025 accounts' });
   expect(saved.verified).toBe(false);
+  await screen.findByText('Earnings saved.');
   fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: '1.234' } });
   fireEvent.click(screen.getByRole('button', { name: 'Save financial fact' }));
   expect(screen.getByRole('alert')).toHaveTextContent('2 decimal places');
@@ -600,4 +601,38 @@ test('historical archived detail does not offer canonical restore', () => {
   const original = detailFixture();
   render(<OpportunityDrawer detail={{ ...original, archivedReadOnly: true, opportunity: { ...original.opportunity, dismissed: true }, crmSummary: { submission: null }, restoreAuthority: { passId: 'pass', passUpdatedAt: '2026-10-19T00:00:00Z', expectedCampaignAuthorityRevision: 7 } }} onClose={vi.fn()} onRestore={vi.fn()} readOnly />);
   expect(screen.queryByRole('button', { name: 'Restore opportunity' })).toBeNull();
+});
+
+
+test('financial values render once with readable context, source and explicit unverified provenance', () => {
+  const detail = detailFixture();
+  const typed = (amount, metric, period, evidenceSource) => JSON.stringify({ version: 1, amount, currency: 'USD', metric, period, evidenceSource });
+  detail.effectiveFacts = { ...detail.effectiveFacts,
+    annual_profit: { value: typed('250000.00', 'ebitda', 'annual', 'P&L'), provenance: 'operator', verified: false },
+    annual_revenue: { value: typed('5000000.00', 'revenue', 'annual', 'P&L'), provenance: 'operator', verified: false },
+    asking_price: { value: typed('2000000.00', 'asking-price', 'current', 'Listing'), provenance: 'operator', verified: false },
+  };
+  detail.opportunity = { ...detail.opportunity, financialCorrectionFields: ['annual_profit','annual_revenue','asking_price'],
+    financials: { annualProfit: 250000, annualRevenue: 5000000, askingPrice: 2000000, profitMultiple: null } };
+  render(<OpportunityDrawer detail={detail} onClose={vi.fn()} />);
+  const financials = screen.getByRole('heading', { name: 'Business & Financials' }).closest('section');
+  for (const amount of ['$250,000', '$5,000,000', '$2,000,000']) expect(within(financials).getAllByText(amount, { exact: true })).toHaveLength(1);
+  expect(within(financials).getByText('USD · EBITDA · Annual')).toBeVisible();
+  expect(within(financials).getByText('USD · Annual')).toBeVisible();
+  expect(within(financials).getByText('USD · Current')).toBeVisible();
+  expect(within(financials).getAllByText('Source: P&L')).toHaveLength(2);
+  expect(within(financials).getByText('Source: Listing')).toBeVisible();
+  expect(within(financials).getAllByText('Operator entered (unverified)')).toHaveLength(3);
+  expect(within(financials).getByText(/saved machine score has not been recomputed/)).toBeVisible();
+});
+
+
+test('an unknown financial currency stays explicit without turning the amount into a wrapping badge', () => {
+  const detail = detailFixture();
+  detail.effectiveFacts.asking_price = { value: JSON.stringify({ version: 1, amount: '0.00', currency: 'unknown', metric: 'asking-price', period: 'current', evidenceSource: 'Synthetic listing' }), provenance: 'operator', verified: false };
+  render(<OpportunityDrawer detail={detail} onClose={vi.fn()} />);
+  const financials = screen.getByRole('heading', { name: 'Business & Financials' }).closest('section');
+  expect(within(financials).getByText('0', { exact: true })).toBeVisible();
+  expect(within(financials).getByText('Unknown currency · Current')).toBeVisible();
+  expect(within(financials).getByText('Operator entered (unverified)')).toBeVisible();
 });

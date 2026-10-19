@@ -31,7 +31,8 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
   const browser = await chromium.connect(browserServer.wsEndpoint());
   t.after(() => browser.close());
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, serviceWorkers: 'block' });
-  const external = [], errors = [], timings = [];
+  const external = [], errors = [], timings = [], expectedSaveErrors = [];
+  let injectingSaveFailure = false;
   await context.route('**/*', (route) => {
     if (new URL(route.request().url()).origin === fixture.origin) return route.continue();
     external.push(route.request().url());
@@ -40,7 +41,13 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
   await context.tracing.start({ screenshots: true, snapshots: true });
   const page = await context.newPage();
   page.on('pageerror', (error) => errors.push(error.message));
-  page.on('console', (message) => { if (['warning', 'error'].includes(message.type())) errors.push(message.text()); });
+  page.on('console', (message) => {
+    if (!['warning', 'error'].includes(message.type())) return;
+    if (injectingSaveFailure && expectedSaveErrors.length === 0 && message.type() === 'error'
+      && message.location().url === `${fixture.origin}/api/admin/deal-hunter/opportunities/fresh/facts/annual_revenue`
+      && /server responded with a status of 503/.test(message.text())) expectedSaveErrors.push(message.text());
+    else errors.push(message.text());
+  });
   page.setDefaultTimeout(10_000);
   const detail = async (id) => {
     const response = await context.request.get(`${fixture.origin}/api/admin/deal-hunter/triage/${id}`);
@@ -103,11 +110,34 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
       await dialog.getByLabel('Financial metric').selectOption(metric);
       await dialog.getByLabel('Financial period').selectOption(period);
       await dialog.getByLabel('Financial evidence source').fill('Synthetic owner financial correction');
+      if (field === 'annual_revenue') {
+        const beforeFailedSave = fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_facts WHERE opportunity_id='fresh' ORDER BY id").all();
+        const failedUrl = `**/api/admin/deal-hunter/opportunities/fresh/facts/${field}`;
+        const rejectSave = (route) => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ success: false, error: 'Temporary synthetic save failure. Try again.' }) });
+        injectingSaveFailure = true;
+        await context.route(failedUrl, rejectSave);
+        await dialog.getByRole('button', { name: 'Save financial fact' }).click();
+        const form = dialog.locator('form').filter({ has: page.getByLabel('Verified fact field') });
+        await expect(form.getByRole('alert')).toHaveText('Temporary synthetic save failure. Try again.');
+        await expect(form.getByRole('status')).toHaveCount(0);
+        await expect(dialog.getByLabel('Verified fact value')).toHaveValue(amount);
+        assert.deepEqual(fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_facts WHERE opportunity_id='fresh' ORDER BY id").all(), beforeFailedSave);
+        await page.screenshot({ path: path.join(fixture.root, 'financial-save-failed.png') });
+        await context.unroute(failedUrl, rejectSave);
+        injectingSaveFailure = false;
+      }
       const financialSaved = page.waitForResponse((response) => response.request().method() === 'PUT' && response.url().endsWith(`/facts/${field}`));
       await dialog.getByRole('button', { name: 'Save financial fact' }).click();
       assert.equal((await financialSaved).status(), 200);
+      await expect(dialog.getByText(`${{ annual_profit: 'Earnings', annual_revenue: 'Revenue', asking_price: 'Asking price' }[field]} saved.`, { exact: true })).toBeVisible();
       await expect(dialog.getByRole('button', { name: 'Save financial fact' })).toBeEnabled();
+      await page.screenshot({ path: path.join(fixture.root, `financial-${field}-saved.png`) });
     }
+    await page.setViewportSize({ width: 390, height: 844 });
+    await dialog.getByText('Asking price saved.', { exact: true }).scrollIntoViewIfNeeded();
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await page.screenshot({ path: path.join(fixture.root, 'mobile-financial-editor-saved.png') });
+    await page.setViewportSize({ width: 1440, height: 1000 });
     await page.reload();
     await page.getByRole('button', { name: 'Open Synthetic Fresh High Fit', exact: true }).click();
     const financialDetail = await detail('fresh');
@@ -119,11 +149,18 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     assert.equal(financialDetail.effectiveFacts.annual_profit.verified, false);
     assert.deepEqual(fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id='fresh'").get(), storedScore);
     assert.deepEqual(fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_source_observations WHERE opportunity_id='fresh' ORDER BY id").all(), sourceRows);
-    await expect(dialog).toContainText('-125.55 CAD');
     await expect(dialog).toContainText('saved machine score has not been recomputed');
     await dialog.getByRole('heading', { name: 'Business & Financials', exact: true }).scrollIntoViewIfNeeded();
-    await expect(dialog.getByText('-125.55 CAD', { exact: true })).toBeVisible();
+    const financials = dialog.locator('section').filter({ has: page.getByRole('heading', { name: 'Business & Financials', exact: true }) });
+    await expect(financials.getByText('-CA$125.55', { exact: true })).toBeVisible();
+    await expect(financials.getByText('CAD · EBITDA · Annual', { exact: true })).toBeVisible();
+    await expect(financials.getByText('-CA$125.55', { exact: true })).toHaveCount(1);
     await page.screenshot({ path: path.join(fixture.root, 'financial-corrections.png') });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await dialog.getByRole('heading', { name: 'Business & Financials', exact: true }).scrollIntoViewIfNeeded();
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+    await page.screenshot({ path: path.join(fixture.root, 'mobile-financial-cards.png') });
+    await page.setViewportSize({ width: 1440, height: 1000 });
     await dialog.getByRole('button', { name: 'Pursue Synthetic Fresh High Fit', exact: true }).click();
     await expect(dialog.getByRole('region', { name: 'Pursue next action' })).toContainText('Create or link the CRM record');
     await dialog.getByRole('button', { name: 'Pass Synthetic Fresh High Fit', exact: true }).click();
@@ -235,7 +272,8 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
         expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     });
     assert.equal(forbidden.status(), 401, 'Real backend rejects viewer writes');
-    assert.deepEqual(errors, [], 'No browser console/runtime errors');
+    assert.equal(expectedSaveErrors.length, 1, 'The deliberately injected save failure was recorded, not ignored');
+    assert.deepEqual(errors, [], 'No unexpected browser console/runtime errors');
     assert.deepEqual(external, [], 'No external browser requests');
     assert.deepEqual(fixture.blockedNetwork, [], 'No server provider/network attempts');
     for (const table of ['crm_email_outbox', 'deal_hunter_cim_requests', 'deal_hunter_cim_campaigns',
@@ -247,7 +285,7 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
   } finally {
     await page.screenshot({ path: path.join(fixture.root, 'last-state.png') }).catch(() => {});
     fs.writeFileSync(path.join(fixture.root, 'observations.json'), JSON.stringify({
-      timings, external, errors, blockedNetwork: fixture.blockedNetwork, requests: fixture.requests,
+      timings, external, errors, expectedSaveErrors, blockedNetwork: fixture.blockedNetwork, requests: fixture.requests,
       environment: 'local synthetic backend; Chromium; no deployed or owner-pilot acceptance',
     }, null, 2));
     await context.tracing.stop({ path: path.join(fixture.root, 'trace.zip') });

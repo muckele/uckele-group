@@ -2719,3 +2719,81 @@ test('unlinked Restore uses exact reviewed Pass authority and reloads the drawer
   await waitFor(() => expect(screen.queryByRole('button', { name: 'Restore opportunity' })).toBeNull());
   expect(writes).toEqual([{ url: '/api/admin/deal-hunter/triage/opp-1/restore', body: authority }]);
 });
+
+
+test('financial save announces pending state and saved success only after acknowledgement and detail refresh', async () => {
+  const save = deferred(); const refresh = deferred(); let reads = 0; let persisted = false;
+  const original = detailResponse();
+  const saved = { ...original, opportunity: { ...original.opportunity,
+    financials: { annualRevenue: 5000000 }, financialCorrectionFields: ['annual_revenue'] },
+    effectiveFacts: { annual_revenue: { value: JSON.stringify({ version: 1, amount: '5000000.00', currency: 'USD', metric: 'revenue', period: 'annual', evidenceSource: 'P&L' }), provenance: 'operator', verified: false } } };
+  vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+    const url = String(input);
+    if (options.method === 'PUT') return save.promise;
+    if (url.endsWith('/triage/opp-1')) { reads += 1; return reads === 1 ? Promise.resolve(jsonResponse(original)) : reads === 2 ? refresh.promise : Promise.resolve(jsonResponse(persisted ? saved : original)); }
+    return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+  }));
+  renderInbox();
+  fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+  const drawer = await screen.findByRole('dialog');
+  fireEvent.change(within(drawer).getByLabelText('Verified fact field'), { target: { value: 'annual_revenue' } });
+  fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: '5000000' } });
+  fireEvent.change(within(drawer).getByLabelText('Financial currency'), { target: { value: 'USD' } });
+  fireEvent.change(within(drawer).getByLabelText('Financial period'), { target: { value: 'annual' } });
+  fireEvent.change(within(drawer).getByLabelText('Financial evidence source'), { target: { value: 'P&L' } });
+  fireEvent.click(within(drawer).getByRole('button', { name: 'Save financial fact' }));
+  expect(within(drawer).getByRole('button', { name: 'Saving financial fact…' })).toBeDisabled();
+  expect(within(drawer).getByLabelText('Verified fact value')).toBeDisabled();
+  expect(within(drawer).queryByText('Revenue saved.')).not.toBeInTheDocument();
+  await act(async () => save.resolve(jsonResponse({ success: true })));
+  expect(within(drawer).queryByText('Revenue saved.')).not.toBeInTheDocument();
+  persisted = true; await act(async () => refresh.resolve(jsonResponse(saved)));
+  const message = await within(drawer).findByText('Revenue saved.');
+  expect(message.closest('[role="status"]')).toHaveAttribute('aria-live', 'polite');
+  expect(message.closest('form')).toContainElement(within(drawer).getByRole('button', { name: 'Save financial fact' }));
+  expect(within(drawer).getByText('$5,000,000', { exact: true })).toBeVisible();
+  fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: '5100000' } });
+  expect(within(drawer).queryByText('Revenue saved.')).not.toBeInTheDocument();
+  fireEvent.click(within(drawer).getByRole('button', { name: 'Close opportunity detail' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' }));
+  expect(await screen.findByText('$5,000,000', { exact: true })).toBeVisible();
+});
+
+test.each([
+  ['HTTP error', () => jsonResponse({ success: false, error: 'Financial save rejected.' }, { ok: false, status: 409 })],
+  ['unsuccessful 200', () => jsonResponse({ success: false, error: 'Financial save rejected.' })],
+  ['transport error', () => Promise.reject(new Error('Financial save rejected.'))],
+])('failed fact save keeps the draft and shows an error by the action without false success: %s', async (_name, failedResponse) => {
+  const save = deferred();
+  vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+    if (options.method === 'PUT') return save.promise;
+    return Promise.resolve(String(input).endsWith('/triage/opp-1') ? jsonResponse(detailResponse()) : jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+  }));
+  renderInbox(); fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+  const drawer = await screen.findByRole('dialog');
+  fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Retain this draft' } });
+  fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
+  await act(async () => save.resolve(failedResponse()));
+  const error = await within(drawer).findByRole('alert');
+  expect(error).toHaveTextContent('Financial save rejected.');
+  expect(error.closest('form')).toContainElement(within(drawer).getByRole('button', { name: 'Save verified fact' }));
+  expect(within(drawer).getByLabelText('Verified fact value')).toHaveValue('Retain this draft');
+  expect(within(drawer).queryByText(/saved\./i)).not.toBeInTheDocument();
+  fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Retry draft' } });
+  expect(within(drawer).queryByRole('alert')).not.toBeInTheDocument();
+});
+
+test('a server-confirmed save with failed detail refresh explicitly distinguishes saved data from stale display', async () => {
+  let reads = 0;
+  vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+    if (options.method === 'PUT') return jsonResponse({ success: true });
+    if (String(input).endsWith('/triage/opp-1')) { reads += 1; return reads === 1 ? jsonResponse(detailResponse()) : jsonResponse({ error: 'Detail refresh unavailable.' }, { ok: false, status: 503 }); }
+    return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+  }));
+  renderInbox(); fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+  const drawer = await screen.findByRole('dialog');
+  fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Persisted seller' } });
+  fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
+  expect(await within(drawer).findByText(/Seller name saved\. Reload to view the saved value/)).toBeVisible();
+  expect(within(drawer).getByRole('alert')).toHaveTextContent('Detail refresh unavailable.');
+});

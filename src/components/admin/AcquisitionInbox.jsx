@@ -715,18 +715,18 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           idempotencyKey: pendingFactCommandRef.current.key }),
       });
       const result = await response.json();
-      if (!response.ok || !result.success) {
+      if (!response.ok || result.success !== true) {
         if (response.status === 409 && result.code === 'fact_edit_conflict' && selectionRef.current === opportunityId) {
           pendingFactCommandRef.current = null;
           await loadDetail(opportunityId, { preserveData: true });
         }
         throw new Error(result.error || 'Unable to save the verified fact.');
       }
-      if (selectionRef.current === opportunityId) await loadDetail(opportunityId, { preserveData: true });
-      return true;
+      const refreshed = selectionRef.current === opportunityId
+        && await loadDetail(opportunityId, { preserveData: true });
+      return { saved: true, refreshed: Boolean(refreshed) };
     } catch (factError) {
-      if (mutationGenerationRef.current === mutationGeneration) setMutationError(factError.message || 'Unable to save the verified fact.');
-      return false;
+      return { saved: false, error: factError.message || 'Unable to save the verified fact.' };
     } finally {
       if (mutationGenerationRef.current === mutationGeneration) {
         mutationPendingRef.current = false;

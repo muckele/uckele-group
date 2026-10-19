@@ -66,13 +66,26 @@ function Section({ children, sectionRef, title, ...props }) {
 
 function Provenance({ fact }) {
   const labels = { operator: 'Operator verified', crm: 'CRM', 'structured-source': 'Structured source', 'enrichment-suggestion': 'Enrichment suggestion' };
-  return <span className="rounded-full border border-line bg-fog px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/58">{fact?.provenance === 'operator' && !fact.verified ? 'Operator entered (unverified)' : labels[fact?.provenance] || formatLabel(fact?.provenance || 'unknown')}</span>;
+  return <span className="text-xs leading-5 text-ink/58">{fact?.provenance === 'operator' && !fact.verified ? 'Operator entered (unverified)' : labels[fact?.provenance] || formatLabel(fact?.provenance || 'unknown')}</span>;
 }
 
 function Fact({ detail, field }) {
   const fact = detail.effectiveFacts?.[field];
   if (!hasValue(fact?.value)) return null;
-  return <div className="rounded-xl border border-line/70 bg-fog/50 p-3"><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-semibold uppercase tracking-wide text-ink/48">{factLabels[field]}</p><Provenance fact={fact} /></div><p className="mt-1.5 text-sm leading-6 text-ink">{financialFactFields.includes(field) ? financialFactDescription(field, fact.value) : String(fact.value)}</p>{fact.note ? <p className="mt-1 text-xs text-ink/58">{fact.note}</p> : null}</div>;
+  const financial = parseFinancialFact(field, fact.value);
+  const context = financial ? [financial.currency === 'unknown' ? 'Unknown currency' : financial.currency,
+    field === 'annual_profit' ? ({ ebitda: 'EBITDA', sde: 'SDE', unknown: 'Unknown metric' }[financial.metric]) : '',
+    financial.period === 'unknown' ? 'Unknown period' : formatLabel(financial.period)].filter(Boolean).join(' · ') : '';
+  const amount = financial ? (financial.currency === 'unknown'
+    ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(Number(financial.amount))
+    : formatMoney(financial.amount, financial.currency)) : '';
+  return <div className="min-w-0 rounded-xl border border-line/70 bg-fog/40 p-3">
+    <p className="text-sm font-medium text-ink/62">{factLabels[field]}</p>
+    <p className={financial ? 'mt-2 break-words text-xl font-semibold tabular-nums text-ink' : 'mt-1 break-words text-sm leading-6 text-ink'}>{financial ? amount : String(fact.value)}</p>
+    {financial ? <><p className="mt-1 text-xs leading-5 text-ink/68">{context}</p><p className="mt-2 break-words text-xs leading-5 text-ink/68">Source: {financial.evidenceSource}</p></> : null}
+    <p className="mt-2"><Provenance fact={fact} /></p>
+    {fact.note ? <p className="mt-1 break-words text-xs leading-5 text-ink/58">{fact.note}</p> : null}
+  </div>;
 }
 
 function MissingInformation({ fields }) {
@@ -109,6 +122,9 @@ function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }
   const [draft, setDraft] = useState({ field: 'seller_name', value: detail.effectiveFacts?.seller_name?.value || '', note: '',
     currency: 'unknown', metric: 'unknown', period: 'unknown', evidenceSource: '', verified: false });
   const [validationError, setValidationError] = useState('');
+  const [saveResult, setSaveResult] = useState({ state: 'idle', message: '' });
+  const savingRef = useRef(false);
+  const saving = saveResult.state === 'saving';
   const financial = financialFactFields.includes(draft.field);
   const expectedRevision = detail.opportunity?.factEditRevision;
   const validExpectedRevision = Number.isInteger(expectedRevision?.campaignAuthorityRevision)
@@ -123,17 +139,29 @@ function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }
       note: current?.note || '', currency: typed?.currency || 'unknown', metric: typed?.metric || (field === 'annual_profit' ? 'unknown' : financialFactMetrics[field]?.[0]) || 'unknown',
       period: typed?.period || 'unknown', evidenceSource: typed?.evidenceSource || '', verified: Boolean(current?.verified) });
     setValidationError('');
+    setSaveResult({ state: 'idle', message: '' });
   }
-  function submit(event) {
+  async function submit(event) {
     event.preventDefault();
-    if (!String(draft.value).trim()) return;
+    if (pending || savingRef.current || !String(draft.value).trim()) return;
     let value = String(draft.value).trim();
     try {
       if (financial) value = JSON.stringify(normalizeFinancialFact(draft.field, { version: 1, amount: value,
         currency: draft.currency, metric: draft.metric, period: draft.period, evidenceSource: draft.evidenceSource }));
-    } catch (error) { setValidationError(error.message); return; }
+    } catch (error) { setValidationError(error.message); setSaveResult({ state: 'idle', message: '' }); return; }
     setValidationError('');
-    onSaveFact({ field: draft.field, value, note: draft.note.trim(), verified: financial ? draft.verified : true, expectedRevision });
+    savingRef.current = true;
+    setSaveResult({ state: 'saving', message: '' });
+    try {
+      const result = await onSaveFact({ field: draft.field, value, note: draft.note.trim(), verified: financial ? draft.verified : true, expectedRevision });
+      if (result?.saved === true) {
+        setSaveResult({ state: 'saved', message: `${factLabels[draft.field]} saved.${result.refreshed === false ? ' Reload to view the saved value.' : ''}` });
+      } else {
+        setSaveResult({ state: 'error', message: result?.error || 'Unable to save this fact. Your draft is preserved; try again.' });
+      }
+    } catch (error) {
+      setSaveResult({ state: 'error', message: error.message || 'Unable to save this fact. Your draft is preserved; try again.' });
+    } finally { savingRef.current = false; }
   }
   useEffect(() => {
     if (!focusFieldRequest) return;
@@ -142,23 +170,30 @@ function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }
   // A monotonically increasing request deliberately re-focuses the existing form.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusFieldRequest]);
-  const update = (key, value) => setDraft((current) => ({ ...current, [key]: value }));
+  const update = (key, value) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+    setValidationError(''); setSaveResult({ state: 'idle', message: '' });
+  };
   return (
-    <form className="rounded-xl border border-moss/20 bg-moss/5 p-4" onSubmit={submit}>
-      <h4 className="text-sm font-semibold text-ink">Add or edit a verified operator fact</h4>
-      <p className="mt-1 text-xs leading-5 text-ink/58">Operator facts remain separate from machine scoring and preserve original source evidence. Financial entries require their context; verification is explicit.</p>
+    <form aria-busy={saving} className="rounded-xl border border-moss/20 bg-moss/5 p-4" onSubmit={submit}>
+      <h4 className="text-sm font-semibold text-ink">Add or edit an operator fact</h4>
+      <p className="mt-1 text-xs leading-5 text-ink/58">Edits preserve source evidence and the saved score. Financial verification is explicit.</p>
+      <fieldset className="min-w-0" disabled={pending || saving}>
       <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-ink/62">Verified fact field<select aria-label="Verified fact field" className="form-control mt-1" onChange={(event) => selectField(event.target.value)} value={draft.field}>{factFields.map(([field, label]) => <option key={field} value={field}>{label}</option>)}</select></label><label className="text-xs font-semibold text-ink/62">Verified fact value<input aria-label="Verified fact value" className="form-control mt-1" inputMode={financial ? 'decimal' : 'text'} onChange={(event) => update('value', event.target.value)} ref={valueRef} value={draft.value} /></label></div>
-      {financial ? <div className="mt-3 space-y-3">
-        <p className="text-xs text-ink/68">Current effective amount: {detail.opportunity.financials?.[{ annual_profit: 'annualProfit', annual_revenue: 'annualRevenue', asking_price: 'askingPrice' }[draft.field]] ?? 'Not provided'}. Source evidence and the stored score remain available above.</p>
+      {financial ? <div className="mt-3 grid gap-3 sm:grid-cols-3">
         <label className="block text-xs font-semibold text-ink/62">Financial currency<select aria-label="Financial currency" className="form-control mt-1" onChange={(event) => update('currency', event.target.value)} value={draft.currency}>{financialFactCurrencies.map((currency) => <option key={currency} value={currency}>{currency === 'unknown' ? 'Unknown currency' : currency}</option>)}</select></label>
         <label className="block text-xs font-semibold text-ink/62">Financial metric<select aria-label="Financial metric" className="form-control mt-1" onChange={(event) => update('metric', event.target.value)} value={draft.metric}>{financialFactMetrics[draft.field].map((metric) => <option key={metric} value={metric}>{formatLabel(metric)}</option>)}</select></label>
         <label className="block text-xs font-semibold text-ink/62">Financial period<select aria-label="Financial period" className="form-control mt-1" onChange={(event) => update('period', event.target.value)} value={draft.period}>{financialFactPeriods.filter((period) => draft.field === 'asking_price' ? ['current', 'unknown'].includes(period) : period !== 'current').map((period) => <option key={period} value={period}>{formatLabel(period)}</option>)}</select></label>
-        <label className="block text-xs font-semibold text-ink/62">Financial evidence source<input aria-label="Financial evidence source" className="form-control mt-1" maxLength={500} onChange={(event) => update('evidenceSource', event.target.value)} required value={draft.evidenceSource} /></label>
-        <label className="flex items-center gap-2 text-xs font-semibold text-ink/62"><input checked={draft.verified} onChange={(event) => update('verified', event.target.checked)} type="checkbox" />Financial fact verified</label>
       </div> : null}
-      <label className="mt-3 block text-xs font-semibold text-ink/62">Verification note<textarea aria-label="Verification note" className="form-control mt-1 min-h-20" onChange={(event) => update('note', event.target.value)} value={draft.note} /></label>
-      {validationError ? <p className="mt-2 text-sm text-red-700" role="alert">{validationError}</p> : null}
-      <button className={`${primaryButton} mt-3`} disabled={pending || !String(draft.value).trim() || !validExpectedRevision} type="submit">{financial ? 'Save financial fact' : 'Save verified fact'}</button>
+      <div className={`mt-3 grid gap-3 ${financial ? 'sm:grid-cols-2' : ''}`}>
+        {financial ? <label className="block text-xs font-semibold text-ink/62">Financial evidence source<input aria-label="Financial evidence source" className="form-control mt-1" maxLength={500} onChange={(event) => update('evidenceSource', event.target.value)} required value={draft.evidenceSource} /></label> : null}
+        <label className="block text-xs font-semibold text-ink/62">Verification note<textarea aria-label="Verification note" className="form-control mt-1 min-h-16" onChange={(event) => update('note', event.target.value)} rows={2} value={draft.note} /></label>
+      </div>
+      {financial ? <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-ink/62"><input checked={draft.verified} onChange={(event) => update('verified', event.target.checked)} type="checkbox" />Financial fact verified</label> : null}
+      <button className={`${primaryButton} mt-3`} disabled={pending || saving || !String(draft.value).trim() || !validExpectedRevision} type="submit">{saving ? (financial ? 'Saving financial fact…' : 'Saving verified fact…') : (financial ? 'Save financial fact' : 'Save verified fact')}</button>
+      </fieldset>
+      {validationError || saveResult.state === 'error' ? <p className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-800" role="alert">{validationError || saveResult.message}</p> : null}
+      {saveResult.state === 'saved' ? <p aria-atomic="true" aria-live="polite" className="mt-3 rounded-lg border border-moss/20 bg-white p-3 text-sm font-medium text-moss" role="status">{saveResult.message}</p> : null}
     </form>
   );
 }
@@ -385,8 +420,10 @@ export default function OpportunityDrawer({
 
             <Section title="Business & Financials">
               {opportunity.financialCorrectionFields?.length ? <p className="mb-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-900" role="status">Operator financial facts are shown. The saved machine score has not been recomputed; use the existing scoring review process before relying on a revised score.</p> : null}
-              <div className="mb-3 grid gap-3 sm:grid-cols-2">{financialFactFields.map((field) => <Fact detail={detail} field={field} key={field} />)}</div>
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[[earnings.label, earnings.amount], ['Revenue', formatMoney(opportunity.financials?.annualRevenue, opportunity.financials?.annualRevenueEvidence?.currency || 'USD')], ['Asking price', formatMoney(opportunity.financials?.askingPrice, opportunity.financials?.askingPriceEvidence?.currency || 'USD')], ['Profit multiple', opportunity.financials?.profitMultiple === null || opportunity.financials?.profitMultiple === undefined ? '' : `${opportunity.financials.profitMultiple}×`]].filter(([, value]) => value).map(([label, value]) => <div className="rounded-xl bg-fog/70 p-3" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
+              <div className="grid gap-3 sm:grid-cols-3">
+                {financialFactFields.map((field) => <Fact detail={detail} field={field} key={field} />)}
+                {[['annual_profit', earnings.label, earnings.amount], ['annual_revenue', 'Revenue', formatMoney(opportunity.financials?.annualRevenue, opportunity.financials?.annualRevenueEvidence?.currency || 'USD')], ['asking_price', 'Asking price', formatMoney(opportunity.financials?.askingPrice, opportunity.financials?.askingPriceEvidence?.currency || 'USD')], ['profit_multiple', 'Profit multiple', opportunity.financials?.profitMultiple === null || opportunity.financials?.profitMultiple === undefined ? '' : `${opportunity.financials.profitMultiple}×`]].filter(([field, , value]) => value && !hasValue(detail.effectiveFacts?.[field]?.value)).map(([field, label, value]) => <div className="min-w-0 rounded-xl bg-fog/50 p-3" key={field}><p className="text-sm font-medium text-ink/62">{label}</p><p className="mt-2 break-words text-xl font-semibold tabular-nums text-ink">{value}</p></div>)}
+              </div>
               <div className="mt-3 grid gap-3 sm:grid-cols-2">{['management_structure', 'customer_concentration', 'reason_for_sale', 'real_estate_included', 'seller_financing'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>
             </Section>
 
