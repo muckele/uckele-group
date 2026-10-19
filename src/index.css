@@ -156,6 +156,23 @@ h6 {
   @apply mx-auto w-full px-4 sm:px-6 lg:px-8 xl:px-10;
 }
 
+/* The priority shortlist responds to its available width beside the sidebar. */
+.priority-shortlist {
+  container: priority-shortlist / inline-size;
+}
+
+@container priority-shortlist (min-width: 54rem) {
+  .priority-opportunity-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container priority-shortlist (min-width: 84rem) {
+  .priority-opportunity-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 .admin-app {
   min-height: 100vh;
   background:

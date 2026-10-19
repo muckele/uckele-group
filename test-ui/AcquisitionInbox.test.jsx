@@ -661,7 +661,7 @@ describe('Acquisition Inbox dashboard entry', () => {
 });
 
 describe('Acquisition Inbox queue', () => {
-  test('Acquisition Inbox renders the ready morning briefing above filters', async () => {
+  test('Acquisition Inbox keeps filters before the morning briefing', async () => {
     const first = queueRow({ opportunityId: 'server-first', name: 'Server-ranked first', fitScore: 61, operatorPriority: 'urgent' });
     const second = queueRow({ opportunityId: 'server-second', name: 'Server-ranked second', fitScore: 99 });
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({
@@ -676,7 +676,7 @@ describe('Acquisition Inbox queue', () => {
     const briefing = await screen.findByRole('region', { name: 'Morning briefing' });
     const filter = screen.getByRole('searchbox', { name: 'Search opportunities' });
 
-    expect(briefing.compareDocumentPosition(filter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(filter.compareDocumentPosition(briefing) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(within(briefing).getByRole('heading', { name: 'Morning briefing' })).toBeVisible();
     for (const [label, value] of [['Needs Review', '7'], ['High Priority', '3'], ['Watchlist', '2'], ['Low Confidence', '1'], ['Current Opportunities', '12']]) {
       expect(within(briefing).getByText(label)).toBeVisible();
