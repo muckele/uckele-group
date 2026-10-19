@@ -74,6 +74,21 @@ test('FL05 rendered volume: real UI at1000 current /5000 archived, desktop and n
   });
   const cdp = await context.newCDPSession(page); await cdp.send('Performance.enable');
   const render = () => page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  // Settle setup transitions before the next input can supersede their reads.
+  const finishQueueTransition = async (view, run) => {
+    const received = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return url.pathname === '/api/admin/deal-hunter/triage' && url.searchParams.get('view') === view;
+    });
+    await run();
+    const response = await received;
+    assert.equal(response.status(), 200);
+    await response.body();
+    await render();
+  };
+  const boundedResponse = (item) => item.status === 200
+    && !item.bodyError && item.bytes > 0 && item.bytes < 512 * 1024 && (item.rows === null || item.rows <= 100)
+    && item.areaRows.every((count) => count <= 25);
   const measure = async (viewport, action, event, run) => {
     await page.evaluate((kind) => { window.__ugVolume.next = kind; window.__ugVolume.start = null; }, event);
     await run(); await render();
@@ -95,14 +110,22 @@ test('FL05 rendered volume: real UI at1000 current /5000 archived, desktop and n
     await page.getByLabel('Username', { exact: true }).fill('fl05-owner');
     await page.getByLabel('Password', { exact: true }).fill('synthetic-owner-password');
     await measure('desktop', 'login-to-inbox', 'click', async () => {
-      await page.getByRole('button', { name: 'Sign In With Password' }).click();
-      await expect(page.getByRole('button', { name: 'All active', exact: true })).toBeVisible();
+      await finishQueueTransition('inbox', async () => {
+        await page.getByRole('button', { name: 'Sign In With Password' }).click();
+        await expect(page.getByRole('button', { name: 'All active', exact: true })).toBeVisible();
+      });
     });
     for (const [viewport, size] of [['desktop', { width: 1440, height: 1000 }], ['narrow', { width: 390, height: 844 }]]) {
       const detailCountAtStart = detailDispatches.length;
       await page.setViewportSize(size);
-      await page.getByRole('tab', { name: 'Fresh-first Inbox', exact: true }).click();
-      await page.getByLabel('Search opportunities', { exact: true }).fill('');
+      const inboxTab = page.getByRole('tab', { name: 'Fresh-first Inbox', exact: true });
+      if (await inboxTab.getAttribute('aria-selected') !== 'true') {
+        await finishQueueTransition('inbox', () => inboxTab.click());
+      }
+      const searchInput = page.getByLabel('Search opportunities', { exact: true });
+      if (await searchInput.inputValue()) {
+        await finishQueueTransition('inbox', () => searchInput.fill(''));
+      }
       await measure(viewport, 'all-active-render', 'click', async () => {
         await page.getByRole('button', { name: 'All active', exact: true }).click();
         await expect(page.getByRole('region', { name: 'All active', exact: true })).toContainText('1007 opportunities');
@@ -111,7 +134,7 @@ test('FL05 rendered volume: real UI at1000 current /5000 archived, desktop and n
       await expect(active.locator(':scope > li')).toHaveCount(25);
       await expect(active.getByRole('button', { name: 'Open Synthetic Volume active 0', exact: true })).toBeVisible();
       await page.screenshot({ path: path.join(fixture.root, `${viewport}-growth-inbox.png`) });
-      await page.getByRole('tab', { name: 'Passed', exact: true }).click();
+      await finishQueueTransition('dismissed', () => page.getByRole('tab', { name: 'Passed', exact: true }).click());
       const search = page.getByLabel('Search opportunities', { exact: true });
       const queue = page.getByRole('list', { name: 'Opportunity queue', exact: true });
       for (let index = 0; index < 10; index += 1) {
@@ -176,10 +199,8 @@ test('FL05 rendered volume: real UI at1000 current /5000 archived, desktop and n
     await Promise.all(responseReads);
     assert.equal(fingerprint(fixture.db), before, 'Rendered reads preserve all protected state');
     assert.deepEqual(errors, []); assert.deepEqual(external, []); assert.deepEqual(fixture.blockedNetwork, []);
-    assert.ok(network.length > 10 && network.every((item) => item.status === 200
-      && !item.bodyError && item.bytes > 0 && item.bytes < 512 * 1024 && (item.rows === null || item.rows <= 100)
-      && item.areaRows.every((count) => count <= 25)),
-    'Every completed queue/detail response has a bounded payload');
+    assert.ok(network.length > 10 && network.every(boundedResponse),
+      `Every completed queue/detail response has a bounded payload: ${JSON.stringify(network.filter((item) => !boundedResponse(item)).slice(0, 5)).slice(0, 4000)}`);
     assert.ok(fixture.requests.every((item) => item.method === 'GET' || (item.method === 'POST' && item.path === '/api/admin/session')));
     passed = true;
   } finally {
@@ -197,7 +218,8 @@ test('FL05 rendered volume: real UI at1000 current /5000 archived, desktop and n
     fs.writeFileSync(path.join(fixture.root, 'browser-volume-requests.json'), JSON.stringify(fixture.requests, null, 2));
     t.diagnostic(`FL05_BROWSER_VOLUME_OBSERVATIONS ${JSON.stringify({ ...observations, samples: undefined, network: undefined,
       detailDispatches: undefined, networkSummary: { responses: network.length, detailDispatches: detailDispatches.length,
-        maxBytes: Math.max(...network.map((item) => item.bytes || 0)), maxRows: Math.max(...network.map((item) => item.rows || 0)) } })}`);
+        maxBytes: Math.max(...network.map((item) => item.bytes || 0)), maxRows: Math.max(...network.map((item) => item.rows || 0)),
+        failingResponses: network.filter((item) => !boundedResponse(item)).slice(0, 5) } })}`);
     await page.screenshot({ path: path.join(fixture.root, 'browser-volume-last-state.png') }).catch(() => {});
     await context.tracing.stop({ path: path.join(fixture.root, 'trace.zip') });
   }
