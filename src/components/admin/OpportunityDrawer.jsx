@@ -15,7 +15,7 @@ const factFields = [
 ];
 const factLabels = Object.fromEntries(factFields);
 const missingLabels = { annual_profit: 'Earnings', annual_revenue: 'Revenue', asking_price: 'Asking price', listing_url: 'Original listing URL', ...factLabels };
-const sectionClass = 'rounded-2xl border border-line bg-white p-4';
+const sectionClass = 'rounded-2xl border border-line bg-white p-4 sm:p-5';
 const secondaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:opacity-50';
 const primaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-moss bg-moss px-4 py-2 text-sm font-semibold text-white transition hover:bg-pine disabled:opacity-50';
 
@@ -61,12 +61,12 @@ function focusableElements(container) {
 }
 
 function Section({ children, sectionRef, title, ...props }) {
-  return <section className={sectionClass} ref={sectionRef} {...props}><h3 className="text-base font-semibold text-ink">{title}</h3><div className="mt-3">{children}</div></section>;
+  return <section className={sectionClass} ref={sectionRef} {...props}><h3 className="text-base font-semibold text-ink">{title}</h3><div className="mt-4">{children}</div></section>;
 }
 
 function Provenance({ fact }) {
   const labels = { operator: 'Operator verified', crm: 'CRM', 'structured-source': 'Structured source', 'enrichment-suggestion': 'Enrichment suggestion' };
-  return <span className="text-xs leading-5 text-ink/58">{fact?.provenance === 'operator' && !fact.verified ? 'Operator entered (unverified)' : labels[fact?.provenance] || formatLabel(fact?.provenance || 'unknown')}</span>;
+  return <span className="text-sm leading-6 text-ink/58">{fact?.provenance === 'operator' && !fact.verified ? 'Operator entered (unverified)' : labels[fact?.provenance] || formatLabel(fact?.provenance || 'unknown')}</span>;
 }
 
 function Fact({ detail, field }) {
@@ -81,8 +81,8 @@ function Fact({ detail, field }) {
     : formatMoney(financial.amount, financial.currency)) : '';
   return <div className="min-w-0 rounded-xl border border-line/70 bg-fog/40 p-3">
     <p className="text-sm font-medium text-ink/62">{factLabels[field]}</p>
-    <p className={financial ? 'mt-2 break-words text-xl font-semibold tabular-nums text-ink' : 'mt-1 break-words text-sm leading-6 text-ink'}>{financial ? amount : String(fact.value)}</p>
-    {financial ? <><p className="mt-1 text-xs leading-5 text-ink/68">{context}</p><p className="mt-2 break-words text-xs leading-5 text-ink/68">Source: {financial.evidenceSource}</p></> : null}
+    <p className={financial ? 'mt-2 break-words text-2xl font-semibold tabular-nums text-ink' : 'mt-1 break-words text-base leading-6 text-ink'}>{financial ? amount : String(fact.value)}</p>
+    {financial ? <><p className="mt-1 text-sm leading-6 text-ink/68">{context}</p><p className="mt-2 break-words text-sm leading-6 text-ink/68">Source: {financial.evidenceSource}</p></> : null}
     <p className="mt-2"><Provenance fact={fact} /></p>
     {fact.note ? <p className="mt-1 break-words text-xs leading-5 text-ink/58">{fact.note}</p> : null}
   </div>;
@@ -345,20 +345,20 @@ export default function OpportunityDrawer({
   }, [focusGuardRef]);
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-ink/30" role="presentation">
-      <section aria-labelledby="opportunity-detail-title" aria-modal="true" className="h-full w-full overflow-y-auto border-l border-line bg-fog shadow-2xl sm:max-w-6xl" ref={dialogRef} role="dialog" tabIndex={-1}>
-        <header className="sticky top-0 z-10 flex items-start justify-between border-b border-line bg-white/95 px-4 py-3 backdrop-blur"><div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Opportunity View</p><h2 className="mt-1 truncate text-xl font-semibold text-ink" id="opportunity-detail-title">{name}</h2>{opportunity ? <p className="mt-1 text-xs text-ink/58">{opportunity.geography?.label || opportunity.state} · {opportunity.industry}</p> : null}</div><button aria-label="Close opportunity detail" className="rounded-full border border-line bg-white p-2 text-ink/60 hover:text-ink disabled:opacity-50" disabled={pending} onClick={onClose} ref={closeButtonRef} type="button"><X className="h-5 w-5" /></button></header>
-        <div className="space-y-3 p-3 sm:p-4">
+      <section aria-labelledby="opportunity-detail-title" aria-modal="true" className="h-full w-full overflow-y-auto border-l border-line bg-fog shadow-2xl" ref={dialogRef} role="dialog" tabIndex={-1}>
+        <header className="sticky top-0 z-10 flex items-start justify-between border-b border-line bg-white/95 p-5 backdrop-blur"><div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Opportunity View</p><h2 className="mt-1 truncate text-xl font-semibold text-ink" id="opportunity-detail-title">{name}</h2>{opportunity ? <p className="mt-1 text-xs text-ink/58">{opportunity.geography?.label || opportunity.state} · {opportunity.industry}</p> : null}</div><button aria-label="Close opportunity detail" className="rounded-full border border-line bg-white p-2 text-ink/60 hover:text-ink disabled:opacity-50" disabled={pending} onClick={onClose} ref={closeButtonRef} type="button"><X className="h-5 w-5" /></button></header>
+        <div className="space-y-5 p-4 sm:p-5">
           {loading ? <p className="text-sm text-ink/62">Loading everything currently known…</p> : null}
           {error ? <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{error}</p> : null}
           {error && onRetry ? <button className={secondaryButton} onClick={onRetry} type="button">Retry opportunity detail</button> : null}
           {mutationError ? <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{mutationError}</p> : null}
           {detail ? <>
             <Section title="Overview">
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">{[
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[
                 ['Fit', opportunity.fitScore], ['Confidence', formatLabel(opportunity.confidence)], ['Operator state', formatLabel(opportunity.operatorPriority || 'normal')], ['Machine state', formatLabel(opportunity.scoreStatus)],
                 ['Completeness', `${opportunity.completenessScore}%`], ['Review', `${reviewState} · ${changedState}`], ['Workflow', `CRM: ${formatLabel(opportunity.workflow?.crmStatus || 'not-started')} · CIM: ${formatLabel(opportunity.workflow?.cimStatus || 'not-requested')}`],
                 ['Evidence', `${opportunity.missingEvidenceCount} missing evidence · ${opportunity.contradictionCount} contradiction${opportunity.contradictionCount === 1 ? '' : 's'}`],
-              ].map(([label, value]) => <div className="rounded-lg bg-fog/70 p-2.5" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
+              ].map(([label, value]) => <div className="rounded-xl bg-fog/70 p-3" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
               {opportunity.observationFreshness ? <p className="mt-3 text-xs text-ink/55">Observed {formatDate(opportunity.observationFreshness)}{opportunity.scoredAt ? ` · Scored ${formatDate(opportunity.scoredAt)}` : ''}{opportunity.rulesVersion ? ` · ${opportunity.rulesVersion}` : ''}</p> : null}
               {opportunity.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-xs text-ink/65">Latest accepted by UG {formatDate(opportunity.freshness.latestAcceptedObservationAt)}</p> : null}
               {opportunity.freshness ? <div className="mt-3 rounded-xl border border-line bg-fog/60 p-3 text-sm text-ink/70"><h4 className="font-semibold text-ink">Discovery and review</h4><p className="mt-1">{opportunity.freshness.firstAcceptedAt ? `First accepted by UG ${formatDate(opportunity.freshness.firstAcceptedAt)}.` : 'First seen date unknown for this existing record.'} {opportunity.freshness.materialRevision > opportunity.freshness.reviewedMaterialRevision ? 'Supported material change awaits review.' : ''}</p><p className="mt-1 text-xs">Discovery version {opportunity.freshness.discoveryRevision}, reviewed {opportunity.freshness.reviewedDiscoveryRevision} · Material version {opportunity.freshness.materialRevision}, reviewed {opportunity.freshness.reviewedMaterialRevision}</p>{opportunity.freshness.publicationClaims?.length ? <ul className="mt-2 space-y-1 text-xs">{opportunity.freshness.publicationClaims.map((claim, index) => <li key={`${claim.source}-${index}`}>Source publication claim: {claim.source || 'Source'} · {claim.rawValue || 'Unknown date'} · {formatLabel(claim.precision)} precision</li>)}</ul> : <p className="mt-2 text-xs">Listing age unknown: no supported publication claim is available.</p>}{!linkedCrmId ? <p className="mt-2 font-semibold text-amber-900">CRM handoff prerequisite: this opportunity is not linked to a CRM record. Create or link one through the existing workflow before outreach.</p> : null}</div> : null}

@@ -153,7 +153,7 @@ h6 {
 }
 
 .admin-workspace-shell {
-  @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8 xl:px-10;
+  @apply mx-auto w-full px-4 sm:px-6 lg:px-8 xl:px-10;
 }
 
 .admin-app {
@@ -175,11 +175,11 @@ h6 {
 }
 
 .admin-topbar-inner {
-  @apply mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8;
+  @apply mx-auto flex items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8;
 }
 
 .admin-page-header {
-  @apply mx-auto w-full max-w-7xl px-4 pt-6 sm:px-6 lg:px-8 xl:px-10;
+  @apply mx-auto w-full px-4 pt-6 sm:px-6 lg:px-8 xl:px-10;
 }
 
 .admin-page-header-card {
@@ -691,12 +691,6 @@ textarea {
 }
 
 @media (min-width: 1536px) {
-  .admin-workspace-shell,
-  .admin-page-header,
-  .admin-topbar-inner {
-    max-width: 82rem;
-  }
-
   .admin-stat-grid {
     grid-template-columns: repeat(7, minmax(0, 1fr));
   }
@@ -720,10 +714,4 @@ textarea {
     opacity: 1;
     transform: none;
   }
-}
-
-/* Give the acquisition queue room for evidence, financials and decisions. */
-.admin-workspace-shell.admin-inbox-shell,
-.admin-page-header.admin-inbox-shell {
-  max-width: 110rem;
 }

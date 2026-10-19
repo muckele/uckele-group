@@ -14,8 +14,8 @@ const views = [
   ['needs-review', 'Needs Review'], ['high-priority', 'High Priority'], ['watchlist', 'Watchlist'],
   ['low-confidence', 'Low Confidence'], ['dismissed', 'Passed'], ['all', 'All Current'],
 ];
-const buttonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-xs font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
-const primaryButtonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-pine disabled:opacity-50';
+const buttonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
+const primaryButtonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-pine disabled:opacity-50';
 const emptyBrokerMaterialsState = {
   preparation: null, recipientSelection: null, preparing: false, updating: false, sending: false,
   checking: false, checkingFailed: false, stale: false, error: '',
@@ -126,16 +126,16 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
     <li className="grid gap-3 rounded-2xl border border-line bg-white p-4 shadow-sm lg:grid-cols-[minmax(0,1fr)_minmax(12rem,.7fr)] lg:gap-x-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(24rem,1.35fr)_minmax(13rem,.8fr)] xl:gap-x-5 md:rounded-none md:border-x-0 md:border-b-0 md:shadow-none">
       <div className="min-w-0">
         <button aria-label={`Open ${row.name}`} className="text-left text-base font-semibold text-ink underline decoration-transparent underline-offset-4 transition hover:text-moss hover:decoration-moss/30" onClick={onOpen} type="button">{row.name}</button>
-        <p className="mt-1 text-xs text-ink/58">{row.geography?.label || row.state || 'Location not supplied'} · {row.industry || 'Industry not supplied'}</p>
+        <p className="mt-1 text-sm text-ink/58">{row.geography?.label || row.state || 'Location not supplied'} · {row.industry || 'Industry not supplied'}</p>
       </div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:col-start-1 lg:row-start-2 xl:col-start-2 xl:row-start-1">
-      <div><p className="text-xs font-medium text-ink/58">Fit</p><p className="text-xl font-semibold tabular-nums text-ink">{row.fitScore}</p><p className="text-xs font-medium text-ink/58">{row.confidence} confidence</p></div>
-      <div><p className="text-xs font-medium text-ink/58">{earnings.label}</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{earnings.amount}</p></div>
-      <div><p className="text-xs font-medium text-ink/58">Revenue</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.annualRevenue)}</p></div>
-      <div><p className="text-xs font-medium text-ink/58">Ask / Multiple</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.askingPrice)}</p>{row.financials?.profitMultiple !== null && row.financials?.profitMultiple !== undefined ? <p className="text-xs text-ink/58">{row.financials.profitMultiple.toFixed(2)}×</p> : null}</div>
+      <div><p className="text-sm font-medium text-ink/58">Fit</p><p className="text-xl font-semibold tabular-nums text-ink">{row.fitScore}</p><p className="text-sm font-medium text-ink/58">{row.confidence} confidence</p></div>
+      <div><p className="text-sm font-medium text-ink/58">{earnings.label}</p><p className="mt-1 text-base font-semibold tabular-nums text-ink">{earnings.amount}</p></div>
+      <div><p className="text-sm font-medium text-ink/58">Revenue</p><p className="mt-1 text-base font-semibold tabular-nums text-ink">{money(row.financials?.annualRevenue)}</p></div>
+      <div><p className="text-sm font-medium text-ink/58">Ask / Multiple</p><p className="mt-1 text-base font-semibold tabular-nums text-ink">{money(row.financials?.askingPrice)}</p>{row.financials?.profitMultiple !== null && row.financials?.profitMultiple !== undefined ? <p className="text-sm text-ink/58">{row.financials.profitMultiple.toFixed(2)}×</p> : null}</div>
       </div>
       <div className="min-w-0 lg:col-start-1 lg:col-span-2 lg:row-start-3 xl:row-start-2">
-        <div className="flex flex-wrap gap-1.5 text-xs font-medium">
+        <div className="flex flex-wrap gap-1.5 text-sm font-medium">
           {row.freshness?.newToUs ? <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-emerald-800">New to UG · first accepted {formatDate(row.freshness.firstAcceptedAt)}</span> : null}
           {row.freshness?.recentlyListed ? <span className="rounded-full bg-sky-50 px-2 py-0.5 text-sky-800">Recently listed · {row.freshness.publicationDate || formatDate(row.freshness.publicationInstant)}{row.freshness.publicationSource ? ` · ${row.freshness.publicationSource}` : ''}</span> : null}
           {row.freshness?.updatedSinceReview ? <span className="rounded-full bg-violet-50 px-2 py-0.5 text-violet-800">{row.freshness.materialField ? formatLabel(row.freshness.materialField) : 'Material value'} changed since review{Number.isFinite(row.freshness.materialBeforeValue) && Number.isFinite(row.freshness.materialAfterValue) ? `: ${row.freshness.materialBeforeValue} → ${row.freshness.materialAfterValue}${row.freshness.materialCurrency ? ` ${row.freshness.materialCurrency}` : ''}` : ''}</span> : null}
@@ -150,16 +150,16 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
           <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CIM: {formatLabel(row.workflow?.cimStatus || 'not-requested')}</span>
           {row.dismissed ? <span className="rounded-full bg-red-50 px-2 py-0.5 text-red-800">Passed: {formatLabel(row.dismissedReason || 'dismissed')}</span> : null}
         </div>
-        {row.dismissedNote ? <p className="mt-1 text-xs leading-5 text-ink/68">Decision note: {row.dismissedNote}</p> : null}
-        {row.dismissedAt ? <p className="mt-1 text-xs text-ink/50">Passed {formatDate(row.dismissedAt)}</p> : null}
-        {row.freshness ? <p className="mt-1 text-xs text-ink/65">Why here? {row.freshness.dueAction ? 'Due owner action' : row.freshness.ownerPriority ? 'Deliberate owner priority' : row.freshness.newToUs ? `First accepted ${formatDate(row.freshness.firstAcceptedAt)}${row.freshness.recentlyListed ? '; supported recent listing' : '; listing age unknown or older'}` : row.freshness.updatedSinceReview ? `${formatLabel(row.freshness.materialField || 'Material value')} changed since review` : row.freshness.sourceConflictCount > 0 ? 'Sources disagree; research needed' : 'Current opportunity backlog'}</p> : null}
-        {row.freshness && !row.freshness.crmLinked ? <p className="mt-1 text-xs text-amber-800">CRM handoff prerequisite: link or create a CRM record before outreach.</p> : null}
-        {observed ? <p className="mt-1 text-xs text-ink/50">Observed {observed}</p> : null}
-        {row.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-xs text-ink/60">Latest accepted by UG {formatDate(row.freshness.latestAcceptedObservationAt)}</p> : null}
+        {row.dismissedNote ? <p className="mt-1 text-sm leading-5 text-ink/68">Decision note: {row.dismissedNote}</p> : null}
+        {row.dismissedAt ? <p className="mt-1 text-sm text-ink/50">Passed {formatDate(row.dismissedAt)}</p> : null}
+        {row.freshness ? <p className="mt-1 text-sm text-ink/65">Why here? {row.freshness.dueAction ? 'Due owner action' : row.freshness.ownerPriority ? 'Deliberate owner priority' : row.freshness.newToUs ? `First accepted ${formatDate(row.freshness.firstAcceptedAt)}${row.freshness.recentlyListed ? '; supported recent listing' : '; listing age unknown or older'}` : row.freshness.updatedSinceReview ? `${formatLabel(row.freshness.materialField || 'Material value')} changed since review` : row.freshness.sourceConflictCount > 0 ? 'Sources disagree; research needed' : 'Current opportunity backlog'}</p> : null}
+        {row.freshness && !row.freshness.crmLinked ? <p className="mt-1 text-sm text-amber-800">CRM handoff prerequisite: link or create a CRM record before outreach.</p> : null}
+        {observed ? <p className="mt-1 text-sm text-ink/50">Observed {observed}</p> : null}
+        {row.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-sm text-ink/60">Latest accepted by UG {formatDate(row.freshness.latestAcceptedObservationAt)}</p> : null}
       </div>
       <div className="min-w-0 lg:col-start-2 lg:row-start-1 lg:row-span-2 xl:col-start-3">
-        {row.topStrength ? <p className="text-xs leading-5 text-moss">{row.topStrength}</p> : null}
-        {row.topConcern ? <p className="mt-1 text-xs leading-5 text-amber-800">{row.topConcern}</p> : null}
+        {row.topStrength ? <p className="text-sm leading-5 text-moss">{row.topStrength}</p> : null}
+        {row.topConcern ? <p className="mt-1 text-sm leading-5 text-amber-800">{row.topConcern}</p> : null}
         <div className="mt-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={onOpen} /></div>
         {!readOnly && !row.dismissed ? <div className="mt-2"><ActionButtons disabled={pending || !actionsAllowed} name={row.name} onAction={onAction} /></div> : null}
       </div>
@@ -1144,7 +1144,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       updated: 'Updated since review', research: 'Research', 'all-active': 'All active',
     }[item.id] || 'Opportunities';
     return (
-      <section aria-label={heading} className="mb-4 rounded-2xl border border-line bg-white" key={item.id}>
+      <section aria-label={heading} className="mb-6 rounded-2xl border border-line bg-white" key={item.id}>
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/80 px-4 py-3">
           <div><h3 className="text-lg font-semibold text-ink">{heading}</h3><p className="text-xs text-ink/58">{item.total} {item.total === 1 ? 'opportunity' : 'opportunities'}{preview ? ` · ${item.counts?.due || 0} due (${item.counts?.overdue || 0} overdue) · ${item.counts?.ownerPriority || 0} owner priorities (${item.counts?.urgent || 0} urgent)` : ''}</p></div>
           <div className="flex flex-wrap gap-2">{preview ? <><button className={buttonClass} onClick={() => selectArea('due-actions')} type="button">View all due ({item.counts?.due || 0})</button><button className={buttonClass} onClick={() => selectArea('owner-priorities')} type="button">View all priorities ({item.counts?.ownerPriority || 0})</button></> : area === 'inbox' && item.id === 'new-important' ? <button className={buttonClass} onClick={() => selectArea('new-important')} type="button">View all New & Important</button> : <button className={buttonClass} onClick={() => selectArea('inbox')} type="button">Back to Inbox</button>}</div>
@@ -1158,9 +1158,9 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   };
 
   return (
-    <section aria-label="Acquisition Inbox" className="section-shell mt-4 pb-6">
+    <section aria-label="Acquisition Inbox" className="section-shell mt-8 pb-8">
       <div className="panel overflow-hidden">
-        <header className="flex flex-col gap-3 border-b border-line/80 p-4 sm:p-5 lg:flex-row lg:items-start lg:justify-between">
+        <header className="flex flex-col gap-5 border-b border-line/80 p-5 sm:p-7 lg:flex-row lg:items-start lg:justify-between">
           <div><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Deal Hunter</p><h2 className="mt-2 text-2xl font-semibold text-ink sm:text-3xl">Acquisition Inbox</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68">Review the authoritative opportunity queue, understand the evidence, and record a human decision without triggering scoring or outreach.</p></div>
           <nav aria-label="Deal Hunter views" className="flex rounded-full border border-line bg-fog/70 p-1"><NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" end to="/admin/deal-hunter">Inbox</NavLink><NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" to="/admin/deal-hunter?view=operations">Operations</NavLink></nav>
         </header>
