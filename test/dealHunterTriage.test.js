@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { restoreCurrentUnlinkedOpportunity } from '../server/services/currentUnlinkedRestore.js';
+import { setCurrentOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
 
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
@@ -1294,5 +1296,137 @@ test('viewer projection contains no recipient envelope provider secret or operat
   assert.equal(response.dailyDigest?.actionsAllowed, true);
   for (const forbidden of [operatorNote, 'recipient-sentinel@example.test', 'PROVIDER SECRET SENTINEL', 'sender-sentinel@example.test', 'PRIVATE ENVELOPE BODY', 'preparedEnvelope']) {
     assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
+});
+
+
+test('financial corrections clear critical missing data after reload without rewriting source observations or the stored score', async (t) => {
+  const storage = await seedQueue(t);
+  const before = await getTriageOpportunityDetail({ opportunityId: 'opp-sparse', storage });
+  const score = await storage.getDealHunterOpportunityScore('opp-sparse');
+  const observations = await storage.listDealHunterOpportunitySourceObservations('opp-sparse');
+  assert.ok(before.missingCriticalFields.includes('asking_price'));
+  await setCurrentOperatorOpportunityFact({ opportunityId: 'opp-sparse', field: 'asking_price',
+    value: JSON.stringify({ version: 1, amount: '0', currency: 'unknown', metric: 'asking-price', period: 'current', evidenceSource: 'Synthetic seller statement' }),
+    actor: 'fixture-owner', verified: true, idempotencyKey: '11111111-1111-4111-8111-111111111111',
+    expectedRevision: before.opportunity.factEditRevision, storage });
+  const after = await getTriageOpportunityDetail({ opportunityId: 'opp-sparse', storage });
+  assert.equal(after.opportunity.financials.askingPrice, 0);
+  assert.equal(after.opportunity.financials.askingPriceEvidence.currency, 'unknown');
+  assert.equal(after.missingCriticalFields.includes('asking_price'), false);
+  assert.equal(after.opportunity.financials.profitMultiple, null);
+  assert.deepEqual(await storage.getDealHunterOpportunityScore('opp-sparse'), score);
+  assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations('opp-sparse'), observations);
+  await seedSourceObservation(storage, 'opp-sparse', 'asking_price', '999999', '2026-10-19T00:00:00Z');
+  const refreshed = await getTriageOpportunityDetail({ opportunityId: 'opp-sparse', storage });
+  assert.equal(refreshed.opportunity.financials.askingPrice, 0);
+});
+
+
+test('current unlinked Restore binds exact Pass and current authority, preserves history and never creates CRM', async (t) => {
+  const storage = await seedQueue(t);
+  const pass = await storage.upsertDealHunterDisposition({ id: '11111111-1111-4111-8111-111111111111',
+    deal_key: 'deal-high', submission_id: null, disposition: 'dismissed', reason: 'Owner reason', note: 'Owner original note',
+    created_at: '2026-10-19T00:00:00Z', updated_at: '2026-10-19T00:00:00Z', dismissed_at: '2026-10-19T00:00:00Z', dismissed_by: 'owner', created_by: 'owner', updated_by: 'owner' });
+  const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-high', storage });
+  assert.equal(detail.opportunity.dismissed, true);
+  assert.equal(detail.restoreAuthority.passId, pass.id);
+  const scoreBefore = await storage.getDealHunterOpportunityScore('opp-high');
+  const opportunityBefore = await storage.getCurrentDealHunterOpportunity('opp-high');
+  const input = { opportunityId: 'opp-high', ...detail.restoreAuthority, actor: 'fixture-owner', storage };
+  const stale = await restoreCurrentUnlinkedOpportunity({ ...input, passUpdatedAt: '2026-10-18T00:00:00Z' });
+  assert.equal(stale.status, 409);
+  const [first, second] = await Promise.all([restoreCurrentUnlinkedOpportunity(input), restoreCurrentUnlinkedOpportunity(input)]);
+  assert.equal(first.ok, true); assert.equal(second.status, 409);
+  for (const field of ['id','deal_key','submission_id','reason','note','dismissed_at','dismissed_by','created_at','created_by']) assert.deepEqual(first.disposition[field], pass[field]);
+  assert.equal(first.disposition.restored_by, 'fixture-owner');
+  const restored = await storage.getDealHunterDisposition({ dealKey: 'deal-high' });
+  assert.equal(restored.disposition, 'restored');
+  assert.deepEqual(await storage.getCurrentDealHunterOpportunity('opp-high'), { ...opportunityBefore, campaign_authority_revision: opportunityBefore.campaign_authority_revision + 1 });
+  assert.deepEqual(await storage.getDealHunterOpportunityScore('opp-high'), scoreBefore);
+  assert.equal((await getTriageOpportunityDetail({ opportunityId: 'opp-high', storage })).opportunity.dismissed, false);
+  await storage.upsertDealHunterDisposition({ ...restored, disposition: 'dismissed', reason: 'New Pass', updated_at: '2026-10-19T01:00:00Z', dismissed_at: '2026-10-19T01:00:00Z' });
+  assert.equal((await restoreCurrentUnlinkedOpportunity(input)).status, 409);
+  assert.equal((await storage.getDealHunterDisposition({ dealKey: 'deal-high' })).reason, 'New Pass');
+});
+
+test('current unlinked Restore rejects foreign CRM binding, changed identity and inactive scores', async (t) => {
+  const storage = await seedQueue(t);
+  const at = '2026-10-19T00:00:00Z';
+  const pass = await storage.upsertDealHunterDisposition({ id: '22222222-2222-4222-8222-222222222222', deal_key: 'deal-high',
+    submission_id: 'foreign-crm', disposition: 'dismissed', reason: 'Retained', created_at: at, updated_at: at, dismissed_at: at, dismissed_by: 'owner', created_by: 'owner', updated_by: 'owner' });
+  const current = await storage.getCurrentDealHunterOpportunity('opp-high');
+  const input = { opportunityId: 'opp-high', expectedCampaignAuthorityRevision: current.campaign_authority_revision,
+    passId: pass.id, passUpdatedAt: at, actor: 'fixture-owner', storage };
+  assert.equal((await restoreCurrentUnlinkedOpportunity(input)).status, 409);
+  await storage.upsertDealHunterDisposition({ ...pass, submission_id: null });
+  await storage.upsertDealHunterOpportunity({ ...current, primary_submission_id: 'newly-linked-crm' });
+  assert.equal((await restoreCurrentUnlinkedOpportunity(input)).status, 409);
+  const linked = await storage.getDealHunterOpportunity('opp-high');
+  await storage.upsertDealHunterOpportunity({ ...linked, primary_submission_id: null });
+  await storage.reconcileDealHunterCurrentScoreEligibility(['opp-watch']);
+  const latest = await storage.getDealHunterOpportunity('opp-high');
+  assert.equal((await restoreCurrentUnlinkedOpportunity({ ...input, expectedCampaignAuthorityRevision: latest.campaign_authority_revision })).status, 409);
+  assert.equal((await storage.getDealHunterDisposition({ dealKey: 'deal-high' })).disposition, 'dismissed');
+});
+
+
+test('unlinked Restore rejects reverse CRM claims and alias Passes, rolls back failures and invalidates fixed-clock stale confirmations', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'restore-exact-pass-'));
+  const sqlitePath = path.join(directory, 'restore.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  const db = new Database(sqlitePath);
+  t.after(() => { db.close(); storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  await seedOpportunity(storage, 'exact-restore');
+  await storage.writeDealHunterOpportunityScore(queueScore('exact-restore'), []);
+  await storage.reconcileDealHunterCurrentScoreEligibility(['exact-restore']);
+  const at = '2026-10-19T00:00:00.000Z';
+  const pass = await storage.upsertDealHunterDisposition({ id: 'd62b76bb-0d36-acd9-67a2-5739838c4e20', deal_key: 'deal-exact-restore',
+    submission_id: null, disposition: 'dismissed', reason: 'Original Pass', note: 'Retain this note', created_at: at, updated_at: at, dismissed_at: at, dismissed_by: 'owner', created_by: 'owner', updated_by: 'owner' });
+  const current = await storage.getCurrentDealHunterOpportunity('exact-restore');
+  const input = { opportunityId: 'exact-restore', expectedCampaignAuthorityRevision: current.campaign_authority_revision, passId: pass.id, passUpdatedAt: at, actor: 'owner', storage };
+  db.prepare(`INSERT INTO contact_submissions(id,created_at,updated_at,status,delivery_provider,delivery_status,crm_status,source,ip_hash,name,email,message,metadata)
+    VALUES ('reverse-crm',?,?,'archived','console','not-sent','not-synced','synthetic','synthetic','Synthetic','broker@example.test','Synthetic','{}')`).run(at, at);
+  for (const mutation of ["deal_hunter_opportunity_id='exact-restore'", `metadata='{"dealHunter":{"opportunityId":"exact-restore"}}'`, `metadata='{"dealHunter":{"dealKey":"deal-exact-restore"}}'`]) {
+    db.exec(`UPDATE contact_submissions SET ${mutation} WHERE id='reverse-crm'`);
+    assert.equal((await restoreCurrentUnlinkedOpportunity(input)).status, 409, mutation);
+    db.exec("UPDATE contact_submissions SET metadata='{}',deal_hunter_opportunity_id=null WHERE id='reverse-crm'");
+  }
+  db.prepare(`INSERT INTO deal_hunter_opportunity_aliases(id,opportunity_id,alias_type,alias_value,alias_key,source,first_observed_at,last_observed_at,evidence_version,resolution_method,confidence_state,resolved_by,metadata)
+    VALUES ('retained-alias','exact-restore','deal-key','retained-key','deal-key:retained-key','synthetic',?,?,'synthetic','exact-deal-key','exact','fixture','{}')`).run(at, at);
+  input.expectedCampaignAuthorityRevision = (await storage.getCurrentDealHunterOpportunity('exact-restore')).campaign_authority_revision;
+  const aliasPass = await storage.upsertDealHunterDisposition({ ...pass, id: '22222222-2222-4222-8222-222222222222', deal_key: 'retained-key' });
+  assert.equal((await restoreCurrentUnlinkedOpportunity(input)).status, 409, 'A second retained alias Pass cannot remain dismissed');
+  db.prepare('DELETE FROM deal_hunter_dispositions WHERE id=?').run(aliasPass.id);
+  db.exec(`UPDATE contact_submissions SET metadata='{"dealHunter":{"dealKey":"retained-key"}}' WHERE id='reverse-crm'`);
+  assert.equal((await restoreCurrentUnlinkedOpportunity(input)).status, 409, 'Retained alias CRM claim is linked authority');
+  db.exec("UPDATE contact_submissions SET metadata='{}' WHERE id='reverse-crm'");
+  const protectedBefore = db.prepare('SELECT * FROM contact_submissions').all();
+  db.exec(`CREATE TRIGGER reject_restore_revision BEFORE UPDATE OF campaign_authority_revision ON deal_hunter_opportunities BEGIN SELECT RAISE(ABORT,'injected restore failure'); END;`);
+  await assert.rejects(restoreCurrentUnlinkedOpportunity(input), /injected restore failure/);
+  assert.deepEqual(await storage.getDealHunterDisposition({ dealKey: pass.deal_key }), pass);
+  db.exec('DROP TRIGGER reject_restore_revision');
+  assert.equal((await restoreCurrentUnlinkedOpportunity(input)).ok, true);
+  assert.deepEqual(db.prepare('SELECT * FROM contact_submissions').all(), protectedBefore);
+  // Even the exact same millisecond/retained Pass ID cannot admit an old tab.
+  await storage.upsertDealHunterDisposition({ ...pass, disposition: 'dismissed', updated_at: at });
+  assert.equal((await restoreCurrentUnlinkedOpportunity(input)).status, 409);
+  assert.equal((await storage.getDealHunterDisposition({ dealKey: pass.deal_key })).disposition, 'dismissed');
+});
+
+
+test('Restore confirmation projection never exposes malformed raw storage authority', async (t) => {
+  const storage = await seedQueue(t);
+  const pass = await storage.upsertDealHunterDisposition({ id: '11111111-1111-4111-8111-111111111111', deal_key: 'deal-high', submission_id: null,
+    disposition: 'dismissed', reason: 'Owner reason', created_at: '2026-10-19T00:00:00Z', updated_at: '2026-10-19T00:00:00Z', created_by: 'owner', updated_by: 'owner' });
+  for (const malformed of [{ id: { private: 'raw-private-authority' } }, { updated_at: { private: 'raw-private-authority' } }, { revision: { private: 'raw-private-authority' } }, { revision: 9007199254740992 }]) {
+    const guarded = new Proxy(storage, { get(target, property) {
+      if (property === 'listDealHunterDispositions') return async () => [{ ...pass, ...malformed }];
+      if (property === 'getCurrentDealHunterOpportunity' && malformed.revision !== undefined) return async (...args) => ({ ...await target[property](...args), campaign_authority_revision: malformed.revision });
+      return target[property];
+    } });
+    const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-high', storage: guarded });
+    assert.equal(detail.restoreAuthority, undefined);
+    assert.equal(JSON.stringify(detail).includes('raw-private-authority'), false);
   }
 });

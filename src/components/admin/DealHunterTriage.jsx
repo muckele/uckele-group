@@ -188,8 +188,9 @@ export default function DealHunterTriage({ readOnly = false }) {
     try {
       const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}`, { credentials: 'same-origin' });
       const result = await response.json();
-      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to load the score explanation.');
-      setDetail({ data: result, loading: false, error: '' });
+      if (!response.ok || result.success === false || !result.opportunity
+        || (!result.score && !Array.isArray(result.dimensions))) throw new Error(result.error || 'Unable to load the score explanation.');
+      setDetail({ data: result.score ? { ...result.score, opportunity: result.opportunity } : result, loading: false, error: '' });
     } catch (detailError) {
       setDetail({ data: null, loading: false, error: detailError.message || 'Unable to load the score explanation.' });
     }

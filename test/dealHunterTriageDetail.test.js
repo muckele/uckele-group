@@ -1932,7 +1932,7 @@ test('detail closes every nested projection and strips injected storage metadata
   for (const activity of detail.history.activities) assertRecordContract(activity, { id: text(200), eventType: text(80), summary: text(500), createdAt: text(80), actor: text(160) }, 'activity');
   assert.equal(detail.history.dispositions.length, 20, 'dispositions retain the literal 20-record cap');
   assert.equal(detail.history.dispositions.at(-1).id, 'disposition-19');
-  for (const disposition of detail.history.dispositions) assertRecordContract(disposition, { id: text(200), disposition: text(80), reason: text(160), note: text(500), dismissedAt: text(80), dismissedBy: text(160) }, 'disposition');
+  for (const disposition of detail.history.dispositions) assertRecordContract(disposition, { id: text(200), disposition: text(80), reason: text(160), note: text(500), dismissedAt: text(80), dismissedBy: text(160), restoredAt: text(80), restoredBy: text(160) }, 'disposition');
   assert.equal(detail.history.operatorFacts.length, 100, 'history operator facts retain the literal 100-record cap');
   assert.equal(detail.history.operatorFacts.at(-1).id, 'fact-99');
   for (const fact of detail.history.operatorFacts) {

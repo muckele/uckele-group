@@ -24,7 +24,7 @@ test('Supabase uses one dedicated restore RPC with no generic update or outreach
 test('fresh and upgrade SQL retain the same service-only atomic restore definition', () => {
   const migration = fs.readFileSync(new URL('../supabase/migrations/20261018120000_atomic_crm_restore.sql', import.meta.url), 'utf8').trim();
   const schema = fs.readFileSync(new URL('../supabase/schema.sql', import.meta.url), 'utf8');
-  assert.ok(schema.endsWith(`${migration}\n`));
+  assert.ok(schema.includes(`${migration}\n`), 'Consolidated schema retains the exact earlier migration before later additions');
   assert.match(migration, /security invoker set search_path = ''/);
   assert.match(migration, /from public, anon, authenticated/);
   assert.match(migration, /to service_role/);

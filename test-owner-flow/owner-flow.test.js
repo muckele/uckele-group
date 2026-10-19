@@ -4,11 +4,14 @@ import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, expect } from '@playwright/test';
-import { startFixture } from './fixture.js';
+import { createOwnerReviewRoutePolicy } from './review-route-policy.js';
+import { startFixture, cases } from './fixture.js';
 import { observeOwnedBrowserSpawn } from '../scripts/fl05-owned-process.js';
 
 test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile and viewer', { timeout: 120_000 }, async (t) => {
-  const fixture = await startFixture(t);
+  let humanGuardEnabled = false;
+  const humanGuard = createOwnerReviewRoutePolicy({ opportunityIds: cases.map((item) => item.id), crmIds: cases.filter((item) => item.linked).map((item) => `crm-${item.id}`) });
+  const fixture = await startFixture(t, { requestPolicy: (method, url) => !humanGuardEnabled || humanGuard(method, url) });
   const browserPidPath = path.join(fixture.root, 'owned-browser.json');
   const restoreSpawn = observeOwnedBrowserSpawn(process.env.FL05_BROWSER_EXECUTABLE, (pid) => {
     const temporary = `${browserPidPath}.tmp`;
@@ -91,10 +94,69 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     const edited = await detail('fresh');
     assert.equal(edited.effectiveFacts.broker_company.value, 'Synthetic fire safety service');
     assert.equal(edited.effectiveFacts.broker_company.provenance, 'operator');
+    const storedScore = fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id='fresh'").get();
+    const sourceRows = fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_source_observations WHERE opportunity_id='fresh' ORDER BY id").all();
+    for (const [field, amount, currency, metric, period] of [['annual_profit','-125.55','CAD','ebitda','annual'], ['annual_revenue','1800000.25','USD','revenue','trailing-twelve-months'], ['asking_price','0','unknown','asking-price','current']]) {
+      await dialog.getByLabel('Verified fact field').selectOption(field);
+      await dialog.getByLabel('Verified fact value').fill(amount);
+      await dialog.getByLabel('Financial currency').selectOption(currency);
+      await dialog.getByLabel('Financial metric').selectOption(metric);
+      await dialog.getByLabel('Financial period').selectOption(period);
+      await dialog.getByLabel('Financial evidence source').fill('Synthetic owner financial correction');
+      const financialSaved = page.waitForResponse((response) => response.request().method() === 'PUT' && response.url().endsWith(`/facts/${field}`));
+      await dialog.getByRole('button', { name: 'Save financial fact' }).click();
+      assert.equal((await financialSaved).status(), 200);
+      await expect(dialog.getByRole('button', { name: 'Save financial fact' })).toBeEnabled();
+    }
+    await page.reload();
+    await page.getByRole('button', { name: 'Open Synthetic Fresh High Fit', exact: true }).click();
+    const financialDetail = await detail('fresh');
+    assert.equal(financialDetail.opportunity.financials.annualProfit, -125.55);
+    assert.equal(financialDetail.opportunity.financials.annualRevenue, 1800000.25);
+    assert.equal(financialDetail.opportunity.financials.askingPrice, 0);
+    assert.equal(financialDetail.opportunity.financials.profitMultiple, null);
+    assert.equal(financialDetail.missingCriticalFields.includes('asking_price'), false);
+    assert.equal(financialDetail.effectiveFacts.annual_profit.verified, false);
+    assert.deepEqual(fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id='fresh'").get(), storedScore);
+    assert.deepEqual(fixture.db.prepare("SELECT * FROM deal_hunter_opportunity_source_observations WHERE opportunity_id='fresh' ORDER BY id").all(), sourceRows);
+    await expect(dialog).toContainText('-125.55 CAD');
+    await expect(dialog).toContainText('saved machine score has not been recomputed');
+    await dialog.getByRole('heading', { name: 'Business & Financials', exact: true }).scrollIntoViewIfNeeded();
+    await expect(dialog.getByText('-125.55 CAD', { exact: true })).toBeVisible();
+    await page.screenshot({ path: path.join(fixture.root, 'financial-corrections.png') });
     await dialog.getByRole('button', { name: 'Pursue Synthetic Fresh High Fit', exact: true }).click();
     await expect(dialog.getByRole('region', { name: 'Pursue next action' })).toContainText('Create or link the CRM record');
+    await dialog.getByRole('button', { name: 'Pass Synthetic Fresh High Fit', exact: true }).click();
+    await dialog.getByLabel('Pass reason', { exact: true }).fill('Synthetic owner Pass');
+    await dialog.getByLabel('Pass note (optional)', { exact: true }).fill('Retained unlinked Pass note');
+    await dialog.getByRole('button', { name: 'Confirm Pass', exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    await page.getByRole('tab', { name: 'Passed', exact: true }).click();
+    await page.getByRole('button', { name: 'Open Synthetic Fresh High Fit', exact: true }).click();
+    await expect(dialog.getByRole('button', { name: 'Restore opportunity', exact: true })).toBeEnabled();
+    const passedUnlinked = await detail('fresh');
+    fixture.db.prepare(`INSERT INTO email_suppressions(id,normalized_email,reason,source,created_at,created_by,metadata)
+      VALUES ('11111111-4444-4444-8444-111111111111','broker-fresh@example.test','explicit-opt-out','synthetic-fixture',?,'fixture-owner','{"retained":true}')`).run(new Date().toISOString());
+    const crmBeforeRestore = fixture.db.prepare('SELECT * FROM contact_submissions ORDER BY id').all();
+    const protectedTables = ['email_suppressions','deal_hunter_pursuit_enrollments','deal_hunter_cim_campaigns','deal_hunter_cim_capability_activations','deal_hunter_cim_live_provider_authorizations','deal_hunter_cim_transmissions','crm_email_outbox'];
+    const protectedBeforeRestore = Object.fromEntries(protectedTables.map((table) => [table, fixture.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all()]));
+    await dialog.getByRole('button', { name: 'Restore opportunity', exact: true }).click();
+    const restoreResponse = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith('/triage/fresh/restore'));
+    await dialog.getByRole('button', { name: 'Confirm Restore opportunity', exact: true }).click();
+    assert.equal((await restoreResponse).status(), 200);
+    await expect(dialog.getByRole('button', { name: 'Pursue Synthetic Fresh High Fit', exact: true })).toBeEnabled();
+    const restoredUnlinked = await detail('fresh');
+    assert.equal(restoredUnlinked.opportunity.dismissed, false);
+    assert.equal(restoredUnlinked.opportunity.factEditRevision.primarySubmissionId, null);
+    assert.equal(restoredUnlinked.history.dispositions[0].note, 'Retained unlinked Pass note');
+    assert.equal(restoredUnlinked.history.dispositions[0].restoredBy, 'fl05-owner');
+    assert.deepEqual(fixture.db.prepare('SELECT * FROM contact_submissions ORDER BY id').all(), crmBeforeRestore);
+    assert.deepEqual(Object.fromEntries(protectedTables.map((table) => [table, fixture.db.prepare(`SELECT * FROM ${table} ORDER BY id`).all()])), protectedBeforeRestore);
+    assert.equal((await context.request.post(`${fixture.origin}/api/admin/deal-hunter/triage/fresh/restore`, { data: passedUnlinked.restoreAuthority })).status(), 409);
+    await page.screenshot({ path: path.join(fixture.root, 'unlinked-restored.png') });
     await closeDetail();
 
+    await page.getByRole('tab', { name: 'Fresh-first Inbox', exact: true }).click();
     await page.getByRole('button', { name: 'Updated since review', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Updated since review', exact: true })).toContainText('1500000 → 1250000 USD');
     await page.getByRole('button', { name: 'All active', exact: true }).click();
@@ -130,6 +192,16 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     assert.deepEqual(restored, { status: 'review', follow_up_state: 'completed', next_action_at: null });
     assert.equal((await detail('low')).opportunity.dismissed, false,
       'CRM Restore must atomically clear the exact linked canonical Pass');
+
+    humanGuardEnabled = true;
+    await page.goto(`${fixture.origin}/admin/crm`);
+    await expect(page.getByText('Records index', { exact: true })).toBeVisible();
+    await expect(page.getByText('Synthetic New Low Fit', { exact: true }).first()).toBeVisible();
+    assert.ok(fixture.requests.some((request) => request.path.startsWith('/api/admin/submissions?') && request.status === 200));
+    await page.screenshot({ path: path.join(fixture.root, 'guarded-crm-index.png') });
+    const deniedSend = await context.request.post(`${fixture.origin}/api/admin/deal-hunter/cim-requests`, { data: {} });
+    assert.equal(deniedSend.status(), 403);
+    humanGuardEnabled = false;
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto(`${fixture.origin}/admin/deal-hunter`);

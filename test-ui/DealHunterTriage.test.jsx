@@ -332,3 +332,17 @@ describe('Deal Hunter triage queue', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Opportunity scoring storage is unavailable.');
   });
 });
+
+
+test('legacy score explanation accepts the consolidated API detail without a success envelope', async () => {
+  const legacy = detailResponse();
+  const { success: _success, ok: _ok, opportunity, ...score } = legacy;
+  vi.stubGlobal('fetch', mockFetch([
+    ['/api/admin/deal-hunter/triage/opp-1', () => ({ opportunity, score })],
+    ['/api/admin/deal-hunter/triage', () => queueResponse([triageRow()])],
+  ]));
+  render(<DealHunterTriage />);
+  fireEvent.click(await screen.findByRole('button', { name: /Why this score/ }));
+  expect(await screen.findByText(/Financial fit/)).toBeVisible();
+  expect(screen.queryByRole('alert')).toBeNull();
+});

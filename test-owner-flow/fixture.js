@@ -18,7 +18,7 @@ export const cases = [
   { id: 'materials', name: 'Synthetic Broker Materials', score: 80, days: 60, linked: true },
 ];
 
-export async function startFixture(t) {
+export async function startFixture(t, { requestPolicy = null } = {}) {
   // Check the runner's exact allowlist before importing any application module.
   const root = process.env.FL05_FIXTURE_ROOT;
   assert.ok(root && path.isAbsolute(root), 'Use npm run test:owner-flow');
@@ -67,6 +67,11 @@ export async function startFixture(t) {
   app.get(['/', '/admin', '/admin/*'], (_request, response) => response.type('html').send(html));
   app.use(express.static(dist));
   server.on('request', (request, response) => {
+    if (requestPolicy && !requestPolicy(request.method, request.url)) {
+      requests.push({ method: request.method, path: request.url, status: 403, deniedBeforeDispatch: true });
+      response.statusCode = 403; response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ success: false, error: 'Outside isolated owner replay.' })); return;
+    }
     response.once('finish', () => requests.push({ method: request.method,
       path: request.url, status: response.statusCode }));
     app(request, response);

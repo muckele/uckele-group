@@ -1,10 +1,11 @@
+import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRestore.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
   normalizeDealHunterSourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
-  opportunityFactFields,
+  opportunityFactCrmSnapshotFields,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
@@ -4275,7 +4276,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if ((expectedSubmissionId === null) !== (expectedSnapshot === null)
         || (expectedSnapshot !== null && (
           typeof expectedSnapshot !== 'object' || Array.isArray(expectedSnapshot)
-          || Object.keys(expectedSnapshot).sort().join(',') !== [...opportunityFactFields].sort().join(',')
+          || Object.keys(expectedSnapshot).sort().join(',') !== [...opportunityFactCrmSnapshotFields].sort().join(',')
           || Object.values(expectedSnapshot).some((value) => value !== null
             && (typeof value !== 'string' || [...value].length > 4000))
         ))) {
@@ -5047,6 +5048,13 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const { data, error } = await query.limit(1).maybeSingle();
       if (error) throw error;
       return normalizeDealHunterDispositionRow(data);
+    },
+
+    async restoreCurrentUnlinkedOpportunity(input) {
+      normalizeCurrentUnlinkedRestore(input);
+      const { data, error } = await client.rpc('restore_current_unlinked_opportunity', { p_input: input });
+      if (error) throw error;
+      return data;
     },
 
     async upsertDealHunterDisposition(record = {}) {

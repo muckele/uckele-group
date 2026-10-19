@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { financialRestoreSeed, financialAndUnlinkedRestoreChecks } from './fixtures/financialAndUnlinkedRestorePostgres.js';
 import { restoreProtectedTables, stoppedRestoreAuthoritySql } from './fixtures/crmRestoreStoppedAuthority.js';
 
 const enabled = process.env.CRM_RESTORE_POSTGRES_INTEGRATION === '1';
@@ -121,7 +122,38 @@ test('FL02 PostgreSQL fresh/upgrade restore is atomic, authorized and retains st
   psql(container, 'restore_fresh', fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8'));
   psql(container, 'restore_upgrade', previous);
   psql(container, 'restore_upgrade', fs.readFileSync(path.join(root, 'supabase/migrations/20261018120000_atomic_crm_restore.sql'), 'utf8'));
+  for (const migration of ['20261019120000_operator_financial_facts.sql', '20261019130000_current_unlinked_restore.sql']) {
+    psql(container, 'restore_upgrade', fs.readFileSync(path.join(root, 'supabase/migrations', migration), 'utf8'));
+  }
   for (const database of ['restore_fresh', 'restore_upgrade']) {
+    // Existing linked seed supplies a separate synthetic CRM for foreign/reverse
+    // link rejection. Every correction/Restore assertion rolls back its rows.
+    psql(container, database, seed);
+    financialAndUnlinkedRestoreChecks({ query: (sql, failure) => psql(container, database, sql, failure), diagnostic: (message) => t.diagnostic(`${database}: ${message}`) });
+    psql(container, database, financialRestoreSeed);
+    const revision = Number(psql(container, database, "SELECT campaign_authority_revision FROM public.deal_hunter_opportunities WHERE opportunity_id='financial-unlinked';").stdout.trim());
+    const currentRestore = `public.restore_current_unlinked_opportunity(${literal(JSON.stringify({ opportunityId: 'financial-unlinked', expectedCampaignAuthorityRevision: revision,
+      passId: '11111111-6666-4666-8666-111111111111', passUpdatedAt: '2026-10-19T00:00:00.000Z', actor: 'fixture-owner', at: '2026-10-19T01:00:00.000Z' }))}::jsonb)`;
+    const currentWriter = asyncPsql(container, database, `BEGIN; UPDATE public.contact_submissions SET metadata=metadata || '{"dealHunter":{"opportunityId":"financial-unlinked"}}'::jsonb WHERE id='${submissionId}';
+      SELECT 'fl02-writer-locked'; SELECT pg_sleep(2); COMMIT;`, true);
+    await currentWriter.marker;
+    const currentRestoring = asyncPsql(container, database, `SET application_name='fl03-current-restore-race'; SET ROLE service_role; SELECT ${currentRestore};`);
+    let currentWait = false;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (Number(psql(container, database, "SELECT count(*) FROM pg_stat_activity WHERE application_name='fl03-current-restore-race' AND wait_event_type='Lock';").stdout.trim()) > 0) { currentWait = true; break; }
+      await delay(25);
+    }
+    assert.equal(currentWait, true, 'Unlinked Restore waits for reverse CRM writer');
+    await currentWriter.completed;
+    assert.equal(JSON.parse((await currentRestoring.completed).trim()).applied, false);
+    assert.equal(psql(container, database, "SELECT disposition FROM public.deal_hunter_dispositions WHERE deal_key='financial-key';").stdout.trim(), 'dismissed');
+    psql(container, database, "DELETE FROM public.deal_hunter_dispositions WHERE deal_key='financial-key'; DELETE FROM public.deal_hunter_opportunities WHERE opportunity_id='financial-unlinked';");
+    t.diagnostic(`${database}: unlinked Restore concurrent reverse CRM race denied after lock wait`);
+    psql(container, database, `DELETE FROM public.deal_hunter_dispositions WHERE id='${passId}';
+      DELETE FROM public.deal_hunter_opportunity_aliases WHERE id='restore-alias';
+      DELETE FROM public.deal_hunter_opportunities WHERE opportunity_id='canonical-restore';
+      DELETE FROM public.contact_submissions WHERE id='${submissionId}';`);
+
     const rows = psql(container, database, `BEGIN; ${seed}
       ${stoppedRestoreAuthoritySql(submissionId, 'canonical-restore')}
       SELECT ${snapshot}; SET LOCAL ROLE service_role; SELECT ${rpc()}; SELECT ${rpc()};

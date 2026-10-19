@@ -2699,3 +2699,23 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     expect(calls.filter(({ url }) => url.endsWith('/triage/opp-1'))).toHaveLength(2);
   });
 });
+
+
+test('unlinked Restore uses exact reviewed Pass authority and reloads the drawer without CRM creation', async () => {
+  const writes = [];
+  let restored = false;
+  const row = queueRow({ dismissed: true, dismissedReason: 'Owner Pass' });
+  const authority = { expectedCampaignAuthorityRevision: 7, passId: '11111111-1111-4111-8111-111111111111', passUpdatedAt: '2026-10-19T00:00:00Z' };
+  vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+    const url = String(input);
+    if (options.method === 'POST') { writes.push({ url, body: JSON.parse(options.body) }); restored = true; return jsonResponse({ success: true }); }
+    if (url.endsWith('/triage/opp-1')) return jsonResponse({ ...detailResponse({ ...row, dismissed: !restored }), ...(!restored ? { restoreAuthority: authority } : {}) });
+    return jsonResponse(queueResponse({ rows: [{ ...row, dismissed: !restored }] }));
+  }));
+  renderInbox({ initialView: 'dismissed' });
+  fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Restore opportunity' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm Restore opportunity' }));
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Restore opportunity' })).toBeNull());
+  expect(writes).toEqual([{ url: '/api/admin/deal-hunter/triage/opp-1/restore', body: authority }]);
+});

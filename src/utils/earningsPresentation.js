@@ -3,9 +3,9 @@ function formatLabel(value) {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function usd(value) {
+function usd(value, maximumFractionDigits = 0) {
   return new Intl.NumberFormat('en-US', {
-    style: 'currency', currency: 'USD', maximumFractionDigits: 0,
+    style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits,
   }).format(Number(value));
 }
 
@@ -18,7 +18,7 @@ export function earningsPresentation(financials = {}) {
     ? formatLabel(evidence.period).toLowerCase() : 'period unverified';
   const value = financials.annualProfit;
   const amount = value === null || value === undefined || value === '' ? '—'
-    : evidence.currency === 'USD' ? usd(value)
-      : `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(Number(value))} ${evidence.currency && evidence.currency !== 'unknown' ? evidence.currency : 'currency unverified'}`;
+    : evidence.currency === 'USD' ? usd(value, evidence.provenance === 'operator' ? 2 : 0)
+      : `${new Intl.NumberFormat('en-US', { maximumFractionDigits: evidence.provenance === 'operator' ? 2 : 0 }).format(Number(value))} ${evidence.currency && evidence.currency !== 'unknown' ? evidence.currency : 'currency unverified'}`;
   return { label: `${metric} · ${period}`, amount };
 }

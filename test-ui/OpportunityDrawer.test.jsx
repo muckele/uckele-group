@@ -560,3 +560,44 @@ describe('Opportunity drawer', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 });
+
+
+test('financial editing requires context, preserves decimals and does not assume verification or SDE', () => {
+  const onSaveFact = vi.fn();
+  render(<OpportunityDrawer detail={detailFixture()} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+  fireEvent.change(screen.getByLabelText('Verified fact field'), { target: { value: 'annual_profit' } });
+  expect(screen.getByLabelText('Financial metric')).toHaveValue('unknown');
+  expect(screen.getByLabelText('Financial currency')).toHaveValue('unknown');
+  expect(screen.getByLabelText('Financial fact verified')).not.toBeChecked();
+  fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: '-125.55' } });
+  fireEvent.change(screen.getByLabelText('Financial currency'), { target: { value: 'CAD' } });
+  fireEvent.change(screen.getByLabelText('Financial metric'), { target: { value: 'ebitda' } });
+  fireEvent.change(screen.getByLabelText('Financial period'), { target: { value: 'annual' } });
+  fireEvent.change(screen.getByLabelText('Financial evidence source'), { target: { value: 'Owner supplied 2025 accounts' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save financial fact' }));
+  const saved = onSaveFact.mock.calls[0][0];
+  expect(JSON.parse(saved.value)).toEqual({ version: 1, amount: '-125.55', currency: 'CAD', metric: 'ebitda', period: 'annual', evidenceSource: 'Owner supplied 2025 accounts' });
+  expect(saved.verified).toBe(false);
+  fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: '1.234' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save financial fact' }));
+  expect(screen.getByRole('alert')).toHaveTextContent('2 decimal places');
+  expect(onSaveFact).toHaveBeenCalledTimes(1);
+});
+
+
+test('a current unlinked passed opportunity offers an explicit restore confirmation without outreach', () => {
+  const original = detailFixture();
+  const onRestore = vi.fn();
+  render(<OpportunityDrawer detail={{ ...original, opportunity: { ...original.opportunity, dismissed: true }, crmSummary: { submission: null }, restoreAuthority: { passId: 'pass', passUpdatedAt: '2026-10-19T00:00:00Z', expectedCampaignAuthorityRevision: 7 } }} onClose={vi.fn()} onRestore={onRestore} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Restore opportunity' }));
+  expect(onRestore).not.toHaveBeenCalled();
+  expect(screen.getByText(/Outreach stays stopped/)).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm Restore opportunity' }));
+  expect(onRestore).toHaveBeenCalledTimes(1);
+});
+
+test('historical archived detail does not offer canonical restore', () => {
+  const original = detailFixture();
+  render(<OpportunityDrawer detail={{ ...original, archivedReadOnly: true, opportunity: { ...original.opportunity, dismissed: true }, crmSummary: { submission: null }, restoreAuthority: { passId: 'pass', passUpdatedAt: '2026-10-19T00:00:00Z', expectedCampaignAuthorityRevision: 7 } }} onClose={vi.fn()} onRestore={vi.fn()} readOnly />);
+  expect(screen.queryByRole('button', { name: 'Restore opportunity' })).toBeNull();
+});

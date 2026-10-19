@@ -626,6 +626,34 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     }
   }
 
+  async function restoreOpportunity(opportunityId) {
+    if (!actionsAllowed || selectionRef.current !== opportunityId || detail.loading || detail.error
+      || !detail.data?.opportunity?.dismissed || detail.data.archivedReadOnly
+      || detail.data.crmSummary?.submission || mutationPendingRef.current) return false;
+    const authority = detail.data.restoreAuthority;
+    if (!authority) return false;
+    mutationPendingRef.current = true;
+    setPendingId(opportunityId);
+    setMutationError('');
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/restore`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(authority),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to restore this opportunity.');
+      await loadQueue();
+      if (selectionRef.current === opportunityId) await loadDetail(opportunityId, { preserveData: true });
+      return true;
+    } catch (restoreError) {
+      if (selectionRef.current === opportunityId) setMutationError(restoreError.message);
+      return false;
+    } finally {
+      mutationPendingRef.current = false;
+      setPendingId('');
+    }
+  }
+
   async function stopCimRelease(opportunityId, authority) {
     if (readOnly || !opportunityId || selectionRef.current !== opportunityId
       || mutationPendingRef.current || !authority?.campaignId
@@ -1164,7 +1192,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         {view === 'inbox' ? <MorningBriefing actionsAllowed={actionsAllowed} digest={dailyDigest} error={queueError} loading={loading} onAction={(row, _action, event) => openDetail(row.opportunityId, event.currentTarget)} onOpen={(row, event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} /> : null}
       </div>
 
-      {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly || detail.data?.archivedReadOnly === true} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onClose={closeDetail} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed || detail.data?.archivedReadOnly === true} /> : null}
+      {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly || detail.data?.archivedReadOnly === true} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onClose={closeDetail} onRestore={hasMatchingDetail ? () => restoreOpportunity(loadedDetailId) : undefined} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed || detail.data?.archivedReadOnly === true} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );
