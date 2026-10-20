@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main, codex/bounded-recovery-capture]
 
@@ -10,7 +11,11 @@ permissions:
 
 jobs:
   validate:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       !(github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository &&
+         github.head_ref == 'codex/bounded-recovery-capture'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -49,21 +54,26 @@ jobs:
       - run: npm run test:browser-volume
 
   recovery-capture-qualification:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/bounded-recovery-capture'
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/codex/bounded-recovery-capture') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.draft &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.head_ref == 'codex/bounded-recovery-capture')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Verify exact source commit
         env:
-          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+          EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
       - uses: actions/setup-node@v6
         with:
           node-version: 22
       - run: npm ci --omit=dev
+      - run: node --test test/recoveryCapture.test.js test/recoverySource.test.js
       - name: Qualify bounded recovery capture with synthetic data only
         run: |
           node scripts/qualify-recovery-capture.js --database-mib 154

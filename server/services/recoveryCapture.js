@@ -13,6 +13,18 @@ export const recoveryCaptureLimits = Object.freeze({
   maxRssBytes: 256 * MiB,
   deadlineMs: 30_000,
 });
+// Shared by the source adapter so invalid bounds fail before opening SQLite.
+export function getRecoveryCaptureLimits(overrides = {}) {
+  const limits = { ...recoveryCaptureLimits, ...overrides };
+  for (const key of Object.keys(limits)) {
+    if (!Object.hasOwn(recoveryCaptureLimits, key) || !Number.isSafeInteger(limits[key]) || limits[key] < 0) throw new Error('Invalid recovery limit.');
+  }
+  if (limits.minimumFreeBytes < recoveryCaptureLimits.minimumFreeBytes
+      || limits.maxDatabaseBytes > recoveryCaptureLimits.maxDatabaseBytes
+      || limits.maxRssBytes > recoveryCaptureLimits.maxRssBytes
+      || limits.deadlineMs > recoveryCaptureLimits.deadlineMs) throw new Error('Recovery limit may only be tightened.');
+  return limits;
+}
 const sameFile = (a, b) => ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].every((key) => a[key] === b[key]);
 
 async function syncDirectory(directory) {
@@ -25,14 +37,7 @@ async function syncDirectory(directory) {
 // Bounds are cooperative; an external process supervisor is required for hard
 // wall/RSS enforcement of synchronous native SQLite operations.
 export async function createZeroDocumentRecoveryBundle({ database, parentDirectory, signal, ...overrides }) {
-  const limits = { ...recoveryCaptureLimits, ...overrides };
-  for (const key of Object.keys(limits)) {
-    if (!Object.hasOwn(recoveryCaptureLimits, key) || !Number.isSafeInteger(limits[key]) || limits[key] < 0) throw new Error('Invalid recovery limit.');
-  }
-  if (limits.minimumFreeBytes < recoveryCaptureLimits.minimumFreeBytes
-      || limits.maxDatabaseBytes > recoveryCaptureLimits.maxDatabaseBytes
-      || limits.maxRssBytes > recoveryCaptureLimits.maxRssBytes
-      || limits.deadlineMs > recoveryCaptureLimits.deadlineMs) throw new Error('Recovery limit may only be tightened.');
+  const limits = getRecoveryCaptureLimits(overrides);
   const started = performance.now();
   function checkBounds() {
     signal?.throwIfAborted();
@@ -46,6 +51,15 @@ export async function createZeroDocumentRecoveryBundle({ database, parentDirecto
   const parentIdentity = await fs.lstat(parent, { bigint: true });
   if (!parentIdentity.isDirectory() || (parentIdentity.mode & 0o077n) !== 0n
       || parentIdentity.uid !== BigInt(process.getuid())) throw new Error('Recovery parent must be a private owned directory.');
+  // A private leaf under a non-sticky writable ancestor can still be replaced
+  // by another uid while SQLite reopens its destination by pathname.
+  for (let ancestor = path.dirname(parent); ; ancestor = path.dirname(ancestor)) {
+    const stat = await fs.lstat(ancestor, { bigint: true });
+    const trustedOwner = stat.uid === 0n || stat.uid === BigInt(process.getuid());
+    if (!stat.isDirectory() || !trustedOwner
+        || ((stat.mode & 0o022n) !== 0n && (stat.mode & 0o1000n) === 0n)) throw new Error('Recovery output directory ancestry is not trusted.');
+    if (ancestor === path.dirname(ancestor)) break;
+  }
   async function checkSpace(minimum) {
     const stat = await fs.statfs(parent, { bigint: true });
     if (stat.bavail * stat.bsize < BigInt(minimum)) throw new Error('Insufficient recovery free space.');

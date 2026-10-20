@@ -149,3 +149,11 @@ for (const schema of [
   await assert.rejects(createZeroDocumentRecoveryBundle(f.options), /secure documents/);
   assert.deepEqual(await fs.readdir(f.output), []);
 });
+
+test('the core also rejects private output under an unsafe writable ancestor', async (t) => {
+  const f = await fixture(t);
+  const unsafe = path.join(f.root, 'unsafe-output'); await fs.mkdir(unsafe, { mode: 0o777 }); await fs.chmod(unsafe, 0o777);
+  const parentDirectory = path.join(unsafe, 'private'); await fs.mkdir(parentDirectory, { mode: 0o700 });
+  await assert.rejects(createZeroDocumentRecoveryBundle({ ...f.options, parentDirectory }), /directory ancestry/);
+  assert.deepEqual(await fs.readdir(parentDirectory), []);
+});

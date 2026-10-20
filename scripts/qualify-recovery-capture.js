@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import Database from 'better-sqlite3';
-import { createZeroDocumentRecoveryBundle, recoveryCaptureLimits } from '../server/services/recoveryCapture.js';
+import { recoveryCaptureLimits } from '../server/services/recoveryCapture.js';
+import { captureRecoveryFromSqlitePath } from '../server/services/recoverySource.js';
 
 const MiB = 1024 * 1024;
 async function hash(file) {
@@ -39,7 +40,7 @@ async function worker(root, mib, hang) {
       process.on('SIGTERM', () => {}); // Force proof of the supervisor's SIGKILL escalation.
       for (;;) { /* Parent must terminate blocked native-like work. */ }
     }
-    const result = await createZeroDocumentRecoveryBundle({ database, parentDirectory: output });
+    const result = await captureRecoveryFromSqlitePath({ sqlitePath: source, parentDirectory: output, acknowledgeWalSharedMemoryEffects: true });
     const copy = new Database(path.join(result.path, 'database.sqlite'), { readonly: true, fileMustExist: true });
     try {
       if (copy.prepare('SELECT value FROM records').get()?.value !== 'WAL-only committed row') throw new Error('WAL state missing.');
@@ -52,7 +53,8 @@ async function worker(root, mib, hang) {
       sqlite: database.prepare('SELECT sqlite_version() AS version').get().version,
       databaseBytes: result.manifest.database.sizeBytes, rss: process.memoryUsage.rss(),
       processPeakRssBytes: process.resourceUsage().maxRSS * 1024,
-      sourceHashesUnchanged: true, walOnlyRowCaptured: true, publishedHashVerified: true });
+      sourceHashesUnchanged: true, walOnlyRowCaptured: true, publishedHashVerified: true,
+      sourceReadOnly: result.sourceReadOnly, sourceConnectionClosed: result.sourceConnectionClosed });
   } finally { database.close(); }
 }
 
@@ -67,6 +69,7 @@ async function supervise(mib, hang) {
   const identity = await fs.lstat(root, { bigint: true });
   let child;
   let peakSampledRssBytes = 0;
+  let peakProcRssBytes = 0;
   let stopReason = null;
   let result = null;
   let totalDeadline;
@@ -109,6 +112,7 @@ async function supervise(mib, hang) {
         const status = await fs.readFile(`/proc/${child.pid}/status`, 'utf8');
         const rss = Number(status.match(/^VmRSS:\s+(\d+) kB$/m)?.[1] || 0) * 1024;
         peakSampledRssBytes = Math.max(peakSampledRssBytes, rss);
+        peakProcRssBytes = Math.max(peakProcRssBytes, rss);
         if (rss > recoveryCaptureLimits.maxRssBytes) stop('rss-limit');
       } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ESRCH') stop('rss-monitor-error'); }
       finally { reading = false; }
@@ -122,7 +126,7 @@ async function supervise(mib, hang) {
     } else if (stopReason || exit.code !== 0 || !result?.ok) throw new Error(`Qualification failed: ${stopReason || diagnostic || JSON.stringify(exit)}`);
     const peak = Math.max(peakSampledRssBytes, result.processPeakRssBytes || 0);
     if (peak > recoveryCaptureLimits.maxRssBytes) throw new Error(`Peak RSS exceeds guard: ${peak}`);
-    return { ...result, peakRssBytes: peak, linuxProcMonitor: process.platform === 'linux', childExitConfirmed: true };
+    return { ...result, peakRssBytes: peak, peakProcRssBytes, linuxProcMonitor: process.platform === 'linux', childExitConfirmed: true };
   } finally {
     clearTimeout(totalDeadline); clearTimeout(captureDeadline); clearTimeout(forceKill); clearInterval(monitor);
     await removeOwnedFixture(root, identity);
