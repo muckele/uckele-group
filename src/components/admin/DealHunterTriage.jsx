@@ -99,7 +99,7 @@ function EvidenceDrawer({ detail, loading, error }) {
           <summary className="cursor-pointer text-sm font-semibold text-ink">
             {dimension.label}
             <span className="ml-2 font-normal text-ink/62">
-              {dimension.contribution > 0 ? `+${dimension.contribution}` : dimension.contribution} points · {dimension.verdict}
+              {dimension.contribution > 0 ? `+${dimension.contribution}` : dimension.contribution} points{dimension.verdict ? ` · ${dimension.verdict}` : ''}
             </span>
           </summary>
           {dimension.rules?.length > 0 ? (
@@ -110,7 +110,7 @@ function EvidenceDrawer({ detail, loading, error }) {
                 </li>
               ))}
             </ul>
-          ) : <p className="mt-3 text-sm text-ink/62">No rule in this dimension applied to this listing.</p>}
+          ) : <p className="mt-3 text-sm text-ink/62">{Array.isArray(dimension.rules) ? 'No rule in this dimension applied to this listing.' : 'Per-rule contributions were not supplied.'}</p>}
 
           {dimension.evidence?.length > 0 ? (
             <div className="mt-3 space-y-1">
@@ -121,6 +121,7 @@ function EvidenceDrawer({ detail, loading, error }) {
                     <Chip tone={row.evidenceClass === 'contradicted' ? 'danger' : row.evidenceClass === 'missing' ? 'warning' : 'default'}>
                       {row.evidenceClass}
                     </Chip>{' '}
+                    {!Array.isArray(dimension.rules) && row.ruleLabel ? <><span className="font-semibold">{row.ruleLabel}</span>{' · '}</> : null}
                     {row.field ? <span className="font-semibold">{row.field}</span> : null}
                     {row.value !== null && row.value !== undefined && row.value !== '' ? <> = {String(row.value)}</> : null}
                     {row.terms?.length > 0 ? <> · matched {row.terms.slice(0, 4).join(', ')}</> : null}
@@ -188,8 +189,9 @@ export default function DealHunterTriage({ readOnly = false }) {
     try {
       const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}`, { credentials: 'same-origin' });
       const result = await response.json();
-      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to load the score explanation.');
-      setDetail({ data: result, loading: false, error: '' });
+      if (!response.ok || result.success === false || !result.opportunity
+        || (!result.score && !Array.isArray(result.dimensions))) throw new Error(result.error || 'Unable to load the score explanation.');
+      setDetail({ data: result.score ? { ...result.score, opportunity: result.opportunity } : result, loading: false, error: '' });
     } catch (detailError) {
       setDetail({ data: null, loading: false, error: detailError.message || 'Unable to load the score explanation.' });
     }

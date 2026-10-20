@@ -153,7 +153,24 @@ h6 {
 }
 
 .admin-workspace-shell {
-  @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8 xl:px-10;
+  @apply mx-auto w-full px-4 sm:px-6 lg:px-8 xl:px-10;
+}
+
+/* The priority shortlist responds to its available width beside the sidebar. */
+.priority-shortlist {
+  container: priority-shortlist / inline-size;
+}
+
+@container priority-shortlist (min-width: 54rem) {
+  .priority-opportunity-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container priority-shortlist (min-width: 84rem) {
+  .priority-opportunity-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 .admin-app {
@@ -175,11 +192,11 @@ h6 {
 }
 
 .admin-topbar-inner {
-  @apply mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8;
+  @apply mx-auto flex items-center justify-between gap-4 px-4 py-3 sm:px-6 lg:px-8;
 }
 
 .admin-page-header {
-  @apply mx-auto w-full max-w-7xl px-4 pt-6 sm:px-6 lg:px-8 xl:px-10;
+  @apply mx-auto w-full px-4 pt-6 sm:px-6 lg:px-8 xl:px-10;
 }
 
 .admin-page-header-card {
@@ -691,12 +708,6 @@ textarea {
 }
 
 @media (min-width: 1536px) {
-  .admin-workspace-shell,
-  .admin-page-header,
-  .admin-topbar-inner {
-    max-width: 82rem;
-  }
-
   .admin-stat-grid {
     grid-template-columns: repeat(7, minmax(0, 1fr));
   }

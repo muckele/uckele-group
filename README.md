@@ -194,6 +194,47 @@ For the CRM follow-up rollout, provider receiving setup, compliance review, moni
 
 GitHub Actions installs dependencies, audits production dependencies, lints, runs backend and UI tests, builds the production application, installs Chromium, and runs Playwright smoke tests. New storage behavior should have provider-parity coverage where practical, and security-sensitive workflows should include integration tests that exercise the HTTP boundary.
 
+`npm run build && npm run test:owner-flow` runs the FL05 backend-connected synthetic
+walkthrough with the already installed Playwright Chromium. It uses real local
+authentication/routes and a new SQLite fixture, private temporary HOME, paused
+automation, and denied external network boundaries. It never starts workers or
+uses an existing database. The runner prints its evidence directory, including
+screenshots, trace, source/build identity, timings and verified process cleanup.
+Browser plugin not available: this workflow uses regular Playwright. It requires
+POSIX process groups and at least 11 GiB free disk space; no dependency installation
+is performed by the runner. External Google font links are removed from fixture
+HTML so rendering uses offline fallback fonts.
+
+The walkthrough is local synthetic evidence, not owner-pilot or release acceptance.
+It now requires CRM Restore to clear the exact linked canonical Pass atomically,
+retain decision history and return the lead to All active after reload. Outreach
+stays stopped. The original failing scenario is preserved as historical evidence;
+the runner no longer reports that failure as an accepted `knownGaps` result.
+PostgreSQL fresh/upgrade and concurrent identity-writer parity are required CI
+checks, using a disposable network-isolated container. No project database
+migration is applied by these tests. Human owner adoption, deployment, mailbox
+qualification and live-send approval remain separate gates.
+
+`npm run test:owner-volume` reuses that isolated runner without launching a
+browser. It verifies an authenticated 1000-row CSV upload and over-limit rejection,
+then measures queue/detail/archive HTTP reads with 1000 synthetic current projection
+rows and 5000 historical ineligible archives. Its evidence directory contains
+30-sample latency observations, response sizes, RSS, representative archive query
+plan and protected-state checks. Timings are observations rather than absolute
+CI timing thresholds or production claims. The imported CSV is retained with
+scoring explicitly deferred when required sources are unavailable; this check
+does not claim a complete importer/reimport lifecycle or PostgreSQL volume parity.
+
+`npm run test:browser-volume` renders the same 1000-current/5000-archive fixture in
+Chromium at desktop and narrow viewports. It verifies pagination/search, bounded
+responses and DOM rows, lazy detail reads, real scrolling, dialog focus and Escape
+recovery, and read-only historical archive detail after current-score eligibility
+is lost. It records ten samples per repeated search/detail/page action, long tasks
+and renderer heap/DOM observations. Input-to-verified-render includes assertion
+polling and two animation frames; it is not standardized INP, production p95,
+mobile-device performance or leak proof. Screenshots/trace, network sizes and
+protected-state checks are retained in the runner's evidence directory.
+
 ## Privacy and security notes
 
 - Do not commit `.env`, database files, uploaded documents, backup bundles, session secrets, provider credentials, or exported CRM data.

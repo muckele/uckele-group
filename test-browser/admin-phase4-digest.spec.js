@@ -66,7 +66,7 @@ const briefingRows = [
   }),
 ];
 
-function healthyDigest(mode = 'healthy') {
+function healthyDigest(mode = 'healthy', rows = briefingRows) {
   const optionalWarnings = mode === 'optional-degraded' ? [{
     sourceId: 'deal-os',
     classification: 'stale',
@@ -80,7 +80,7 @@ function healthyDigest(mode = 'healthy') {
     notificationType: 'normal-digest',
     sourceAuthority: { requiredHealthy: true, blockingIssues: [], optionalWarnings },
     summary: { needsReview: 7, highPriority: 5, watchlist: 3, lowConfidence: 2, currentOpportunities: 19 },
-    topOpportunities: briefingRows,
+    topOpportunities: rows,
     job: { status: 'completed', attemptCount: 1, completedAt: '2026-09-05T15:02:00.000Z', notificationType: 'normal-digest' },
     actionsAllowed: true,
     links: { inbox: '/admin/deal-hunter', operations: '/admin/deal-hunter?view=operations' },
@@ -127,7 +127,7 @@ function queueResponse(state) {
     summary: { needsReview: rows.length, highPriority: rows.length, watchlist: 0, lowConfidence: 0, currentOpportunities: rows.length },
     views: ['needs-review', 'high-priority', 'watchlist', 'low-confidence', 'dismissed', 'all'],
     priorities: ['urgent', 'high', 'normal', 'watch'],
-    dailyDigest: state.sourceMode === 'required-failure' ? requiredFailureDigest() : healthyDigest(state.sourceMode),
+    dailyDigest: state.sourceMode === 'required-failure' ? requiredFailureDigest() : healthyDigest(state.sourceMode, state.briefingRows),
   };
 }
 
@@ -442,6 +442,224 @@ async function expectBriefingCounts(page) {
     const labelNode = briefing.getByText(label, { exact: true });
     await expect(labelNode.locator('..')).toContainText(value);
   }
+}
+
+const queueTabs = [['inbox', 'Fresh-first Inbox'], ['needs-review', 'Needs Review'], ['high-priority', 'High Priority'], ['watchlist', 'Watchlist'], ['low-confidence', 'Low Confidence'], ['dismissed', 'Passed'], ['all', 'All Current']];
+
+for (const width of [1920, 390]) {
+  test(`queue navigation remains present across all tabs, history and empty results at ${width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1080 });
+    const state = await installFixture(page);
+    await page.route('**/api/admin/deal-hunter/triage?*', async route => {
+      const params = new URL(route.request().url()).searchParams;
+      const view = params.get('view');
+      const label = queueTabs.find(([id]) => id === view)[1];
+      const rows = params.get('search') ? [] : [opportunity({ name: `Navigation result ${label}`, dismissed: view === 'dismissed' })];
+      await fulfillJson(route, state, { ...queueResponse(state), view, rows, total: rows.length,
+        areas: view === 'inbox' ? [{ id: 'new-important', total: rows.length, rows, counts: {}, revision: 'navigation' }] : undefined });
+    });
+    await page.goto('/admin/deal-hunter');
+    const tabs = page.getByRole('tablist', { name: 'Opportunity queues' });
+    const observations = [];
+    for (const [id, label] of queueTabs) {
+      if (id !== 'inbox') {
+        const response = page.waitForResponse(r => new URL(r.url()).pathname.endsWith('/triage') && new URL(r.url()).searchParams.get('view') === id);
+        await tabs.getByRole('tab', { name: label, exact: true }).click();
+        await response;
+      }
+      await expect(page.getByRole('button', { name: `Open Navigation result ${label}`, exact: true })).toBeVisible();
+      observations.push({ view: id, url: page.url(), header: await page.getByRole('heading', { name: 'Acquisition Inbox', exact: true }).count(),
+        areaNavigation: await page.getByRole('navigation', { name: 'Fresh Inbox areas' }).count(),
+        tabs: await tabs.count(), search: await page.getByRole('searchbox', { name: 'Search opportunities' }).count(),
+        briefing: await page.getByRole('region', { name: 'Morning briefing' }).count(),
+        controlsBeforeBriefing: await page.getByRole('searchbox', { name: 'Search opportunities' }).evaluate(element => Boolean(element.compareDocumentPosition(document.querySelector('[aria-labelledby=morning-briefing-heading]')) & Node.DOCUMENT_POSITION_FOLLOWING)) });
+      await page.screenshot({ path: testInfo.outputPath(`navigation-${id}-${width}.png`) });
+    }
+    await testInfo.attach('navigation-observations', { body: JSON.stringify(observations, null, 2), contentType: 'application/json' });
+    for (const observation of observations) expect(observation).toMatchObject({ header: 1, areaNavigation: 1, tabs: 1, search: 1, briefing: 1, controlsBeforeBriefing: true });
+    for (let index = queueTabs.length - 2; index >= 0; index -= 1) {
+      await page.goBack();
+      await expect(tabs.getByRole('tab', { name: queueTabs[index][1], exact: true })).toHaveAttribute('aria-selected', 'true');
+      await expect(page.getByRole('button', { name: `Open Navigation result ${queueTabs[index][1]}`, exact: true })).toBeVisible();
+      await expect(page.getByRole('navigation', { name: 'Fresh Inbox areas' })).toBeVisible();
+    }
+    for (let index = 1; index < queueTabs.length; index += 1) {
+      await page.goForward();
+      await expect(tabs.getByRole('tab', { name: queueTabs[index][1], exact: true })).toHaveAttribute('aria-selected', 'true');
+      await expect(page.getByRole('button', { name: `Open Navigation result ${queueTabs[index][1]}`, exact: true })).toBeVisible();
+    }
+    for (const [id, label] of queueTabs) {
+      await tabs.getByRole('tab', { name: label, exact: true }).click();
+      await page.getByRole('searchbox', { name: 'Search opportunities' }).fill('empty-query');
+      await expect(page.getByText(id === 'inbox' ? 'No opportunities in this area.' : 'No opportunities in this view.', { exact: true })).toBeVisible();
+      await expect(page.getByRole('navigation', { name: 'Fresh Inbox areas' })).toBeVisible();
+      await expect(tabs.getByRole('tab', { name: label, exact: true })).toHaveAttribute('aria-selected', 'true');
+      await page.getByRole('searchbox', { name: 'Search opportunities' }).fill('');
+    }
+    await page.getByRole('button', { name: 'New & Important', exact: true }).click();
+    await expect(tabs.getByRole('tab', { name: 'Fresh-first Inbox', exact: true })).toHaveAttribute('aria-selected', 'true');
+    await page.reload();
+    await expect(tabs.getByRole('tab', { name: 'Fresh-first Inbox', exact: true })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('navigation', { name: 'Fresh Inbox areas' })).toBeVisible();
+    await assertNoOutreachOrAuthoritySideEffects(page, state);
+  });
+}
+
+test('queue history resets pagination and inbox cursors before fetching the restored view', async ({ page }, testInfo) => {
+  const state = await installFixture(page);
+  const requests = [];
+  await page.route('**/api/admin/deal-hunter/triage?*', async route => {
+    const params = new URL(route.request().url()).searchParams;
+    const view = params.get('view');
+    const pageNumber = Number(params.get('page'));
+    const area = params.get('area');
+    const cursor = params.get('cursor');
+    requests.push({ view, page: pageNumber, area, cursor });
+    const rows = [opportunity({ name: `History ${view} ${area || 'queue'} page ${pageNumber}${cursor ? ' continued' : ''}` })];
+    await fulfillJson(route, state, { ...queueResponse(state), view, rows, page: pageNumber, total: 75, totalPages: 3,
+      areas: view === 'inbox' ? [{ id: area === 'inbox' ? 'new-important' : area, total: 75, rows,
+        nextCursor: cursor ? '' : 'history-next-cursor', counts: {}, revision: 'history' }] : undefined });
+  });
+  const expectHistoryRow = (name) => expect(page.getByRole('button', { name: `Open ${name}`, exact: true })).toBeVisible();
+  await page.goto('/admin/deal-hunter');
+  await expectHistoryRow('History inbox inbox page 1');
+  await page.getByRole('button', { name: 'Research', exact: true }).click();
+  await expectHistoryRow('History inbox research page 1');
+  await page.getByRole('button', { name: 'Next page', exact: true }).click();
+  await expectHistoryRow('History inbox research page 1 continued');
+  await page.getByRole('tab', { name: 'High Priority', exact: true }).click();
+  await expectHistoryRow('History high-priority queue page 1');
+  await page.getByRole('button', { name: 'Next page', exact: true }).click();
+  await expectHistoryRow('History high-priority queue page 2');
+  await page.getByRole('tab', { name: 'Watchlist', exact: true }).click();
+  await expectHistoryRow('History watchlist queue page 1');
+  await page.getByRole('button', { name: 'Next page', exact: true }).click();
+  await expectHistoryRow('History watchlist queue page 2');
+  await page.getByRole('button', { name: 'Next page', exact: true }).click();
+  await expectHistoryRow('History watchlist queue page 3');
+  let start = requests.length;
+  await page.goBack();
+  await expectHistoryRow('History high-priority queue page 1');
+  expect(requests.slice(start).length).toBeGreaterThan(0);
+  expect(requests.slice(start).every(request => request.view === 'high-priority' && request.page === 1 && request.area === null && request.cursor === null)).toBe(true);
+  start = requests.length;
+  await page.goBack();
+  await expectHistoryRow('History inbox inbox page 1');
+  expect(requests.slice(start).length).toBeGreaterThan(0);
+  expect(requests.slice(start).every(request => request.view === 'inbox' && request.page === 1 && request.area === 'inbox' && request.cursor === null)).toBe(true);
+  await page.getByRole('button', { name: 'Research', exact: true }).click();
+  await expectHistoryRow('History inbox research page 1');
+  await page.getByRole('button', { name: 'Next page', exact: true }).click();
+  await expectHistoryRow('History inbox research page 1 continued');
+  start = requests.length;
+  await page.goForward();
+  await expectHistoryRow('History high-priority queue page 1');
+  expect(requests.slice(start).length).toBeGreaterThan(0);
+  expect(requests.slice(start).every(request => request.view === 'high-priority' && request.page === 1 && request.area === null && request.cursor === null)).toBe(true);
+  start = requests.length;
+  await page.goBack();
+  await expectHistoryRow('History inbox inbox page 1');
+  expect(requests.slice(start).length).toBeGreaterThan(0);
+  expect(requests.slice(start).every(request => request.view === 'inbox' && request.page === 1 && request.area === 'inbox' && request.cursor === null)).toBe(true);
+  await page.getByRole('tab', { name: 'Watchlist', exact: true }).click();
+  await expectHistoryRow('History watchlist queue page 1');
+  await page.getByRole('button', { name: 'Research', exact: true }).click();
+  await expectHistoryRow('History inbox research page 1');
+  await expect(page.getByRole('button', { name: 'Research', exact: true })).toHaveAttribute('aria-current', 'page');
+  await testInfo.attach('history-pagination-requests', { body: JSON.stringify(requests, null, 2), contentType: 'application/json' });
+  await assertNoOutreachOrAuthoritySideEffects(page, state);
+});
+
+for (const mode of ['required-failure', 'optional-degraded', 'queue-unavailable']) {
+  test(`queue navigation and recovery controls remain available with ${mode}`, async ({ page }) => {
+    const state = await installFixture(page, { sourceMode: mode === 'queue-unavailable' ? 'healthy' : mode });
+    if (mode === 'queue-unavailable') await page.route('**/api/admin/deal-hunter/triage?*', route => fulfillJson(route, state, { success: false, error: 'Synthetic queue unavailable.' }, 503));
+    await page.goto('/admin/deal-hunter');
+    for (const [, label] of queueTabs) {
+      await page.getByRole('tab', { name: label, exact: true }).click();
+      await expect(page.getByRole('heading', { name: 'Acquisition Inbox', exact: true })).toBeVisible();
+      await expect(page.getByRole('navigation', { name: 'Fresh Inbox areas' })).toBeVisible();
+      await expect(page.getByRole('tablist', { name: 'Opportunity queues' })).toBeVisible();
+      await expect(page.getByRole('searchbox', { name: 'Search opportunities' })).toBeVisible();
+      await expect(page.getByRole('combobox', { name: 'Confidence', exact: true })).toBeVisible();
+      const briefing = page.getByRole('region', { name: 'Morning briefing' });
+      if (mode === 'required-failure') {
+        await expect(briefing.getByText('ACTION REQUIRED', { exact: true })).toBeVisible();
+        await expect(briefing.getByRole('link', { name: 'Open Operations' })).toBeVisible();
+        await expect(briefing.getByRole('list', { name: 'Morning briefing opportunities' })).toHaveCount(0);
+      } else if (mode === 'optional-degraded') {
+        await expect(briefing.getByRole('status', { name: 'Optional source status' })).toBeVisible();
+      } else {
+        await expect(page.getByRole('alert')).toContainText('Synthetic queue unavailable.');
+        await expect(page.getByRole('button', { name: label === 'Fresh-first Inbox' ? 'Refresh this area' : 'Retry loading opportunities', exact: true })).toBeVisible();
+      }
+    }
+    if (mode !== 'queue-unavailable') await assertNoOutreachOrAuthoritySideEffects(page, state);
+    else {
+      expect(state.pageErrors).toEqual([]);
+      expect(state.consoleErrors.every(message => message === 'Failed to load resource: the server responded with a status of 503 (Service Unavailable)')).toBe(true);
+      expect(state.apiRequests.every(request => request.method === 'GET')).toBe(true);
+      expect(state.offOriginRequests).toEqual([]);
+      expect(state.unexpectedRequests).toEqual([]);
+    }
+  });
+}
+
+for (const [width, columns] of [[2560, 3], [1920, 3], [1440, 2], [1280, 2], [1024, 1], [390, 1], [320, 1]]) {
+  test(`priority shortlist uses ${columns} readable columns at ${width}px with aligned actions`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1080 });
+    const state = await installFixture(page);
+    state.rows = Array.from({ length: 5 }, (_, index) => opportunity({
+      opportunityId: `tile-${index}`, dealKey: `tile-deal-${index}`,
+      name: index === 2 ? 'Regional Fire Inspection and Suppression Services with Long Established Customer Relationships' : `Priority business ${index + 1}`,
+      listingUrl: index === 3 ? '' : `https://broker.example/tile-${index}`,
+      topStrength: index === 0 ? 'Recurring inspections.' : 'Recurring commercial inspection contracts and dense service routes support continued demand.',
+      topConcern: index === 0 ? '' : 'Customer concentration and the proposed management transition require supporting evidence before pursuit.',
+      contradictionCount: index === 1 ? 2 : 0,
+    }));
+    state.briefingRows = state.rows;
+    await page.goto('/admin/deal-hunter');
+    const list = page.getByRole('list', { name: 'Morning briefing opportunities', exact: true });
+    await expect(list.getByRole('listitem')).toHaveCount(5);
+    const layout = await list.evaluate((element) => ({
+      columns: getComputedStyle(element).gridTemplateColumns.split(' ').length,
+      cards: [...element.children].map((card) => {
+        const bounds = card.getBoundingClientRect();
+        const button = card.querySelector('button[aria-label^="Pursue shortlist lead"]');
+        return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height,
+          actionY: button.getBoundingClientRect().y,
+          titlePx: parseFloat(getComputedStyle(card.querySelector('button[aria-label^="Open shortlist lead"]')).fontSize),
+          bodyPx: parseFloat(getComputedStyle([...card.querySelectorAll('p')].find(p => p.textContent.startsWith('Why it fits:'))).fontSize),
+          overflow: card.scrollWidth > card.clientWidth };
+      }),
+      documentOverflow: document.documentElement.scrollWidth > innerWidth,
+      zoom: getComputedStyle(document.documentElement).zoom,
+    }));
+    expect(layout.columns).toBe(columns);
+    expect(layout.documentOverflow).toBe(false);
+    expect(layout.zoom).toBe('1');
+    for (const card of layout.cards) {
+      expect(card.titlePx).toBeGreaterThanOrEqual(16);
+      expect(card.bodyPx).toBeGreaterThanOrEqual(14);
+      expect(card.overflow).toBe(false);
+      if (columns > 1) expect(card.width).toBeGreaterThanOrEqual(400);
+    }
+    for (let index = 0; index < layout.cards.length; index += columns) {
+      const row = layout.cards.slice(index, index + columns);
+      for (const card of row) {
+        expect(Math.abs(card.y - row[0].y)).toBeLessThan(1);
+        expect(Math.abs(card.height - row[0].height)).toBeLessThan(1);
+        expect(Math.abs(card.actionY - row[0].actionY)).toBeLessThan(1);
+      }
+    }
+    expect((await page.locator('.admin-workspace-shell').boundingBox()).width).toBe(width);
+    await testInfo.attach('priority-layout', { body: JSON.stringify({ width, ...layout }, null, 2), contentType: 'application/json' });
+    await list.screenshot({ path: testInfo.outputPath(`priority-tiles-${width}.png`) });
+    assertNoPrivateProjection(state);
+    await assertNoOutreachOrAuthoritySideEffects(page, state);
+    expect(state.consoleErrors).toEqual([]);
+    expect(state.pageErrors).toEqual([]);
+  });
 }
 
 test('healthy administrator can reach the legacy briefing and drawer at desktop and mobile widths', async ({ page }) => {

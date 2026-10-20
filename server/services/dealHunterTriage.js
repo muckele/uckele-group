@@ -28,12 +28,14 @@ import {
   getEffectiveOpportunityFacts,
   normalizeOpportunityFactAuthorityValue,
   opportunityFactFields,
+  opportunityFactCrmSnapshotFields,
   opportunitySourceObservationFields,
 } from './dealHunterOpportunityFacts.js';
 import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.js';
 import { normalizeCanonicalCimRequestId } from './cimRequestIdPolicy.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 import { projectDealHunterBrokerMaterials } from './dealHunterBrokerMaterials.js';
+import { financialFactFields, parseFinancialFact } from '../../shared/opportunityFinancialFacts.js';
 import { orchestratePursuitEnrollment } from './pursueCimEnrollment.js';
 
 export const triageViews = Object.freeze([
@@ -737,7 +739,7 @@ function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceR
       primarySubmissionId: currentOpportunity?.primary_submission_id
         ? detailText(currentOpportunity.primary_submission_id, 240) : null,
       submissionFactSnapshot: currentOpportunity?.primary_submission_id
-        ? Object.fromEntries(opportunityFactFields.map((field) => [
+        ? Object.fromEntries(opportunityFactCrmSnapshotFields.map((field) => [
             field, crmFacts.find((fact) => fact.field === field)?.value ?? null,
           ])) : null,
     },
@@ -841,9 +843,28 @@ export async function getTriageOpportunityDetail({
   ) {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
-  const [currentOpportunity, score] = await Promise.all([
+  const [currentOpportunity, currentScore] = await Promise.all([
     storage.getCurrentDealHunterOpportunity(id), storage.getCurrentDealHunterOpportunityScore(id),
   ]);
+  let score = currentScore;
+  let archivedDispositions = null;
+  // Archive search intentionally survives source/current-score eligibility loss.
+  // Admit its retained evidence only for the exact active canonical Pass, never
+  // as current action authority or as a fallback for unarchived/superseded rows.
+  if (currentOpportunity?.opportunity_id === id && !score
+    && typeof storage.getDealHunterOpportunityScore === 'function'
+    && typeof storage.listDealHunterDispositions === 'function') {
+    const retained = await storage.getDealHunterOpportunityScore(id);
+    if (retained?.opportunity_id === id && typeof retained.deal_key === 'string' && retained.deal_key) {
+      const rows = (await storage.listDealHunterDispositions({ dealKeys: [retained.deal_key], limit: 20 }))
+        .filter((row) => row.deal_key === retained.deal_key);
+      if (currentDetailDisposition(rows).state === 'dismissed'
+        && rows.every((row) => !row.submission_id || row.submission_id === currentOpportunity.primary_submission_id)) {
+        score = retained;
+        archivedDispositions = rows;
+      }
+    }
+  }
   if (!currentOpportunity || !score) return { ok: false, status: 404, error: 'No current score has been recorded for this opportunity.' };
   const evidence = await storage.listDealHunterScoreEvidence?.(id, { limit: 500 }) || [];
 
@@ -873,7 +894,7 @@ export async function getTriageOpportunityDetail({
     currentOpportunity.primary_submission_id && storage.listCrmActivityEvents
       ? storage.listCrmActivityEvents({ submissionId: currentOpportunity.primary_submission_id, limit: 100 })
       : [],
-    storage.listDealHunterDispositions?.({ dealKeys: [score.deal_key], limit: 20 }) || [],
+    archivedDispositions ?? (storage.listDealHunterDispositions?.({ dealKeys: [score.deal_key], limit: 20 }) || []),
     currentOpportunity.primary_submission_id && storage.listCrmCommunications
       ? storage.listCrmCommunications({ submissionId: currentOpportunity.primary_submission_id, page: 1, pageSize: 100 })
       : { rows: [] },
@@ -925,6 +946,24 @@ export async function getTriageOpportunityDetail({
     materialEvent,
     annualProfitEvidence,
   });
+  const financialProperties = { annual_profit: 'annualProfit', annual_revenue: 'annualRevenue', asking_price: 'askingPrice' };
+  const correctedFinancialFields = [];
+  for (const field of financialFactFields) {
+    const fact = effectiveFacts[field];
+    const financial = fact?.provenance === 'operator' ? parseFinancialFact(field, fact.value) : null;
+    if (!financial) continue;
+    const property = financialProperties[field];
+    opportunity.financials[property] = Number(financial.amount);
+    opportunity.financials[`${property}Evidence`] = { metric: financial.metric, currency: financial.currency,
+      period: financial.period, evidenceSource: financial.evidenceSource, provenance: 'operator', verified: fact.verified };
+    correctedFinancialFields.push(field);
+  }
+  if (correctedFinancialFields.length) {
+    // Keep the stored score/source evidence, but do not display an old derived
+    // multiple as if it used the newly corrected amount, metric or currency.
+    opportunity.financials.profitMultiple = null;
+    opportunity.financialCorrectionFields = correctedFinancialFields;
+  }
   const projectedScore = projectScore(score, byDimension, unattributed);
   const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({
     id: detailText(communication.id, 200), direction: detailText(communication.direction, 80), channel: detailText(communication.channel, 80),
@@ -941,7 +980,17 @@ export async function getTriageOpportunityDetail({
   return {
     ok: true,
     status: 200,
+    ...(archivedDispositions ? { archivedReadOnly: true } : {}),
     opportunity,
+    ...(!archivedDispositions && currentOpportunity.primary_submission_id === null && opportunity.dismissed
+      && Number.isSafeInteger(currentOpportunity.campaign_authority_revision) && currentOpportunity.campaign_authority_revision > 0
+      && dispositions.filter((item) => item.disposition === 'dismissed').length === 1
+      && dispositions.some((item) => item.disposition === 'dismissed' && item.deal_key === score.deal_key && item.submission_id === null
+        && typeof item.id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.id)
+        && typeof item.updated_at === 'string' && item.updated_at.length <= 80 && Number.isFinite(Date.parse(item.updated_at)))
+      ? { restoreAuthority: { expectedCampaignAuthorityRevision: currentOpportunity.campaign_authority_revision,
+        passId: dispositions.find((item) => item.disposition === 'dismissed').id,
+        passUpdatedAt: dispositions.find((item) => item.disposition === 'dismissed').updated_at } } : {}),
     brokerMaterials,
     pursueCimReleaseAvailable: Boolean(pursueCimDiscovery?.decision
       || pursueCimDiscovery?.enrollment || pursueCimDiscovery?.campaign),
@@ -963,7 +1012,7 @@ export async function getTriageOpportunityDetail({
     },
     history: {
       activities: activities.slice(0, 100).map((item) => ({ id: detailText(item.id, 200), eventType: detailText(item.event_type, 80), summary: detailText(item.summary, 500), createdAt: detailText(item.created_at, 80), actor: detailText(item.actor, 160) })),
-      dispositions: dispositions.slice(0, 20).map((item) => ({ id: detailText(item.id, 200), disposition: detailText(item.disposition, 80), reason: detailText(item.reason, 160), note: detailText(item.note, 500), dismissedAt: detailText(item.dismissed_at, 80), dismissedBy: detailText(item.dismissed_by, 160) })),
+      dispositions: dispositions.slice(0, 20).map((item) => ({ id: detailText(item.id, 200), disposition: detailText(item.disposition, 80), reason: detailText(item.reason, 160), note: detailText(item.note, 500), dismissedAt: detailText(item.dismissed_at, 80), dismissedBy: detailText(item.dismissed_by, 160), restoredAt: detailText(item.restored_at, 80), restoredBy: detailText(item.restored_by, 160) })),
       operatorFacts: sanitizedOperatorFacts.map(projectOperatorFact),
       operatorState: { priority: detailText(opportunity.operatorPriority, 40), note: detailText(opportunity.operatorNote, 2000), reviewed: Boolean(opportunity.reviewed), reviewedAt: detailText(opportunity.reviewedAt, 80), reviewedBy: detailText(opportunity.reviewedBy, 160) },
     },
@@ -1133,7 +1182,9 @@ export async function recordAcquisitionOwnerCommand({
   }
   const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
   if (sourceGate) return sourceGate;
-  const normalizedReason = action === 'pass' ? normalizeDealHunterDispositionReason(reason) : null;
+  // The owner command accepts bounded free text. Legacy disposition-category
+  // normalization would erase distinct reasons and collapse replay authority.
+  const normalizedReason = action === 'pass' ? reason.trim() : null;
   if (action === 'pass' && !normalizedReason) {
     return { ok: false, status: 400, error: 'A disposition reason is required.' };
   }
@@ -1415,5 +1466,6 @@ export async function restoreDealHunterOpportunityWithInboxAuthority({
 } = {}) {
   const authority = await resolveDealHunterDispositionAuthority({ dealKey, storage });
   if (!authority.ok) return authority;
+  if (authority.canonical) return { ok: false, status: 409, error: 'Restore this current opportunity from its reviewed Acquisition Inbox detail or linked CRM record.' };
   return restoreDealHunterOpportunity({ dealKey: authority.dealKey, actor, storage });
 }

@@ -1,10 +1,11 @@
+import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRestore.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
   normalizeDealHunterSourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
-  opportunityFactFields,
+  opportunityFactCrmSnapshotFields,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
@@ -783,6 +784,7 @@ function normalizeAtomicMutationResult(operation, data) {
   const normalizers = {
     insert_submission: normalizeSubmissionRow,
     update_submission: normalizeSubmissionRow,
+    restore_submission: normalizeSubmissionRow,
     insert_secure_upload_request: normalizeUploadRequestRow,
     finalize_secure_document_upload: normalizeUploadRequestRow,
     update_secure_upload_request: normalizeUploadRequestRow,
@@ -1847,12 +1849,13 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const usesLifecycleSubmissionFields = operation === 'update_submission'
         && lifecycleSubmissionFields.some((field) => Object.hasOwn(payload?.values || {}, field));
       const isSubmissionInsert = operation === 'insert_submission';
-      const rpcName = isSubmissionInsert
+      const isRestore = operation === 'restore_submission';
+      const rpcName = isRestore ? 'restore_archived_submission_with_crm_activity' : isSubmissionInsert
         ? 'insert_submission_with_crm_activity'
         : communicationsOperations.has(operation) || usesLifecycleSubmissionFields
           ? 'mutate_communications_with_crm_activity'
           : 'mutate_with_crm_activity';
-      const rpcPayload = isSubmissionInsert
+      const rpcPayload = isSubmissionInsert || isRestore
         ? { p_payload: payload || {}, p_activity: activity }
         : { p_operation: operation, p_payload: payload || {}, p_activity: activity };
       const { data, error } = await client.rpc(rpcName, rpcPayload);
@@ -4273,7 +4276,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if ((expectedSubmissionId === null) !== (expectedSnapshot === null)
         || (expectedSnapshot !== null && (
           typeof expectedSnapshot !== 'object' || Array.isArray(expectedSnapshot)
-          || Object.keys(expectedSnapshot).sort().join(',') !== [...opportunityFactFields].sort().join(',')
+          || Object.keys(expectedSnapshot).sort().join(',') !== [...opportunityFactCrmSnapshotFields].sort().join(',')
           || Object.values(expectedSnapshot).some((value) => value !== null
             && (typeof value !== 'string' || [...value].length > 4000))
         ))) {
@@ -5045,6 +5048,13 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const { data, error } = await query.limit(1).maybeSingle();
       if (error) throw error;
       return normalizeDealHunterDispositionRow(data);
+    },
+
+    async restoreCurrentUnlinkedOpportunity(input) {
+      normalizeCurrentUnlinkedRestore(input);
+      const { data, error } = await client.rpc('restore_current_unlinked_opportunity', { p_input: input });
+      if (error) throw error;
+      return data;
     },
 
     async upsertDealHunterDisposition(record = {}) {

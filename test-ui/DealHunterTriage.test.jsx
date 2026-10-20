@@ -332,3 +332,37 @@ describe('Deal Hunter triage queue', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Opportunity scoring storage is unavailable.');
   });
 });
+
+
+test('legacy score explanation accepts the consolidated API detail without a success envelope', async () => {
+  const legacy = detailResponse();
+  const { success: _success, ok: _ok, opportunity, ...score } = legacy;
+  vi.stubGlobal('fetch', mockFetch([
+    ['/api/admin/deal-hunter/triage/opp-1', () => ({ opportunity, score })],
+    ['/api/admin/deal-hunter/triage', () => queueResponse([triageRow()])],
+  ]));
+  render(<DealHunterTriage />);
+  fireEvent.click(await screen.findByRole('button', { name: /Why this score/ }));
+  expect(await screen.findByText(/Financial fit/)).toBeVisible();
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+
+test('consolidated score evidence does not claim that omitted per-rule breakdowns mean no rule applied', async () => {
+  vi.stubGlobal('fetch', mockFetch([
+    ['/api/admin/deal-hunter/triage/opp-1', () => ({ opportunity: triageRow(), score: {
+      dimensions: [{ id: 'financial-fit', label: 'Financial fit', contribution: 37, evidence: [{ ruleId: 'profit.in-band', ruleLabel: 'Annual profit inside the target band', evidenceClass: 'observed', field: 'annualProfit', value: '450000', sourceName: 'Owned synthetic source' }] }, { id: 'industry-fit', label: 'Industry fit', contribution: 0, evidence: [] }],
+      confidenceReasons: [], missingEvidence: [], gates: [],
+    } })],
+    ['/api/admin/deal-hunter/triage', () => queueResponse([triageRow()])],
+  ]));
+  render(<DealHunterTriage />);
+  fireEvent.click(await screen.findByRole('button', { name: /Why this score/ }));
+  const dimension = (await screen.findByText('Financial fit')).closest('details'); dimension.open = true;
+  expect(within(dimension).getByText('Annual profit inside the target band')).toBeVisible();
+  expect(within(dimension).queryByText('No rule in this dimension applied to this listing.')).toBeNull();
+  expect(within(dimension).getByText('Per-rule contributions were not supplied.')).toBeVisible();
+  const emptyDimension = screen.getByText('Industry fit').closest('details'); emptyDimension.open = true;
+  expect(within(emptyDimension).getByText('Per-rule contributions were not supplied.')).toBeVisible();
+  expect(within(emptyDimension).queryByText(/retained evidence is shown below/)).toBeNull();
+});

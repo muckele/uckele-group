@@ -33,6 +33,10 @@ import { normalizeDealHunterListingIdentity } from '../services/dealHunterListin
 import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersession.js';
 import { buildFreshInboxAreas, classifyFreshInboxCandidate } from '../services/dealHunterFreshInboxPolicy.js';
 import { createPursueCimSqliteTransitions } from './pursueCimSqliteTransitions.js';
+import { restoreCrmLifecycleInTransaction } from './crmRestoreSqlite.js';
+import { upgradeOperatorFinancialFacts } from './operatorFinancialFactsSqlite.js';
+import { restoreCurrentUnlinkedInTransaction } from './currentUnlinkedRestoreSqlite.js';
+import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRestore.js';
 
 function cimSafetyDigest(...parts) {
   const framed = parts.map((part) => {
@@ -4201,7 +4205,7 @@ export function createSqliteStorage(config, options = {}) {
         CHECK(
           id = trim(id) AND length(id) BETWEEN 1 AND 240
           AND opportunity_id = trim(opportunity_id) AND length(opportunity_id) BETWEEN 1 AND 200
-          AND field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'annual_profit', 'annual_revenue', 'asking_price')
           AND value = trim(value) AND length(value) BETWEEN 1 AND 4000
           AND source = 'operator'
           AND verified IN (0, 1)
@@ -4222,7 +4226,7 @@ export function createSqliteStorage(config, options = {}) {
         SELECT CASE WHEN NOT (
           NEW.id = trim(NEW.id) AND length(NEW.id) BETWEEN 1 AND 240
           AND NEW.opportunity_id = trim(NEW.opportunity_id) AND length(NEW.opportunity_id) BETWEEN 1 AND 200
-          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'annual_profit', 'annual_revenue', 'asking_price')
           AND NEW.value = trim(NEW.value) AND length(NEW.value) BETWEEN 1 AND 4000
           AND NEW.source = 'operator'
           AND NEW.verified IN (0, 1)
@@ -4242,7 +4246,7 @@ export function createSqliteStorage(config, options = {}) {
         SELECT CASE WHEN NOT (
           NEW.id = trim(NEW.id) AND length(NEW.id) BETWEEN 1 AND 240
           AND NEW.opportunity_id = trim(NEW.opportunity_id) AND length(NEW.opportunity_id) BETWEEN 1 AND 200
-          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'annual_profit', 'annual_revenue', 'asking_price')
           AND NEW.value = trim(NEW.value) AND length(NEW.value) BETWEEN 1 AND 4000
           AND NEW.source = 'operator'
           AND NEW.verified IN (0, 1)
@@ -5785,6 +5789,7 @@ export function createSqliteStorage(config, options = {}) {
     "TEXT CHECK(idempotency_key_digest IS NULL OR (length(idempotency_key_digest) = 64 AND idempotency_key_digest NOT GLOB '*[^0-9a-f]*'))");
   ensureColumn(database, 'deal_hunter_opportunity_facts', 'request_digest',
     "TEXT CHECK(request_digest IS NULL OR (length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'))");
+  upgradeOperatorFinancialFacts(database);
   database.exec(`
     CREATE TRIGGER IF NOT EXISTS deal_hunter_opportunity_facts_idempotency_boundary_insert
     BEFORE INSERT ON deal_hunter_opportunity_facts
@@ -7856,7 +7861,7 @@ export function createSqliteStorage(config, options = {}) {
       assertCrmSubmissionWritableInTransaction(activity.submission_id);
     }
 
-    const mutatedSubmissionId = operation === 'update_submission'
+    const mutatedSubmissionId = ['update_submission', 'restore_submission'].includes(operation)
       ? payload.id
       : operation === 'archive_submission'
         ? payload.id || payload.submissionId
@@ -7882,6 +7887,11 @@ export function createSqliteStorage(config, options = {}) {
       }
       insertSubmissionStatement.run(serializeSubmission(payload.submission));
       record = payload.submission;
+    } else if (operation === 'restore_submission') {
+      const result = restoreCrmLifecycleInTransaction(database, payload, activity);
+      if (!result.applied) return result;
+      record = normalizeSubmissionRow(result.record);
+      activity = { ...activity, opportunity_id: result.opportunityId, metadata: result.metadata };
     } else if (operation === 'update_submission') {
       if (Object.hasOwn(payload.values || {}, 'deal_hunter_opportunity_id')) {
         throw new Error('Canonical CRM linkage must use the atomic Deal Hunter link primitive.');
@@ -14789,6 +14799,11 @@ export function createSqliteStorage(config, options = {}) {
         ? database.prepare('SELECT * FROM deal_hunter_dispositions WHERE id = ? LIMIT 1').get(String(id).trim())
         : database.prepare('SELECT * FROM deal_hunter_dispositions WHERE deal_key = ? LIMIT 1').get(String(dealKey).trim());
       return normalizeDealHunterDispositionRow(row);
+    },
+
+    async restoreCurrentUnlinkedOpportunity(input) {
+      normalizeCurrentUnlinkedRestore(input);
+      return database.transaction(() => restoreCurrentUnlinkedInTransaction(database, input)).immediate();
     },
 
     async upsertDealHunterDisposition(record = {}) {

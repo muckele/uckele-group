@@ -34,7 +34,10 @@
     "test": "node --test test/*.test.js",
     "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
     "test:ui": "vitest run test-ui",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test:owner-flow": "node scripts/run-fl05-owner-walkthrough.js",
+    "test:owner-volume": "node scripts/run-fl05-owner-walkthrough.js --volume",
+    "test:browser-volume": "node scripts/run-fl05-owner-walkthrough.js --browser-volume"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",

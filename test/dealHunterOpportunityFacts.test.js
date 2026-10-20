@@ -4,6 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import { upgradeOperatorFinancialFacts } from '../server/storage/operatorFinancialFactsSqlite.js';
+import { normalizeFinancialFact } from '../shared/opportunityFinancialFacts.js';
 
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import * as opportunityFactsModule from '../server/services/dealHunterOpportunityFacts.js';
@@ -11,6 +16,7 @@ import {
   getEffectiveOpportunityFacts,
   buildOpportunitySourceObservationSnapshot,
   opportunityFactFields,
+  opportunityFactCrmSnapshotFields,
   opportunitySourceObservationFields,
   normalizeOpportunityFactField,
   setCurrentOperatorOpportunityFact,
@@ -64,7 +70,7 @@ const submissionsServiceUrl = new URL('../server/services/submissions.js', impor
 const opportunityId = 'opp-facts-1';
 
 function crmFactSnapshot(overrides = {}) {
-  return Object.fromEntries(opportunityFactFields.map((field) => [field, overrides[field] ?? null]));
+  return Object.fromEntries(opportunityFactCrmSnapshotFields.map((field) => [field, overrides[field] ?? null]));
 }
 
 function factEditRevision(campaignAuthorityRevision, primarySubmissionId = null, submissionFactSnapshot = null) {
@@ -552,6 +558,28 @@ function conflictAssignments(definition, target) {
   assert.ok(match, `Missing ${target} conflict update body`);
   return [...match[1].matchAll(/([a-z_]+)\s*=\s*excluded\./g)].map((assignment) => assignment[1]);
 }
+
+test('typed financial operator facts persist with context and exact replay while contact snapshots stay at thirteen fields', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  const value = JSON.stringify({ version: 1, amount: '-425000.00', currency: 'USD', metric: 'ebitda',
+    period: 'annual', evidenceSource: 'Owner-reviewed synthetic statement' });
+  const current = await storage.getCurrentDealHunterOpportunity(opportunityId);
+  const input = { opportunityId, field: 'annual_profit', value, actor: 'fixture-owner', verified: false,
+    note: 'Unverified owner entry', idempotencyKey: factIdempotencyKey(990),
+    expectedRevision: factEditRevision(current.campaign_authority_revision), storage };
+  const first = await setCurrentOperatorOpportunityFact(input);
+  const replay = await setCurrentOperatorOpportunityFact(input);
+  assert.equal(first.id, replay.id);
+  assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).length, 1);
+  assert.deepEqual(JSON.parse(first.value), JSON.parse(value));
+  assert.equal(first.actor, 'fixture-owner'); assert.equal(first.verified, false);
+  assert.equal(opportunityFactsModule.opportunityFactCrmSnapshotFields.length, 13);
+  await assert.rejects(setCurrentOperatorOpportunityFact({ ...input,
+    value: value.replace('USD', 'CAD') }), /idempotency key conflicts/);
+  await assert.rejects(setCurrentOperatorOpportunityFact({ ...input,
+    idempotencyKey: factIdempotencyKey(991) }), /changed since this edit/);
+});
 
 test('verified operator facts survive a structured-source refresh', async (t) => {
   // Break caught: a source refresh mutates or takes precedence over a verified operator fact.
@@ -2709,4 +2737,78 @@ test('canonical-merge inspection classifies and preserves opportunity-owned fact
     (await storage.listDealHunterOpportunitySourceObservations(approval.survivorId)).map((observation) => observation.id),
     ['merge-guard-observation'],
   );
+});
+
+
+test('financial contract rejects ambiguous amounts and incompatible context and treats zero as known', () => {
+  const valid = { version: 1, amount: '0', currency: 'unknown', metric: 'revenue', period: 'unknown', evidenceSource: 'Synthetic account' };
+  assert.equal(normalizeFinancialFact('annual_revenue', valid).amount, '0.00');
+  for (const amount of ['1,000', '$12', '1e3', '01', '1.234', '1000000000000', '-1', '', 'NaN']) {
+    assert.throws(() => normalizeFinancialFact('annual_revenue', { ...valid, amount }), /Amount|negative/);
+  }
+  for (const change of [{ currency: '' }, { metric: 'ebitda' }, { period: 'current' }, { evidenceSource: '' }, { evidenceSource: 'bad\nsource' }, { source: 'hidden' }]) {
+    assert.throws(() => normalizeFinancialFact('annual_revenue', { ...valid, ...change }));
+  }
+});
+
+test('financial facts upgrade a populated pre-change SQLite database without losing rows, indexes, authority or constraints', async (t) => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'financial-upgrade-'));
+  const sqlitePath = path.join(folder, 'upgrade.sqlite');
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
+  const require = createRequire(import.meta.url);
+  const oldSource = execFileSync('git', ['show', 'e0e5d63401f1ec577738d91ba51a4e3d9e121a1d:server/storage/sqlite.js'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 })
+    .replace(/from '([^']+)'/g, (text, specifier) => specifier.startsWith('node:') ? text
+      : `from '${specifier.startsWith('.') ? new URL(specifier, sqliteStorageUrl).href : pathToFileURL(require.resolve(specifier)).href}'`);
+  const oldModule = await import(`data:text/javascript;base64,${Buffer.from(oldSource).toString('base64')}`);
+  const previous = oldModule.createSqliteStorage({ storage: { sqlitePath } });
+  await seedOpportunity(previous);
+  await setOperatorOpportunityFact({ opportunityId, field: 'seller_name', value: 'Retained seller', actor: 'fixture-owner', storage: previous });
+  const beforeDb = new Database(sqlitePath);
+  const before = beforeDb.prepare('SELECT * FROM deal_hunter_opportunity_facts').all();
+  const definitions = beforeDb.prepare("SELECT type,name FROM sqlite_master WHERE tbl_name='deal_hunter_opportunity_facts' AND type IN ('index','trigger') ORDER BY type,name").all();
+  const authorityBefore = await previous.getCurrentDealHunterOpportunity(opportunityId);
+  beforeDb.close(); previous.close();
+  const current = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => current.close());
+  const db = new Database(sqlitePath); t.after(() => db.close());
+  assert.deepEqual(db.prepare('SELECT * FROM deal_hunter_opportunity_facts').all(), before);
+  for (const item of definitions) assert.ok(db.prepare('SELECT 1 FROM sqlite_master WHERE type=? AND name=?').get(item.type, item.name), item.name);
+  assert.deepEqual(await current.getCurrentDealHunterOpportunity(opportunityId), authorityBefore);
+  assert.deepEqual(db.pragma('foreign_key_check'), []);
+  const value = JSON.stringify(normalizeFinancialFact('annual_revenue', { version: 1, amount: '0', currency: 'CAD', metric: 'revenue', period: 'annual', evidenceSource: 'Synthetic statement' }));
+  await setCurrentOperatorOpportunityFact({ opportunityId, field: 'annual_revenue', value, actor: 'fixture-owner', idempotencyKey: factIdempotencyKey(999), expectedRevision: factEditRevision(authorityBefore.campaign_authority_revision), storage: current });
+  const insert = db.prepare(`INSERT INTO deal_hunter_opportunity_facts (id,opportunity_id,field,value,source,verified,actor,created_at,updated_at) VALUES (?,?,?,?,'operator',0,'fixture-owner','2026-10-19T00:00:00Z','2026-10-19T00:00:00Z')`);
+  for (const [index, invalid] of ['123', '{}', value.replace('0.00', '01.00'), value.replace('CAD', 'XXX'), value.replace('revenue', 'ebitda'), value.replace('Synthetic statement', '')].entries()) {
+    assert.throws(() => insert.run(`invalid-${index}`, opportunityId, 'annual_revenue', invalid), /invalid typed financial fact/);
+  }
+  assert.throws(() => insert.run('provider', opportunityId, 'fit_score', '99'), /invalid operator|CHECK constraint/);
+});
+
+
+test('financial SQLite upgrade rolls back a failure after table replacement and never rewrites current triggers on reopen', () => {
+  const db = new Database(':memory:');
+  try {
+    const source = execFileSync('git', ['show', 'e0e5d63401f1ec577738d91ba51a4e3d9e121a1d:server/storage/sqlite.js'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    const ddl = source.match(/CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_facts \([\s\S]*?\n {6}\);/)[0];
+    db.exec('CREATE TABLE deal_hunter_opportunities(opportunity_id TEXT PRIMARY KEY);'); db.exec(ddl);
+    db.exec("INSERT INTO deal_hunter_opportunities VALUES ('retained'); CREATE INDEX retained_index ON deal_hunter_opportunity_facts(actor);");
+    db.prepare("INSERT INTO deal_hunter_opportunity_facts(id,opportunity_id,field,value,actor,created_at,updated_at) VALUES ('retained','retained','seller_name','Old fact','owner','2026-10-19T00:00:00Z','2026-10-19T00:00:00Z')").run();
+    const master = () => db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all();
+    const before = master();
+    const proxy = new Proxy(db, { get(target, key) {
+      if (key === 'exec') return (sql) => { target.exec(sql); if (sql.includes('DROP TABLE deal_hunter_opportunity_facts')) throw new Error('injected replacement failure'); };
+      return typeof target[key] === 'function' ? target[key].bind(target) : target[key];
+    } });
+    assert.throws(() => upgradeOperatorFinancialFacts(proxy), /injected replacement failure/);
+    assert.deepEqual(master(), before);
+    assert.equal(db.prepare('SELECT value FROM deal_hunter_opportunity_facts').get().value, 'Old fact');
+    upgradeOperatorFinancialFacts(db);
+    const current = master();
+    const noDdl = new Proxy(db, { get(target, key) {
+      if (key === 'transaction' || key === 'exec') return () => { throw new Error('Unexpected repeated migration write'); };
+      return typeof target[key] === 'function' ? target[key].bind(target) : target[key];
+    } });
+    upgradeOperatorFinancialFacts(noDdl);
+    assert.deepEqual(master(), current);
+  } finally { db.close(); }
 });

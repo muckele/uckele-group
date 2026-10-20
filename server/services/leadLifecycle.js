@@ -135,6 +135,7 @@ export async function restoreLead({
   role = 'admin',
   storage = getStorage(),
 } = {}) {
+  if (role !== 'admin') return { ok: false, status: 403, error: 'Administrator access is required to restore a lead.' };
   const id = compactText(submissionId, 120);
   const nextStatus = compactText(status, 40).toLowerCase();
   await assertCrmSubmissionWritable({ storage, submissionId: id });
@@ -146,32 +147,26 @@ export async function restoreLead({
 
   const now = new Date().toISOString();
   const expectedVersion = compactText(expectedUpdatedAt, 80) || existing.updated_at;
-  const values = {
-    updated_at: now,
-    status: nextStatus,
-    status_updated_at: now,
-    restored_at: now,
-    restored_by: compactText(actor, 160) || 'admin',
-    // Restoring a record never restarts outreach. The administrator must schedule a new action explicitly.
-    follow_up_state: 'completed',
-    next_action_at: null,
-  };
   const mutation = await commitCrmActivityMutation({
     storage,
-    operation: 'update_submission',
-    payload: { id: existing.id, expectedUpdatedAt: expectedVersion, values },
+    operation: 'restore_submission',
+    payload: { id: existing.id, expectedUpdatedAt: expectedVersion, status: nextStatus },
     activity: {
       submissionId: existing.id,
       eventType: 'submission.restored',
       summary: `Archived lead restored to ${nextStatus}. Outreach remains stopped.`,
       actor: compactText(actor, 160) || 'admin',
       role,
+      createdAt: now,
       metadata: { restoredStatus: nextStatus, outreachRestarted: false },
     },
   });
 
   if (!mutation.applied || !mutation.record) {
-    return { ok: false, status: 409, error: 'Lead state changed before the restore could be saved.' };
+    return { ok: false, status: 409, code: mutation.reason || 'restore-version-conflict',
+      error: mutation.reason === 'restore-identity-conflict'
+        ? 'Current canonical and CRM identity must be resolved before this lead can be restored.'
+        : 'Lead state changed before the restore could be saved.' };
   }
   return { ok: true, status: 200, submission: mutation.record };
 }

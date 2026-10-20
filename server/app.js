@@ -1,3 +1,4 @@
+import { restoreCurrentUnlinkedOpportunity } from './services/currentUnlinkedRestore.js';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -50,7 +51,7 @@ import {
   restoreDealHunterOpportunityWithInboxAuthority,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
-import { opportunityFactFields, setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
+import { opportunityFactCrmSnapshotFields, setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
 import { appendExplicitOpportunityTimezoneRevision } from './services/opportunityTimezoneRevision.js';
 import {
   getPursueCimReleaseReport,
@@ -2021,7 +2022,7 @@ export function createApp({
       const snapshot = expectedRevision?.submissionFactSnapshot;
       const validSnapshot = snapshot === null || (
         snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)
-        && Object.keys(snapshot).sort().join(',') === [...opportunityFactFields].sort().join(',')
+        && Object.keys(snapshot).sort().join(',') === [...opportunityFactCrmSnapshotFields].sort().join(',')
         && Object.values(snapshot).every((value) => value === null
           || (typeof value === 'string' && [...value].length <= 4000))
       );
@@ -2257,6 +2258,17 @@ export function createApp({
       response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
+
+  app.post('/api/admin/deal-hunter/triage/:opportunityId/restore', asyncRoute(async (request, response) => {
+    const session = await requireAdmin(request);
+    if (!session) { response.status(401).json({ success: false, error: 'Administrator access is required.' }); return; }
+    if (Object.keys(request.body || {}).sort().join(',') !== 'expectedCampaignAuthorityRevision,passId,passUpdatedAt') {
+      response.status(400).json({ success: false, error: 'An exact reviewed Pass is required.' }); return;
+    }
+    const result = await restoreCurrentUnlinkedOpportunity({ opportunityId: request.params.opportunityId,
+      ...request.body, actor: session.username || 'admin' });
+    response.status(result.status).json({ success: result.ok, ...result });
+  }));
 
   app.post(
     '/api/admin/deal-hunter/dispositions',

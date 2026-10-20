@@ -362,6 +362,25 @@ describe('Opportunity drawer', () => {
     expect(screen.getByRole('dialog')).toHaveClass('h-full');
   });
 
+  test('historical archive read-only view exposes retained evidence and no mutation controls despite supplied callbacks', () => {
+    const mutation = vi.fn();
+    const detail = detailFixture({ archivedReadOnly: true });
+    detail.opportunity.dismissed = true;
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture()} cimReleaseReadOnly detail={detail}
+      onAction={mutation} onSaveFact={mutation} onBrokerMaterialsPrepare={mutation}
+      onBrokerMaterialsApprove={mutation} onBrokerMaterialsCheckStatus={mutation}
+      onCimReleaseStop={mutation} onFollowUpApprove={mutation} onFollowUpPrepare={mutation}
+      onFollowUpStart={mutation} onFollowUpStop={mutation} onFollowUpCheckStatus={mutation}
+      onClose={vi.fn()} readOnly />);
+    expect(screen.getByRole('status')).toHaveTextContent('Historical archive view. This retained score is not current');
+    expect(screen.getByText('Previously passed.', { exact: false })).toBeVisible();
+    expect(screen.getByText('Persisted CIM subject')).toBeVisible();
+    expect(screen.queryAllByRole('textbox')).toHaveLength(0);
+    // Historical evidence still permits navigation/copy; no mutation entry is present.
+    expect(screen.queryByRole('button', { name: /^(Pursue |Watch |Pass |Save verified fact|Mark reviewed|Prepare |Approve |Start |Stop )/ })).toBeNull();
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
   test('renders only persisted canary release evidence and one explicit stop control', () => {
     const onCimReleaseStop = vi.fn();
     render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()}
@@ -472,6 +491,22 @@ describe('Opportunity drawer', () => {
     expect(disclosure).toHaveFocus();
   });
 
+  test('recovers keyboard focus after a pending decision disabled the focused control', () => {
+    const onClose = vi.fn();
+    const focusGuardRef = { current: true };
+    const { rerender } = render(<OpportunityDrawer detail={detailFixture()} focusGuardRef={focusGuardRef} onClose={onClose} pending />);
+    document.body.tabIndex = -1;
+    document.body.focus();
+    expect(document.body).toHaveFocus();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+    rerender(<OpportunityDrawer detail={detailFixture()} focusGuardRef={focusGuardRef} onClose={onClose} pending={false} />);
+    expect(screen.getByRole('button', { name: 'Close opportunity detail' })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    document.body.removeAttribute('tabindex');
+  });
+
   test('lets Escape close an active contact selector before a later Escape closes the drawer', () => {
     const onClose = vi.fn();
     render(<OpportunityDrawer brokerMaterialsState={{ preparation: brokerPreparation() }} detail={detailFixture()} onBrokerMaterialsPrepare={vi.fn()} onClose={onClose} />);
@@ -524,4 +559,80 @@ describe('Opportunity drawer', () => {
     fireEvent.keyDown(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' }), { key: 'Escape', code: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+});
+
+
+test('financial editing requires context, preserves decimals and does not assume verification or SDE', async () => {
+  const onSaveFact = vi.fn().mockResolvedValue({ saved: true, refreshed: true });
+  render(<OpportunityDrawer detail={detailFixture()} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+  fireEvent.change(screen.getByLabelText('Verified fact field'), { target: { value: 'annual_profit' } });
+  expect(screen.getByLabelText('Financial metric')).toHaveValue('unknown');
+  expect(screen.getByLabelText('Financial currency')).toHaveValue('unknown');
+  expect(screen.getByLabelText('Financial fact verified')).not.toBeChecked();
+  fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: '-125.55' } });
+  fireEvent.change(screen.getByLabelText('Financial currency'), { target: { value: 'CAD' } });
+  fireEvent.change(screen.getByLabelText('Financial metric'), { target: { value: 'ebitda' } });
+  fireEvent.change(screen.getByLabelText('Financial period'), { target: { value: 'annual' } });
+  fireEvent.change(screen.getByLabelText('Financial evidence source'), { target: { value: 'Owner supplied 2025 accounts' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save financial fact' }));
+  const saved = onSaveFact.mock.calls[0][0];
+  expect(JSON.parse(saved.value)).toEqual({ version: 1, amount: '-125.55', currency: 'CAD', metric: 'ebitda', period: 'annual', evidenceSource: 'Owner supplied 2025 accounts' });
+  expect(saved.verified).toBe(false);
+  await screen.findByText('Earnings saved.');
+  fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: '1.234' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save financial fact' }));
+  expect(screen.getByRole('alert')).toHaveTextContent('2 decimal places');
+  expect(onSaveFact).toHaveBeenCalledTimes(1);
+});
+
+
+test('a current unlinked passed opportunity offers an explicit restore confirmation without outreach', () => {
+  const original = detailFixture();
+  const onRestore = vi.fn();
+  render(<OpportunityDrawer detail={{ ...original, opportunity: { ...original.opportunity, dismissed: true }, crmSummary: { submission: null }, restoreAuthority: { passId: 'pass', passUpdatedAt: '2026-10-19T00:00:00Z', expectedCampaignAuthorityRevision: 7 } }} onClose={vi.fn()} onRestore={onRestore} />);
+  fireEvent.click(screen.getByRole('button', { name: 'Restore opportunity' }));
+  expect(onRestore).not.toHaveBeenCalled();
+  expect(screen.getByText(/Outreach stays stopped/)).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm Restore opportunity' }));
+  expect(onRestore).toHaveBeenCalledTimes(1);
+});
+
+test('historical archived detail does not offer canonical restore', () => {
+  const original = detailFixture();
+  render(<OpportunityDrawer detail={{ ...original, archivedReadOnly: true, opportunity: { ...original.opportunity, dismissed: true }, crmSummary: { submission: null }, restoreAuthority: { passId: 'pass', passUpdatedAt: '2026-10-19T00:00:00Z', expectedCampaignAuthorityRevision: 7 } }} onClose={vi.fn()} onRestore={vi.fn()} readOnly />);
+  expect(screen.queryByRole('button', { name: 'Restore opportunity' })).toBeNull();
+});
+
+
+test('financial values render once with readable context, source and explicit unverified provenance', () => {
+  const detail = detailFixture();
+  const typed = (amount, metric, period, evidenceSource) => JSON.stringify({ version: 1, amount, currency: 'USD', metric, period, evidenceSource });
+  detail.effectiveFacts = { ...detail.effectiveFacts,
+    annual_profit: { value: typed('250000.00', 'ebitda', 'annual', 'P&L'), provenance: 'operator', verified: false },
+    annual_revenue: { value: typed('5000000.00', 'revenue', 'annual', 'P&L'), provenance: 'operator', verified: false },
+    asking_price: { value: typed('2000000.00', 'asking-price', 'current', 'Listing'), provenance: 'operator', verified: false },
+  };
+  detail.opportunity = { ...detail.opportunity, financialCorrectionFields: ['annual_profit','annual_revenue','asking_price'],
+    financials: { annualProfit: 250000, annualRevenue: 5000000, askingPrice: 2000000, profitMultiple: null } };
+  render(<OpportunityDrawer detail={detail} onClose={vi.fn()} />);
+  const financials = screen.getByRole('heading', { name: 'Business & Financials' }).closest('section');
+  for (const amount of ['$250,000', '$5,000,000', '$2,000,000']) expect(within(financials).getAllByText(amount, { exact: true })).toHaveLength(1);
+  expect(within(financials).getByText('USD · EBITDA · Annual')).toBeVisible();
+  expect(within(financials).getByText('USD · Annual')).toBeVisible();
+  expect(within(financials).getByText('USD · Current')).toBeVisible();
+  expect(within(financials).getAllByText('Source: P&L')).toHaveLength(2);
+  expect(within(financials).getByText('Source: Listing')).toBeVisible();
+  expect(within(financials).getAllByText('Operator entered (unverified)')).toHaveLength(3);
+  expect(within(financials).getByText(/saved machine score has not been recomputed/)).toBeVisible();
+});
+
+
+test('an unknown financial currency stays explicit without turning the amount into a wrapping badge', () => {
+  const detail = detailFixture();
+  detail.effectiveFacts.asking_price = { value: JSON.stringify({ version: 1, amount: '0.00', currency: 'unknown', metric: 'asking-price', period: 'current', evidenceSource: 'Synthetic listing' }), provenance: 'operator', verified: false };
+  render(<OpportunityDrawer detail={detail} onClose={vi.fn()} />);
+  const financials = screen.getByRole('heading', { name: 'Business & Financials' }).closest('section');
+  expect(within(financials).getByText('0', { exact: true })).toBeVisible();
+  expect(within(financials).getByText('Unknown currency · Current')).toBeVisible();
+  expect(within(financials).getByText('Operator entered (unverified)')).toBeVisible();
 });

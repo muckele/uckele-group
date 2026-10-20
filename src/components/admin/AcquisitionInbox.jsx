@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, ExternalLink, Search } from 'lucide-react';
-import { NavLink } from 'react-router-dom';
+import { NavLink, useNavigationType, useSearchParams } from 'react-router-dom';
 import OpportunityDrawer, { PassForm, safeListingUrl } from './OpportunityDrawer.jsx';
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
 
@@ -14,8 +14,8 @@ const views = [
   ['needs-review', 'Needs Review'], ['high-priority', 'High Priority'], ['watchlist', 'Watchlist'],
   ['low-confidence', 'Low Confidence'], ['dismissed', 'Passed'], ['all', 'All Current'],
 ];
-const buttonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-xs font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
-const primaryButtonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-pine disabled:opacity-50';
+const buttonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
+const primaryButtonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-pine disabled:opacity-50';
 const emptyBrokerMaterialsState = {
   preparation: null, recipientSelection: null, preparing: false, updating: false, sending: false,
   checking: false, checkingFailed: false, stale: false, error: '',
@@ -113,7 +113,35 @@ function MorningBriefing({ actionsAllowed = false, digest, error = '', loading =
       {optionalWarning ? <div aria-label="Optional source status" aria-live="polite" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-950" role="status"><strong>{optionalWarning.title || 'Optional source warning'}.</strong>{optionalWarning.message ? ` ${optionalWarning.message}` : ''} Primary Sheet-backed review remains available.</div> : null}
       <div className="mt-4 grid grid-cols-2 overflow-hidden rounded-2xl border border-line/80 bg-white sm:grid-cols-3 xl:grid-cols-5">{summaryItems.map(([key, itemLabel]) => <div className="min-w-0 border-b border-r border-line/70 px-3 py-3 last:border-r-0 xl:border-b-0" key={key}><p className="text-2xl font-semibold tabular-nums text-ink">{summary[key] ?? 0}</p><p className="mt-1 text-[11px] font-semibold uppercase tracking-[0.06em] text-ink/55">{itemLabel}</p></div>)}</div>
       {summary.needsReview === 0 && topOpportunities.length === 0 ? <p className="mt-4 rounded-xl border border-line bg-white p-4 text-sm text-ink/68">No opportunities need review this morning.</p> : null}
-      {topOpportunities.length > 0 ? <div className="mt-5"><div className="flex flex-wrap items-end justify-between gap-2"><div><h4 className="text-base font-semibold text-ink">Current priority shortlist</h4><p className="mt-1 text-xs text-ink/58">Existing fit scores, evidence, and operator priority; no rescore is triggered.</p></div><p className="text-xs font-semibold text-ink/55">Top {topOpportunities.length}</p></div><ol aria-label="Morning briefing opportunities" className="mt-3 grid gap-3 lg:grid-cols-2">{topOpportunities.map((row, index) => <li className="min-w-0 rounded-xl border border-line/80 bg-white p-4" key={row.opportunityId}><div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><p className="text-[11px] font-bold uppercase tracking-[0.1em] text-moss">Priority #{index + 1}</p><button aria-label={`Open shortlist lead ${row.name}`} className="mt-1 break-words text-left text-sm font-semibold text-ink underline decoration-transparent underline-offset-4 transition hover:text-moss hover:decoration-moss/30" onClick={(event) => onOpen?.(row, event)} type="button">{row.name}</button><p className="mt-1 text-xs text-ink/58">{row.state || 'State not supplied'} · Fit {row.fitScore} · {formatLabel(row.confidence)} confidence</p></div><span className="rounded-full bg-moss/10 px-2 py-1 text-[11px] font-semibold text-moss">{formatLabel(row.operatorPriority || 'normal')}</span></div><p className="mt-3 text-xs leading-5 text-moss"><strong>Why it fits:</strong> {row.topStrength || 'No bounded strength supplied.'}</p>{row.topConcern ? <p className="mt-1 text-xs leading-5 text-amber-800"><strong>Check before pursuit:</strong> {row.topConcern}</p> : null}<div className="mt-3 flex flex-wrap gap-1.5 text-[11px] font-semibold">{row.missingEvidenceCount > 0 ? <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-900">{row.missingEvidenceCount} missing evidence {row.missingEvidenceCount === 1 ? 'item' : 'items'}</span> : null}{row.contradictionCount > 0 ? <span className="rounded-full bg-red-50 px-2 py-1 text-red-800">{row.contradictionCount} source {row.contradictionCount === 1 ? 'conflict' : 'conflicts'}</span> : null}</div><p className="mt-3 text-[11px] text-ink/55">{row.changedSinceReview ? 'Changed since review' : row.reviewed ? 'Reviewed' : 'Needs review'} · CRM {formatLabel(row.workflow?.crmStatus)} · CIM {formatLabel(row.workflow?.cimStatus)}{formatDate(row.observationFreshness) ? ` · Observed ${formatDate(row.observationFreshness)}` : ''}</p><div className="mt-3"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => onOpen?.(row, event)} /></div>{!readOnly ? <div className="mt-3"><ActionButtons context="shortlist lead" disabled={pending || !actionsAllowed} name={row.name} onAction={(action, event) => onAction?.(row, action, event)} /><p className="mt-2 text-[11px] text-ink/55">Opens current evidence for final review before recording the decision.</p></div> : null}</li>)}</ol></div> : null}
+      {topOpportunities.length > 0 ? <div className="priority-shortlist mt-5">
+        <div className="flex flex-wrap items-end justify-between gap-2">
+          <div><h4 className="text-base font-semibold text-ink">Current priority shortlist</h4><p className="mt-1 text-sm text-ink/58">Existing fit scores, evidence, and operator priority; no rescore is triggered.</p></div>
+          <p className="text-sm font-semibold text-ink/55">Top {topOpportunities.length}</p>
+        </div>
+        <ol aria-label="Morning briefing opportunities" className="priority-opportunity-grid mt-4 grid gap-4">
+          {topOpportunities.map((row, index) => <li className="flex min-w-0 flex-col rounded-xl border border-line/80 bg-white p-5" key={row.opportunityId}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-bold uppercase tracking-[0.1em] text-moss">Priority #{index + 1}</p>
+                <button aria-label={`Open shortlist lead ${row.name}`} className="mt-1 break-words text-left text-base font-semibold text-ink underline decoration-transparent underline-offset-4 transition hover:text-moss hover:decoration-moss/30" onClick={(event) => onOpen?.(row, event)} type="button">{row.name}</button>
+                <p className="mt-2 text-sm text-ink/58">{row.state || 'State not supplied'} · Fit {row.fitScore} · {formatLabel(row.confidence)} confidence</p>
+              </div>
+              <span className="shrink-0 rounded-full bg-moss/10 px-2 py-1 text-xs font-semibold text-moss">{formatLabel(row.operatorPriority || 'normal')}</span>
+            </div>
+            <p className="mt-4 text-sm leading-6 text-moss"><strong>Why it fits:</strong> {row.topStrength || 'No bounded strength supplied.'}</p>
+            {row.topConcern ? <p className="mt-2 text-sm leading-6 text-amber-800"><strong>Check before pursuit:</strong> {row.topConcern}</p> : null}
+            <div className="mt-3 flex flex-wrap gap-2 text-xs font-semibold">
+              {row.missingEvidenceCount > 0 ? <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-900">{row.missingEvidenceCount} missing evidence {row.missingEvidenceCount === 1 ? 'item' : 'items'}</span> : null}
+              {row.contradictionCount > 0 ? <span className="rounded-full bg-red-50 px-2 py-1 text-red-800">{row.contradictionCount} source {row.contradictionCount === 1 ? 'conflict' : 'conflicts'}</span> : null}
+            </div>
+            <p className="mt-3 text-sm leading-6 text-ink/55">{row.changedSinceReview ? 'Changed since review' : row.reviewed ? 'Reviewed' : 'Needs review'} · CRM {formatLabel(row.workflow?.crmStatus)} · CIM {formatLabel(row.workflow?.cimStatus)}{formatDate(row.observationFreshness) ? ` · Observed ${formatDate(row.observationFreshness)}` : ''}</p>
+            <div className="mt-auto pt-4">
+              <OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => onOpen?.(row, event)} />
+              {!readOnly ? <div className="mt-3 [&>div]:justify-start"><ActionButtons context="shortlist lead" disabled={pending || !actionsAllowed} name={row.name} onAction={(action, event) => onAction?.(row, action, event)} /><p className="mt-3 text-xs leading-5 text-ink/55">Opens current evidence for final review before recording the decision.</p></div> : null}
+            </div>
+          </li>)}
+        </ol>
+      </div> : null}
     </section>
   );
 }
@@ -123,11 +151,19 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
   const observed = formatDate(row.observationFreshness);
   const earnings = earningsPresentation(row.financials);
   return (
-    <li className="grid gap-4 rounded-2xl border border-line bg-white p-4 shadow-sm md:grid-cols-[minmax(15rem,1.35fr)_repeat(4,minmax(6.5rem,.65fr))_minmax(10rem,.8fr)] md:items-center md:rounded-none md:border-x-0 md:border-b-0 md:p-3 md:shadow-none">
+    <li className="grid gap-3 rounded-2xl border border-line bg-white p-4 shadow-sm lg:grid-cols-[minmax(0,1fr)_minmax(12rem,.7fr)] lg:gap-x-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(24rem,1.35fr)_minmax(13rem,.8fr)] xl:gap-x-5 md:rounded-none md:border-x-0 md:border-b-0 md:shadow-none">
       <div className="min-w-0">
         <button aria-label={`Open ${row.name}`} className="text-left text-base font-semibold text-ink underline decoration-transparent underline-offset-4 transition hover:text-moss hover:decoration-moss/30" onClick={onOpen} type="button">{row.name}</button>
-        <p className="mt-1 text-xs text-ink/58">{row.geography?.label || row.state || 'Location not supplied'} · {row.industry || 'Industry not supplied'}</p>
-        <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-semibold">
+        <p className="mt-1 text-sm text-ink/58">{row.geography?.label || row.state || 'Location not supplied'} · {row.industry || 'Industry not supplied'}</p>
+      </div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:col-start-1 lg:row-start-2 xl:col-start-2 xl:row-start-1">
+      <div><p className="text-sm font-medium text-ink/58">Fit</p><p className="text-xl font-semibold tabular-nums text-ink">{row.fitScore}</p><p className="text-sm font-medium text-ink/58">{row.confidence} confidence</p></div>
+      <div><p className="text-sm font-medium text-ink/58">{earnings.label}</p><p className="mt-1 text-base font-semibold tabular-nums text-ink">{earnings.amount}</p></div>
+      <div><p className="text-sm font-medium text-ink/58">Revenue</p><p className="mt-1 text-base font-semibold tabular-nums text-ink">{money(row.financials?.annualRevenue)}</p></div>
+      <div><p className="text-sm font-medium text-ink/58">Ask / Multiple</p><p className="mt-1 text-base font-semibold tabular-nums text-ink">{money(row.financials?.askingPrice)}</p>{row.financials?.profitMultiple !== null && row.financials?.profitMultiple !== undefined ? <p className="text-sm text-ink/58">{row.financials.profitMultiple.toFixed(2)}×</p> : null}</div>
+      </div>
+      <div className="min-w-0 lg:col-start-1 lg:col-span-2 lg:row-start-3 xl:row-start-2">
+        <div className="flex flex-wrap gap-1.5 text-sm font-medium">
           {row.freshness?.newToUs ? <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-emerald-800">New to UG · first accepted {formatDate(row.freshness.firstAcceptedAt)}</span> : null}
           {row.freshness?.recentlyListed ? <span className="rounded-full bg-sky-50 px-2 py-0.5 text-sky-800">Recently listed · {row.freshness.publicationDate || formatDate(row.freshness.publicationInstant)}{row.freshness.publicationSource ? ` · ${row.freshness.publicationSource}` : ''}</span> : null}
           {row.freshness?.updatedSinceReview ? <span className="rounded-full bg-violet-50 px-2 py-0.5 text-violet-800">{row.freshness.materialField ? formatLabel(row.freshness.materialField) : 'Material value'} changed since review{Number.isFinite(row.freshness.materialBeforeValue) && Number.isFinite(row.freshness.materialAfterValue) ? `: ${row.freshness.materialBeforeValue} → ${row.freshness.materialAfterValue}${row.freshness.materialCurrency ? ` ${row.freshness.materialCurrency}` : ''}` : ''}</span> : null}
@@ -142,20 +178,16 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
           <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CIM: {formatLabel(row.workflow?.cimStatus || 'not-requested')}</span>
           {row.dismissed ? <span className="rounded-full bg-red-50 px-2 py-0.5 text-red-800">Passed: {formatLabel(row.dismissedReason || 'dismissed')}</span> : null}
         </div>
-        {row.dismissedNote ? <p className="mt-2 text-xs leading-5 text-ink/68">Decision note: {row.dismissedNote}</p> : null}
-        {row.dismissedAt ? <p className="mt-1 text-[11px] text-ink/50">Passed {formatDate(row.dismissedAt)}</p> : null}
-        {row.freshness ? <p className="mt-2 text-xs text-ink/65">Why here? {row.freshness.dueAction ? 'Due owner action' : row.freshness.ownerPriority ? 'Deliberate owner priority' : row.freshness.newToUs ? `First accepted ${formatDate(row.freshness.firstAcceptedAt)}${row.freshness.recentlyListed ? '; supported recent listing' : '; listing age unknown or older'}` : row.freshness.updatedSinceReview ? `${formatLabel(row.freshness.materialField || 'Material value')} changed since review` : row.freshness.sourceConflictCount > 0 ? 'Sources disagree; research needed' : 'Current opportunity backlog'}</p> : null}
-        {row.freshness && !row.freshness.crmLinked ? <p className="mt-2 text-xs text-amber-800">CRM handoff prerequisite: link or create a CRM record before outreach.</p> : null}
-        {observed ? <p className="mt-2 text-[11px] text-ink/50">Observed {observed}</p> : null}
-        {row.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-[11px] text-ink/60">Latest accepted by UG {formatDate(row.freshness.latestAcceptedObservationAt)}</p> : null}
+        {row.dismissedNote ? <p className="mt-1 text-sm leading-5 text-ink/68">Decision note: {row.dismissedNote}</p> : null}
+        {row.dismissedAt ? <p className="mt-1 text-sm text-ink/50">Passed {formatDate(row.dismissedAt)}</p> : null}
+        {row.freshness ? <p className="mt-1 text-sm text-ink/65">Why here? {row.freshness.dueAction ? 'Due owner action' : row.freshness.ownerPriority ? 'Deliberate owner priority' : row.freshness.newToUs ? `First accepted ${formatDate(row.freshness.firstAcceptedAt)}${row.freshness.recentlyListed ? '; supported recent listing' : '; listing age unknown or older'}` : row.freshness.updatedSinceReview ? `${formatLabel(row.freshness.materialField || 'Material value')} changed since review` : row.freshness.sourceConflictCount > 0 ? 'Sources disagree; research needed' : 'Current opportunity backlog'}</p> : null}
+        {row.freshness && !row.freshness.crmLinked ? <p className="mt-1 text-sm text-amber-800">CRM handoff prerequisite: link or create a CRM record before outreach.</p> : null}
+        {observed ? <p className="mt-1 text-sm text-ink/50">Observed {observed}</p> : null}
+        {row.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-sm text-ink/60">Latest accepted by UG {formatDate(row.freshness.latestAcceptedObservationAt)}</p> : null}
       </div>
-      <div><p className="text-[10px] font-semibold uppercase text-ink/45 md:hidden">Fit</p><p className="text-xl font-semibold tabular-nums text-ink">{row.fitScore}</p><p className="text-[11px] font-semibold text-ink/58">{row.confidence} confidence</p></div>
-      <div><p className="text-[10px] font-semibold uppercase text-ink/45">{earnings.label}</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{earnings.amount}</p></div>
-      <div><p className="text-[10px] font-semibold uppercase text-ink/45">Revenue</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.annualRevenue)}</p></div>
-      <div><p className="text-[10px] font-semibold uppercase text-ink/45">Ask / Multiple</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.askingPrice)}</p>{row.financials?.profitMultiple !== null && row.financials?.profitMultiple !== undefined ? <p className="text-xs text-ink/58">{row.financials.profitMultiple.toFixed(2)}×</p> : null}</div>
-      <div className="min-w-0">
-        {row.topStrength ? <p className="text-xs leading-5 text-moss">{row.topStrength}</p> : null}
-        {row.topConcern ? <p className="mt-1 text-xs leading-5 text-amber-800">{row.topConcern}</p> : null}
+      <div className="min-w-0 lg:col-start-2 lg:row-start-1 lg:row-span-2 xl:col-start-3">
+        {row.topStrength ? <p className="text-sm leading-5 text-moss">{row.topStrength}</p> : null}
+        {row.topConcern ? <p className="mt-1 text-sm leading-5 text-amber-800">{row.topConcern}</p> : null}
         <div className="mt-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={onOpen} /></div>
         {!readOnly && !row.dismissed ? <div className="mt-2"><ActionButtons disabled={pending || !actionsAllowed} name={row.name} onAction={onAction} /></div> : null}
       </div>
@@ -223,7 +255,19 @@ function QueuePassDialog({ error, focusGuardRef, name, onCancel, onSubmit, pendi
 }
 
 export default function AcquisitionInbox({ readOnly = false, initialView = 'inbox' }) {
-  const [view, setView] = useState(initialView);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const navigationType = useNavigationType();
+  const requestedQueue = searchParams.get('queue');
+  const view = views.some(([id]) => id === requestedQueue) ? requestedQueue : initialView;
+  const setView = (nextView) => {
+    if (nextView === view) return;
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      if (nextView === initialView) next.delete('queue');
+      else next.set('queue', nextView);
+      return next;
+    }, { preventScrollReset: true });
+  };
   const [area, setArea] = useState('inbox');
   const [areaCursor, setAreaCursor] = useState('');
   const [cursorHistory, setCursorHistory] = useState([]);
@@ -247,6 +291,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const [pursueChoice, setPursueChoice] = useState(null);
   const queueRequestRef = useRef({ generation: 0, controller: null });
   const queueQueryRef = useRef(null);
+  const queueViewRef = useRef(view);
   const detailRequestRef = useRef({ generation: 0, controller: null });
   const cimReleaseRequestRef = useRef({ generation: 0, controller: null });
   const cimReleaseStopKeyRef = useRef(null);
@@ -312,12 +357,20 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   }, []);
 
   useEffect(() => {
+    // History navigation must reset paging just like clicking a queue tab.
+    if (queueViewRef.current !== view) {
+      queueViewRef.current = view;
+      if (navigationType === 'POP') {
+        setPage(1); setArea('inbox'); setAreaCursor(''); setCursorHistory([]);
+        queueQueryRef.current = { ...queueQueryRef.current, page: 1, area: 'inbox', areaCursor: '' };
+      }
+    }
     loadQueue();
     return () => {
       queueRequestRef.current.controller?.abort();
       queueRequestRef.current.generation += 1;
     };
-  }, [area, areaCursor, confidence, loadQueue, page, priority, search, sort, view]);
+  }, [area, areaCursor, confidence, loadQueue, navigationType, page, priority, search, sort, view]);
 
   useEffect(() => {
     if (view !== 'inbox' || !queue.areas?.length) return undefined;
@@ -626,6 +679,34 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     }
   }
 
+  async function restoreOpportunity(opportunityId) {
+    if (!actionsAllowed || selectionRef.current !== opportunityId || detail.loading || detail.error
+      || !detail.data?.opportunity?.dismissed || detail.data.archivedReadOnly
+      || detail.data.crmSummary?.submission || mutationPendingRef.current) return false;
+    const authority = detail.data.restoreAuthority;
+    if (!authority) return false;
+    mutationPendingRef.current = true;
+    setPendingId(opportunityId);
+    setMutationError('');
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/restore`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(authority),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to restore this opportunity.');
+      await loadQueue();
+      if (selectionRef.current === opportunityId) await loadDetail(opportunityId, { preserveData: true });
+      return true;
+    } catch (restoreError) {
+      if (selectionRef.current === opportunityId) setMutationError(restoreError.message);
+      return false;
+    } finally {
+      mutationPendingRef.current = false;
+      setPendingId('');
+    }
+  }
+
   async function stopCimRelease(opportunityId, authority) {
     if (readOnly || !opportunityId || selectionRef.current !== opportunityId
       || mutationPendingRef.current || !authority?.campaignId
@@ -687,18 +768,18 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           idempotencyKey: pendingFactCommandRef.current.key }),
       });
       const result = await response.json();
-      if (!response.ok || !result.success) {
+      if (!response.ok || result.success !== true) {
         if (response.status === 409 && result.code === 'fact_edit_conflict' && selectionRef.current === opportunityId) {
           pendingFactCommandRef.current = null;
           await loadDetail(opportunityId, { preserveData: true });
         }
         throw new Error(result.error || 'Unable to save the verified fact.');
       }
-      if (selectionRef.current === opportunityId) await loadDetail(opportunityId, { preserveData: true });
-      return true;
+      const refreshed = selectionRef.current === opportunityId
+        && await loadDetail(opportunityId, { preserveData: true });
+      return { saved: true, refreshed: Boolean(refreshed) };
     } catch (factError) {
-      if (mutationGenerationRef.current === mutationGeneration) setMutationError(factError.message || 'Unable to save the verified fact.');
-      return false;
+      return { saved: false, error: factError.message || 'Unable to save the verified fact.' };
     } finally {
       if (mutationGenerationRef.current === mutationGeneration) {
         mutationPendingRef.current = false;
@@ -1133,12 +1214,10 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           <nav aria-label="Deal Hunter views" className="flex rounded-full border border-line bg-fog/70 p-1"><NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" end to="/admin/deal-hunter">Inbox</NavLink><NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" to="/admin/deal-hunter?view=operations">Operations</NavLink></nav>
         </header>
 
-        {view === 'inbox' ? <nav aria-label="Fresh Inbox areas" className="flex flex-wrap gap-2 border-b border-line/80 px-4 py-3 sm:px-5">{[
+        <nav aria-label="Fresh Inbox areas" className="flex flex-wrap gap-2 border-b border-line/80 px-4 py-3 sm:px-5">{[
           ['inbox', 'Default Inbox'], ['new-important', 'New & Important'], ['updated', 'Updated since review'],
           ['research', 'Research'], ['all-active', 'All active'],
-        ].map(([id, label]) => <button aria-current={area === id ? 'page' : undefined} className={buttonClass} key={id} onClick={() => selectArea(id)} type="button">{label}</button>)}</nav> : null}
-
-        {view !== 'inbox' ? <MorningBriefing actionsAllowed={actionsAllowed} digest={dailyDigest} error={queueError} loading={loading} onAction={(row, _action, event) => openDetail(row.opportunityId, event.currentTarget)} onOpen={(row, event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} /> : null}
+        ].map(([id, label]) => <button aria-current={view === 'inbox' && area === id ? 'page' : undefined} className={buttonClass} key={id} onClick={() => selectArea(id)} type="button">{label}</button>)}</nav>
 
         <div className="border-b border-line/80 p-4 sm:p-5">
           {view === 'inbox' && newResultsAvailable ? <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-900" role="status"><span>New Inbox results are available. Your current rows and open draft remain in place.</span><button className={buttonClass} onClick={() => { queueQueryRef.current.areaCursor = ''; setAreaCursor(''); setCursorHistory([]); loadQueue(); }} type="button">Refresh Inbox results</button></div> : null}
@@ -1154,17 +1233,17 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         </div>
 
         <div className="p-4 sm:p-5">
-          {queueError ? <div className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{queueError}{view === 'inbox' ? <button className={`${buttonClass} ml-3`} onClick={() => { setAreaCursor(''); setCursorHistory([]); queueQueryRef.current.areaCursor = ''; loadQueue(); }} type="button">Refresh this area</button> : null}</div> : null}
+          {queueError ? <div className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{queueError}<button className={`${buttonClass} ml-3`} onClick={() => { setAreaCursor(''); setCursorHistory([]); queueQueryRef.current.areaCursor = ''; loadQueue(); }} type="button">{view === 'inbox' ? 'Refresh this area' : 'Retry loading opportunities'}</button></div> : null}
           {mutationError && !selectedId && !passTarget ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{mutationError}</p> : null}
           {queueIsLastKnown ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50/70 p-3 text-sm font-semibold text-red-900">Last known queue — persisted rows are retained for reference, but current required-source authority is unavailable.</p> : null}
           {loading && queue.rows.length === 0 ? <p className="text-sm text-ink/62">Loading current opportunities…</p> : null}
           {view === 'inbox' ? inboxAreas.map(renderInboxArea) : <>{!loading && !queueError && queue.rows.length === 0 ? <p className="rounded-xl border border-line bg-fog/60 p-4 text-sm text-ink/68">No opportunities in this view.</p> : null}<ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => action === 'pass' ? openQueuePass(row, event.currentTarget) : recordAction(row.opportunityId, action)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>{queue.totalPages > 1 ? <div className="mt-4 flex items-center justify-between"><button aria-label="Previous page" className={buttonClass} disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))} type="button"><ChevronLeft className="h-4 w-4" />Previous</button><p className="text-xs font-semibold text-ink/58">Page {queue.page || page} of {queue.totalPages}</p><button aria-label="Next page" className={buttonClass} disabled={page >= queue.totalPages || loading} onClick={() => setPage((current) => current + 1)} type="button">Next<ChevronRight className="h-4 w-4" /></button></div> : null}</>}
           {readOnly ? <p className="mt-4 text-sm font-semibold text-ink/62">Read-only access: decisions and verified-fact edits are unavailable.</p> : null}
         </div>
-        {view === 'inbox' ? <MorningBriefing actionsAllowed={actionsAllowed} digest={dailyDigest} error={queueError} loading={loading} onAction={(row, _action, event) => openDetail(row.opportunityId, event.currentTarget)} onOpen={(row, event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} /> : null}
+        <MorningBriefing actionsAllowed={actionsAllowed} digest={dailyDigest} error={queueError} loading={loading} onAction={(row, _action, event) => openDetail(row.opportunityId, event.currentTarget)} onOpen={(row, event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} />
       </div>
 
-      {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onClose={closeDetail} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed} /> : null}
+      {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly || detail.data?.archivedReadOnly === true} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onClose={closeDetail} onRestore={hasMatchingDetail ? () => restoreOpportunity(loadedDetailId) : undefined} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed || detail.data?.archivedReadOnly === true} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );

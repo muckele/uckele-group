@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { financialFactFields, normalizeFinancialFact, parseFinancialFact } from '../../shared/opportunityFinancialFacts.js';
 
-export const opportunityFactFields = Object.freeze([
+export const opportunityFactCrmSnapshotFields = Object.freeze([
   'seller_name',
   'seller_email',
   'seller_phone',
@@ -15,6 +16,12 @@ export const opportunityFactFields = Object.freeze([
   'customer_concentration',
   'operator_contact_notes',
 ]);
+export const opportunityFactFields = Object.freeze([...opportunityFactCrmSnapshotFields, ...financialFactFields]);
+
+function normalizeFactValue(field, value) {
+  return financialFactFields.includes(field) ? JSON.stringify(normalizeFinancialFact(field, value))
+    : normalizeText(value, 'Opportunity fact value', { maxLength: 4000 });
+}
 
 export function normalizeOpportunityFactAuthorityValue(value) {
   if (!['string', 'number', 'boolean'].includes(typeof value)) return null;
@@ -152,7 +159,7 @@ export function normalizeOperatorOpportunityFactRecord(fact = {}) {
     id: normalizeText(fact.id, 'Opportunity fact id', { maxLength: 240 }),
     opportunity_id: normalizeText(fact.opportunity_id, 'Canonical opportunity id', { maxLength: 200 }),
     field: normalizeOpportunityFactField(fact.field),
-    value: normalizeText(fact.value, 'Opportunity fact value', { maxLength: 4000 }),
+    value: normalizeFactValue(normalizeOpportunityFactField(fact.field), fact.value),
     source,
     verified: fact.verified,
     actor: normalizeText(fact.actor, 'Opportunity fact actor', { maxLength: 200 }),
@@ -425,7 +432,7 @@ export async function setOperatorOpportunityFact({
     id: randomUUID(),
     opportunity_id: normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 }),
     field: normalizeOpportunityFactField(field),
-    value: normalizeText(value, 'Opportunity fact value'),
+    value: normalizeFactValue(normalizeOpportunityFactField(field), value),
     source: 'operator',
     verified,
     actor: normalizeText(actor, 'Opportunity fact actor', { maxLength: 200 }),
@@ -466,7 +473,7 @@ export async function setCurrentOperatorOpportunityFact({
     ? null : authority.submissionFactSnapshot;
   const validSnapshot = submissionFactSnapshot === null || (
     typeof submissionFactSnapshot === 'object' && !Array.isArray(submissionFactSnapshot)
-    && Object.keys(submissionFactSnapshot).sort().join(',') === [...opportunityFactFields].sort().join(',')
+    && Object.keys(submissionFactSnapshot).sort().join(',') === [...opportunityFactCrmSnapshotFields].sort().join(',')
     && Object.values(submissionFactSnapshot).every((value) => value === null
       || (typeof value === 'string' && [...value].length <= 4000))
   );
@@ -481,7 +488,7 @@ export async function setCurrentOperatorOpportunityFact({
     throw new Error('A valid client idempotency key is required.');
   }
   const normalizedField = normalizeOpportunityFactField(field);
-  const normalizedValue = normalizeText(value, 'Opportunity fact value');
+  const normalizedValue = normalizeFactValue(normalizedField, value);
   const normalizedActor = normalizeText(actor, 'Opportunity fact actor', { maxLength: 200 });
   const normalizedNote = normalizeText(note, 'Opportunity fact note', { required: false, maxLength: 4000 });
   const idempotencyKeyDigest = operatorFactDigest([
@@ -525,6 +532,7 @@ function isUsefulFact(row) {
   } catch {
     return false;
   }
+  if (financialFactFields.includes(row.field)) return Boolean(parseFinancialFact(row.field, row.value));
   return ['string', 'number', 'boolean'].includes(typeof row.value) && String(row.value).trim() !== '';
 }
 

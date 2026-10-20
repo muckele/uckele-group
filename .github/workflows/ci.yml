@@ -14,6 +14,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Verify exact source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -22,7 +29,16 @@ jobs:
       - run: npm audit --omit=dev
       - run: npm run lint
       - run: npm test
+      - name: Prepare disposable PostgreSQL test dependency
+        run: docker pull postgres:16
+      - name: Verify atomic restore on fresh and upgraded isolated PostgreSQL
+        env:
+          CRM_RESTORE_POSTGRES_INTEGRATION: '1'
+        run: node --test test/crmRestorePostgres.test.js
       - run: npm run test:ui
       - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser
+      - run: npm run test:owner-flow
+      - run: npm run test:owner-volume
+      - run: npm run test:browser-volume

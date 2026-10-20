@@ -3,8 +3,11 @@ import { ExternalLink, X } from 'lucide-react';
 import BrokerMaterialsCard, { BrokerMaterialsAttachmentStatus } from './BrokerMaterialsCard.jsx';
 import PursueNextAction from './PursueNextAction.jsx';
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
+import { financialFactFields, financialFactCurrencies, financialFactPeriods, financialFactMetrics,
+  normalizeFinancialFact, parseFinancialFact, financialFactDescription } from '../../../shared/opportunityFinancialFacts.js';
 
 const factFields = [
+  ['annual_profit', 'Earnings'], ['annual_revenue', 'Revenue'], ['asking_price', 'Asking price'],
   ['seller_name', 'Seller name'], ['seller_email', 'Seller email'], ['seller_phone', 'Seller phone'],
   ['broker_name', 'Broker name'], ['broker_company', 'Broker company'], ['broker_email', 'Broker email'], ['broker_phone', 'Broker phone'],
   ['reason_for_sale', 'Reason for sale'], ['real_estate_included', 'Real estate included'], ['seller_financing', 'Seller financing'],
@@ -20,10 +23,11 @@ function formatLabel(value) {
   return String(value || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[-_]/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function formatMoney(value) {
+function formatMoney(value, currency = 'USD') {
   if (value === null || value === undefined || value === '') return '';
   const number = Number(value);
-  return Number.isFinite(number) ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(number) : String(value);
+  return Number.isFinite(number) ? (currency === 'unknown' ? `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(number)} currency unverified`
+    : new Intl.NumberFormat('en-US', { style: 'currency', currency, minimumFractionDigits: 0, maximumFractionDigits: 2 }).format(number)) : String(value);
 }
 
 function formatDate(value) {
@@ -62,13 +66,26 @@ function Section({ children, sectionRef, title, ...props }) {
 
 function Provenance({ fact }) {
   const labels = { operator: 'Operator verified', crm: 'CRM', 'structured-source': 'Structured source', 'enrichment-suggestion': 'Enrichment suggestion' };
-  return <span className="rounded-full border border-line bg-fog px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-ink/58">{labels[fact?.provenance] || formatLabel(fact?.provenance || 'unknown')}</span>;
+  return <span className="text-sm leading-6 text-ink/58">{fact?.provenance === 'operator' && !fact.verified ? 'Operator entered (unverified)' : labels[fact?.provenance] || formatLabel(fact?.provenance || 'unknown')}</span>;
 }
 
 function Fact({ detail, field }) {
   const fact = detail.effectiveFacts?.[field];
   if (!hasValue(fact?.value)) return null;
-  return <div className="rounded-xl border border-line/70 bg-fog/50 p-3"><div className="flex flex-wrap items-center gap-2"><p className="text-xs font-semibold uppercase tracking-wide text-ink/48">{factLabels[field]}</p><Provenance fact={fact} /></div><p className="mt-1.5 text-sm leading-6 text-ink">{String(fact.value)}</p>{fact.note ? <p className="mt-1 text-xs text-ink/58">{fact.note}</p> : null}</div>;
+  const financial = parseFinancialFact(field, fact.value);
+  const context = financial ? [financial.currency === 'unknown' ? 'Unknown currency' : financial.currency,
+    field === 'annual_profit' ? ({ ebitda: 'EBITDA', sde: 'SDE', unknown: 'Unknown metric' }[financial.metric]) : '',
+    financial.period === 'unknown' ? 'Unknown period' : formatLabel(financial.period)].filter(Boolean).join(' · ') : '';
+  const amount = financial ? (financial.currency === 'unknown'
+    ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(Number(financial.amount))
+    : formatMoney(financial.amount, financial.currency)) : '';
+  return <div className="min-w-0 rounded-xl border border-line/70 bg-fog/40 p-3">
+    <p className="text-sm font-medium text-ink/62">{factLabels[field]}</p>
+    <p className={financial ? 'mt-2 break-words text-2xl font-semibold tabular-nums text-ink' : 'mt-1 break-words text-base leading-6 text-ink'}>{financial ? amount : String(fact.value)}</p>
+    {financial ? <><p className="mt-1 text-sm leading-6 text-ink/68">{context}</p><p className="mt-2 break-words text-sm leading-6 text-ink/68">Source: {financial.evidenceSource}</p></> : null}
+    <p className="mt-2"><Provenance fact={fact} /></p>
+    {fact.note ? <p className="mt-1 break-words text-xs leading-5 text-ink/58">{fact.note}</p> : null}
+  </div>;
 }
 
 function MissingInformation({ fields }) {
@@ -102,22 +119,49 @@ function DetailActions({ name, onAction, onPass, pending }) {
 }
 
 function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
-  const [draft, setDraft] = useState({ field: factFields[0][0], value: detail.effectiveFacts?.[factFields[0][0]]?.value || '', note: '' });
+  const [draft, setDraft] = useState({ field: 'seller_name', value: detail.effectiveFacts?.seller_name?.value || '', note: '',
+    currency: 'unknown', metric: 'unknown', period: 'unknown', evidenceSource: '', verified: false });
+  const [validationError, setValidationError] = useState('');
+  const [saveResult, setSaveResult] = useState({ state: 'idle', message: '' });
+  const savingRef = useRef(false);
+  const saving = saveResult.state === 'saving';
+  const financial = financialFactFields.includes(draft.field);
   const expectedRevision = detail.opportunity?.factEditRevision;
   const validExpectedRevision = Number.isInteger(expectedRevision?.campaignAuthorityRevision)
     && expectedRevision.campaignAuthorityRevision > 0
-    && (expectedRevision.primarySubmissionId === null
-      ? expectedRevision.submissionFactSnapshot === null
+    && (expectedRevision.primarySubmissionId === null ? expectedRevision.submissionFactSnapshot === null
       : Boolean(expectedRevision.primarySubmissionId && expectedRevision.submissionFactSnapshot));
   const valueRef = useRef(null);
   function selectField(field) {
     const current = detail.effectiveFacts?.[field];
-    setDraft({ field, value: current?.value || '', note: current?.note || '' });
+    const typed = parseFinancialFact(field, current?.value);
+    setDraft({ field, value: typed?.amount || (financialFactFields.includes(field) ? '' : current?.value || ''),
+      note: current?.note || '', currency: typed?.currency || 'unknown', metric: typed?.metric || (field === 'annual_profit' ? 'unknown' : financialFactMetrics[field]?.[0]) || 'unknown',
+      period: typed?.period || 'unknown', evidenceSource: typed?.evidenceSource || '', verified: Boolean(current?.verified) });
+    setValidationError('');
+    setSaveResult({ state: 'idle', message: '' });
   }
-  function submit(event) {
+  async function submit(event) {
     event.preventDefault();
-    if (!String(draft.value).trim()) return;
-    onSaveFact({ field: draft.field, value: String(draft.value).trim(), note: draft.note.trim(), verified: true, expectedRevision });
+    if (pending || savingRef.current || !String(draft.value).trim()) return;
+    let value = String(draft.value).trim();
+    try {
+      if (financial) value = JSON.stringify(normalizeFinancialFact(draft.field, { version: 1, amount: value,
+        currency: draft.currency, metric: draft.metric, period: draft.period, evidenceSource: draft.evidenceSource }));
+    } catch (error) { setValidationError(error.message); setSaveResult({ state: 'idle', message: '' }); return; }
+    setValidationError('');
+    savingRef.current = true;
+    setSaveResult({ state: 'saving', message: '' });
+    try {
+      const result = await onSaveFact({ field: draft.field, value, note: draft.note.trim(), verified: financial ? draft.verified : true, expectedRevision });
+      if (result?.saved === true) {
+        setSaveResult({ state: 'saved', message: `${factLabels[draft.field]} saved.${result.refreshed === false ? ' Reload to view the saved value.' : ''}` });
+      } else {
+        setSaveResult({ state: 'error', message: result?.error || 'Unable to save this fact. Your draft is preserved; try again.' });
+      }
+    } catch (error) {
+      setSaveResult({ state: 'error', message: error.message || 'Unable to save this fact. Your draft is preserved; try again.' });
+    } finally { savingRef.current = false; }
   }
   useEffect(() => {
     if (!focusFieldRequest) return;
@@ -126,13 +170,30 @@ function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }
   // A monotonically increasing request deliberately re-focuses the existing form.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusFieldRequest]);
+  const update = (key, value) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+    setValidationError(''); setSaveResult({ state: 'idle', message: '' });
+  };
   return (
-    <form className="rounded-xl border border-moss/20 bg-moss/5 p-4" onSubmit={submit}>
-      <h4 className="text-sm font-semibold text-ink">Add or edit a verified operator fact</h4>
-      <p className="mt-1 text-xs leading-5 text-ink/58">Verified facts remain separate from machine scoring and outrank refreshed source observations.</p>
-      <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-ink/62">Verified fact field<select aria-label="Verified fact field" className="form-control mt-1" onChange={(event) => selectField(event.target.value)} value={draft.field}>{factFields.map(([field, label]) => <option key={field} value={field}>{label}</option>)}</select></label><label className="text-xs font-semibold text-ink/62">Verified fact value<input aria-label="Verified fact value" className="form-control mt-1" onChange={(event) => setDraft((current) => ({ ...current, value: event.target.value }))} ref={valueRef} value={draft.value} /></label></div>
-      <label className="mt-3 block text-xs font-semibold text-ink/62">Verification note<textarea aria-label="Verification note" className="form-control mt-1 min-h-20" onChange={(event) => setDraft((current) => ({ ...current, note: event.target.value }))} value={draft.note} /></label>
-      <button className={`${primaryButton} mt-3`} disabled={pending || !String(draft.value).trim() || !validExpectedRevision} type="submit">Save verified fact</button>
+    <form aria-busy={saving} className="rounded-xl border border-moss/20 bg-moss/5 p-4" onSubmit={submit}>
+      <h4 className="text-sm font-semibold text-ink">Add or edit an operator fact</h4>
+      <p className="mt-1 text-xs leading-5 text-ink/58">Edits preserve source evidence and the saved score. Financial verification is explicit.</p>
+      <fieldset className="min-w-0" disabled={pending || saving}>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-ink/62">Verified fact field<select aria-label="Verified fact field" className="form-control mt-1" onChange={(event) => selectField(event.target.value)} value={draft.field}>{factFields.map(([field, label]) => <option key={field} value={field}>{label}</option>)}</select></label><label className="text-xs font-semibold text-ink/62">Verified fact value<input aria-label="Verified fact value" className="form-control mt-1" inputMode={financial ? 'decimal' : 'text'} onChange={(event) => update('value', event.target.value)} ref={valueRef} value={draft.value} /></label></div>
+      {financial ? <div className="mt-3 grid gap-3 sm:grid-cols-3">
+        <label className="block text-xs font-semibold text-ink/62">Financial currency<select aria-label="Financial currency" className="form-control mt-1" onChange={(event) => update('currency', event.target.value)} value={draft.currency}>{financialFactCurrencies.map((currency) => <option key={currency} value={currency}>{currency === 'unknown' ? 'Unknown currency' : currency}</option>)}</select></label>
+        <label className="block text-xs font-semibold text-ink/62">Financial metric<select aria-label="Financial metric" className="form-control mt-1" onChange={(event) => update('metric', event.target.value)} value={draft.metric}>{financialFactMetrics[draft.field].map((metric) => <option key={metric} value={metric}>{formatLabel(metric)}</option>)}</select></label>
+        <label className="block text-xs font-semibold text-ink/62">Financial period<select aria-label="Financial period" className="form-control mt-1" onChange={(event) => update('period', event.target.value)} value={draft.period}>{financialFactPeriods.filter((period) => draft.field === 'asking_price' ? ['current', 'unknown'].includes(period) : period !== 'current').map((period) => <option key={period} value={period}>{formatLabel(period)}</option>)}</select></label>
+      </div> : null}
+      <div className={`mt-3 grid gap-3 ${financial ? 'sm:grid-cols-2' : ''}`}>
+        {financial ? <label className="block text-xs font-semibold text-ink/62">Financial evidence source<input aria-label="Financial evidence source" className="form-control mt-1" maxLength={500} onChange={(event) => update('evidenceSource', event.target.value)} required value={draft.evidenceSource} /></label> : null}
+        <label className="block text-xs font-semibold text-ink/62">Verification note<textarea aria-label="Verification note" className="form-control mt-1 min-h-16" onChange={(event) => update('note', event.target.value)} rows={2} value={draft.note} /></label>
+      </div>
+      {financial ? <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-ink/62"><input checked={draft.verified} onChange={(event) => update('verified', event.target.checked)} type="checkbox" />Financial fact verified</label> : null}
+      <button className={`${primaryButton} mt-3`} disabled={pending || saving || !String(draft.value).trim() || !validExpectedRevision} type="submit">{saving ? (financial ? 'Saving financial fact…' : 'Saving verified fact…') : (financial ? 'Save financial fact' : 'Save verified fact')}</button>
+      </fieldset>
+      {validationError || saveResult.state === 'error' ? <p className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-800" role="alert">{validationError || saveResult.message}</p> : null}
+      {saveResult.state === 'saved' ? <p aria-atomic="true" aria-live="polite" className="mt-3 rounded-lg border border-moss/20 bg-white p-3 text-sm font-medium text-moss" role="status">{saveResult.message}</p> : null}
     </form>
   );
 }
@@ -204,10 +265,11 @@ export default function OpportunityDrawer({
   actionsBlocked = false, brokerMaterialsState = {}, cimRelease = null, cimReleaseError = '', cimReleaseLoading = false, cimReleaseReadOnly = false, cimReleaseStopping = false, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
   onCimReleaseStop,
-  onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
+  onRestore, onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
   onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, pursueChoice = null, readOnly = false,
 }) {
   const [passOpen, setPassOpen] = useState(false);
+  const [restoreOpen, setRestoreOpen] = useState(false);
   const [brokerEmailFocusRequest, setBrokerEmailFocusRequest] = useState(0);
   const dialogRef = useRef(null);
   const closeButtonRef = useRef(null);
@@ -225,6 +287,15 @@ export default function OpportunityDrawer({
   useLayoutEffect(() => {
     closeButtonRef.current?.focus();
   }, [opportunity?.opportunityId]);
+  useLayoutEffect(() => {
+    // A disabled decision button can move native browser focus to the body.
+    // Restore modal keyboard access once the mutation settles, while preserving
+    // an input or disclosure that is still focused inside the drawer.
+    const dialog = dialogRef.current;
+    if (!pending && focusGuardRef?.current && dialog && !dialog.contains(document.activeElement)) {
+      closeButtonRef.current?.focus();
+    }
+  }, [pending, focusGuardRef]);
   function handleDialogKeyDown(event) {
     if (event.key === 'Escape' && !pending) {
       event.preventDefault();
@@ -274,7 +345,7 @@ export default function OpportunityDrawer({
   }, [focusGuardRef]);
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-ink/30" role="presentation">
-      <section aria-labelledby="opportunity-detail-title" aria-modal="true" className="h-full w-full overflow-y-auto border-l border-line bg-fog shadow-2xl sm:max-w-3xl" ref={dialogRef} role="dialog" tabIndex={-1}>
+      <section aria-labelledby="opportunity-detail-title" aria-modal="true" className="h-full w-full overflow-y-auto border-l border-line bg-fog shadow-2xl" ref={dialogRef} role="dialog" tabIndex={-1}>
         <header className="sticky top-0 z-10 flex items-start justify-between border-b border-line bg-white/95 p-5 backdrop-blur"><div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Opportunity View</p><h2 className="mt-1 truncate text-xl font-semibold text-ink" id="opportunity-detail-title">{name}</h2>{opportunity ? <p className="mt-1 text-xs text-ink/58">{opportunity.geography?.label || opportunity.state} · {opportunity.industry}</p> : null}</div><button aria-label="Close opportunity detail" className="rounded-full border border-line bg-white p-2 text-ink/60 hover:text-ink disabled:opacity-50" disabled={pending} onClick={onClose} ref={closeButtonRef} type="button"><X className="h-5 w-5" /></button></header>
         <div className="space-y-5 p-4 sm:p-5">
           {loading ? <p className="text-sm text-ink/62">Loading everything currently known…</p> : null}
@@ -292,7 +363,12 @@ export default function OpportunityDrawer({
               {opportunity.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-xs text-ink/65">Latest accepted by UG {formatDate(opportunity.freshness.latestAcceptedObservationAt)}</p> : null}
               {opportunity.freshness ? <div className="mt-3 rounded-xl border border-line bg-fog/60 p-3 text-sm text-ink/70"><h4 className="font-semibold text-ink">Discovery and review</h4><p className="mt-1">{opportunity.freshness.firstAcceptedAt ? `First accepted by UG ${formatDate(opportunity.freshness.firstAcceptedAt)}.` : 'First seen date unknown for this existing record.'} {opportunity.freshness.materialRevision > opportunity.freshness.reviewedMaterialRevision ? 'Supported material change awaits review.' : ''}</p><p className="mt-1 text-xs">Discovery version {opportunity.freshness.discoveryRevision}, reviewed {opportunity.freshness.reviewedDiscoveryRevision} · Material version {opportunity.freshness.materialRevision}, reviewed {opportunity.freshness.reviewedMaterialRevision}</p>{opportunity.freshness.publicationClaims?.length ? <ul className="mt-2 space-y-1 text-xs">{opportunity.freshness.publicationClaims.map((claim, index) => <li key={`${claim.source}-${index}`}>Source publication claim: {claim.source || 'Source'} · {claim.rawValue || 'Unknown date'} · {formatLabel(claim.precision)} precision</li>)}</ul> : <p className="mt-2 text-xs">Listing age unknown: no supported publication claim is available.</p>}{!linkedCrmId ? <p className="mt-2 font-semibold text-amber-900">CRM handoff prerequisite: this opportunity is not linked to a CRM record. Create or link one through the existing workflow before outreach.</p> : null}</div> : null}
               {opportunity.freshness?.materialChange && Number.isFinite(opportunity.freshness.materialChange.beforeValue) && Number.isFinite(opportunity.freshness.materialChange.afterValue) ? <p className="mt-3 rounded-xl bg-violet-50 p-3 text-sm text-violet-900">{formatLabel(opportunity.freshness.materialChange.field)} changed from {opportunity.freshness.materialChange.beforeValue} to {opportunity.freshness.materialChange.afterValue}{opportunity.freshness.materialChange.currency ? ` ${opportunity.freshness.materialChange.currency}` : ''} · {opportunity.freshness.materialChange.source || 'Accepted source'}</p> : null}
+              {detail.archivedReadOnly === true ? <p className="mt-3 rounded-xl bg-amber-50 p-3 text-sm font-semibold text-amber-900" role="status">Historical archive view. This retained score is not current; actions are unavailable.</p> : null}
               {opportunity.dismissed ? <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-800">Passed: {formatLabel(opportunity.dismissedReason || 'dismissed')}</p> : null}
+              {opportunity.dismissed && !linkedCrmId && !readOnly && !detail.archivedReadOnly && detail.restoreAuthority && onRestore ? <div className="mt-3">
+                {restoreOpen ? <div className="rounded-xl border border-line bg-white p-3"><p className="text-sm text-ink/70">Restore this opportunity to review? The original Pass reason and note remain in history. Outreach stays stopped; opt-outs and permissions are unchanged.</p><div className="mt-3 flex gap-2"><button className={primaryButton} disabled={pending || actionsBlocked} onClick={onRestore} type="button">Confirm Restore opportunity</button><button className={secondaryButton} disabled={pending} onClick={() => setRestoreOpen(false)} type="button">Cancel Restore</button></div></div>
+                  : <button className={secondaryButton} disabled={pending || actionsBlocked} onClick={() => setRestoreOpen(true)} type="button">Restore opportunity</button>}
+              </div> : null}
               <div className="mt-4"><PursueNextAction brokerMaterials={detail.brokerMaterials} cimRelease={cimRelease} linkedCrmId={linkedCrmId} opportunity={opportunity} pursueCimReleaseAvailable={detail.pursueCimReleaseAvailable} /></div>
               <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending || actionsBlocked} /></div>
               {pursueChoice?.options?.length > 1 && actionable ? <div aria-label="Choose Pursue recipient" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
@@ -343,7 +419,11 @@ export default function OpportunityDrawer({
             </Section>
 
             <Section title="Business & Financials">
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[[earnings.label, earnings.amount], ['Revenue', formatMoney(opportunity.financials?.annualRevenue)], ['Asking price', formatMoney(opportunity.financials?.askingPrice)], ['Profit multiple', opportunity.financials?.profitMultiple === null || opportunity.financials?.profitMultiple === undefined ? '' : `${opportunity.financials.profitMultiple}×`]].filter(([, value]) => value).map(([label, value]) => <div className="rounded-xl bg-fog/70 p-3" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
+              {opportunity.financialCorrectionFields?.length ? <p className="mb-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-900" role="status">Operator financial facts are shown. The saved machine score has not been recomputed; use the existing scoring review process before relying on a revised score.</p> : null}
+              <div className="grid gap-3 sm:grid-cols-3">
+                {financialFactFields.map((field) => <Fact detail={detail} field={field} key={field} />)}
+                {[['annual_profit', earnings.label, earnings.amount], ['annual_revenue', 'Revenue', formatMoney(opportunity.financials?.annualRevenue, opportunity.financials?.annualRevenueEvidence?.currency || 'USD')], ['asking_price', 'Asking price', formatMoney(opportunity.financials?.askingPrice, opportunity.financials?.askingPriceEvidence?.currency || 'USD')], ['profit_multiple', 'Profit multiple', opportunity.financials?.profitMultiple === null || opportunity.financials?.profitMultiple === undefined ? '' : `${opportunity.financials.profitMultiple}×`]].filter(([field, , value]) => value && !hasValue(detail.effectiveFacts?.[field]?.value)).map(([field, label, value]) => <div className="min-w-0 rounded-xl bg-fog/50 p-3" key={field}><p className="text-sm font-medium text-ink/62">{label}</p><p className="mt-2 break-words text-xl font-semibold tabular-nums text-ink">{value}</p></div>)}
+              </div>
               <div className="mt-3 grid gap-3 sm:grid-cols-2">{['management_structure', 'customer_concentration', 'reason_for_sale', 'real_estate_included', 'seller_financing'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>
             </Section>
 
@@ -363,15 +443,15 @@ export default function OpportunityDrawer({
 
             <Section sectionRef={crmCimRef} title="CRM/CIM">
               {detail.crmSummary?.submission ? <div className="rounded-xl bg-fog/70 p-3"><h4 className="text-sm font-semibold text-ink">CRM record</h4><p className="mt-2 text-sm text-ink/68">{detail.crmSummary.submission.company} · {formatLabel(detail.crmSummary.submission.status)}{detail.crmSummary.submission.updatedAt ? ` · ${formatDate(detail.crmSummary.submission.updatedAt)}` : ''}</p>{[['Seller', detail.crmSummary.submission.sellerName, detail.crmSummary.submission.sellerEmail], ['Broker', detail.crmSummary.submission.brokerName, detail.crmSummary.submission.brokerEmail]].map(([label, person, email]) => person || email ? <p className="mt-1 text-sm text-ink/68" key={label}>{label}: {[person, email].filter(Boolean).join(' · ')}</p> : null)}</div> : null}
-              {detail.crmSummary?.factObservations?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CRM facts</h4>{detail.crmSummary.factObservations.map((fact) => <p className="mt-2 rounded-lg bg-fog/60 p-3 text-sm text-ink/68" key={fact.field}>CRM fact · {formatLabel(fact.field)} · {String(fact.value)}</p>)}</div> : null}{detail.crmSummary?.conflicts?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CRM conflicts</h4>{detail.crmSummary.conflicts.map((conflict) => <p className="mt-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-900" key={conflict.field}>CRM conflict · {formatLabel(conflict.field)} · {conflict.crmValue} · {formatLabel(conflict.winningProvenance)} wins</p>)}</div> : null}
+              {detail.crmSummary?.factObservations?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CRM facts</h4>{detail.crmSummary.factObservations.map((fact) => <p className="mt-2 rounded-lg bg-fog/60 p-3 text-sm text-ink/68" key={fact.field}>CRM fact · {formatLabel(fact.field)} · {financialFactFields.includes(fact.field) ? financialFactDescription(fact.field, fact.value) : String(fact.value)}</p>)}</div> : null}{detail.crmSummary?.conflicts?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CRM conflicts</h4>{detail.crmSummary.conflicts.map((conflict) => <p className="mt-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-900" key={conflict.field}>CRM conflict · {formatLabel(conflict.field)} · {conflict.crmValue} · {formatLabel(conflict.winningProvenance)} wins</p>)}</div> : null}
               {detail.cimSummary?.requests?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CIM history</h4>{detail.cimSummary.requests.map((request) => <p className="mt-2 rounded-lg bg-fog/60 p-3 text-sm text-ink/68" key={request.id}>{formatLabel(request.status)}{request.updatedAt ? ` · ${formatDate(request.updatedAt)}` : ''}</p>)}</div> : null}<CommunicationList communications={detail.crmSummary?.communications} title="CRM communications" /><CommunicationList communications={detail.cimSummary?.communications} title="CIM communications" />
             </Section>
 
             <Section title="Notes & History">
               {detail.history?.operatorState ? <div className="rounded-xl bg-fog/70 p-3"><h4 className="text-sm font-semibold text-ink">Operator state</h4><p className="mt-2 text-sm text-ink/68">Priority: {formatLabel(detail.history.operatorState.priority || 'normal')}</p>{detail.history.operatorState.note ? <p className="mt-1 text-sm text-ink/68">Note: {detail.history.operatorState.note}</p> : null}<p className="mt-1 text-sm text-ink/68">Review state · {detail.history.operatorState.reviewed ? `Reviewed${detail.history.operatorState.reviewedBy ? ` by ${detail.history.operatorState.reviewedBy}` : ''}${detail.history.operatorState.reviewedAt ? ` on ${formatDate(detail.history.operatorState.reviewedAt)}` : ''}` : 'Needs Review'}</p></div> : null}
-              {detail.history?.operatorFacts?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">Operator fact audit</h4>{detail.history.operatorFacts.map((fact) => <div className="mt-2 rounded-lg border border-line/70 p-3 text-sm text-ink/68" key={fact.id}><p>Operator fact · {formatLabel(fact.field)} · {fact.value} · {fact.verified ? 'Verified' : 'Unverified'}</p>{fact.actor || fact.updatedAt || fact.note ? <p className="mt-1 text-xs text-ink/55">{[fact.actor, formatDate(fact.updatedAt), fact.note].filter(Boolean).join(' · ')}</p> : null}</div>)}</div> : null}
+              {detail.history?.operatorFacts?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">Operator fact audit</h4>{detail.history.operatorFacts.map((fact) => <div className="mt-2 rounded-lg border border-line/70 p-3 text-sm text-ink/68" key={fact.id}><p>Operator fact · {formatLabel(fact.field)} · {financialFactFields.includes(fact.field) ? financialFactDescription(fact.field, fact.value) : fact.value} · {fact.verified ? 'Verified' : 'Unverified'}</p>{fact.actor || fact.updatedAt || fact.note ? <p className="mt-1 text-xs text-ink/55">{[fact.actor, formatDate(fact.updatedAt), fact.note].filter(Boolean).join(' · ')}</p> : null}</div>)}</div> : null}
               {detail.history?.activities?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">Activity</h4><ul className="mt-2 space-y-2">{detail.history.activities.map((activity) => <li className="border-l-2 border-moss/25 pl-3 text-sm leading-6 text-ink/68" key={activity.id}><p className="text-xs font-semibold uppercase tracking-wide text-ink/48">Event: {formatLabel(activity.eventType)}</p><strong>{activity.summary}</strong>{activity.actor ? ` · ${activity.actor}` : ''}{activity.createdAt ? ` · ${formatDate(activity.createdAt)}` : ''}</li>)}</ul></div> : null}
-              {detail.history?.dispositions?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">Disposition history</h4><ul className="mt-2 space-y-2">{detail.history.dispositions.map((item) => <li className="border-l-2 border-red-200 pl-3 text-sm leading-6 text-ink/68" key={item.id}>Passed: {formatLabel(item.reason)}{item.note ? ` · ${item.note}` : ''}{item.dismissedBy ? ` · ${item.dismissedBy}` : ''}{item.dismissedAt ? ` · ${formatDate(item.dismissedAt)}` : ''}</li>)}</ul></div> : null}
+              {detail.history?.dispositions?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">Disposition history</h4><ul className="mt-2 space-y-2">{detail.history.dispositions.map((item) => <li className="border-l-2 border-red-200 pl-3 text-sm leading-6 text-ink/68" key={item.id}>Passed: {formatLabel(item.reason)}{item.note ? ` · ${item.note}` : ''}{item.dismissedBy ? ` · ${item.dismissedBy}` : ''}{item.dismissedAt ? ` · ${formatDate(item.dismissedAt)}` : ''}{item.restoredAt ? ` · Restored for review ${formatDate(item.restoredAt)}${item.restoredBy ? ` by ${item.restoredBy}` : ''}` : ''}</li>)}</ul></div> : null}
             </Section>
           </> : null}
           {readOnly ? <p className="text-sm font-semibold text-ink/62">Read-only access: decisions and verified-fact edits are unavailable.</p> : null}
