@@ -3,13 +3,14 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, codex/bounded-recovery-capture]
 
 permissions:
   contents: read
 
 jobs:
   validate:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -29,6 +30,10 @@ jobs:
       - run: npm audit --omit=dev
       - run: npm run lint
       - run: npm test
+      - name: Qualify bounded recovery capture on Linux with synthetic data
+        run: |
+          node scripts/qualify-recovery-capture.js --database-mib 154
+          node scripts/qualify-recovery-capture.js --test-timeout
       - name: Prepare disposable PostgreSQL test dependency
         run: docker pull postgres:16
       - name: Verify atomic restore on fresh and upgraded isolated PostgreSQL
@@ -42,3 +47,24 @@ jobs:
       - run: npm run test:owner-flow
       - run: npm run test:owner-volume
       - run: npm run test:browser-volume
+
+  recovery-capture-qualification:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/bounded-recovery-capture'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify exact source commit
+        env:
+          EXPECTED_SOURCE_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - run: npm ci --omit=dev
+      - name: Qualify bounded recovery capture with synthetic data only
+        run: |
+          node scripts/qualify-recovery-capture.js --database-mib 154
+          node scripts/qualify-recovery-capture.js --test-timeout
