@@ -88,9 +88,9 @@ function Fact({ detail, field }) {
   </div>;
 }
 
-function MissingInformation({ fields }) {
+function MissingInformation({ fields, onEditField, editingDisabled = false }) {
   if (!fields?.length) return null;
-  return <section aria-label="Missing Information" className="rounded-xl border border-amber-200 bg-amber-50 p-4"><h4 className="text-sm font-semibold text-amber-950">Missing Information</h4><div className="mt-3 grid gap-2 sm:grid-cols-2">{fields.map((field) => <div className="flex items-center justify-between gap-3 rounded-lg bg-white/70 px-3 py-2 text-sm" key={field}><span className="font-medium text-ink">{missingLabels[field] || formatLabel(field)}</span><span className="text-amber-800">Not provided</span></div>)}</div></section>;
+  return <section aria-label="Missing Information" className="rounded-xl border border-amber-200 bg-amber-50 p-4"><h4 className="text-sm font-semibold text-amber-950">Missing Information</h4><div className="mt-3 grid gap-2 sm:grid-cols-2">{fields.map((field) => <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg bg-white/70 px-3 py-2 text-sm" key={field}><span className="font-medium text-ink">{missingLabels[field] || formatLabel(field)}</span><span className="text-amber-800">Not provided</span>{onEditField && factFields.some(([editableField]) => editableField === field) ? <button aria-label={`Edit ${missingLabels[field] || formatLabel(field)}`} className={secondaryButton} disabled={editingDisabled} onClick={() => onEditField(field)} type="button">Edit</button> : null}</div>)}</div></section>;
 }
 
 export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit, pending = false, submitDisabled = false }) {
@@ -118,7 +118,7 @@ function DetailActions({ name, onAction, onPass, pending }) {
   return <div className="flex flex-wrap gap-2"><button aria-label={`Pursue ${name}`} className={primaryButton} disabled={pending} onClick={() => onAction('pursue')} type="button">Pursue</button><button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
 }
 
-function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
+function VerifiedFactForm({ detail, focusFieldRequest = null, onSaveFact, pending }) {
   const [draft, setDraft] = useState({ field: 'seller_name', value: detail.effectiveFacts?.seller_name?.value || '', note: '',
     currency: 'unknown', metric: 'unknown', period: 'unknown', evidenceSource: '', verified: false });
   const [validationError, setValidationError] = useState('');
@@ -165,9 +165,9 @@ function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }
   }
   useEffect(() => {
     if (!focusFieldRequest) return;
-    selectField('broker_email');
+    if (draft.field !== focusFieldRequest.field) selectField(focusFieldRequest.field);
     valueRef.current?.focus();
-  // A monotonically increasing request deliberately re-focuses the existing form.
+  // A new request deliberately re-focuses the existing form, including the same field.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusFieldRequest]);
   const update = (key, value) => {
@@ -270,7 +270,7 @@ export default function OpportunityDrawer({
 }) {
   const [passOpen, setPassOpen] = useState(false);
   const [restoreOpen, setRestoreOpen] = useState(false);
-  const [brokerEmailFocusRequest, setBrokerEmailFocusRequest] = useState(0);
+  const [factFieldFocusRequest, setFactFieldFocusRequest] = useState(null);
   const dialogRef = useRef(null);
   const closeButtonRef = useRef(null);
   const crmCimRef = useRef(null);
@@ -285,6 +285,7 @@ export default function OpportunityDrawer({
   const reviewState = opportunity?.reviewed ? 'Reviewed' : 'Needs Review';
   const changedState = opportunity?.changedSinceReview ? 'Changed' : 'Current';
   useLayoutEffect(() => {
+    setFactFieldFocusRequest(null);
     closeButtonRef.current?.focus();
   }, [opportunity?.opportunityId]);
   useLayoutEffect(() => {
@@ -393,7 +394,7 @@ export default function OpportunityDrawer({
                 checking={brokerMaterialsState.checking}
                 checkingFailed={brokerMaterialsState.checkingFailed}
                 error={brokerMaterialsState.error}
-                onAddBrokerEmail={() => setBrokerEmailFocusRequest((current) => current + 1)}
+                onAddBrokerEmail={() => setFactFieldFocusRequest({ opportunityId: opportunity.opportunityId, field: 'broker_email' })}
                 onApprove={onBrokerMaterialsApprove}
                 onCheckStatus={onBrokerMaterialsCheckStatus}
                 onInvalidatePreparation={onBrokerMaterialsInvalidate}
@@ -415,7 +416,7 @@ export default function OpportunityDrawer({
                 stale={brokerMaterialsState.stale}
                 updating={brokerMaterialsState.updating}
               /></div> : null}
-              {opportunity.topStrength ? <p className="mt-4 rounded-xl bg-moss/8 p-3 text-sm leading-6 text-moss">{opportunity.topStrength}</p> : null}{opportunity.topConcern ? <p className="mt-2 rounded-xl bg-amber-50 p-3 text-sm leading-6 text-amber-900">{opportunity.topConcern}</p> : null}{detail.missingCriticalFields?.length ? <div className="mt-4"><MissingInformation fields={detail.missingCriticalFields} /></div> : null}
+              {opportunity.topStrength ? <p className="mt-4 rounded-xl bg-moss/8 p-3 text-sm leading-6 text-moss">{opportunity.topStrength}</p> : null}{opportunity.topConcern ? <p className="mt-2 rounded-xl bg-amber-50 p-3 text-sm leading-6 text-amber-900">{opportunity.topConcern}</p> : null}{detail.missingCriticalFields?.length ? <div className="mt-4"><MissingInformation editingDisabled={pending || actionsBlocked} fields={detail.missingCriticalFields} onEditField={!readOnly && onSaveFact ? (field) => setFactFieldFocusRequest({ opportunityId: opportunity.opportunityId, field }) : undefined} /></div> : null}
             </Section>
 
             <Section title="Business & Financials">
@@ -427,7 +428,7 @@ export default function OpportunityDrawer({
               <div className="mt-3 grid gap-3 sm:grid-cols-2">{['management_structure', 'customer_concentration', 'reason_for_sale', 'real_estate_included', 'seller_financing'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>
             </Section>
 
-            <Section title="Broker & Seller"><div className="grid gap-3 sm:grid-cols-2">{['broker_name', 'broker_company', 'broker_email', 'broker_phone', 'seller_name', 'seller_email', 'seller_phone', 'operator_contact_notes'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>{!readOnly && onSaveFact ? <div className="mt-4"><VerifiedFactForm detail={detail} focusFieldRequest={brokerEmailFocusRequest} key={opportunity.opportunityId} onSaveFact={onSaveFact} pending={pending} /></div> : null}</Section>
+            <Section title="Broker & Seller"><div className="grid gap-3 sm:grid-cols-2">{['broker_name', 'broker_company', 'broker_email', 'broker_phone', 'seller_name', 'seller_email', 'seller_phone', 'operator_contact_notes'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>{!readOnly && onSaveFact ? <div className="mt-4"><VerifiedFactForm detail={detail} focusFieldRequest={factFieldFocusRequest?.opportunityId === opportunity.opportunityId ? factFieldFocusRequest : null} key={opportunity.opportunityId} onSaveFact={onSaveFact} pending={pending} /></div> : null}</Section>
 
             <Section title="Score & Evidence">
               {strengths.length || concerns.length ? <div className="grid gap-3 sm:grid-cols-2">{strengths.length ? <div className="rounded-xl bg-moss/8 p-3"><h4 className="text-sm font-semibold text-moss">Strengths</h4>{strengths.map((item) => <p className="mt-1 text-sm text-ink/70" key={item}>{item}</p>)}</div> : null}{concerns.length ? <div className="rounded-xl bg-amber-50 p-3"><h4 className="text-sm font-semibold text-amber-900">Concerns</h4>{concerns.map((item) => <p className="mt-1 text-sm text-ink/70" key={item}>{item}</p>)}</div> : null}</div> : null}

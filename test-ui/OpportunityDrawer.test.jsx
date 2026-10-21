@@ -349,6 +349,80 @@ describe('Opportunity drawer', () => {
     expect(screen.queryByRole('option', { name: /fit score|confidence|canonical identity/i })).not.toBeInTheDocument();
   });
 
+  test.each([
+    ['annual_profit', 'Earnings'], ['annual_revenue', 'Revenue'], ['asking_price', 'Asking price'],
+  ])('opens the existing editor for missing %s without writing or assuming financial context', (field, label) => {
+    const onSaveFact = vi.fn();
+    render(<OpportunityDrawer detail={detailFixture({ missingCriticalFields: [field] })} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+
+    fireEvent.click(within(screen.getByRole('region', { name: 'Missing Information' })).getByRole('button', { name: `Edit ${label}` }));
+
+    expect(screen.getByLabelText('Verified fact field')).toHaveValue(field);
+    expect(screen.getByLabelText('Verified fact value')).toHaveFocus();
+    expect(screen.getByLabelText('Financial currency')).toHaveValue('unknown');
+    expect(screen.getByLabelText('Financial period')).toHaveValue('unknown');
+    expect(screen.getByLabelText('Financial fact verified')).not.toBeChecked();
+    expect(onSaveFact).not.toHaveBeenCalled();
+  });
+
+  test('missing broker email selects its supported editor while source-owned missing fields stay informational', () => {
+    const onSaveFact = vi.fn();
+    render(<OpportunityDrawer detail={detailFixture({ missingCriticalFields: ['broker_email', 'listing_url', 'canonical_identity'] })} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+    const missing = screen.getByRole('region', { name: 'Missing Information' });
+    expect(within(missing).getAllByRole('button')).toHaveLength(1);
+    fireEvent.click(within(missing).getByRole('button', { name: 'Edit Broker email' }));
+    expect(screen.getByLabelText('Verified fact field')).toHaveValue('broker_email');
+    expect(screen.getByLabelText('Verified fact value')).toHaveFocus();
+    expect(onSaveFact).not.toHaveBeenCalled();
+  });
+
+  test('repeated missing-field shortcuts refocus the editor and preserve the existing save contract', async () => {
+    const onSaveFact = vi.fn().mockResolvedValue({ saved: true, refreshed: true });
+    render(<OpportunityDrawer detail={detailFixture({ missingCriticalFields: ['asking_price'] })} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+    const edit = screen.getByRole('button', { name: 'Edit Asking price' });
+    fireEvent.click(edit);
+    fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: '1250000.50' } });
+    fireEvent.change(screen.getByLabelText('Financial evidence source'), { target: { value: 'Owner listing review' } });
+    screen.getByLabelText('Verification note').focus();
+    fireEvent.click(edit);
+    expect(screen.getByLabelText('Verified fact value')).toHaveFocus();
+    expect(screen.getByLabelText('Verified fact value')).toHaveValue('1250000.50');
+    expect(screen.getByLabelText('Financial evidence source')).toHaveValue('Owner listing review');
+    fireEvent.click(screen.getByRole('button', { name: 'Save financial fact' }));
+    await screen.findByText('Asking price saved.');
+    expect(onSaveFact).toHaveBeenCalledTimes(1);
+    expect(onSaveFact.mock.calls[0][0]).toMatchObject({ field: 'asking_price', verified: false,
+      expectedRevision: { campaignAuthorityRevision: 7, primarySubmissionId: null, submissionFactSnapshot: null } });
+    expect(JSON.parse(onSaveFact.mock.calls[0][0].value)).toEqual({ version: 1, amount: '1250000.50', currency: 'unknown', metric: 'asking-price', period: 'unknown', evidenceSource: 'Owner listing review' });
+  });
+
+  test('does not carry a missing-field focus request into another opportunity', () => {
+    const onSaveFact = vi.fn();
+    const first = detailFixture();
+    const { rerender } = render(<OpportunityDrawer detail={first} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Asking price' }));
+    const next = detailFixture();
+    next.opportunity = { ...next.opportunity, opportunityId: 'opp-2', name: 'Another opportunity' };
+    rerender(<OpportunityDrawer detail={next} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+    expect(screen.getByLabelText('Verified fact field')).toHaveValue('seller_name');
+    expect(screen.getByRole('button', { name: 'Close opportunity detail' })).toHaveFocus();
+    rerender(<OpportunityDrawer detail={first} onClose={vi.fn()} onSaveFact={onSaveFact} />);
+    expect(screen.getByLabelText('Verified fact field')).toHaveValue('seller_name');
+    expect(screen.getByRole('button', { name: 'Close opportunity detail' })).toHaveFocus();
+    expect(onSaveFact).not.toHaveBeenCalled();
+  });
+
+  test.each([{ readOnly: true }, { onSaveFact: undefined }])('omits missing-field shortcuts without editing authority: %j', (props) => {
+    render(<OpportunityDrawer detail={detailFixture()} onClose={vi.fn()} onSaveFact={vi.fn()} {...props} />);
+    expect(within(screen.getByRole('region', { name: 'Missing Information' })).queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  test.each([{ pending: true }, { actionsBlocked: true }])('disables missing-field shortcuts while detail actions are blocked: %j', (props) => {
+    render(<OpportunityDrawer detail={detailFixture()} onClose={vi.fn()} onSaveFact={vi.fn()} {...props} />);
+    expect(screen.getByRole('button', { name: 'Edit Asking price' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Edit Broker email' })).toBeDisabled();
+  });
+
   test('keeps primary decisions accessible in the full-height responsive detail', () => {
     const onAction = vi.fn();
     render(<OpportunityDrawer detail={detailFixture()} onAction={onAction} onClose={vi.fn()} />);
