@@ -12,7 +12,9 @@ from unittest.mock import patch
 import guard
 
 
-def fixture(path, arch='amd64', corrupt=False, missing_layer=False, nested=True):
+def fixture(path, arch='amd64', corrupt=False, missing_layer=False, nested=True,
+            named=True, predicate=None, predicate_type='https://slsa.dev/provenance/v0.2',
+            subject_digest=None, attestation_copies=1, extra_root=False):
     blobs = {}
     def blob(value, media):
         data = json.dumps(value, sort_keys=True).encode()
@@ -25,14 +27,14 @@ def fixture(path, arch='amd64', corrupt=False, missing_layer=False, nested=True)
                    'application/vnd.oci.image.config.v1+json')
     layer = blob({'synthetic': True}, 'application/vnd.oci.image.layer.v1.tar')
     manifest = blob({'schemaVersion': 2, 'config': config, 'layers': [layer]}, 'application/vnd.oci.image.manifest.v1+json')
-    attestation = blob({'predicateType':'https://slsa.dev/provenance/v0.2',
-                        'predicate':{'fixture':'synthetic'},
-                        'subject':[{'digest':{'sha256':manifest['digest'][7:]}}]}, 'application/vnd.in-toto+json')
+    attestation = blob({'predicateType':predicate_type,
+                        'predicate':predicate if predicate is not None else {'fixture':'synthetic'},
+                        'subject':[{'digest':{'sha256':subject_digest or manifest['digest'][7:]}}] if named else []}, 'application/vnd.in-toto+json')
     attest_config = blob({'os':'unknown','architecture':'unknown'}, 'application/vnd.oci.image.config.v1+json')
-    attest_manifest = blob({'schemaVersion':2,'config':attest_config,'layers':[attestation]}, 'application/vnd.oci.image.manifest.v1+json')
+    attest_manifest = blob({'schemaVersion':2,'config':attest_config,'layers':[attestation]*attestation_copies}, 'application/vnd.oci.image.manifest.v1+json')
     if nested:
         manifest = blob({'schemaVersion': 2, 'manifests': [manifest,attest_manifest]}, 'application/vnd.oci.image.index.v1+json')
-    blobs['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': [manifest]}).encode()
+    blobs['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': [manifest]+([attest_manifest] if extra_root else [])}).encode()
     blobs['oci-layout'] = b'{"imageLayoutVersion":"1.0.0"}'
     if corrupt:
         blobs['blobs/sha256/' + config['digest'][7:]] = b'X' * config['size']
@@ -56,6 +58,24 @@ class GuardTests(unittest.TestCase):
         r = guard.inspect_oci(self.p / 'image')
         self.assertEqual(r['platform'], 'linux/amd64')
         self.assertEqual(r['archive_sha256'], guard.digest(self.p / 'image'))
+
+    def test_unnamed_export_has_no_subject_and_returns_bounded_structure(self):
+        # Version-pinned BuildKit writer.go/make.go: empty image name gives no
+        # default subjects. No live archive is available from run40568987891.
+        fixture(self.p/'image',named=False)
+        diagnostic={}
+        with self.assertRaisesRegex(ValueError,'cardinality: expected1, found0'):
+            guard.inspect_oci(self.p/'image',diagnostics=diagnostic)
+        self.assertEqual(diagnostic['matching_provenance_count'],0)
+        self.assertEqual(diagnostic['attestations'][0]['subject_sha256'],[])
+        self.assertLess(len(json.dumps(diagnostic).encode()),16384)
+
+    def test_wrong_subject_duplicate_provenance_and_extra_roots_fail_closed(self):
+        for options,error in [({'subject_digest':'0'*64},'found0'),
+                ({'attestation_copies':2},'found2'),({'extra_root':True},'exactly one OCI export root')]:
+            with self.subTest(options=options):
+                fixture(self.p/'image',**options)
+                with self.assertRaisesRegex(ValueError,error):guard.inspect_oci(self.p/'image')
 
     def test_wrong_platform_fails(self):
         fixture(self.p / 'image', arch='arm64')
@@ -147,18 +167,41 @@ class GuardTests(unittest.TestCase):
         os.chmod(self.p/'source-file', 0o755)
         source={'source':guard.SOURCE,'tree':guard.TREE,'recipe_hashes':guard.PINS,
                 'files':{'source-file':{'sha256':guard.digest(self.p/'source-file'),'mode':0o755}}}
-        image={'result_root_digests':['sha256:'+'a'*64],'config_digest':'sha256:'+'b'*64}
-        metadata={'containerimage.digest':'sha256:'+'a'*64,
-                  'containerimage.descriptor':{'digest':'sha256:'+'a'*64},
-                  'containerimage.config.digest':'sha256:'+'b'*64,
-                  'buildx.build.provenance':{'buildType':'https://mobyproject.org/buildkit@v1',
+        provenance={'buildType':'https://mobyproject.org/buildkit@v1',
                     'materials':[{'uri':'pkg:docker/node@22-bookworm-slim?platform=linux%2Famd64','digest':{'sha256':'c'*64}}],
-                    'invocation':{'parameters':{'args':{}}}}}
-        image['provenance_predicate']=json.loads(json.dumps(metadata['buildx.build.provenance']))
+                    'invocation':{'parameters':{'args':{}}}}
+        fixture(self.p/'image',predicate=provenance)
+        image=guard.inspect_oci(self.p/'image');(self.p/'image').unlink()
+        metadata={'containerimage.digest':image['result_root_digests'][0],
+                  'containerimage.descriptor':image['result_root_descriptor'],
+                  'containerimage.config.digest':image['config_digest'],
+                  'buildx.build.provenance':provenance}
         return image,metadata,source
 
     def test_valid_source_and_build_binding(self):
         guard.validate_binding(*self.binding_fixture(),self.p)
+
+    def test_index_export_binds_config_via_verified_root_without_optional_metadata_key(self):
+        image,metadata,source=self.binding_fixture()
+        del metadata['containerimage.config.digest']
+        guard.validate_binding(image,metadata,source,self.p)
+
+    def test_present_config_digest_and_root_descriptor_must_match(self):
+        image,metadata,source=self.binding_fixture()
+        for key,value in [('containerimage.config.digest','sha256:'+'d'*64),
+                ('containerimage.config.digest',None),
+                ('containerimage.descriptor',dict(metadata['containerimage.descriptor'],size=1)),
+                ('containerimage.descriptor',dict(metadata['containerimage.descriptor'],mediaType='unknown'))]:
+            changed=dict(metadata,**{key:value})
+            with self.subTest(key=key,value=value):
+                with self.assertRaises(ValueError):guard.validate_binding(image,changed,source,self.p)
+
+    def test_reduced_metadata_cannot_replace_full_image_provenance(self):
+        image,metadata,source=self.binding_fixture()
+        image['provenance_predicate']['buildConfig']={'llbDefinition':[{'id':'step0'}]}
+        metadata['buildx.build.provenance']=dict(metadata['buildx.build.provenance'],buildConfig=None)
+        with self.assertRaisesRegex(ValueError,'provenance mismatch'):
+            guard.validate_binding(image,metadata,source,self.p)
 
     def test_mismatched_result_digest_fails(self):
         i,m,s=self.binding_fixture(); m['containerimage.digest']='sha256:'+'d'*64

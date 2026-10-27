@@ -1,17 +1,21 @@
 # One hosted UG image qualification
 
-Second execution candidate, **pending fresh approval and not dispatched**.
+Third execution candidate, **not approved and not dispatched**.
 The original one-run grant was consumed by run40567282005 attempt1, which stopped
 before the application build at the cgroup membership detector. Its cleanup and
 failure receipts remain unchanged. No application/image qualification passed.
+The second run40568987891 completed build/export, failed provenance qualification,
+and reported unverified cleanup after a volume-delete timeout. Its exact archive
+was not uploaded or retained as a GitHub artifact; neither its full structure nor
+verified owned temporary-file cleanup can be reconstructed from the returned logs.
 Reuse the reviewed October21 source/OCI/provenance verifier. Application source
 remains `f22738d22ee33ed3f30df448fdcbebbad396d91a`, tree
 `8d436f7a7db338157d791bc64396bbfdb4cd4747`; no product/configuration change.
 
 Install exactly the sealed helper files at `release-tools/ug-image/` and the
 selected workflow at `.github/workflows/ug-image-once.yml` on an operator commit
-based on accepted source. Push only branch `codex/ug-image-f22738d-cgroup-20261027` and,
-only after fresh approval, create tag `ug-ui-image-f22738d-20261027-attempt2` at that exact
+based on accepted source. Push only branch `codex/ug-image-oci-binding-20261027` and,
+only after fresh approval, create tag `ug-ui-image-f22738d-20261027-attempt3` at that exact
 reviewed operator commit. The branch alone is not a trigger; existing CI only
 triggers main pushes/PRs. No PR/main merge/default-branch installation.
 First read the tag, run list and source/seal bindings; any prior/uncertain trigger
@@ -68,6 +72,10 @@ plus a fresh descendant snapshot. No global process, kernel, Docker or security
 settings change. Docker cleanup revalidates exact ID plus the random owner nonce;
 it never broad-signals/deletes by name alone. Ambiguous orphan volumes are retained
 and fail the receipt. Existing local Mac apps/originals/SanDisk files are untouched.
+If the one owned volume delete times out, do not repeat it: one fresh exact-name
+absence read may reconcile that outcome, followed by the existing final volume
+absence read. Present/unreadable state still fails closed and preserves temporary
+files. Builder-container absence is recorded separately. No deadline is increased.
 The smoke start is persisted before container creation; the independent ancestor
 stops a stalled workload by90seconds and reserves30seconds for verified smoke
 removal. Only the ancestor retires that lease after its own fresh absence check.
@@ -82,6 +90,26 @@ Docker store. Require the imported **config digest and every uncompressed rootfs
 diffID** to match the verified OCI. Keep original OCI/index/attestation bytes for
 any optional GHCR copy; import conversion is not a rebuild. Resolved base material
 is recorded; floating Node base does not imply bit-reproducibility.
+
+The OCI export has a task-local image name (no registry push), explicitly uses
+`mode=max,version=v0.2`, and fixes `BUILDX_METADATA_PROVENANCE=max` in the clean
+child environment. This supplies image-bound subjects and matches the verifier's
+existing full v0.2 schema; reduced/unequal provenance remains rejected. BuildKit's
+[writer and index path](https://raw.githubusercontent.com/moby/buildkit/v0.31.1/exporter/containerimage/writer.go)
+omit a top-level config-digest annotation for an attested index, and its
+[subject construction](https://raw.githubusercontent.com/moby/buildkit/v0.31.1/exporter/attestation/make.go)
+needs an image name. Require exactly one export root; its digest, size and media
+type must match exporter metadata. Verified blob hashes bind that index to its
+sole linux/amd64 manifest and config. A supplied config-digest metadata key must
+still match; an absent key is supported only for that verified OCI index chain.
+The config digest is never guessed from the index digest. Full provenance,
+source files/modes, build arguments, base materials and import identity remain
+checked. Buildx's [metadata provenance conversion](https://raw.githubusercontent.com/docker/buildx/v0.38.0/build/provenance.go)
+and [default reduced mode](https://raw.githubusercontent.com/docker/buildx/v0.38.0/util/confutil/metadata.go)
+are explicit compatibility inputs, not substitutes for attestation verification.
+Failure receipts add only bounded digest/type/count structure and completed
+admission evidence (each<=16KiB), inside existing output/receipt/storage caps;
+they expose no provenance contents, subject names, credentials or application data.
 
 Use the image's unchanged CMD `node server/index.js` and inherited Node
 `docker-entrypoint.sh`. Verify actual image and container env/command/mounts first.

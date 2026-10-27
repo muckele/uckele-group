@@ -1,0 +1,34 @@
+{
+  "recorded_at": "2026-10-27T19:42:47.292738+00:00",
+  "reviewer": "/root/oci_binding_cleanup_review",
+  "base_commit": "3a857466604c9a7e1d8f5f27d0fbb3c8e5262ef1",
+  "outcome": "accepted for offline correction; no required findings",
+  "scope": "static read-only; no tests/app/Docker/build/network/mutations by reviewer",
+  "verified_hashes": {
+    "release-tools/ug-image/guard.py": "80038f663de9b3253b7728c43577f93e959b81859fd4b70ebc017bc395009d97",
+    "release-tools/ug-image/operator_once.py": "2514ad3ffcf0e29298214fa56ae36fb0b9984460336b01b37745d01a300df834",
+    "release-tools/ug-image/test_guard.py": "86b26db7b51c6024998be2e987abaac84e5ac57203c6b0a3f6c873aea401b693",
+    "release-tools/ug-image/test_operator.py": "53fd7153fae7abdcfb583c965c47b6393ab8bd92b7094e83f26aec60efd49f9a",
+    "release-tools/ug-image/SHA256SUMS": "01a7245e66d68a6873f372d718a7e05d1f4786fff99d3ff664ed127b747f2e7b",
+    "release-tools/ug-image/PROPOSAL.md": "22685efbd8ccacc684de98301dfff218ba7503c54af840420edb023a27a36cff",
+    ".github/workflows/ug-image-once.yml": "829bd8e8b52645cd6dc67a858313d0ff64fb41c67cafc958f70bb17f62d5b515"
+  },
+  "verified_patch_sha256": "8233001417fa6db08ef2a5d003bb3d0d76bdd9632e7e4e0128431fa85257581c",
+  "findings": [
+    "Sole verified root digest/size/type binds exactly one linuxamd64 manifest/config; absent top-level config metadata supported only for verified OCI index; supplied config digest still must match",
+    "Exact predicate/source/files/modes/materials/build-arguments/import binding preserved",
+    "One volume delete only; timeout reconciliation needs fresh exact-name absence and existing final absence read; present/unreadable still false",
+    "Independent AST comparison confirms unchanged owner/watchdog/admission/resource/cgroup/smoke/deadline/descendant/private-publish functions",
+    "All seven reviewed modes100644, five checksum entries and eight pinned upstream hashes verified",
+    "Original failed run summary/log hashes verified; original archive unavailable and actual statement layout/cause unproven"
+  ],
+  "author_tests": {
+    "passed": 61,
+    "scope": "complete offline guard/operator suite; no real application/image/remote qualification"
+  },
+  "optional_coverage_not_required": [
+    "Non-index root missing-config rejection",
+    "Volume appears or final read fails after first timeout-absence read; current implementation handles correctly by inspection"
+  ],
+  "runtime": "Original run remains failed; original cleanup remains unverified; future attempt3 unapproved and untriggered"
+}

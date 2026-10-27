@@ -189,7 +189,7 @@ def run_bounded(command, log, seconds=900, file_limit=IMAGE_MAX, log_limit=LOG_M
     return receipt
 
 
-def inspect_oci(archive):
+def inspect_oci(archive, diagnostics=None):
     regular(archive, IMAGE_MAX)
     members = {}
     with tarfile.open(archive, 'r:') as tf:
@@ -221,6 +221,13 @@ def inspect_oci(archive):
         index = read_json('index.json')
         # Buildx OCI export wraps its result in a layout index. Follow nested indexes.
         roots = [d['digest'] for d in index.get('manifests', [])]
+        if len(roots) != 1:
+            raise ValueError('expected exactly one OCI export root')
+        root_descriptor = index['manifests'][0]
+        if root_descriptor.get('mediaType') not in (
+                'application/vnd.oci.image.index.v1+json',
+                'application/vnd.oci.image.manifest.v1+json'):
+            raise ValueError('unsupported OCI root descriptor type')
         descriptors = list(index.get('manifests', []))
         leaves = []
         visited = set()
@@ -269,11 +276,25 @@ def inspect_oci(archive):
         matched = [a['predicate'] for a in attestations
                    if a.get('predicateType', '').startswith('https://slsa.dev/provenance/') and
                    any(s.get('digest', {}).get('sha256') == dg[7:] for s in a.get('subject', []))]
+        if diagnostics is not None:
+            diagnostics.update(
+                root_descriptor={k:root_descriptor[k] for k in ('digest','size','mediaType')},
+                platform_manifest_digest=dg,config_digest=config_digest,
+                attestation_count=len(attestations),matching_provenance_count=len(matched),
+                attestations=[{
+                    'predicate_type':a.get('predicateType') if a.get('predicateType') in
+                        ('https://slsa.dev/provenance/v0.2','https://slsa.dev/provenance/v1') else 'unsupported',
+                    'subject_sha256':[s.get('digest',{}).get('sha256') if re.fullmatch(
+                        '[0-9a-f]{64}',str(s.get('digest',{}).get('sha256'))) else 'invalid'
+                        for s in a.get('subject',[])[:8]],
+                    'subject_count':len(a.get('subject',[]))} for a in attestations[:8]])
         if len(matched) != 1:
-            raise ValueError('missing image-bound provenance attestation')
+            raise ValueError('image-bound provenance cardinality: expected1, found'+str(len(matched)))
     return {'archive_sha256': digest(archive), 'archive_bytes': archive.stat().st_size,
             'platform': 'linux/amd64', 'platform_manifest_digest': dg,
             'config_digest': config_digest, 'result_root_digests': roots,
+            'result_root_descriptor':{k:root_descriptor[k] for k in ('digest','size','mediaType')},
+            'config_digest_source':'verified OCI root -> platform manifest -> config descriptor chain',
             'provenance_predicate': matched[0], 'image_config': config}
 
 
@@ -289,9 +310,18 @@ def validate_binding(image, metadata, source, context):
         if digest(p) != expected['sha256'] or stat.S_IMODE(p.stat().st_mode) != expected['mode']:
             raise ValueError('context bytes/mode drift')
     result = metadata.get('containerimage.digest')
-    if result not in image['result_root_digests'] or metadata.get('containerimage.descriptor', {}).get('digest') != result:
+    descriptor=metadata.get('containerimage.descriptor',{})
+    root=image['result_root_descriptor']
+    if image['result_root_digests'] != [result] or not isinstance(descriptor,dict) or \
+       any(descriptor.get(k)!=root[k] for k in ('digest','size','mediaType')):
         raise ValueError('build result/archive root mismatch')
-    if metadata.get('containerimage.config.digest') != image['config_digest']:
+    # BuildKit's attested index branch has no single top-level config annotation.
+    # The verified result root cryptographically binds its sole runnable image's
+    # config. Never substitute the index digest for the config digest.
+    if 'containerimage.config.digest' in metadata:
+        if metadata['containerimage.config.digest'] != image['config_digest']:
+            raise ValueError('build config/archive mismatch')
+    elif root['mediaType'] != 'application/vnd.oci.image.index.v1+json':
         raise ValueError('build config/archive mismatch')
     provenance = metadata.get('buildx.build.provenance', {})
     if provenance != image['provenance_predicate']:

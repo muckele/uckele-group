@@ -72,6 +72,9 @@ class OperatorPolicyTests(unittest.TestCase):
             self.assertIn(['docker','rm',sid],calls)
             self.assertTrue((root/'local-image-intent.json').exists())
             self.assertEqual(result['smoke']['GETs'],[1,2,3,4])
+            build=[args for args in calls if args[:3]==['docker','buildx','build']][0]
+            self.assertEqual(build[build.index('--tag')+1],'ug-ui-qualification:1')
+            self.assertIn('--provenance=mode=max,version=v0.2',build)
     def test_shared_deadline_reserves_cleanup(self):
         with patch('operator_once.time.monotonic', return_value=1150):
             with self.assertRaisesRegex(RuntimeError, 'cleanup reserve'):
@@ -105,6 +108,7 @@ class OperatorPolicyTests(unittest.TestCase):
         self.assertNotIn('RETENTION_TOKEN',env)
         self.assertNotIn('NODE_OPTIONS',env)
         self.assertEqual(env['HOME'],'/tmp/owned/home')
+        self.assertEqual(env['BUILDX_METADATA_PROVENANCE'],'max')
 
     def test_builder_actual_limits_and_namespace_required(self):
         b={'Config':{'Env':['UG_IMAGE_OWNER=owned']},'HostConfig':{
@@ -232,6 +236,32 @@ class OperatorPolicyTests(unittest.TestCase):
         self.assertFalse(result['verified'])
         self.assertFalse(any(x[:3]==['docker','volume','rm'] for x in calls))
 
+    def test_owned_volume_timeout_is_reconciled_only_by_fresh_exact_absence(self):
+        nonce='a'*32;identity='b'*64;name='buildx_buildkit_ug-image-1'
+        for outcome in ('absent','present','unreadable'):
+            present=True;delete_count=0
+            def run(args,*a,**kw):
+                nonlocal present,delete_count
+                if args[:2]==['docker','inspect']:
+                    if args[-1]!=name or not present:
+                        raise subprocess.CalledProcessError(1,args,stderr=('No such object: '+args[-1]).encode())
+                    return json.dumps([{'Id':identity,'Name':'/'+name,
+                        'Config':{'Env':['UG_IMAGE_OWNER='+nonce]},'State':{'Running':False},
+                        'Mounts':[{'Type':'volume','Name':name+'_state'}]}]).encode()
+                if args[:2]==['docker','rm']:present=False;return b''
+                if args[:3]==['docker','volume','rm']:
+                    delete_count+=1;raise subprocess.TimeoutExpired(args,3)
+                if args[:3]==['docker','volume','ls']:
+                    self.assertEqual(args[-1],'name=^'+name+'_state$')
+                    if outcome=='unreadable':raise PermissionError('fixture denied')
+                    return b'' if outcome=='absent' else (name+'_state\n').encode()
+                raise AssertionError(args)
+            with self.subTest(outcome=outcome):
+                result=op.cleanup_objects('1',nonce,run)
+                self.assertEqual(delete_count,1)
+                self.assertEqual(result['verified'],outcome=='absent')
+                self.assertTrue(result['builder_container_absence_verified'])
+
     def test_unknown_inspect_failure_is_not_absence(self):
         def run(args):raise subprocess.CalledProcessError(1,args,stderr=b'permission denied')
         with self.assertRaises(subprocess.CalledProcessError):op.inspect_container('owned',run)
@@ -334,6 +364,17 @@ class OperatorPolicyTests(unittest.TestCase):
         self.assertNotIn('secret-token',result['bounded_terminal_tail'])
         self.assertNotIn('fake_key',result['bounded_terminal_tail'])
         self.assertNotIn('synthetic-token',result['bounded_terminal_tail'])
+
+    def test_failure_receipt_preserves_bounded_structure_and_completed_admission(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as tmp:
+            root=Path(tmp)
+            (root/'oci-structure.json').write_text(json.dumps({'matching_provenance_count':0}))
+            (root/'admission-evidence.json').write_text(json.dumps({'kernel_cgroup':{'memory_max':'4294967296'}}))
+            result=op.failure_diagnostics(root)
+            self.assertEqual(result['actual_oci_structure']['matching_provenance_count'],0)
+            self.assertEqual(result['completed_admission']['kernel_cgroup']['memory_max'],'4294967296')
+            (root/'oci-structure.json').write_bytes(b'x'*16385)
+            self.assertEqual(op.failure_diagnostics(root)['actual_oci_structure'],{'available':False})
 
     def test_owned_file_cleanup_preserves_only_bounded_receipt_and_operator_log(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as tmp:

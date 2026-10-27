@@ -25,7 +25,7 @@ import guard
 
 GIB = 1024**3
 REPOSITORY_ID = 1196769573
-TAG = 'ug-ui-image-f22738d-20261027-attempt2'
+TAG = 'ug-ui-image-f22738d-20261027-attempt3'
 PACKAGE = 'ug-ui-verification'
 BUILDER_IMAGE = 'moby/buildkit:v0.31.1'
 OWNER_KEY = 'UG_IMAGE_OWNER='
@@ -56,7 +56,8 @@ def enforce_smoke_lease(root,run_id,owner,now):
 def child_environment(root):
     env = {k: os.environ[k] for k in ('PATH', 'DOCKER_HOST') if k in os.environ}
     env.update(HOME=str(root/'home'), DOCKER_CONFIG=str(root/'docker-config'),
-               TMPDIR=str(root/'tmp'), LANG='C.UTF-8', TZ='UTC')
+               TMPDIR=str(root/'tmp'), LANG='C.UTF-8', TZ='UTC',
+               BUILDX_METADATA_PROVENANCE='max')
     return env
 
 
@@ -189,9 +190,16 @@ def cleanup_objects(run_id, owner, run):
             if inspect_container(name,run) is not None:
                 raise ValueError('owned container absence uncertain')
             if name==builder:
+                result['builder_container_absence_verified']=True
                 expected=builder+'_state'
                 if volumes != [expected]:raise ValueError('unexpected builder volume binding')
-                run(['docker','volume','rm',expected])
+                try:run(['docker','volume','rm',expected])
+                except subprocess.TimeoutExpired:
+                    # Deletion may finish in the daemon after its CLI times out.
+                    # Reconcile with one exact read; never retry the mutation.
+                    if run(['docker','volume','ls','-q','--filter','name=^'+expected+'$']).strip():
+                        raise ValueError('owned volume removal timeout; absence unproven')
+                    result['volume_removal_timeout_reconciled']=True
             result['objects'].append({'name':name,'id':identity,'absent':True,'verified_at':time.monotonic()})
         except Exception as e:
             result['verified']=False
@@ -202,6 +210,7 @@ def cleanup_objects(run_id, owner, run):
         if leftovers:
             result['verified']=False
             result['orphan_volume_preserved']=True
+        result['volume_absence_verified']=not bool(leftovers)
     except Exception as e:
         result['verified']=False;result['absence_error']=str(e)[:300]
     return result
@@ -331,17 +340,25 @@ def workload(root, source, start, run_id, owner):
     free=json.loads(run(['docker','exec',b['Id'],'sh','-c',
         '''printf '{"free_kib":%s}' "$(df -Pk /var/lib/buildkit | awk 'NR==2 {print $4}')"''']))
     if free['free_kib']*1024<5*GIB:raise ValueError('guest disk admission')
+    guard.bounded_json(root/'admission-evidence.json',{
+        'source_export':{k:source_binding[k] for k in
+            ['context_tar_sha256','context_tar_bytes','tracked_files','recipe_hashes']},
+        'resolved_builder_image_id':b['Image'],'kernel_cgroup':cg,
+        'guest_disk_free_bytes':free['free_kib']*1024},maximum=16384)
     out=root/'candidate.oci.tar';meta=root/'metadata.json'
     build_seconds=min(start+900-time.monotonic(),remaining(start))
     if build_seconds<=0:raise RuntimeError('15 minute build window exhausted')
     run(['docker','buildx','build','--builder',builder,'--platform','linux/amd64',
-         '--provenance=mode=max','--metadata-file',str(meta),
+         '--tag','ug-ui-qualification:'+run_id,
+         '--provenance=mode=max,version=v0.2','--metadata-file',str(meta),
          '--output','type=oci,dest='+str(out),
          '--label','org.opencontainers.image.revision='+guard.SOURCE,
          '--label','org.opencontainers.image.source=https://github.com/muckele/uckele-group',
          str(root/'work/context')],seconds=build_seconds)
     guard.regular(meta,guard.RECEIPT_MAX)
-    image=guard.inspect_oci(out)
+    structure={}
+    try:image=guard.inspect_oci(out,diagnostics=structure)
+    finally:guard.bounded_json(root/'oci-structure.json',structure,maximum=16384)
     guard.validate_binding(image,json.loads(meta.read_bytes()),source_binding,root/'work/context')
     # Release builder RAM before the fixed import/fixture phase; owner removes it.
     run(['docker','stop','--time','5',b['Id']])
@@ -605,6 +622,13 @@ def failure_diagnostics(root,token=''):
                 'config_digest':m.get('containerimage.config.digest'),
                 'provenance_keys':sorted(p),'buildType':p.get('buildType')}
         except (ValueError,OSError):result['metadata_available']=False
+    for name,key in [('oci-structure.json','actual_oci_structure'),
+                     ('admission-evidence.json','completed_admission')]:
+        path=root/name
+        if path.exists():
+            try:
+                guard.regular(path,16384);result[key]=json.loads(path.read_bytes())
+            except (ValueError,OSError):result[key]={'available':False}
     return result
 
 

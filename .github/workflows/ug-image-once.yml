@@ -2,12 +2,12 @@
 name: UG accepted image qualification once
 'on':
   push:
-    tags: [ug-ui-image-f22738d-20261027-attempt2]
+    tags: [ug-ui-image-f22738d-20261027-attempt3]
 permissions:
   contents: read
   packages: write
 concurrency:
-  group: ug-image-f22738d-attempt2-20261027
+  group: ug-image-f22738d-attempt3-20261027
   cancel-in-progress: false
 jobs:
   qualify:
@@ -53,6 +53,7 @@ jobs:
           command -v skopeo
           command -v sudo
           docker version --format '{{.Server.Version}}'
+          docker buildx version
           skopeo --version
       - name: One capped build, unchanged entrypoint smoke and private retention gate
         shell: bash
