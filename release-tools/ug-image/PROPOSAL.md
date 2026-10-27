@@ -1,14 +1,17 @@
 # One hosted UG image qualification
 
-Execution candidate under the October27 one-run approval; **not dispatched**.
+Second execution candidate, **pending fresh approval and not dispatched**.
+The original one-run grant was consumed by run40567282005 attempt1, which stopped
+before the application build at the cgroup membership detector. Its cleanup and
+failure receipts remain unchanged. No application/image qualification passed.
 Reuse the reviewed October21 source/OCI/provenance verifier. Application source
 remains `f22738d22ee33ed3f30df448fdcbebbad396d91a`, tree
 `8d436f7a7db338157d791bc64396bbfdb4cd4747`; no product/configuration change.
 
 Install exactly the sealed helper files at `release-tools/ug-image/` and the
 selected workflow at `.github/workflows/ug-image-once.yml` on an operator commit
-based on accepted source. Push only branch `codex/ug-image-f22738d-20261027` and
-then create the single new tag `ug-ui-image-f22738d-20261027-once` at that exact
+based on accepted source. Push only branch `codex/ug-image-f22738d-cgroup-20261027` and,
+only after fresh approval, create tag `ug-ui-image-f22738d-20261027-attempt2` at that exact
 reviewed operator commit. The branch alone is not a trigger; existing CI only
 triggers main pushes/PRs. No PR/main merge/default-branch installation.
 First read the tag, run list and source/seal bindings; any prior/uncertain trigger
@@ -45,6 +48,14 @@ Create one task-named standard Docker-container BuildKit builder, version tag
 container inside the disposable GitHub VM**, with2CPU,4GiB RAM,4GiB total RAM+swap,
 restart=no. Actual inspect and private cgroup namespace/root kernel values must
 agree (`memory.max=4294967296`, `memory.swap.max=0`, `cpu.max=200000 100000`).
+The cgroup mount root must remain `/`. Process membership may be exactly `0::/`
+or `0::/init`: BuildKit v0.31.1's default startup moves processes into its `init`
+child to enable nested controllers. Limits are still read from the private
+enclosing namespace root, never from that child or a guessed host limit. All
+other paths, missing/extra metadata and changed/unlimited counters fail closed.
+The upstream [resource monitor](https://raw.githubusercontent.com/moby/buildkit/v0.31.1/executor/resources/monitor.go)
+and [image default](https://raw.githubusercontent.com/moby/buildkit/v0.31.1/Dockerfile)
+explain this layout; the original run's exact five-field payload is a regression fixture.
 All worker cgroups are beneath that private enclosing namespace; a host/unknown
 namespace or missing control is a stop. No per-RUN cap is substituted. Ordinary
 source/build inputs cannot request extra entitlements; the accepted Dockerfile is

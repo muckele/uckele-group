@@ -54,7 +54,7 @@ class OperatorPolicyTests(unittest.TestCase):
                     if args[:2]==['docker','stop'] and args[-1]==sid:stopped=True
                     if args[:3]==['docker','exec',bid]:
                         if 'free_kib' in args[-1]:return b'{"free_kib":100000000}'
-                        return json.dumps({'self_cgroup':'0::/','memory_max':str(4*op.GIB),
+                        return json.dumps({'self_cgroup':'0::/init','memory_max':str(4*op.GIB),
                               'swap_max':'0','cpu_max':'200000 100000','mount_root':'/'}).encode()
                     if args[:2]==['docker','exec']:return b'{"GETs":[1,2,3,4]}'
                     return b''
@@ -127,6 +127,41 @@ class OperatorPolicyTests(unittest.TestCase):
                           ('swap_max','max'),('cpu_max','max 100000'),
                           ('mount_root','/host')]:
             with self.assertRaises(ValueError):op.validate_cgroup(dict(good,**{key:value}))
+
+    def test_cgroup_captured_buildkit_init_layout_keeps_enclosing_limits(self):
+        # Exact non-sensitive payload from failed run40567282005 attempt1.
+        captured={'cpu_max':'200000 100000','memory_max':'4294967296',
+                  'mount_root':'/','self_cgroup':'0::/init','swap_max':'0'}
+        try:
+            op.validate_cgroup(captured)
+        except ValueError as error:
+            self.fail('documented BuildKit init child under bounded root rejected: '+str(error))
+
+    def test_cgroup_membership_rejects_unknown_escape_and_malformed_paths(self):
+        good={'self_cgroup':'0::/init','memory_max':str(4*op.GIB),
+              'swap_max':'0','cpu_max':'200000 100000','mount_root':'/'}
+        for membership in ('0::/host/sibling','0::/../host','0::/init/../',
+                '0::/init/worker','0::/init/','0:://init','0::/INIT',
+                '0::/init\n0::/','1:memory:/init','/init','',None,0):
+            with self.subTest(membership=membership):
+                with self.assertRaises(ValueError):
+                    op.validate_cgroup(dict(good,self_cgroup=membership))
+
+    def test_cgroup_both_layouts_reject_missing_extra_and_altered_root_limits(self):
+        for membership in ('0::/','0::/init'):
+            good={'self_cgroup':membership,'memory_max':str(4*op.GIB),
+                  'swap_max':'0','cpu_max':'200000 100000','mount_root':'/'}
+            for key in good:
+                missing=dict(good);del missing[key]
+                with self.subTest(membership=membership,missing=key):
+                    with self.assertRaises(ValueError):op.validate_cgroup(missing)
+            for key,value in [('memory_max','max'),('memory_max',str(8*op.GIB)),
+                    ('memory_max',4*op.GIB),('memory_max',''),('memory_max',None),
+                    ('swap_max','max'),('swap_max','1'),('cpu_max','max 100000'),
+                    ('cpu_max','300000 100000'),('cpu_max','200000 200000'),
+                    ('mount_root','/host'),('mount_root','/init'),('extra','unknown')]:
+                with self.subTest(membership=membership,key=key,value=value):
+                    with self.assertRaises(ValueError):op.validate_cgroup(dict(good,**{key:value}))
 
     def test_smoke_preserves_node_entrypoint_and_rejects_unknown_image_env(self):
         config={'Entrypoint':['docker-entrypoint.sh'],'Cmd':['node','server/index.js'],

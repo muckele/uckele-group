@@ -25,7 +25,7 @@ import guard
 
 GIB = 1024**3
 REPOSITORY_ID = 1196769573
-TAG = 'ug-ui-image-f22738d-20261027-once'
+TAG = 'ug-ui-image-f22738d-20261027-attempt2'
 PACKAGE = 'ug-ui-verification'
 BUILDER_IMAGE = 'moby/buildkit:v0.31.1'
 OWNER_KEY = 'UG_IMAGE_OWNER='
@@ -91,8 +91,11 @@ def validate_builder(b, owner):
 
 
 def validate_cgroup(c):
-    if c != {'self_cgroup':'0::/', 'memory_max':str(4*GIB), 'swap_max':'0',
-             'cpu_max':'200000 100000', 'mount_root':'/'}:
+    expected={'self_cgroup':'0::/', 'memory_max':str(4*GIB), 'swap_max':'0',
+              'cpu_max':'200000 100000', 'mount_root':'/'}
+    # BuildKit v0.31.1 moves processes to /init to enable nested controllers.
+    # These counters still come from the private enclosing namespace root.
+    if c != expected and c != dict(expected,self_cgroup='0::/init'):
         raise ValueError('private enclosing kernel cgroup limits unproven: '+json.dumps(c,sort_keys=True)[:1000])
 
 

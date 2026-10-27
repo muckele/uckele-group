@@ -1,0 +1,28 @@
+{
+  "recorded_at": "2026-10-27T19:22:50.819774+00:00",
+  "reviewer": "/root/cgroup_repair_review",
+  "base_commit": "6f976a4dff493c264590a538abf0838ebca66c54",
+  "outcome": "accepted; no required findings",
+  "scope": "static read-only review of exact five-file diff; no tests/network/Docker/runtime/mutations by reviewer",
+  "verified_hashes": {
+    ".github/workflows/ug-image-once.yml": "e357895c6547aa52c83a2ce0f3e9215391c37693c1be42fdfbe2f5e98c318b9b",
+    "release-tools/ug-image/operator_once.py": "9f8f1492d9b61f26d691880d149aef230f1693ebfc96129624852e6c8948551b",
+    "release-tools/ug-image/test_operator.py": "f69e6329802b3c2b8939449488554013a0085ab7d9c5f3bdcce98e39c44d2eb8",
+    "release-tools/ug-image/SHA256SUMS": "6dc6cc240f6f17c98b360c51459af9807cdb3506951472efd524eb5d9cb3a722",
+    "release-tools/ug-image/PROPOSAL.md": "0dc772d1893041afdc281f1fd14739eb37d3adcb8a1e82e89dd0ea0e3d1af771"
+  },
+  "verified_patch_sha256": "30554aa77b080dc03a7efab48dba1865a1bfbf8da5168b6bfbd2862b8702e49c",
+  "findings": [
+    "Only exact root or documented init membership admitted, with all five fields and unchanged enclosing root limit values",
+    "Builder ownership/private namespace validation, counter collection and all other runtime guards unchanged",
+    "Captured-payload, malformed/unknown membership, missing/extra field and changed-limit regressions inspected",
+    "Workflow, operator TAG and proposal consistently bind fresh attempt2; fresh approval explicitly required",
+    "All five helper checksum entries verified"
+  ],
+  "author_test_evidence": {
+    "passed": 54,
+    "seconds": 0.35,
+    "scope": "complete guard/operator offline suite, not independently rerun by reviewer"
+  },
+  "runtime": "Build, OCI, entrypoint smoke and private retention remain unverified; no new hosted run approved"
+}
