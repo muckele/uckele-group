@@ -1,0 +1,67 @@
+# Reviewed execution candidate; publish only after the one-run grant and seal check.
+name: UG accepted image qualification once
+'on':
+  push:
+    tags: [ug-ui-image-f22738d-20261027-once]
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: ug-image-f22738d-once-20261027
+  cancel-in-progress: false
+jobs:
+  qualify:
+    if: >-
+      github.repository_id == '1196769573' &&
+      github.event.repository.private == false &&
+      github.event.created == true && github.event.deleted == false &&
+      github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Establish shared job deadline before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,time
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'ug-image-job-start.json'
+          with p.open('x') as f:json.dump({'monotonic':time.monotonic()},f)
+          PY
+      - name: Read exact operator revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          path: operator
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Read accepted application source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: f22738d22ee33ed3f30df448fdcbebbad396d91a
+          path: source
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify sealed operator and existing tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd operator/release-tools/ug-image
+          sha256sum --check SHA256SUMS
+          command -v docker
+          command -v skopeo
+          command -v sudo
+          docker version --format '{{.Server.Version}}'
+          skopeo --version
+      - name: One capped build, unchanged entrypoint smoke and private retention gate
+        shell: bash
+        env:
+          RETENTION_TOKEN: ${{ github.token }}
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: |
+          set -euo pipefail
+          # Parent watchdog starts before any builder creation and survives a
+          # failed/hung build/import/probe/publication child. Job20min is outer.
+          python3 operator/release-tools/ug-image/operator_once.py once \
+            "$GITHUB_WORKSPACE/source" retain-private

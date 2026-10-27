@@ -1,0 +1,26 @@
+{
+  "recorded_at": "2026-10-27T18:04:43.335184+00:00",
+  "reviewer": "/root/hosted_image_review",
+  "outcome": "accepted; no remaining required findings",
+  "review_scope": "static read-only; reviewer ran no tests/Docker/network/mutations",
+  "verified_hashes": {
+    "operator_once.py": "612766e2714dbb62e0d721213abb2e3cc4c2bc21a386f766aae5563ffb3a980e",
+    "workflow.yml": "90b459c5b8a70b06b4e82f6dd9c4f775b442da5c60c890b7069a20c380892b8a",
+    "SHA256SUMS": "c556cb1665fb5c8bdc5449df096b62321df54ad2905a4b24692f312b9e83ce93",
+    "PROPOSAL.md": "14000ebcf49733398b1d877180500cc1bc22718dd53b5230fb795abdea9a15a2"
+  },
+  "offline_tests": {
+    "passed": 51,
+    "seconds": 0.347,
+    "scope": "tiny policy/guard fixtures and mocked full lifecycle; no app/database/Docker/network"
+  },
+  "syntax": {
+    "Python_compile": "passed",
+    "MJS_parse": [
+      "smoke-probe.mjs",
+      "scratch-sample.mjs"
+    ],
+    "YAML_parse": "both variants passed using existing Ruby standard library"
+  },
+  "runtime": "unproven; existing admission/qualification/cleanup gates apply"
+}
