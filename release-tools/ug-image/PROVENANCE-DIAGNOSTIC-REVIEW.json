@@ -1,0 +1,32 @@
+{
+  "recorded_at": "2026-10-27T20:27:46.647004+00:00",
+  "reviewer": "/root/provenance_diagnostics_review",
+  "base_commit": "3141aa5e183c3992639ccdf10c4f0246282206dd",
+  "outcome": "accepted; no blocking findings introduced",
+  "scope": "static reads/hashes/AST comparison only; reviewer did not execute tests/apps/Docker/build/network/CI/Gitmutations",
+  "verified_hashes": {
+    "release-tools/ug-image/guard.py": "f7edc925a687b521ee8ccd84e554f0620c7592f00b392651655122e37add1494",
+    "release-tools/ug-image/operator_once.py": "e8044189d41901f31e6cda3ab902a489616d43b50debfb065eb0e4abca296b48",
+    "release-tools/ug-image/test_guard.py": "3dea1f2e020795df85711711f8d310a0b906a81237320dc631a93e5cf6587d45",
+    "release-tools/ug-image/test_operator.py": "743370ac90afb8c2b619d12235f74482720d228865a0b59ba1d14e675fdd6b8e",
+    "release-tools/ug-image/SHA256SUMS": "b05e69e0accd1451e36041f484b0c609c0bcf5e91bc952a5471b8ecbd92cccae",
+    "release-tools/ug-image/PROPOSAL.md": "38dee859386e3d72245c771db817dff3f1470a4bd24877adbcdb44e10606914c"
+  },
+  "verified_patch_sha256": "53efc04dc2661153a1eff79bc97df62db858026a04cc6d4789fd28c2b297e633",
+  "findings": [
+    "All6recorded hashes/5checksum entries/5upstream sources match",
+    "Workflow byte-identical; all13listed control-function ASTs match",
+    "Predicate equality and substantive source/config/image binding unchanged; diagnostic errors preserve failure; mismatch blocks publication",
+    "New report protects raw values and dynamic keys using fresh per-report HMAC; bounded output captured before owned cleanup",
+    "Pinned sources support possible history/export usage differences, not measured run3cause"
+  ],
+  "scope_notes": [
+    "1024nodes/12levels bound diagnostic walk frames; fingerprints/equality still scan bounded input subtrees",
+    "Inherited metadata projection retains root key names/buildType and whole-artifact metadata digest; this patch adds no unkeyed scalar-value hash"
+  ],
+  "author_tests": {
+    "passed": 70,
+    "scope": "complete offline operator/guard suite, reviewed but not independently executed"
+  },
+  "runtime": "run40575744697remains failed with verified cleanup; exact field mismatch unavailable; no fourth run proposed/authorized"
+}

@@ -1,6 +1,11 @@
 # One hosted UG image qualification
 
-Third execution candidate, **not approved and not dispatched**.
+**Diagnostic-only revision; no fourth run proposed or authorized.**
+The third approved candidate ran once as40575744697, passed OCI subject/config
+binding and failed exact metadata/image predicate equality. Its cleanup passed.
+The raw predicate pair and differing paths were not retained, so its exact live
+field mismatch remains unknown. This revision adds safe failure evidence only;
+the existing equality guard and all substantive validation remain unchanged.
 The original one-run grant was consumed by run40567282005 attempt1, which stopped
 before the application build at the cgroup membership detector. Its cleanup and
 failure receipts remain unchanged. No application/image qualification passed.
@@ -12,12 +17,13 @@ Reuse the reviewed October21 source/OCI/provenance verifier. Application source
 remains `f22738d22ee33ed3f30df448fdcbebbad396d91a`, tree
 `8d436f7a7db338157d791bc64396bbfdb4cd4747`; no product/configuration change.
 
-Install exactly the sealed helper files at `release-tools/ug-image/` and the
-selected workflow at `.github/workflows/ug-image-once.yml` on an operator commit
-based on accepted source. Push only branch `codex/ug-image-oci-binding-20261027` and,
-only after fresh approval, create tag `ug-ui-image-f22738d-20261027-attempt3` at that exact
-reviewed operator commit. The branch alone is not a trigger; existing CI only
-triggers main pushes/PRs. No PR/main merge/default-branch installation.
+Publish this reviewed correction only on project branch
+`codex/ug-provenance-diagnostics-20261027`. The existing tag
+`ug-ui-image-f22738d-20261027-attempt3` is consumed at3141aa5e183c3992639ccdf10c4f0246282206dd;
+never move, replace or recreate it. Workflow/TAG are unchanged and no new trigger
+is prepared. The branch alone is not a trigger; existing CI only triggers main
+pushes/PRs. No PR/main merge/default-branch installation. Any future execution
+requires a separate concrete proposal and explicit fresh approval.
 First read the tag, run list and source/seal bindings; any prior/uncertain trigger
 stops. Only a creation event and `run_attempt==1` admit. No tag force/replacement,
 rerun, automatic retry or fallback backend. This is not a server-enforced forever
@@ -110,6 +116,26 @@ are explicit compatibility inputs, not substitutes for attestation verification.
 Failure receipts add only bounded digest/type/count structure and completed
 admission evidence (each<=16KiB), inside existing output/receipt/storage caps;
 they expose no provenance contents, subject names, credentials or application data.
+
+Exact predicate inequality additionally writes `provenance-comparison.json`
+before cleanup. This failure-only report is<=8KiB, with at most8 differences,
+1024visited nodes and12levels. It exposes allowlisted schema path components,
+JSON types and HMAC-SHA256 fingerprints. Unknown/dynamic key names are keyed too;
+no raw values or reusable unkeyed value hashes are emitted. A fresh32-byte random
+key exists only in memory for this report and is never saved or returned. Flags
+show truncation/unavailability. Diagnostic write failure preserves the original
+provenance failure. The existing bounded terminal receipt incorporates this report
+before owned temporary files are removed. Existing64KiB public/512KiB receipt
+and all time/storage limits still apply; publication is never reached on mismatch.
+
+The comparator uses parsed JSON values, not byte equality: formatting/key order
+already do not matter. Whole-predicate equality is stronger than documented build
+identity. Version-pinned [history generation](https://raw.githubusercontent.com/moby/buildkit/v0.31.1/solver/llbsolver/history.go)
+enables `capture-usage=true`, while [image predicate generation](https://raw.githubusercontent.com/moby/buildkit/v0.31.1/solver/llbsolver/provenance.go)
+defaults it off; resource samples may legitimately differ. A synthetic fixture
+reproduces that distinction without claiming it was the live difference. No field
+is ignored or normalized in this revision: source/config/image binding and strict
+predicate failure remain intact until actual differences justify a reviewed rule.
 
 Use the image's unchanged CMD `node server/index.js` and inherited Node
 `docker-entrypoint.sh`. Verify actual image and container env/command/mounts first.

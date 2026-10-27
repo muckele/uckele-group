@@ -4,6 +4,7 @@ Only the future ephemeral Linux runner's approved job may use prepare/run/finish
 Local tests use tiny disposable fixtures and Python child processes only.
 """
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -298,7 +299,72 @@ def inspect_oci(archive, diagnostics=None):
             'provenance_predicate': matched[0], 'image_config': config}
 
 
-def validate_binding(image, metadata, source, context):
+def provenance_difference(metadata, image):
+    """Failure evidence only: no values, dynamic key names, or reusable hashes."""
+    try:
+        key=os.urandom(32)  # Never returned or persisted; prevents guessing values.
+        missing=object()
+        public_fields=set(('buildType builder id invocation configSource uri digest sha256 sha1 '
+            'entryPoint parameters environment frontend args locals name optional inputs root '
+            'compatibilityVersion platform dockerfileVersion buildConfig llbDefinition op Op '
+            'metadata buildInvocationID buildStartedOn buildFinishedOn completeness materials '
+            'reproducible source locations infos data filename language digestMapping layers '
+            'resourceUsage samples sysUsage timestamp cpuStat usageNanos network mode').split())
+        public_fields.update(('https://mobyproject.org/buildkit@v1#metadata',
+                              'https://mobyproject.org/buildkit@v1#hermetic'))
+        def fingerprint(value):
+            data=json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+            if len(data)>RECEIPT_MAX:raise ValueError('diagnostic input cap')
+            return hmac.new(key,data,hashlib.sha256).hexdigest()
+        def kind(value):
+            if value is missing:return 'missing'
+            if value is None:return 'null'
+            return {dict:'object',list:'array',str:'string',bool:'boolean',
+                    int:'number',float:'number'}[type(value)]
+        def shape(value):
+            result={'type':kind(value)}
+            if value is not missing:result['hmac_sha256']=fingerprint(value)
+            return result
+        def component(name):
+            return name.replace('~','~0').replace('/','~1') if name in public_fields \
+                   else '@'+fingerprint(name)[:32]
+        report={'hash_scheme':'HMAC-SHA256; random per-report key discarded',
+                'metadata':shape(metadata),'image':shape(image),
+                'differences':[],'truncated':False,'nodes_examined':0}
+        def walk(left,right,path='',depth=0):
+            if report['nodes_examined']>=1024 or len(report['differences'])>=8:
+                report['truncated']=True;return False
+            report['nodes_examined']+=1
+            same_type=kind(left)==kind(right)
+            if same_type and left==right:return True
+            if depth>=12 or not same_type or not isinstance(left,(dict,list)):
+                if len(path)>192:
+                    path=path[:128]+'/@path:'+fingerprint(path)[:32]
+                    report['truncated']=True
+                report['differences'].append({'path':path or '/',
+                    'metadata':shape(left),'image':shape(right)})
+                if depth>=12:report['truncated']=True
+                return True
+            if isinstance(left,dict):
+                for name in sorted(left.keys()|right.keys()):
+                    if not walk(left.get(name,missing),right.get(name,missing),
+                                path+'/'+component(name),depth+1):return False
+            else:
+                for index in range(max(len(left),len(right))):
+                    if not walk(left[index] if index<len(left) else missing,
+                                right[index] if index<len(right) else missing,
+                                path+'/'+str(index),depth+1):return False
+            return True
+        walk(metadata,image)
+        while len((json.dumps(report,sort_keys=True,indent=2)+'\n').encode())>8192:
+            report['differences'].pop();report['truncated']=True
+        return report
+    except Exception as error:
+        # An unavailable diagnostic must neither leak error text nor mask cause.
+        return {'status':'unavailable','error_type':type(error).__name__}
+
+
+def validate_binding(image, metadata, source, context, diagnostic_path=None):
     if source.get('source') != SOURCE or source.get('tree') != TREE or source.get('recipe_hashes') != PINS:
         raise ValueError('source receipt mismatch')
     actual_files = {str(p.relative_to(context)) for p in context.rglob('*') if not p.is_dir()}
@@ -325,6 +391,13 @@ def validate_binding(image, metadata, source, context):
         raise ValueError('build config/archive mismatch')
     provenance = metadata.get('buildx.build.provenance', {})
     if provenance != image['provenance_predicate']:
+        if diagnostic_path is not None:
+            try:
+                bounded_json(diagnostic_path,provenance_difference(
+                    provenance,image['provenance_predicate']),maximum=8192)
+            except Exception as error:
+                raise ValueError('metadata/image provenance mismatch; diagnostic unavailable: '+
+                                 type(error).__name__) from None
         raise ValueError('metadata/image provenance mismatch')
     if provenance.get('buildType') != 'https://mobyproject.org/buildkit@v1':
         raise ValueError('missing BuildKit provenance')

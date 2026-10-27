@@ -376,6 +376,25 @@ class OperatorPolicyTests(unittest.TestCase):
             (root/'oci-structure.json').write_bytes(b'x'*16385)
             self.assertEqual(op.failure_diagnostics(root)['actual_oci_structure'],{'available':False})
 
+    def test_safe_provenance_differences_survive_owned_cleanup_in_receipt(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as tmp:
+            root=Path(tmp)
+            diagnostic=op.guard.provenance_difference({'builder':{'id':'synthetic-secret'}},
+                                                     {'builder':{'id':'changed'}})
+            op.guard.bounded_json(root/'provenance-comparison.json',diagnostic,maximum=8192)
+            captured=op.failure_diagnostics(root)
+            self.assertEqual(captured['provenance_comparison'],diagnostic)
+            op.guard.bounded_json(root/'receipt.json',{'failure':'metadata/image provenance mismatch',
+                                                     'failure_diagnostics':captured})
+            with patch('operator_once.shutil.rmtree.avoids_symlink_attacks',True,create=True):
+                op.clean_owned_files(root)
+            self.assertFalse((root/'provenance-comparison.json').exists())
+            retained=json.loads((root/'receipt.json').read_bytes())
+            self.assertEqual(retained['failure_diagnostics']['provenance_comparison'],diagnostic)
+            self.assertNotIn('synthetic-secret',json.dumps(retained))
+            (root/'provenance-comparison.json').write_bytes(b'x'*8193)
+            self.assertEqual(op.failure_diagnostics(root)['provenance_comparison'],{'available':False})
+
     def test_owned_file_cleanup_preserves_only_bounded_receipt_and_operator_log(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as tmp:
             root=Path(tmp);(root/'work').mkdir();(root/'work'/'copy').write_text('synthetic')

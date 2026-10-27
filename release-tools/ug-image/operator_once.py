@@ -359,7 +359,8 @@ def workload(root, source, start, run_id, owner):
     structure={}
     try:image=guard.inspect_oci(out,diagnostics=structure)
     finally:guard.bounded_json(root/'oci-structure.json',structure,maximum=16384)
-    guard.validate_binding(image,json.loads(meta.read_bytes()),source_binding,root/'work/context')
+    guard.validate_binding(image,json.loads(meta.read_bytes()),source_binding,root/'work/context',
+                           diagnostic_path=root/'provenance-comparison.json')
     # Release builder RAM before the fixed import/fixture phase; owner removes it.
     run(['docker','stop','--time','5',b['Id']])
     local='ug-ui-qualification:'+run_id
@@ -622,12 +623,13 @@ def failure_diagnostics(root,token=''):
                 'config_digest':m.get('containerimage.config.digest'),
                 'provenance_keys':sorted(p),'buildType':p.get('buildType')}
         except (ValueError,OSError):result['metadata_available']=False
-    for name,key in [('oci-structure.json','actual_oci_structure'),
-                     ('admission-evidence.json','completed_admission')]:
+    for name,key,maximum in [('oci-structure.json','actual_oci_structure',16384),
+                     ('admission-evidence.json','completed_admission',16384),
+                     ('provenance-comparison.json','provenance_comparison',8192)]:
         path=root/name
         if path.exists():
             try:
-                guard.regular(path,16384);result[key]=json.loads(path.read_bytes())
+                guard.regular(path,maximum);result[key]=json.loads(path.read_bytes())
             except (ValueError,OSError):result[key]={'available':False}
     return result
 

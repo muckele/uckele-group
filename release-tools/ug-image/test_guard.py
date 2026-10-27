@@ -229,6 +229,92 @@ class GuardTests(unittest.TestCase):
         i,m,s=self.binding_fixture(); i['provenance_predicate']['buildType']='other'
         with self.assertRaisesRegex(ValueError,'provenance mismatch'): guard.validate_binding(i,m,s,self.p)
 
+    def test_provenance_difference_ignores_json_key_order_only(self):
+        report=guard.provenance_difference({'builder':{'id':'synthetic'},'materials':[]},
+                                          {'materials':[],'builder':{'id':'synthetic'}})
+        self.assertEqual(report['differences'],[])
+        self.assertEqual(report['metadata']['hmac_sha256'],report['image']['hmac_sha256'])
+        self.assertFalse(report['truncated'])
+
+    def test_provenance_difference_reports_types_missing_and_safe_paths(self):
+        report=guard.provenance_difference(
+            {'builder':{'id':'synthetic'},'metadata':None,'materials':[{'digest':{'sha256':'a'*64}}]},
+            {'builder':{'id':None},'materials':[{'digest':{'sha256':'b'*64}}]})
+        differences={x['path']:x for x in report['differences']}
+        self.assertEqual(differences['/builder/id']['metadata']['type'],'string')
+        self.assertEqual(differences['/builder/id']['image']['type'],'null')
+        self.assertEqual(differences['/metadata']['image']['type'],'missing')
+        digest=differences['/materials/0/digest/sha256']
+        self.assertNotEqual(digest['metadata']['hmac_sha256'],digest['image']['hmac_sha256'])
+
+    def test_provenance_difference_never_exposes_values_or_dynamic_keys(self):
+        secret='synthetic-secret-please-do-not-print'
+        key='ghp_synthetic_sensitive_dynamic_key'
+        report=guard.provenance_difference(
+            {'invocation':{'parameters':{'args':{key:secret}}}},
+            {'invocation':{'parameters':{'args':{key:'different'}}}})
+        text=json.dumps(report)
+        self.assertNotIn(secret,text);self.assertNotIn(key,text)
+        self.assertNotIn(hashlib.sha256(secret.encode()).hexdigest(),text)
+        self.assertIn('/invocation/parameters/args/@',text)
+        again=guard.provenance_difference(
+            {'invocation':{'parameters':{'args':{key:secret}}}},
+            {'invocation':{'parameters':{'args':{key:'different'}}}})
+        self.assertNotEqual(report['metadata']['hmac_sha256'],again['metadata']['hmac_sha256'])
+
+    def test_provenance_difference_is_bounded_and_failure_safe(self):
+        report=guard.provenance_difference({'materials':list(range(2000))},
+                                          {'materials':list(range(1,2001))})
+        self.assertTrue(report['truncated']);self.assertLessEqual(len(report['differences']),8)
+        self.assertLessEqual(len((json.dumps(report,sort_keys=True,indent=2)+'\n').encode()),8192)
+        with patch('guard.os.urandom',side_effect=OSError('synthetic-secret-error')):
+            unavailable=guard.provenance_difference({'builder':1},{'builder':2})
+        self.assertEqual(unavailable,{'status':'unavailable','error_type':'OSError'})
+        self.assertNotIn('synthetic-secret-error',json.dumps(unavailable))
+
+    def test_provenance_difference_marks_depth_and_node_limits(self):
+        left,right='left','right'
+        for _ in range(30):left={'root':left};right={'root':right}
+        deep=guard.provenance_difference(left,right)
+        self.assertTrue(deep['truncated']);self.assertLessEqual(deep['nodes_examined'],1024)
+        self.assertLessEqual(len(deep['differences'][0]['path']),192)
+        wide=guard.provenance_difference({'materials':[0]*2000},
+                                         {'materials':[0]*1999+[1]})
+        self.assertTrue(wide['truncated']);self.assertLessEqual(wide['nodes_examined'],1024)
+
+    def test_successful_binding_does_not_create_diagnostic(self):
+        image,metadata,source=self.binding_fixture();path=self.p/'comparison.json'
+        guard.validate_binding(image,metadata,source,self.p,diagnostic_path=path)
+        self.assertFalse(path.exists())
+
+    def test_history_usage_fixture_reports_difference_and_keeps_guard(self):
+        # BuildKit v0.31.1 history.go requests capture-usage=true. Image output
+        # defaults false in NewProvenanceCreator. These are synthetic shapes,
+        # not recovered values from run40575744697.
+        image,metadata,source=self.binding_fixture()
+        common={'llbDefinition':[{'id':'step0'}]}
+        image['provenance_predicate']['buildConfig']=json.loads(json.dumps(common))
+        metadata['buildx.build.provenance']['buildConfig']=json.loads(json.dumps(common))
+        metadata['buildx.build.provenance']['buildConfig']['llbDefinition'][0]['resourceUsage']={
+            'samples':[{'timestamp':'2026-10-27T00:00:00Z','cpuStat':{'usageNanos':1}}]}
+        path=self.p/'comparison.json'
+        with self.assertRaisesRegex(ValueError,'metadata/image provenance mismatch'):
+            guard.validate_binding(image,metadata,source,self.p,diagnostic_path=path)
+        report=json.loads(path.read_bytes())
+        self.assertEqual([x['path'] for x in report['differences']],
+                         ['/buildConfig/llbDefinition/0/resourceUsage'])
+        delta=next(x for x in report['differences'] if x['path'].endswith('/resourceUsage'))
+        self.assertEqual(delta['metadata']['type'],'object')
+        self.assertEqual(delta['image']['type'],'missing')
+        self.assertNotIn('2026-10-27',json.dumps(report))
+
+    def test_diagnostic_write_failure_preserves_provenance_failure_without_secret(self):
+        image,metadata,source=self.binding_fixture();image['provenance_predicate']['buildType']='other'
+        with patch('guard.bounded_json',side_effect=OSError('synthetic-secret-error')):
+            with self.assertRaisesRegex(ValueError,'metadata/image provenance mismatch') as error:
+                guard.validate_binding(image,metadata,source,self.p,diagnostic_path=self.p/'comparison.json')
+        self.assertNotIn('synthetic-secret-error',str(error.exception))
+
     def test_disk_admission_monitor_stops(self):
         with self.assertRaisesRegex(RuntimeError, 'disk_floor'):
             guard.run_bounded([sys.executable, '-c', 'import time; time.sleep(3)'], self.p / 'log', seconds=2, minimum_free=10**30)
