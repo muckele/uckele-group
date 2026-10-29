@@ -23,6 +23,20 @@ test('Sheet CSV rejects unfinished quoted cells even beyond the selected row cap
   }
 });
 
+test('Sheet CSV rejects populated extra columns even beyond the selected row cap', () => {
+  const csv = 'Name,Description\nAlpha,Complete\nBeta,Recurring maintenance,unretained data';
+  assert.throws(() => parseSheetCsvDeals(csv, 0, 1), /record 3.*more populated fields than the header/i);
+});
+
+test('Sheet CSV retains omitted trailing fields and accepts spare empty cells', () => {
+  const csv = 'Name,Description\nAlpha\nBeta,Complete,,, \nGamma,"Recurring, service"';
+  assert.deepEqual(parseSheetCsvDeals(csv).deals.map(({ name, description }) => ({ name, description })), [
+    { name: 'Alpha', description: '' },
+    { name: 'Beta', description: 'Complete' },
+    { name: 'Gamma', description: 'Recurring, service' },
+  ]);
+});
+
 test('Sheet CSV preserves complete multiline quoted cells, escaped quotes and following listings', () => {
   const csv = 'Name,Description\r\n"Alpha, HVAC","Recurring\r\nmaintenance with ""priority"" support"\r\nBeta,Complete';
   const { deals } = parseSheetCsvDeals(csv);
@@ -32,7 +46,7 @@ test('Sheet CSV preserves complete multiline quoted cells, escaped quotes and fo
   ]);
 });
 
-test('an unfinished quoted Sheet cell cannot replace the last complete source snapshot or scores', async (t) => {
+test('malformed Sheet CSV cannot replace the last complete source snapshot or scores', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-incomplete-sheet-csv-'));
   const sqlitePath = path.join(directory, 'observations.sqlite');
   const storage = createSqliteStorage({ storage: { sqlitePath } });
@@ -66,33 +80,47 @@ test('an unfinished quoted Sheet cell cannot replace the last complete source sn
   assert.equal(new Set(before.observations.map((row) => row.opportunity_id)).size, 3);
   const outreachBefore = await storage.readCimOutreachCounters();
 
-  // A missing closing quote absorbs Gamma into Beta's description. The
-  // lenient parser reports two rows as a complete source and removes Gamma.
-  sourceCsv = sourceCsv.replace(',475000,Recurring maintenance', ',475000,"Unfinished maintenance');
-  const failed = await refresh();
-  assert.equal(new Set(snapshot().observations.map((row) => row.opportunity_id)).size, 3,
-    'the malformed refresh must not remove Gamma from the retained source snapshot');
-  assert.equal(failed.ok, false);
-  assert.equal(failed.status, 503);
-  const sheet = failed.review.sources.find(({ id }) => id === 'sheet-0');
-  assert.equal(sheet.fetched, false);
-  assert.match(sheet.error, /unterminated quoted field/i);
-  assert.deepEqual(snapshot(), before);
-  assert.deepEqual(await storage.readCimOutreachCounters(), outreachBefore);
+  const completeCsv = sourceCsv;
+  for (const { csv, pattern } of [
+    // A missing closing quote absorbs Gamma into Beta's description. The
+    // lenient parser reports two rows as a complete source and removes Gamma.
+    { csv: completeCsv.replace(',475000,Recurring maintenance', ',475000,"Unfinished maintenance'),
+      pattern: /unterminated quoted field/i },
+    { csv: completeCsv.replace(',475000,Recurring maintenance', ',475000,Recurring maintenance,unretained data'),
+      pattern: /more populated fields than the header/i },
+  ]) {
+    sourceCsv = csv;
+    const failed = await refresh();
+    assert.equal(new Set(snapshot().observations.map((row) => row.opportunity_id)).size, 3,
+      'the malformed refresh must not remove Gamma from the retained source snapshot');
+    assert.equal(failed.ok, false);
+    assert.equal(failed.status, 503);
+    const sheet = failed.review.sources.find(({ id }) => id === 'sheet-0');
+    assert.equal(sheet.fetched, false);
+    assert.match(sheet.error, pattern);
+    assert.deepEqual(snapshot(), before);
+    assert.deepEqual(await storage.readCimOutreachCounters(), outreachBefore);
+  }
 });
 
-test('Deal OS rejects an unfinished quoted CSV before storing an import', async (t) => {
+test('Deal OS rejects malformed CSV before storing an import', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-incomplete-deal-os-csv-'));
   const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'imports.sqlite') } });
   t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
-  const result = await importDealOsExport({
-    fileBuffer: Buffer.from('Listing ID,Business Name,Description\nDOS-1,Alpha,Complete\nDOS-2,Beta,"Unfinished\nDOS-3,Gamma,Swallowed'),
-    fileName: 'incomplete.csv', exportedAt: new Date().toISOString(),
-    scope: 'saved-search', coverageLabel: 'Synthetic completeness regression',
-    importedBy: 'incomplete-csv-test', storage,
-  });
-  assert.equal(result.ok, false);
-  assert.equal(result.status, 422);
-  assert.match(result.error, /unterminated quoted field/i);
-  assert.equal(await storage.getLatestDealHunterDealOsImport(), null);
+  for (const { csv, pattern } of [
+    { csv: 'Listing ID,Business Name,Description\nDOS-1,Alpha,Complete\nDOS-2,Beta,"Unfinished\nDOS-3,Gamma,Swallowed',
+      pattern: /unterminated quoted field/i },
+    { csv: 'Listing ID,Business Name,Description\nDOS-1,Alpha,Complete\nDOS-2,Beta,Recurring maintenance,unretained data',
+      pattern: /more populated fields than the header/i },
+  ]) {
+    const result = await importDealOsExport({
+      fileBuffer: Buffer.from(csv), fileName: 'incomplete.csv', exportedAt: new Date().toISOString(),
+      scope: 'saved-search', coverageLabel: 'Synthetic completeness regression',
+      importedBy: 'incomplete-csv-test', storage,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 422);
+    assert.match(result.error, pattern);
+    assert.equal(await storage.getLatestDealHunterDealOsImport(), null);
+  }
 });

@@ -1261,12 +1261,15 @@ function parseCsvRows(csvText = '') {
     usedHeaders.add(candidate);
     return candidate;
   });
-  return rows.slice(1).map((values) =>
-    headers.reduce((record, header, index) => {
+  return rows.slice(1).map((values, recordIndex) => {
+    if (values.slice(headers.length).some((item) => item.trim() !== '')) {
+      throw new Error(`CSV record ${recordIndex + 2} has more populated fields than the header. Check delimiters and export again.`);
+    }
+    return headers.reduce((record, header, index) => {
       record[header] = normalizeText(values[index] || '', 5000);
       return record;
-    }, Object.create(null)),
-  );
+    }, Object.create(null));
+  });
 }
 
 function normalizeDailyDealUpdateRow(row = {}) {
