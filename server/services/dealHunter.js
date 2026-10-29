@@ -1231,6 +1231,10 @@ function parseCsvRows(csvText = '') {
     }
   }
 
+  if (inQuotes) {
+    throw new Error('CSV contains an unterminated quoted field. Export or fetch the complete file and try again.');
+  }
+
   row.push(value);
 
   if (row.some((item) => item.trim() !== '')) {
