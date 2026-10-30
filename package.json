@@ -52,10 +52,10 @@
     "react-helmet-async": "^2.0.5",
     "react-joyride": "^3.2.0",
     "react-router-dom": "7.18.2",
-    "zod": "^4.4.3"
+    "zod": "^4.6.6"
   },
   "overrides": {
-    "qs": "6.16.0"
+    "qs": "6.16.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
