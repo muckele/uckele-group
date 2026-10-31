@@ -1181,7 +1181,7 @@ test('canonical ingestion retains separate bounded Sheet and Deal OS observation
   const description = 'Commercial HVAC maintenance company with recurring service agreements, trained field technicians, and diversified B2B customers.';
   sourceCsv = [
     'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Name,Broker Email,Description,Unbounded Workbook Blob',
-    `SHEET-42,Observation HVAC Services,https://broker.example/sheet-observation,CA,${new Date().toISOString().slice(0, 10)},450000,1200000,900000,Sheet Broker,sheet@example.test,${description},RAW_WORKBOOK_CONTENT_MUST_NOT_PERSIST`,
+    `SHEET-42,Observation HVAC Services,https://broker.example/sheet-observation,CA,${new Date().toISOString().slice(0, 10)},450000,1200000,900000,Sheet Broker,sheet@example.test,"${description}",RAW_WORKBOOK_CONTENT_MUST_NOT_PERSIST`,
   ].join('\n');
   sourceWorkbook = buildWorkbook([]);
   dealOsImport = {
