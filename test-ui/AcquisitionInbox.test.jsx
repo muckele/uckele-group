@@ -2972,7 +2972,7 @@ describe('Criteria-grouped Acquisition Inbox', () => {
   });
 
   test('older rows without limits render the failed value without a parenthetical', async () => {
-    const bare = (entry) => { const { limit, targetStates, ...rest } = entry; return rest; };
+    const bare = (entry) => { const { limit: _limit, targetStates: _targetStates, ...rest } = entry; return rest; };
     const row = criteriaRow({ opportunityId: 'old', name: 'Old Air', criteriaGroup: 'review',
       criteriaResult: { mustHaves: mustHaves({ multiple: { outcome: 'fail', observed: 5.1 } }).map(bare), failed: ['multiple'], unknown: [] } });
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox', rows: [row],
