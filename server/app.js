@@ -93,6 +93,7 @@ import {
   validateCimReviewDecisions,
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
+import { getAutoPursueStatus, runAutoPursue, setAutoPursueMode } from './services/autoPursue.js';
 import {
   createManualSubmission,
   enforceContactBodyRateLimit,
@@ -712,7 +713,7 @@ export function createApp({
     },
   );
   app.use(
-    ['/api/admin/deal-hunter/send', '/api/deal-hunter/daily-email'],
+    ['/api/admin/deal-hunter/send', '/api/deal-hunter/daily-email', '/api/deal-hunter/auto-pursue/run'],
     (request, response, next) => {
       if (request.method !== 'POST') {
         next();
@@ -2447,6 +2448,45 @@ export function createApp({
   );
 
   app.get(
+    '/api/admin/deal-hunter/auto-pursue',
+    asyncRoute(async (request, response) => {
+      // Read-only viewers may inspect the capability, like adjacent Deal Hunter reads.
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      try {
+        response.json({ success: true, ...await getAutoPursueStatus() });
+      } catch {
+        response.status(503).json({ success: false, error: 'Automatic Pursue status is unavailable.' });
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/auto-pursue/mode',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      if (session.role !== 'admin') {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await setAutoPursueMode({
+        mode: request.body?.mode,
+        dailyCap: request.body?.dailyCap,
+        reason: request.body?.reason,
+        confirmation: request.body?.confirmation,
+        actor: session.username,
+      });
+      response.status(result.status || (result.ok ? 200 : 409)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
     '/api/admin/deal-hunter/cim-stage2/runs/:id/decisions',
     asyncRoute(async (request, response) => {
       if (!await requireAdmin(request)) {
@@ -2639,6 +2679,33 @@ export function createApp({
         providerCalls: Number(result.providerCalls || 0),
         duplicateInvocation: Boolean(result.duplicateInvocation),
         run: result.run || null,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/deal-hunter/auto-pursue/run',
+    asyncRoute(async (request, response) => {
+      if (!requireDealHunterCron(request, config)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      // Mode, cap, and clock are server-owned; the cron caller supplies nothing.
+      if (!hasStrictEmptyBody(request)) {
+        response.status(400).json({ success: false, error: 'Automatic Pursue accepts an empty request body only.' });
+        return;
+      }
+      const result = await runAutoPursue({ triggeredBy: 'external-auto-pursue-cron' });
+      response.status(result.status || (result.ok ? 200 : 500)).json({
+        success: Boolean(result.ok),
+        status: result.status,
+        mode: result.mode,
+        businessDate: result.businessDate,
+        commands: Number(result.commands || 0),
+        skipped: Array.isArray(result.skipped) ? result.skipped : [],
+        wouldPursue: Array.isArray(result.wouldPursue) ? result.wouldPursue : [],
+        duplicateInvocation: Boolean(result.duplicateInvocation),
+        reason: result.reason || null,
       });
     }),
   );
