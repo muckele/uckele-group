@@ -31,6 +31,8 @@ fs.writeFileSync(process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH, JSON
 
 const { getStorage } = await import('../server/storage/index.js');
 const { recordAcquisitionOwnerCommand } = await import('../server/services/dealHunterTriage.js');
+const { loadBrokerMaterialsAuthority } = await import('../server/services/dealHunterBrokerMaterials.js');
+const { setCurrentOperatorOpportunityFact } = await import('../server/services/dealHunterOpportunityFacts.js');
 
 const storage = getStorage();
 
@@ -84,7 +86,43 @@ test('pursue writes warm-up evidence with the criteria group', async () => {
   assert.equal(rows[0].criteria_profile_version, 'uckele-criteria-v1');
   assert.equal(rows[0].action, 'pursue');
   assert.equal(rows[0].policy_version, 'owner-decision-v1');
-  assert.equal(rows[0].recipient_unchanged, 1);
+});
+
+test('a no-ref pursue whose enrollment ends action-required records recipient_unchanged 0', async () => {
+  // No recipient authority exists for this opportunity, so the recipient is never resolved.
+  const id = await seed('opp-evidence-action-required');
+  const result = await recordAcquisitionOwnerCommand(command(id, 'pursue'));
+  assert.equal(result.status, 200);
+  assert.equal(result.enrollment.state, 'action-required');
+  const [row] = await evidenceFor(id);
+  assert.equal(row.recipient_unchanged, 0);
+});
+
+test('a supplied ref resolving to the single recipient option records recipient_unchanged 1', async () => {
+  const id = await seed('opp-evidence-resolved-ref');
+  await setCurrentOperatorOpportunityFact({ opportunityId: id, field: 'broker_email',
+    value: 'broker@example.test', actor: 'owner', verified: true, idempotencyKey: randomUUID(),
+    expectedRevision: { campaignAuthorityRevision: 1, primarySubmissionId: null,
+      submissionFactSnapshot: null },
+    storage });
+  const authority = await loadBrokerMaterialsAuthority({ opportunityId: id, storage });
+  assert.equal(authority.recipientOptions.length, 1);
+  // Full enrollment orchestration needs complete source, timezone and permission authority,
+  // which this fixture does not build. Without a transition writer the enrollment is left as
+  // the decision created it (not action-required), so this isolates the recipient comparison.
+  const transition = storage.transitionPursuitEnrollment;
+  storage.transitionPursuitEnrollment = undefined;
+  let result;
+  try {
+    result = await recordAcquisitionOwnerCommand(command(id, 'pursue',
+      { recipientContactRef: authority.recipientOptions[0].recipientContactRef }));
+  } finally {
+    storage.transitionPursuitEnrollment = transition;
+  }
+  assert.equal(result.status, 200);
+  assert.notEqual(result.enrollment.state, 'action-required');
+  const [row] = await evidenceFor(id);
+  assert.equal(row.recipient_unchanged, 1);
 });
 
 test('pass writes warm-up evidence with the criteria group', async () => {

@@ -1171,6 +1171,7 @@ async function ownerCommandRecipientUnchanged({ storage, opportunityId, recipien
 /** Warm-up evidence is best effort: a failed write never fails the owner's command. */
 async function recordOwnerDecisionEvidence({
   storage, opportunityId, action, decision, score, policyVersion, recipientContactRef,
+  enrollmentState,
 }) {
   try {
     if (typeof storage.insertAutoPursueDecisionEvidence !== 'function') return;
@@ -1185,8 +1186,10 @@ async function recordOwnerDecisionEvidence({
       policy_version: policyVersion,
       criteria_group: score?.criteria_group ?? null,
       criteria_profile_version: score?.criteria_profile_version ?? null,
-      recipient_unchanged: await ownerCommandRecipientUnchanged({
-        storage, opportunityId, recipientContactRef }),
+      // An enrollment that ended action-required never resolved the recipient (it was
+      // ambiguous, missing, or changed), so it cannot count as an unchanged recipient.
+      recipient_unchanged: enrollmentState === 'action-required' ? false
+        : await ownerCommandRecipientUnchanged({ storage, opportunityId, recipientContactRef }),
       created_at: new Date().toISOString(),
     });
   } catch (error) {
@@ -1290,7 +1293,8 @@ export async function recordAcquisitionOwnerCommand({
   const score = await storage.getDealHunterOpportunityScore(opportunityId);
   if (result.applied && !result.replay && ['pursue', 'pass'].includes(action)) {
     await recordOwnerDecisionEvidence({ storage, opportunityId, action, decision: result.decision,
-      score, policyVersion: decisionPolicyVersion, recipientContactRef });
+      score, policyVersion: decisionPolicyVersion, recipientContactRef,
+      enrollmentState: action === 'pursue' ? enrollment?.state : undefined });
   }
   const disposition = action === 'pass' && score?.deal_key
     ? await storage.getDealHunterDisposition({ dealKey: score.deal_key }) : null;
