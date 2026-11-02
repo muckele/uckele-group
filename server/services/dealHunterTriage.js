@@ -775,6 +775,9 @@ function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceR
       profitMultiple: currentDetailSourceNumber(sources, ['profit_multiple', 'ebitda_multiple'], row.financials?.profitMultiple),
     },
     topStrength, topConcern, workflow: { crmStatus, cimStatus }, observationFreshness, operatorPriority: detailText(row.operatorPriority, 40) || 'normal', operatorNote: detailText(row.operatorNote, 2000), reviewed: Boolean(row.reviewed), reviewedAt: detailText(row.reviewedAt, 80), reviewedBy: detailText(row.reviewedBy, 160), changedSinceReview: Boolean(row.changedSinceReview), disposition, dismissed, dismissedReason: dismissed ? disposition.reason : '', scoredAt: detailText(row.scoredAt, 80), scoreFingerprint: detailText(row.scoreFingerprint, 200), rulesVersion: detailText(row.rulesVersion, 160),
+    // The drawer gates Request SIM on these, so they must match the list row.
+    criteriaGroup: row.criteriaGroup, criteriaResult: row.criteriaResult,
+    criteriaCurrent: row.criteriaCurrent, autoPursueBlocker: row.autoPursueBlocker,
     freshness: { discoveryState: detailText(currentOpportunity?.discovery_state, 40) || 'untracked_legacy',
       firstAcceptedAt: detailText(currentOpportunity?.first_accepted_at, 80),
       latestAcceptedObservationAt,

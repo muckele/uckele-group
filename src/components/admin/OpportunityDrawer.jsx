@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
 import BrokerMaterialsCard, { BrokerMaterialsAttachmentStatus } from './BrokerMaterialsCard.jsx';
 import PursueNextAction from './PursueNextAction.jsx';
+import { NearMissConfirmPanel, isNearMiss } from './AcquisitionCriteria.jsx';
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
 import { financialFactFields, financialFactCurrencies, financialFactPeriods, financialFactMetrics,
   normalizeFinancialFact, parseFinancialFact, financialFactDescription } from '../../../shared/opportunityFinancialFacts.js';
@@ -113,9 +114,9 @@ export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit
   );
 }
 
-function DetailActions({ name, onAction, onPass, pending }) {
+function DetailActions({ name, onAction, onPass, onRequestSim, pending }) {
   if (!onAction) return null;
-  return <div className="flex flex-wrap gap-2"><button aria-label={`Pursue ${name}`} className={primaryButton} disabled={pending} onClick={() => onAction('pursue')} type="button">Pursue</button><button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
+  return <div className="flex flex-wrap gap-2"><button aria-label={`Request SIM ${name}`} className={primaryButton} disabled={pending} onClick={onRequestSim} type="button">Request SIM</button><button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
 }
 
 function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
@@ -269,6 +270,7 @@ export default function OpportunityDrawer({
   onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, pursueChoice = null, readOnly = false,
 }) {
   const [passOpen, setPassOpen] = useState(false);
+  const [simConfirmOpen, setSimConfirmOpen] = useState(false);
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [brokerEmailFocusRequest, setBrokerEmailFocusRequest] = useState(0);
   const dialogRef = useRef(null);
@@ -286,6 +288,7 @@ export default function OpportunityDrawer({
   const changedState = opportunity?.changedSinceReview ? 'Changed' : 'Current';
   useLayoutEffect(() => {
     closeButtonRef.current?.focus();
+    setSimConfirmOpen(false);
   }, [opportunity?.opportunityId]);
   useLayoutEffect(() => {
     // A disabled decision button can move native browser focus to the body.
@@ -370,7 +373,8 @@ export default function OpportunityDrawer({
                   : <button className={secondaryButton} disabled={pending || actionsBlocked} onClick={() => setRestoreOpen(true)} type="button">Restore opportunity</button>}
               </div> : null}
               <div className="mt-4"><PursueNextAction brokerMaterials={detail.brokerMaterials} cimRelease={cimRelease} linkedCrmId={linkedCrmId} opportunity={opportunity} pursueCimReleaseAvailable={detail.pursueCimReleaseAvailable} /></div>
-              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending || actionsBlocked} /></div>
+              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} onRequestSim={() => (isNearMiss(opportunity) ? setSimConfirmOpen(true) : onAction('pursue'))} pending={pending || actionsBlocked} /></div>
+              {simConfirmOpen && actionable && isNearMiss(opportunity) ? <NearMissConfirmPanel onCancel={() => setSimConfirmOpen(false)} onConfirm={() => { setSimConfirmOpen(false); onAction('pursue'); }} pending={pending || actionsBlocked} row={opportunity} /> : null}
               {pursueChoice?.options?.length > 1 && actionable ? <div aria-label="Choose Pursue recipient" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
                 <p className="text-sm font-semibold text-amber-950">Choose the authoritative broker recipient to continue Pursue</p>
                 <p className="mt-1 text-xs text-amber-900">The choice is checked against current contact authority before a campaign can be created.</p>

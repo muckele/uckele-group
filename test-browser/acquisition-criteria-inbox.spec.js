@@ -4,9 +4,9 @@ const appOrigin = 'http://127.0.0.1:4173';
 
 function mustHaves({ multiple = { outcome: 'pass', observed: 3.2 } } = {}) {
   return [
-    { id: 'profit', outcome: 'pass', observed: 420000 },
-    { id: 'multiple', ...multiple },
-    { id: 'geography', outcome: 'pass', observed: 'Phoenix, AZ | AZ' },
+    { id: 'profit', outcome: 'pass', observed: 420000, limit: { min: 300000, max: 750000 } },
+    { id: 'multiple', limit: { max: 4 }, ...multiple },
+    { id: 'geography', outcome: 'pass', observed: 'Phoenix, AZ | AZ', targetStates: ['AZ', 'CA'] },
     { id: 'industry', outcome: 'pass', observed: 'Desert HVAC' },
     { id: 'gates', outcome: 'pass', observed: 0 },
   ];
@@ -154,6 +154,8 @@ async function installFixture(page) {
     } else if (method === 'POST' && url.pathname === '/api/admin/deal-hunter/triage/opp-review/action') {
       state.actions.push({ path: url.pathname, body: request.postDataJSON() });
       await fulfillJson(route, { success: true, action: 'pursue', enrollment: { state: 'action-required' }, recipientOptions });
+    } else if (method === 'GET' && url.pathname === '/api/admin/deal-hunter/triage/opp-near') {
+      await fulfillJson(route, detailResponse(nearMissRow));
     } else if (method === 'POST' && url.pathname === '/api/admin/deal-hunter/triage/opp-near/action') {
       state.actions.push({ path: url.pathname, body: request.postDataJSON() });
       await fulfillJson(route, { success: true, action: 'pursue' });
@@ -209,6 +211,29 @@ test('near misses stay collapsed and ask before Request SIM', async ({ page }) =
   await expect.poll(() => state.actions.length).toBe(1);
   expect(state.actions[0].body).toEqual(expect.objectContaining({ action: 'pursue' }));
   await expect(page.getByRole('dialog')).toHaveCount(0);
+  expect(state.unexpected).toEqual([]);
+  expect(state.consoleErrors).toEqual([]);
+  expect(state.pageErrors).toEqual([]);
+});
+
+test('a near miss opened in the drawer asks before Request SIM', async ({ page }) => {
+  const state = await installFixture(page);
+  await page.goto('/admin/deal-hunter');
+
+  await page.getByRole('button', { name: 'Show near misses (1)' }).click();
+  await page.getByRole('button', { name: 'Open Pricey Plumbing' }).click();
+  const drawer = page.getByRole('dialog', { name: /Pricey Plumbing/ });
+  await drawer.getByRole('button', { name: 'Request SIM Pricey Plumbing' }).click();
+  const confirm = drawer.getByRole('group', { name: 'Confirm Request SIM' });
+  await expect(confirm.getByText('This deal misses the multiple limit. Request the SIM anyway?')).toBeVisible();
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  await expect(confirm).toHaveCount(0);
+  expect(state.actions).toHaveLength(0);
+
+  await drawer.getByRole('button', { name: 'Request SIM Pricey Plumbing' }).click();
+  await drawer.getByRole('group', { name: 'Confirm Request SIM' }).getByRole('button', { name: 'Request SIM' }).click();
+  await expect.poll(() => state.actions.length).toBe(1);
+  expect(state.actions[0].body).toEqual(expect.objectContaining({ action: 'pursue' }));
   expect(state.unexpected).toEqual([]);
   expect(state.consoleErrors).toEqual([]);
   expect(state.pageErrors).toEqual([]);

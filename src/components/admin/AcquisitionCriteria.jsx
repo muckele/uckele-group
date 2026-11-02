@@ -1,11 +1,9 @@
 import React, { useEffect, useRef } from 'react';
 
-// Presentation of the owner criteria groups in the Acquisition Inbox. The
-// thresholds below mirror server/services/dealCriteriaProfile.js and are used
-// only to word the rule a failed must-have missed; the server decides pass/fail.
-const MINIMUM_PROFIT = 300000;
-const MAXIMUM_PROFIT = 750000;
-const MAXIMUM_MULTIPLE = 4;
+// Presentation of the owner criteria groups in the Acquisition Inbox. The server
+// decides pass/fail and sends each rule's limits on the must-have entry; nothing
+// here knows a threshold. Rows stored before limits were emitted simply show the
+// observed value without the parenthetical rule.
 
 const blockerReasons = {
   generic_mailbox: 'only a generic mailbox',
@@ -61,19 +59,26 @@ function mustHavePhrase(entry, row) {
       const value = number(observed);
       if (unknown || value === null) return 'Profit not disclosed';
       if (pass) return `Profit ${compactMoney(value)} ✓`;
-      return value < MINIMUM_PROFIT
-        ? `Profit ${compactMoney(value)} (min ${compactMoney(MINIMUM_PROFIT)})`
-        : `Profit ${compactMoney(value)} (max ${compactMoney(MAXIMUM_PROFIT)})`;
+      const min = number(entry.limit?.min);
+      const max = number(entry.limit?.max);
+      let rule = '';
+      if (min !== null && value < min) rule = ` (min ${compactMoney(min)})`;
+      else if (max !== null && value > max) rule = ` (max ${compactMoney(max)})`;
+      return `Profit ${compactMoney(value)}${rule}`;
     }
     case 'multiple': {
       const value = number(observed);
       if (unknown || value === null) return 'Multiple not disclosed';
-      return pass ? `${multiple(value)} ✓` : `Multiple ${multiple(value)} (max ${multiple(MAXIMUM_MULTIPLE)})`;
+      if (pass) return `${multiple(value)} ✓`;
+      const max = number(entry.limit?.max);
+      return `Multiple ${multiple(value)}${max !== null ? ` (max ${multiple(max)})` : ''}`;
     }
     case 'geography': {
       const code = stateCode(observed);
       if (unknown) return 'Location not disclosed';
-      return pass ? `${code || 'Target state'} ✓` : `Location ${code || 'unknown'} (outside target states)`;
+      if (pass) return `${code || 'Target state'} ✓`;
+      const states = Array.isArray(entry.targetStates) ? entry.targetStates.filter((state) => typeof state === 'string' && state) : [];
+      return `Location ${code || 'unknown'}${states.length > 0 ? ` (target: ${states.join(', ')})` : ''}`;
     }
     case 'industry': {
       const industry = String(row?.industry || '').trim();
@@ -123,6 +128,10 @@ export function missedMustHaves(row) {
   if (labels.length === 0) return 'a must-have';
   if (labels.length === 1) return labels[0];
   return `${labels.slice(0, -1).join(', ')} and ${labels.at(-1)}`;
+}
+
+export function nearMissPrompt(row) {
+  return `This deal misses ${missedMustHaves(row)}. Request the SIM anyway?`;
 }
 
 export function AutoPursueModeBadge({ status }) {
@@ -177,11 +186,28 @@ export function NearMissConfirmDialog({ name, onCancel, onConfirm, pending, row 
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-ink/40 p-4" role="presentation">
       <div aria-describedby="near-miss-confirm-message" aria-labelledby="near-miss-confirm-title" aria-modal="true" className="w-full max-w-md rounded-2xl border border-line bg-white p-5 shadow-2xl" ref={dialogRef} role="dialog">
         <h2 className="sr-only" id="near-miss-confirm-title">Confirm Request SIM for {name}</h2>
-        <p className="text-sm font-semibold leading-6 text-ink" id="near-miss-confirm-message">This deal misses {missedMustHaves(row)}. Request the SIM anyway?</p>
+        <p className="text-sm font-semibold leading-6 text-ink" id="near-miss-confirm-message">{nearMissPrompt(row)}</p>
         <div className="mt-4 flex flex-wrap justify-end gap-2">
           <button className="inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50" disabled={pending} onClick={onCancel} ref={cancelRef} type="button">Cancel</button>
           <button className="inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-pine disabled:opacity-50" disabled={pending} onClick={onConfirm} type="button">Request SIM</button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Inline variant for the opportunity drawer, which traps focus and so cannot host a second modal.
+export function NearMissConfirmPanel({ onCancel, onConfirm, pending, row }) {
+  const cancelRef = useRef(null);
+  useEffect(() => {
+    cancelRef.current?.focus();
+  }, []);
+  return (
+    <div aria-label="Confirm Request SIM" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4" role="group">
+      <p className="text-sm font-semibold leading-6 text-amber-950">{nearMissPrompt(row)}</p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button className="inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-pine disabled:opacity-50" disabled={pending} onClick={onConfirm} type="button">Request SIM</button>
+        <button className="inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50" disabled={pending} onClick={onCancel} ref={cancelRef} type="button">Cancel</button>
       </div>
     </div>
   );

@@ -40,9 +40,12 @@ export function getDealCriteriaProfile(config = getConfig()) {
 
 function evaluateProfit(deal, profile) {
   const observed = finiteNumber(deal.annualProfit);
-  if (observed === null) return { id: 'profit', outcome: 'unknown', observed: null };
+  // The limit travels with the result so the inbox words the failed rule from
+  // the same profile that decided it.
+  const limit = { min: profile.minimumAnnualProfit, max: profile.maximumAnnualProfit };
+  if (observed === null) return { id: 'profit', outcome: 'unknown', observed: null, limit };
   const pass = observed >= profile.minimumAnnualProfit && observed <= profile.maximumAnnualProfit;
-  return { id: 'profit', outcome: pass ? 'pass' : 'fail', observed };
+  return { id: 'profit', outcome: pass ? 'pass' : 'fail', observed, limit };
 }
 
 function evaluateMultiple(deal, profile) {
@@ -54,14 +57,16 @@ function evaluateMultiple(deal, profile) {
       observed = askingPrice / annualProfit;
     }
   }
-  if (observed === null) return { id: 'multiple', outcome: 'unknown', observed: null };
+  const limit = { max: profile.maximumProfitMultiple };
+  if (observed === null) return { id: 'multiple', outcome: 'unknown', observed: null, limit };
   const pass = observed > 0 && observed <= profile.maximumProfitMultiple;
-  return { id: 'multiple', outcome: pass ? 'pass' : 'fail', observed };
+  return { id: 'multiple', outcome: pass ? 'pass' : 'fail', observed, limit };
 }
 
 function evaluateGeography(deal, profile) {
   const fields = [deal.location, deal.state].map((value) => String(value || '').trim()).filter(Boolean);
-  if (fields.length === 0) return { id: 'geography', outcome: 'unknown', observed: null };
+  const targetStates = [...profile.targetStates];
+  if (fields.length === 0) return { id: 'geography', outcome: 'unknown', observed: null, targetStates };
   const pass = fields.some((field) => {
     let text = field.toUpperCase();
     for (const [name, code] of Object.entries(stateNameCodes)) {
@@ -69,7 +74,7 @@ function evaluateGeography(deal, profile) {
     }
     return profile.targetStates.some((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(text));
   });
-  return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed: fields.join(' | ') };
+  return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed: fields.join(' | '), targetStates };
 }
 
 function evaluateIndustry(deal, profile) {

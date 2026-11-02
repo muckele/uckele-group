@@ -1484,7 +1484,7 @@ describe('Acquisition Inbox queue', () => {
     expect(within(drawer).getByText('Needs Review · Current')).toBeVisible();
     expect(within(drawer).getByText('Priority: Normal')).toBeVisible();
     expect(within(drawer).queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(within(drawer).getByRole('button', { name: action })).toBeEnabled();
     }
     fireEvent.click(within(drawer).getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
@@ -1500,7 +1500,7 @@ describe('Acquisition Inbox queue', () => {
     expect(within(drawer).getByText('Needs Review · Current')).toBeVisible();
     expect(within(drawer).getByText('Priority: Normal')).toBeVisible();
     expect(within(drawer).queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(within(drawer).getByRole('button', { name: action })).toBeEnabled();
     }
     expect(reads).toHaveLength(2);
@@ -1830,7 +1830,7 @@ describe('Acquisition Inbox queue', () => {
       expectMobileReachable(retry, retryDrawer);
       activateWithKeyboard(retry, ' ');
       let drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
-      for (const control of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection', 'Save verified fact', 'Close opportunity detail']) {
+      for (const control of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection', 'Save verified fact', 'Close opportunity detail']) {
         expectMobileReachable(within(drawer).getByRole('button', { name: control }), drawer);
       }
       expect(drawer).toHaveClass('h-full');
@@ -1843,7 +1843,7 @@ describe('Acquisition Inbox queue', () => {
       activateWithKeyboard(within(drawer).getByRole('button', { name: 'Save verified fact' }), 'Enter');
       await waitFor(() => expect(writes).toHaveLength(4));
       drawer = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
-      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Pursue Evergreen Fire Protection' }), 'Enter');
+      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }), 'Enter');
       await waitFor(() => expect(writes).toHaveLength(5));
       drawer = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
       activateWithKeyboard(within(drawer).getByRole('button', { name: 'Watch Evergreen Fire Protection' }), ' ');
@@ -2800,9 +2800,9 @@ test('a server-confirmed save with failed detail refresh explicitly distinguishe
 
 describe('Criteria-grouped Acquisition Inbox', () => {
   const mustHaves = (overrides = {}) => [
-    { id: 'profit', outcome: 'pass', observed: 420000 },
-    { id: 'multiple', outcome: 'pass', observed: 3.2 },
-    { id: 'geography', outcome: 'pass', observed: 'Phoenix, AZ | AZ' },
+    { id: 'profit', outcome: 'pass', observed: 420000, limit: { min: 300000, max: 750000 } },
+    { id: 'multiple', outcome: 'pass', observed: 3.2, limit: { max: 4 } },
+    { id: 'geography', outcome: 'pass', observed: 'Phoenix, AZ | AZ', targetStates: ['AZ', 'CA', 'NV'] },
     { id: 'industry', outcome: 'pass', observed: 'Desert HVAC' },
     { id: 'gates', outcome: 'pass', observed: 0 },
   ].map((entry) => ({ ...entry, ...(overrides[entry.id] || {}) }));
@@ -2841,6 +2841,8 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       if (url.includes('/auto-pursue')) {
         return status ? jsonResponse(status) : jsonResponse({ error: 'nope' }, { ok: false, status: 503 });
       }
+      if (url.endsWith('/triage/near-1')) return jsonResponse({ success: true, ...detailResponse(nearMissRow) });
+      if (url.endsWith('/triage/review-1')) return jsonResponse({ success: true, ...detailResponse(reviewRow) });
       if (url.endsWith('/action')) {
         writes.push({ url, body: JSON.parse(options.body) });
         return jsonResponse({ success: true, action: 'pursue' });
@@ -2953,6 +2955,65 @@ describe('Criteria-grouped Acquisition Inbox', () => {
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     expect(writes[0].body.action).toBe('pursue');
+  });
+
+  test.each([
+    ['multiple', { outcome: 'fail', observed: 3.9, limit: { max: 3.5 } }, 'Profit $420K ✓ · Multiple 3.9× (max 3.5×) · AZ ✓ · HVAC ✓'],
+    ['profit', { outcome: 'fail', observed: 250000, limit: { min: 275000, max: 600000 } }, 'Profit $250K (min $275K) · 3.2× ✓ · AZ ✓ · HVAC ✓'],
+    ['profit', { outcome: 'fail', observed: 900000, limit: { min: 275000, max: 600000 } }, 'Profit $900K (max $600K) · 3.2× ✓ · AZ ✓ · HVAC ✓'],
+    ['geography', { outcome: 'fail', observed: 'Austin | TX', targetStates: ['AZ', 'CA'] }, 'Profit $420K ✓ · 3.2× ✓ · Location TX (target: AZ, CA) · HVAC ✓'],
+  ])('renders the failed %s rule from the limits the server sent', async (id, entry, text) => {
+    const row = criteriaRow({ opportunityId: 'rule', name: 'Rule Air', criteriaGroup: 'review',
+      criteriaResult: { mustHaves: mustHaves({ [id]: entry }), failed: [id], unknown: [] } });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox', rows: [row],
+      areas: [{ id: 'your-review', rows: [row], total: 1, counts: {} }] }))));
+    renderInbox({ initialView: 'inbox' });
+    expect(await within(await screen.findByRole('region', { name: 'Your review' })).findByText(text)).toBeVisible();
+  });
+
+  test('older rows without limits render the failed value without a parenthetical', async () => {
+    const bare = (entry) => { const { limit, targetStates, ...rest } = entry; return rest; };
+    const row = criteriaRow({ opportunityId: 'old', name: 'Old Air', criteriaGroup: 'review',
+      criteriaResult: { mustHaves: mustHaves({ multiple: { outcome: 'fail', observed: 5.1 } }).map(bare), failed: ['multiple'], unknown: [] } });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox', rows: [row],
+      areas: [{ id: 'your-review', rows: [row], total: 1, counts: {} }] }))));
+    renderInbox({ initialView: 'inbox' });
+    const review = await screen.findByRole('region', { name: 'Your review' });
+    expect(within(review).getByText('Profit $420K ✓ · Multiple 5.1× · AZ ✓ · HVAC ✓')).toBeVisible();
+    expect(review.textContent).not.toMatch(/\((min|max|target)/);
+  });
+
+  test('a near miss opened in the drawer asks before Request SIM', async () => {
+    const writes = [];
+    stubCriteriaFetch({ writes });
+    renderInbox({ initialView: 'inbox' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Show near misses (1)' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open Near Air' }));
+    const drawer = await screen.findByRole('dialog', { name: /Near Air/ });
+    fireEvent.click(await within(drawer).findByRole('button', { name: 'Request SIM Near Air' }));
+    const confirm = within(drawer).getByRole('group', { name: 'Confirm Request SIM' });
+    expect(within(confirm).getByText('This deal misses the multiple limit. Request the SIM anyway?')).toBeVisible();
+    expect(writes).toHaveLength(0);
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Cancel' }));
+    expect(within(drawer).queryByRole('group', { name: 'Confirm Request SIM' })).not.toBeInTheDocument();
+    expect(writes).toHaveLength(0);
+
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Request SIM Near Air' }));
+    fireEvent.click(within(within(drawer).getByRole('group', { name: 'Confirm Request SIM' })).getByRole('button', { name: 'Request SIM' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].url).toContain('/triage/near-1/action');
+    expect(writes[0].body).toEqual(expect.objectContaining({ action: 'pursue' }));
+  });
+
+  test('a non-near-miss opened in the drawer requests without a confirm', async () => {
+    const writes = [];
+    stubCriteriaFetch({ writes });
+    renderInbox({ initialView: 'inbox' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Review Air' }));
+    const drawer = await screen.findByRole('dialog', { name: /Review Air/ });
+    fireEvent.click(await within(drawer).findByRole('button', { name: 'Request SIM Review Air' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(within(drawer).queryByRole('group', { name: 'Confirm Request SIM' })).not.toBeInTheDocument();
   });
 
   test('shows the mode badge and today count', async () => {

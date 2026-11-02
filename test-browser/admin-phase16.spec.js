@@ -2563,7 +2563,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(refreshedSources.getByText(/Observed Aug 30, 2026/).first()).toBeVisible();
   expect(state.requests.some((request) => /refresh|review|backfill|import/i.test(request.path))).toBe(false);
 
-  await dialog.getByRole('button', { name: 'Pursue Evergreen Safety Services' }).click();
+  await dialog.getByRole('button', { name: 'Request SIM Evergreen Safety Services' }).click();
   await expect.poll(() => state.actionPayloads.filter((payload) => payload.path === '/api/admin/deal-hunter/triage/opp-evergreen/action').length).toBe(1);
   await expectPhase1DetailValue(dialog, 'Operator state', 'High');
   await expectPhase1DetailValue(dialog, 'Fit', 92);
@@ -2615,7 +2615,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(dialog.getByText('Passed: Valuation').first()).toBeVisible();
   await expect(dialog.getByRole('heading', { name: 'Disposition history' })).toBeVisible();
   await expect(dialog.getByText(/Passed: Valuation · Asking price exceeds the current acquisition valuation. · phase1-admin/)).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: 'Request SIM Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Watch Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Pass Cascade Field Compliance' })).toHaveCount(0);
   await dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
@@ -2690,7 +2690,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   expect(mobileDialogBox.height).toBeGreaterThanOrEqual(811);
   for (const control of [
     dialog.getByRole('button', { name: 'Close opportunity detail' }),
-    dialog.getByRole('button', { name: 'Pursue Summit Fire Systems' }),
+    dialog.getByRole('button', { name: 'Request SIM Summit Fire Systems' }),
     dialog.getByRole('button', { name: 'Watch Summit Fire Systems' }),
     dialog.getByRole('button', { name: 'Pass Summit Fire Systems' }),
     dialog.getByLabel('Verified fact field'),
@@ -2846,7 +2846,7 @@ test('Request Broker Materials desktop review sends the exact approved proposal 
   score.financials.annualProfit = null;
   const { dialog, card } = await openBrokerOpportunity(page);
 
-  await dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' }).click();
+  await dialog.getByRole('button', { name: 'Request SIM Cascade Field Compliance' }).click();
   await expect(card.getByRole('button', { name: 'Request Broker Materials' })).toBeVisible();
   await card.getByRole('button', { name: 'Request Broker Materials' }).click();
 
@@ -3025,7 +3025,7 @@ test('Request Broker Materials viewer can inspect preview and status but cannot 
   const state = await installPhase1Fixture(page, { role: 'viewer' });
   markBrokerOpportunityPursued(state);
   const { dialog, card } = await openBrokerOpportunity(page);
-  await expect(dialog.getByRole('button', { name: /Pursue|Watch|Pass/ })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: /Request SIM|Pursue|Watch|Pass/ })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Save verified fact' })).toHaveCount(0);
   await card.getByRole('button', { name: 'Preview Broker Materials' }).click();
   await expect(card.getByLabel('Greeting')).toHaveAttribute('readonly');

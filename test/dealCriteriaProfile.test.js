@@ -69,3 +69,20 @@ test('group precedence', () => {
 test('automatic floor cannot be configured below 90', () => {
   assert.equal(getDealCriteriaProfile({ dealHunter: { criteria: { automaticFloor: 80 } } }).automaticFloor, 90);
 });
+
+test('failed and passing must-haves carry the profile limits the owner is shown', () => {
+  const profile = getDealCriteriaProfile();
+  const result = evaluateDealCriteria(deal({ annualProfit: 900000, profitMultiple: 5.1 }));
+  const byId = Object.fromEntries(result.mustHaves.map((entry) => [entry.id, entry]));
+  assert.deepEqual(byId.profit.limit, { min: profile.minimumAnnualProfit, max: profile.maximumAnnualProfit });
+  assert.deepEqual(byId.multiple.limit, { max: profile.maximumProfitMultiple });
+  assert.deepEqual(byId.geography.targetStates, [...profile.targetStates]);
+  assert.equal(Object.hasOwn(byId.industry, 'limit'), false);
+  assert.equal(Object.hasOwn(byId.gates, 'limit'), false);
+});
+
+test('unknown must-haves still state the limits', () => {
+  const result = evaluateDealCriteria(deal({ annualProfit: null, profitMultiple: null, askingPrice: null }));
+  assert.deepEqual(result.mustHaves.find((entry) => entry.id === 'profit').limit, { min: 300000, max: 750000 });
+  assert.deepEqual(result.mustHaves.find((entry) => entry.id === 'multiple').limit, { max: 4 });
+});

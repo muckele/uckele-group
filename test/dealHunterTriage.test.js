@@ -1590,3 +1590,15 @@ test('a machine rescore keeps the runner-owned auto-Pursue columns', async (t) =
   assert.deepEqual({ ...kept }, { fit_score: 93, auto_pursue_blocker: 'generic_mailbox',
     auto_pursue_checked_at: '2026-11-02T10:00:00.000Z' });
 });
+
+test('triage detail carries the persisted criteria fields', async (t) => {
+  const { publicTriageRow } = await import('../server/services/dealHunterTriage.js');
+  const storage = await seedQueue(t);
+  const persisted = publicTriageRow(await storage.getCurrentDealHunterOpportunityScore('opp-high'));
+  assert.ok(persisted.criteriaResult, 'the seeded row has a stored criteria result');
+  const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-high', storage });
+  assert.equal(detail.ok, true);
+  for (const field of ['criteriaGroup', 'criteriaResult', 'criteriaCurrent', 'autoPursueBlocker']) {
+    assert.deepEqual(detail.opportunity[field], persisted[field], field);
+  }
+});

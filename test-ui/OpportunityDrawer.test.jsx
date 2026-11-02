@@ -353,7 +353,7 @@ describe('Opportunity drawer', () => {
     const onAction = vi.fn();
     render(<OpportunityDrawer detail={detailFixture()} onAction={onAction} onClose={vi.fn()} />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
     fireEvent.click(screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
 
@@ -377,7 +377,7 @@ describe('Opportunity drawer', () => {
     expect(screen.getByText('Persisted CIM subject')).toBeVisible();
     expect(screen.queryAllByRole('textbox')).toHaveLength(0);
     // Historical evidence still permits navigation/copy; no mutation entry is present.
-    expect(screen.queryByRole('button', { name: /^(Pursue |Watch |Pass |Save verified fact|Mark reviewed|Prepare |Approve |Start |Stop )/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^(Request SIM |Pursue |Watch |Pass |Save verified fact|Mark reviewed|Prepare |Approve |Start |Stop )/ })).toBeNull();
     expect(mutation).not.toHaveBeenCalled();
   });
 
@@ -437,7 +437,7 @@ describe('Opportunity drawer', () => {
     render(<OpportunityDrawer detail={detailFixture()} onAction={vi.fn()} onBrokerMaterialsPrepare={onBrokerMaterialsPrepare} onClose={vi.fn()} />);
 
     const dialog = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
-    const pursue = within(dialog).getByRole('button', { name: 'Pursue Evergreen Fire Protection' });
+    const pursue = within(dialog).getByRole('button', { name: 'Request SIM Evergreen Fire Protection' });
     const card = within(dialog).getByRole('region', { name: 'Broker Materials' });
     const strength = within(dialog).getByText('Recurring inspections support durable demand.');
     expect(pursue.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
