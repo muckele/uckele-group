@@ -12,6 +12,7 @@
 import { randomUUID } from 'node:crypto';
 import { sha256 } from '../utils/security.js';
 import { freshInboxAreaIds } from './dealHunterFreshInboxPolicy.js';
+import { DEAL_CRITERIA_PROFILE_VERSION } from './dealCriteriaProfile.js';
 import { recordCrmActivity } from './activity.js';
 import { getStorage } from '../storage/index.js';
 import {
@@ -243,6 +244,13 @@ export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) 
   if (typeof annualProfitEvidence === 'string') {
     try { annualProfitEvidence = JSON.parse(annualProfitEvidence); } catch { annualProfitEvidence = null; }
   }
+  // SQLite returns criteria_result as a JSON string, Supabase as a parsed object.
+  // This is the one place the two shapes are reconciled.
+  let criteriaResult = row.criteria_result ?? null;
+  if (typeof criteriaResult === 'string') {
+    try { criteriaResult = JSON.parse(criteriaResult); } catch { criteriaResult = null; }
+  }
+  if (!criteriaResult || typeof criteriaResult !== 'object' || Array.isArray(criteriaResult)) criteriaResult = null;
   return {
     opportunityId: row.opportunity_id,
     dealKey: row.deal_key || '',
@@ -291,6 +299,10 @@ export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) 
     scoredAt: row.scored_at || '',
     scoreFingerprint: row.score_fingerprint || '',
     rulesVersion: row.rules_version || '',
+    criteriaGroup: row.criteria_group || '',
+    criteriaResult,
+    criteriaCurrent: row.criteria_profile_version === DEAL_CRITERIA_PROFILE_VERSION,
+    autoPursueBlocker: row.auto_pursue_blocker || '',
     freshness: row.discovery_state !== undefined ? {
       discoveryState: row.discovery_state || 'untracked_legacy',
       firstAcceptedAt: row.first_accepted_at || '',

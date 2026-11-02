@@ -103,7 +103,8 @@ test('operator full-backfill reconciles a stale supplemental score out of curren
     });
     const importInbox = await importInboxResponse.json();
     assert.equal(importInboxResponse.status, 200, JSON.stringify(importInbox));
-    assert.equal(importInbox.areas.find((area) => area.id === 'new-important')?.rows.some(
+    // TX is outside the target states, so the criteria evaluation files it under near-miss.
+    assert.equal(importInbox.areas.find((area) => area.id === 'near-miss')?.rows.some(
       (row) => row.opportunityId === importedDeal.opportunity_id,
     ), true, JSON.stringify(importInbox.areas.map((area) => ({ id: area.id, total: area.total }))));
     const importedInboxRow = importInbox.rows.find(

@@ -5779,6 +5779,10 @@ export function createSqliteStorage(config, options = {}) {
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_profile_version', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_group', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_result', 'TEXT');
+  // Runner-owned automatic-Pursue state, written only by the Pursue runner. It is
+  // deliberately absent from the machine score write and every operator-owned writer.
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_blocker', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_checked_at', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunities', 'first_accepted_at', 'TEXT');
@@ -11232,7 +11236,8 @@ export function createSqliteStorage(config, options = {}) {
           scores.contradiction_count, scores.operator_priority,
           scores.reviewed_at, scores.reviewed_discovery_revision,
           scores.reviewed_material_revision, scores.score_fingerprint,
-          scores.semantic_digest,
+          scores.semantic_digest, scores.criteria_profile_version, scores.criteria_group,
+          scores.criteria_result, scores.auto_pursue_blocker,
           (SELECT MAX(source.updated_at)
             FROM deal_hunter_opportunity_source_observations AS source
             WHERE source.opportunity_id = scores.opportunity_id) AS source_snapshot_updated_at,

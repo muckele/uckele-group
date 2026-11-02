@@ -17,6 +17,7 @@ const { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } = await import('../
 const { getTriageOpportunityDetail, listTriageQueue, passTriageOpportunity, setTriageOperatorDecision } =
   await import('../server/services/dealHunterTriage.js');
 const { buildFreshInboxAreas } = await import('../server/services/dealHunterFreshInboxPolicy.js');
+const { DEAL_CRITERIA_PROFILE_VERSION } = await import('../server/services/dealCriteriaProfile.js');
 
 const briefingGeneratedAt = '2026-09-05T15:00:00.000Z';
 
@@ -561,7 +562,8 @@ test('fresh discovery has its own first page despite more than a page of old pri
   assert.equal(accepted.reconciled, true);
   const inbox = await storage.listDealHunterFreshInbox({ area: 'inbox', asOf: new Date().toISOString() });
   const actions = inbox.areas.find((area) => area.id === 'action-preview');
-  const discovery = inbox.areas.find((area) => area.id === 'new-important');
+  const discovery = (await storage.listDealHunterFreshInbox({ area: 'new-important',
+    asOf: new Date().toISOString() })).areas[0];
   assert.equal(actions.total, 3);
   assert.equal(actions.counts.ownerPriority, 15);
   assert.equal(discovery.total, 1);
@@ -570,9 +572,12 @@ test('fresh discovery has its own first page despite more than a page of old pri
   const served = await listTriageQueue({ view: 'inbox', storage,
     getCachedSourceHealth: async () => ({ healthy: false }) });
   assert.equal(served.ok, true);
-  assert.deepEqual(served.areas.map((area) => area.id), ['action-preview', 'new-important']);
-  assert.equal(served.areas[1].rows[0].freshness.newToUs, true);
-  assert.equal(served.areas[1].rows[0].freshness.crmLinked, false);
+  assert.deepEqual(served.areas.map((area) => area.id),
+    ['action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss']);
+  const servedNew = (await listTriageQueue({ view: 'inbox', area: 'new-important', storage,
+    getCachedSourceHealth: async () => ({ healthy: false }) })).areas[0];
+  assert.equal(servedNew.rows[0].freshness.newToUs, true);
+  assert.equal(servedNew.rows[0].freshness.crmLinked, false);
   const servedPriorities = await listTriageQueue({ view: 'inbox', area: 'owner-priorities',
     pageSize: 5, storage, getCachedSourceHealth: async () => ({ healthy: false }) });
   assert.equal(servedPriorities.areas[0].total, 15);
@@ -1429,4 +1434,159 @@ test('Restore confirmation projection never exposes malformed raw storage author
     assert.equal(detail.restoreAuthority, undefined);
     assert.equal(JSON.stringify(detail).includes('raw-private-authority'), false);
   }
+});
+
+
+const criteriaAsOf = '2026-09-23T18:00:00.000Z';
+const criteriaAreaIds = ['auto-pursue', 'your-review', 'needs-info', 'near-miss'];
+
+function criteriaCandidate(id, overrides = {}) {
+  return { opportunity_id: id, fit_score: 90, confidence: 'high', operator_priority: 'normal',
+    discovery_state: 'untracked_legacy', discovery_revision: 0, reviewed_discovery_revision: 0,
+    material_revision: 0, reviewed_material_revision: 0, publication_state: 'unknown',
+    publication_distinct_count: 0, publication_unsupported_count: 0,
+    first_accepted_at: '2026-09-01T18:00:00.000Z',
+    criteria_profile_version: DEAL_CRITERIA_PROFILE_VERSION, criteria_group: 'review',
+    auto_pursue_blocker: null, ...overrides };
+}
+
+function areaIds(result, id) {
+  return result.areas.find((area) => area.id === id).rows.map((row) => row.opportunity_id);
+}
+
+test('default inbox returns the criteria areas in order', () => {
+  const result = buildFreshInboxAreas([criteriaCandidate('a')], { area: 'inbox', asOf: criteriaAsOf });
+  assert.deepEqual(result.areas.map((area) => area.id),
+    ['action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss']);
+});
+
+test('new-important stays a selectable area but leaves the default inbox', () => {
+  const result = buildFreshInboxAreas([criteriaCandidate('a', { discovery_state: 'known_prospective',
+    discovery_revision: 1, first_accepted_at: '2026-09-22T18:00:00.000Z' })],
+  { area: 'new-important', asOf: criteriaAsOf });
+  assert.deepEqual(result.areas.map((area) => area.id), ['new-important']);
+  assert.deepEqual(areaIds(result, 'new-important'), ['a']);
+});
+
+test('criteria areas place each group, in discovery order within an area', () => {
+  const result = buildFreshInboxAreas([
+    criteriaCandidate('review-lower', { criteria_group: 'review', fit_score: 80 }),
+    criteriaCandidate('review-higher', { criteria_group: 'review', fit_score: 88 }),
+    criteriaCandidate('info', { criteria_group: 'needs-info' }),
+    criteriaCandidate('miss', { criteria_group: 'near-miss' }),
+    criteriaCandidate('auto', { criteria_group: 'auto' }),
+  ], { area: 'inbox', asOf: criteriaAsOf });
+  assert.deepEqual(areaIds(result, 'auto-pursue'), ['auto']);
+  assert.deepEqual(areaIds(result, 'your-review'), ['review-higher', 'review-lower']);
+  assert.deepEqual(areaIds(result, 'needs-info'), ['info']);
+  assert.deepEqual(areaIds(result, 'near-miss'), ['miss']);
+});
+
+test('blocked auto rows and stale-version rows go to your-review', () => {
+  const result = buildFreshInboxAreas([
+    criteriaCandidate('a', { criteria_group: 'auto' }),
+    criteriaCandidate('b', { criteria_group: 'auto', auto_pursue_blocker: 'generic_mailbox' }),
+    criteriaCandidate('c', { criteria_group: 'auto', criteria_profile_version: 'uckele-criteria-v0' }),
+    criteriaCandidate('d', { criteria_group: null, criteria_profile_version: null }),
+    criteriaCandidate('e', { criteria_group: 'near-miss', criteria_profile_version: 'uckele-criteria-v0' }),
+  ], { area: 'inbox', asOf: criteriaAsOf });
+  assert.deepEqual(areaIds(result, 'auto-pursue'), ['a']);
+  assert.deepEqual(areaIds(result, 'your-review').sort(), ['b', 'c', 'd', 'e']);
+  assert.deepEqual(areaIds(result, 'near-miss'), []);
+});
+
+test('below-review and sub-75 rows appear in no criteria area', () => {
+  const result = buildFreshInboxAreas([
+    criteriaCandidate('d', { fit_score: 70, criteria_group: 'below-review' }),
+    criteriaCandidate('stale-low', { fit_score: 70, criteria_profile_version: 'uckele-criteria-v0' }),
+    criteriaCandidate('info-low', { fit_score: 70, criteria_group: 'needs-info' }),
+  ], { area: 'inbox', asOf: criteriaAsOf });
+  for (const id of criteriaAreaIds) assert.deepEqual(areaIds(result, id), []);
+});
+
+test('a criteria area can be requested alone and pages with a cursor', () => {
+  const rows = ['x', 'y', 'z'].map((id, index) => criteriaCandidate(id,
+    { criteria_group: 'review', fit_score: 90 - index }));
+  const first = buildFreshInboxAreas(rows, { area: 'your-review', limit: 2, asOf: criteriaAsOf });
+  assert.deepEqual(areaIds(first, 'your-review'), ['x', 'y']);
+  const second = buildFreshInboxAreas(rows, { area: 'your-review', limit: 2,
+    cursor: first.areas[0].nextCursor, asOf: criteriaAsOf });
+  assert.deepEqual(areaIds(second, 'your-review'), ['z']);
+});
+
+test('publicTriageRow exposes criteria fields from SQLite strings and Supabase objects', async () => {
+  const { publicTriageRow } = await import('../server/services/dealHunterTriage.js');
+  const result = { profileVersion: DEAL_CRITERIA_PROFILE_VERSION, group: 'review',
+    mustHaves: [{ id: 'profit', outcome: 'pass', observed: 400000 }], failed: [], unknown: [] };
+  const base = { opportunity_id: 'o', criteria_profile_version: DEAL_CRITERIA_PROFILE_VERSION,
+    criteria_group: 'review', auto_pursue_blocker: 'generic_mailbox' };
+  const fromSqlite = publicTriageRow({ ...base, criteria_result: JSON.stringify(result) });
+  const fromSupabase = publicTriageRow({ ...base, criteria_result: result });
+  assert.deepEqual(fromSqlite.criteriaResult, result);
+  assert.deepEqual(fromSupabase.criteriaResult, result);
+  assert.equal(fromSqlite.criteriaGroup, 'review');
+  assert.equal(fromSqlite.criteriaCurrent, true);
+  assert.equal(fromSqlite.autoPursueBlocker, 'generic_mailbox');
+  const stale = publicTriageRow({ ...base, criteria_profile_version: 'uckele-criteria-v0',
+    criteria_result: '{not json', auto_pursue_blocker: null });
+  assert.equal(stale.criteriaCurrent, false);
+  assert.equal(stale.criteriaResult, null);
+  assert.equal(stale.autoPursueBlocker, '');
+  const bare = publicTriageRow({ opportunity_id: 'o' });
+  assert.equal(bare.criteriaGroup, '');
+  assert.equal(bare.criteriaResult, null);
+  assert.equal(bare.criteriaCurrent, false);
+});
+
+test('storage inbox rows carry criteria columns and criteria areas honour exclusions', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-criteria-areas-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'criteria.sqlite') } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const result = { profileVersion: DEAL_CRITERIA_PROFILE_VERSION, group: 'review',
+    mustHaves: [], failed: [], unknown: [] };
+  const ids = ['crit-review', 'crit-auto', 'crit-removed', 'crit-passed'];
+  for (const id of ids) {
+    await seedOpportunity(storage, id);
+    await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: 92, confidence: 'high',
+      high_fit: true, criteria_profile_version: DEAL_CRITERIA_PROFILE_VERSION,
+      criteria_group: id === 'crit-auto' ? 'auto' : 'review', criteria_result: result,
+      should_remove: id === 'crit-removed' }), []);
+  }
+  await storage.reconcileDealHunterCurrentScoreEligibility(ids);
+  await storage.upsertDealHunterDisposition({ id: '22222222-2222-4222-8222-222222222222',
+    deal_key: 'deal-crit-passed', submission_id: null, disposition: 'dismissed', reason: 'Owner reason',
+    created_at: '2026-10-19T00:00:00Z', updated_at: '2026-10-19T00:00:00Z',
+    created_by: 'owner', updated_by: 'owner' });
+  const page = await storage.listDealHunterFreshInbox({ area: 'your-review' });
+  assert.deepEqual(page.areas.map((area) => area.id), ['your-review']);
+  assert.deepEqual(page.areas[0].rows.map((row) => row.opportunity_id), ['crit-review']);
+  assert.ok(page.areas[0].rows.every((row) => 'criteria_group' in row
+    && 'criteria_profile_version' in row && 'criteria_result' in row && 'auto_pursue_blocker' in row));
+  const inbox = await storage.listDealHunterFreshInbox({ area: 'inbox' });
+  assert.deepEqual(inbox.areas.find((area) => area.id === 'auto-pursue').rows
+    .map((row) => row.opportunity_id), ['crit-auto']);
+  const served = await listTriageQueue({ view: 'inbox', area: 'your-review', storage,
+    getCachedSourceHealth: async () => ({ healthy: false }) });
+  assert.equal(served.areas[0].rows[0].criteriaGroup, 'review');
+  assert.deepEqual(served.areas[0].rows[0].criteriaResult, result);
+  assert.equal(served.areas[0].rows[0].criteriaCurrent, true);
+});
+
+test('a machine rescore keeps the runner-owned auto-Pursue columns', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-blocker-keep-'));
+  const sqlitePath = path.join(directory, 'blocker.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  const db = new Database(sqlitePath);
+  t.after(() => { db.close(); storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  await seedOpportunity(storage, 'blocker-keep');
+  await storage.writeDealHunterOpportunityScore(queueScore('blocker-keep', { fit_score: 92 }), []);
+  db.prepare(`UPDATE deal_hunter_opportunity_scores SET auto_pursue_blocker = 'generic_mailbox',
+    auto_pursue_checked_at = '2026-11-02T10:00:00.000Z' WHERE opportunity_id = 'blocker-keep'`).run();
+  await storage.writeDealHunterOpportunityScore(queueScore('blocker-keep', { fit_score: 93,
+    score_fingerprint: 'fingerprint-rescored', criteria_group: 'auto',
+    criteria_profile_version: DEAL_CRITERIA_PROFILE_VERSION }), []);
+  const kept = db.prepare(`SELECT fit_score, auto_pursue_blocker, auto_pursue_checked_at
+    FROM deal_hunter_opportunity_scores WHERE opportunity_id = 'blocker-keep'`).get();
+  assert.deepEqual({ ...kept }, { fit_score: 93, auto_pursue_blocker: 'generic_mailbox',
+    auto_pursue_checked_at: '2026-11-02T10:00:00.000Z' });
 });

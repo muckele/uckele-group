@@ -1,9 +1,32 @@
 import { createHash } from 'node:crypto';
+import { DEAL_CRITERIA_PROFILE_VERSION } from './dealCriteriaProfile.js';
 
 export const freshInboxAreaIds = Object.freeze([
-  'action-preview', 'due-actions', 'owner-priorities', 'new-important',
+  'action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss',
+  'due-actions', 'owner-priorities', 'new-important',
   'updated', 'research', 'all-active',
 ]);
+
+// The default inbox request, in display order. new-important stays selectable
+// as its own area but is no longer part of the default list.
+export const freshInboxDefaultAreaIds = Object.freeze([
+  'action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss',
+]);
+
+const criteriaAreaIds = Object.freeze(['auto-pursue', 'your-review', 'needs-info', 'near-miss']);
+const criteriaFitFloor = 75;
+
+// Placement of one 75+ row into at most one criteria area. A row scored under
+// another profile version is never trusted for auto-pursue or the other groups.
+function criteriaAreaFor(row) {
+  if (Number(row.fit_score || 0) < criteriaFitFloor) return null;
+  if (row.criteria_profile_version !== DEAL_CRITERIA_PROFILE_VERSION) return 'your-review';
+  if (row.criteria_group === 'auto') return row.auto_pursue_blocker ? 'your-review' : 'auto-pursue';
+  if (row.criteria_group === 'review') return 'your-review';
+  if (row.criteria_group === 'needs-info') return 'needs-info';
+  if (row.criteria_group === 'near-miss') return 'near-miss';
+  return null;
+}
 
 const ownerTimeZone = 'America/Los_Angeles';
 const ownerDateFormatter = new Intl.DateTimeFormat('en-US', {
@@ -87,6 +110,7 @@ function foldRevision(rows, areaId, filtersKey, businessDate) {
       row.reviewed_material_revision, row.score_fingerprint, row.semantic_digest,
       row.disposition_state, row.publication_state, row.publication_date,
       row.source_conflict_count, row.material_field, row.source_snapshot_updated_at,
+      row.criteria_profile_version, row.criteria_group, row.auto_pursue_blocker,
     ]);
     state = createHash('md5').update(`${state}${Buffer.byteLength(tuple)}:${tuple}`).digest('hex');
   }
@@ -157,8 +181,15 @@ export function buildFreshInboxAreas(candidates, { area = 'inbox', cursor = null
     .sort(compareAll);
   const all = [...rows].sort(effectiveSort === 'highest-fit' ? compareHighestFit
     : effectiveSort === 'newest-discovery' ? compareNewestDiscovery : compareAll);
+  const criteriaSets = Object.fromEntries(criteriaAreaIds.map((id) => [id, []]));
+  for (const row of rows) {
+    const placed = criteriaAreaFor(row);
+    if (placed) criteriaSets[placed].push(row);
+  }
+  for (const id of criteriaAreaIds) criteriaSets[id].sort(compareDiscovery);
   const sets = {
     'action-preview': preview,
+    ...criteriaSets,
     'due-actions': due,
     'owner-priorities': priorities,
     'new-important': discovery,
@@ -166,7 +197,7 @@ export function buildFreshInboxAreas(candidates, { area = 'inbox', cursor = null
     research,
     'all-active': all,
   };
-  const requested = area === 'inbox' ? ['action-preview', 'new-important'] : [area];
+  const requested = area === 'inbox' ? [...freshInboxDefaultAreaIds] : [area];
   if (requested.some((id) => !freshInboxAreaIds.includes(id))) {
     throw new Error('Unknown Acquisition Inbox area.');
   }
@@ -182,7 +213,7 @@ export function buildFreshInboxAreas(candidates, { area = 'inbox', cursor = null
       error.code = 'DEAL_HUNTER_STALE_PAGE'; error.status = 409; throw error;
     }
     const start = cursor?.lastOrdinal || 0;
-    const pageLimit = id === 'action-preview' ? 3 : id === 'new-important' && area === 'inbox' ? 10
+    const pageLimit = id === 'action-preview' ? 3 : area === 'inbox' ? 10
       : Math.max(1, Math.min(Number(limit) || 25, 100));
     const selected = full.slice(start, start + pageLimit);
     const end = start + selected.length;

@@ -6539,7 +6539,9 @@ create table if not exists public.deal_hunter_opportunity_scores (
   operator_updated_at timestamptz,
   criteria_profile_version text,
   criteria_group text,
-  criteria_result jsonb
+  criteria_result jsonb,
+  auto_pursue_blocker text,
+  auto_pursue_checked_at text
 );
 
 create table if not exists public.deal_hunter_score_evidence (
@@ -9273,6 +9275,7 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         where source.opportunity_id = scores.opportunity_id) as source_snapshot_updated_at,
       scores.operator_priority, scores.reviewed_at,
       scores.reviewed_discovery_revision, scores.reviewed_material_revision,
+      scores.criteria_profile_version, scores.criteria_group, scores.auto_pursue_blocker,
       opportunity.first_accepted_at, opportunity.discovery_state,
       opportunity.discovery_revision, opportunity.material_revision,
       opportunity.last_material_change_at,
@@ -9371,7 +9374,15 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
     select classified.*,
       case when new_to_ug and fit_score >= 75 and confidence <> 'low'
         and discovery_revision > reviewed_discovery_revision then
-          case when recently_listed then 1 else 2 end else 6 end as discovery_group
+          case when recently_listed then 1 else 2 end else 6 end as discovery_group,
+      case when fit_score < 75 then null
+        when criteria_profile_version is distinct from 'uckele-criteria-v1' then 'your-review'
+        when criteria_group = 'auto' then
+          case when nullif(auto_pursue_blocker, '') is not null then 'your-review'
+            else 'auto-pursue' end
+        when criteria_group = 'review' then 'your-review'
+        when criteria_group = 'needs-info' then 'needs-info'
+        when criteria_group = 'near-miss' then 'near-miss' end as criteria_area
     from classified
   ), ordered as materialized (
     select eligible.*,
@@ -9390,7 +9401,9 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
     union all select 'owner-priorities', ordered.*, null::bigint from ordered
       where p_area = 'owner-priorities' and owner_priority
     union all select 'new-important', ordered.*, null::bigint from ordered
-      where p_area in ('inbox', 'new-important') and discovery_group <= 2
+      where p_area = 'new-important' and discovery_group <= 2
+    union all select ordered.criteria_area, ordered.*, null::bigint from ordered
+      where criteria_area is not null and p_area in ('inbox', criteria_area)
     union all select 'updated', ordered.*, null::bigint from ordered
       where p_area = 'updated' and updated_since_review
     union all select 'research', ordered.*, null::bigint from ordered
@@ -9406,7 +9419,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         case when area_id = 'all-active' and p_sort = 'newest-discovery'
           then first_accepted_at end desc nulls last,
         case when area_id = 'all-active' and p_sort = 'highest-fit' then fit_score end desc,
-        case when area_id = 'new-important' then discovery_group end,
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then discovery_group end,
         case when area_id = 'new-important' and p_area <> 'inbox'
           and p_sort = 'newest-discovery' then first_accepted_at end desc nulls last,
         case when area_id = 'new-important' and p_area <> 'inbox'
@@ -9423,13 +9437,18 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
           then due_ordinal end,
         case when area_id = 'action-preview' and owner_priority
           and priority_ordinal = first_remaining_priority then priority_ordinal end,
-        case when area_id in ('action-preview', 'owner-priorities', 'new-important') then
+        case when area_id in ('action-preview', 'owner-priorities', 'new-important', 'auto-pursue',
+          'your-review', 'needs-info', 'near-miss') then
           case operator_priority when 'urgent' then 0 when 'high' then 1 else 2 end end,
-        case when area_id = 'new-important' then due_at end asc nulls last,
-        case when area_id = 'new-important' then fit_score end desc,
-        case when area_id = 'new-important' then
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then due_at end asc nulls last,
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then fit_score end desc,
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then
           case confidence when 'high' then 0 when 'medium' then 1 else 2 end end,
-        case when area_id in ('new-important', 'research', 'all-active')
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss', 'research', 'all-active')
           then first_accepted_at end desc nulls last,
         case when area_id = 'updated' then last_material_change_at end desc nulls last,
         fit_score desc, opportunity_id
@@ -9437,7 +9456,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
     from memberships
   ), selected as materialized (
     select * from numbered where (p_area = 'inbox' and area_id in
-      ('action-preview', 'new-important')) or area_id = p_area
+      ('action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss'))
+      or area_id = p_area
   ), totals as (
     select area_id, count(*)::integer as total,
       public.deal_hunter_fresh_inbox_hash_v1(
@@ -9451,6 +9471,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         || ':' || coalesce(publication_date::text, '')
         || ':' || source_conflict_count || ':' || coalesce(material_field, '')
         || ':' || coalesce(source_snapshot_updated_at::text, '')
+        || ':' || coalesce(criteria_profile_version, '') || ':' || coalesce(criteria_group, '')
+        || ':' || coalesce(auto_pursue_blocker, '')
         order by ordinal) as revision
     from selected where area_id <> 'action-preview' or ordinal <= 3
     group by area_id
@@ -9589,7 +9611,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         and evidence.publication_meaning = 'listing_publication'
     ) as display_publication_stats on true
     cross join parameters
-    where ((p_area = 'inbox' and area_id in ('action-preview', 'new-important'))
+    where ((p_area = 'inbox' and area_id in ('action-preview', 'auto-pursue', 'your-review',
+      'needs-info', 'near-miss'))
       or area_id = p_area)
       and ordinal > case when p_area = 'inbox' then 0 else parameters.page_offset end
       and ordinal <= case when area_id = 'action-preview' then 3
@@ -9597,9 +9620,11 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         else parameters.page_offset + parameters.page_limit end
     group by area_id
   ), requested as (
-    select id from (values ('action-preview'), ('new-important'), ('due-actions'),
+    select id from (values ('action-preview'), ('auto-pursue'), ('your-review'), ('needs-info'),
+      ('near-miss'), ('new-important'), ('due-actions'),
       ('owner-priorities'), ('updated'), ('research'), ('all-active')) as ids(id)
-    where (p_area = 'inbox' and id in ('action-preview', 'new-important')) or id = p_area
+    where (p_area = 'inbox' and id in ('action-preview', 'auto-pursue', 'your-review',
+      'needs-info', 'near-miss')) or id = p_area
   )
   select jsonb_build_object('asOf', p_as_of, 'businessDate', parameters.business_date,
     'areas', coalesce((select jsonb_agg(jsonb_build_object(
@@ -9617,7 +9642,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         'ownerPriority', (select count(*) from ordered where owner_priority),
         'urgent', (select count(*) from ordered where operator_priority = 'urgent'))
         else '{}'::jsonb end
-    ) order by case requested.id when 'action-preview' then 0 else 1 end)
+    ) order by case requested.id when 'action-preview' then 0 when 'auto-pursue' then 1
+      when 'your-review' then 2 when 'needs-info' then 3 when 'near-miss' then 4 else 5 end)
       from requested left join totals on totals.area_id = requested.id
       left join pages on pages.area_id = requested.id), '[]'::jsonb),
     'counts', jsonb_build_object(
