@@ -3039,7 +3039,7 @@ test('relationship inventory classifies the exact supersession relationship surf
 test('relationship inventory classifies every reviewed omission exactly once in all four categories', () => {
   const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries;
   const keys = entries.map((entry) => `${entry.table}.${entry.column}`);
-  assert.equal(entries.length, 315);
+  assert.equal(entries.length, 317);
   assert.equal(new Set(keys).size, keys.length);
   assert.deepEqual(
     [...new Set(entries.map((entry) => entry.category))].sort(),
@@ -3052,7 +3052,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     ])),
     {
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 157,
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 66,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 68,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE]: 54,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 38,
     },
@@ -3068,7 +3068,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.enforcement === enforcement).length,
     ])),
     {
-      [materialScannerPathEnforcement]: 267,
+      [materialScannerPathEnforcement]: 269,
       [independentGateEnforcement]: 10,
       [approvalPreconditionEnforcement]: 12,
       [explicitExclusionEnforcement]: 26,
@@ -3085,7 +3085,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     [...new Set(optionalLegacyEntries.map((entry) => entry.table))].sort(),
     ['admin_magic_links_legacy_v1', 'deal_hunter_candidates', 'prospect_discoveries'],
   );
-  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 308);
+  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 310);
   const pursueCimTables = new Set([
     'deal_hunter_owner_decision_events',
     'deal_hunter_pursuit_enrollments',
@@ -3189,8 +3189,8 @@ test('relationship inventory checksum is deterministic over the complete presenc
   const first = canonicalOpportunityMergeRelationshipInventorySummary();
   const second = canonicalOpportunityMergeRelationshipInventorySummary();
   assert.deepEqual(first, second);
-  assert.equal(first.entryCount, 315);
-  assert.equal(first.checksum, 'd3a0a22ecadc219aa2983078639a22539b8b9adce3f8c2883129fc43b785c6f2');
+  assert.equal(first.entryCount, 317);
+  assert.equal(first.checksum, 'd3c420bae2a958bb740504a278f882a1516645d03c6f3cd405dc64c5f1dd43e3');
   assert.equal(
     first.checksum,
     createHash('sha256')
