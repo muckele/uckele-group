@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { appOrigin } from './app-origin.js';
 
 const ownerCommandUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -922,7 +923,7 @@ async function fulfillPhase1Json(route, body, status = 200) {
   await route.fulfill({ contentType: 'application/json', status, body: JSON.stringify(body) });
 }
 
-const phase1AppOrigin = 'http://127.0.0.1:4173';
+const phase1AppOrigin = appOrigin;
 
 function phase1RequestRecord(request) {
   const url = new URL(request.url());
@@ -2040,7 +2041,7 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
   const inboxViews = page.getByRole('navigation', { name: 'Deal Hunter views' });
   await inboxViews.getByRole('link', { name: 'Operations' }).click();
 
-  await expect(page).toHaveURL('http://127.0.0.1:4173/admin/deal-hunter?view=operations');
+  await expect(page).toHaveURL(`${phase1AppOrigin}/admin/deal-hunter?view=operations`);
   const operationsViews = page.getByRole('navigation', { name: 'Deal Hunter views' });
   await expect(operationsViews.getByRole('link', { name: 'Operations' })).toHaveAttribute('aria-current', 'page');
   await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toHaveCount(0);
@@ -2082,7 +2083,7 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
   await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toBeVisible();
   await page.getByRole('navigation', { name: 'Deal Hunter views' }).getByRole('link', { name: 'Operations' }).click();
 
-  await expect(page).toHaveURL('http://127.0.0.1:4173/admin/deal-hunter?view=operations');
+  await expect(page).toHaveURL(`${phase1AppOrigin}/admin/deal-hunter?view=operations`);
   await expect(page.getByRole('heading', { level: 2, name: 'Daily source review' })).toBeVisible();
   const sheetSource = page.getByText('SMB Deal Hunter Google Sheet', { exact: true }).locator('..').locator('..');
   await expect(sheetSource).toContainText('1 rows');

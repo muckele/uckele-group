@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
+import { appOrigin } from './app-origin.js';
 import { getOperationsCenter, sanitizeViewerOperations } from '../server/services/operations.js';
 
-const appOrigin = 'http://127.0.0.1:4173';
 const ownerCommandUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const privateSentinels = [
   'PRIVATE_RECIPIENT_phase4@example.test',

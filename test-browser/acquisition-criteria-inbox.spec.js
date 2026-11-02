@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
+import { appOrigin } from './app-origin.js';
 
-const appOrigin = 'http://127.0.0.1:4173';
 
 function mustHaves({ multiple = { outcome: 'pass', observed: 3.2 } } = {}) {
   return [
