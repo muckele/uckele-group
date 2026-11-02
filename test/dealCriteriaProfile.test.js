@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { test } from 'node:test';
-import { evaluateDealCriteria, getDealCriteriaProfile } from '../server/services/dealCriteriaProfile.js';
+import { fileURLToPath } from 'node:url';
+import {
+  DEAL_CRITERIA_PROFILE_VERSION, evaluateDealCriteria, getDealCriteriaProfile,
+} from '../server/services/dealCriteriaProfile.js';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function deal(overrides = {}) {
   return {
@@ -112,4 +119,14 @@ test('observed text is bounded to 200 characters (spec 5)', () => {
     assert.equal(entry.outcome, 'pass', id);
   }
   assert.ok(JSON.stringify(result).length < 2000);
+});
+
+test('every criteria version literal hard-coded in SQL is the current profile version', () => {
+  for (const file of ['supabase/schema.sql', 'supabase/migrations/20261102120000_best_first_deal_list.sql']) {
+    const sql = fs.readFileSync(path.join(root, file), 'utf8');
+    // Any quoted '<name>-criteria-v<n>' literal, in code or comments.
+    const literals = [...sql.matchAll(/'([a-z0-9]+(?:-[a-z0-9]+)*-criteria-v[0-9]+)'/gi)].map((match) => match[1]);
+    assert.ok(literals.length > 0, `${file} names the criteria version it groups by`);
+    assert.deepEqual([...new Set(literals)], [DEAL_CRITERIA_PROFILE_VERSION], file);
+  }
 });
