@@ -5483,6 +5483,19 @@ export function createSqliteStorage(config, options = {}) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
+      CREATE TABLE IF NOT EXISTS deal_hunter_auto_pursue_decision_evidence (
+        decision_event_id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('pursue', 'pass')),
+        policy_version TEXT NOT NULL,
+        criteria_group TEXT,
+        criteria_profile_version TEXT,
+        recipient_unchanged INTEGER NOT NULL CHECK(recipient_unchanged IN (0, 1)),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_auto_pursue_evidence_policy
+        ON deal_hunter_auto_pursue_decision_evidence(policy_version, created_at);
+
     CREATE TABLE IF NOT EXISTS scheduled_job_runs (
       job_key TEXT PRIMARY KEY,
       job_name TEXT NOT NULL,
@@ -10893,6 +10906,35 @@ export function createSqliteStorage(config, options = {}) {
         return normalizeDealHunterOpportunityScoreRow(
           database.prepare('SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?').get(String(opportunityId || '').trim()),
         );
+      },
+
+      /** Warm-up evidence, one row per owner decision; idempotent on decision_event_id. */
+      async insertAutoPursueDecisionEvidence(row = {}) {
+        database.prepare(`
+          INSERT OR IGNORE INTO deal_hunter_auto_pursue_decision_evidence (
+            decision_event_id, opportunity_id, action, policy_version,
+            criteria_group, criteria_profile_version, recipient_unchanged, created_at
+          ) VALUES (
+            @decision_event_id, @opportunity_id, @action, @policy_version,
+            @criteria_group, @criteria_profile_version, @recipient_unchanged, @created_at
+          )
+        `).run({
+          decision_event_id: String(row.decision_event_id || ''),
+          opportunity_id: String(row.opportunity_id || ''),
+          action: String(row.action || ''),
+          policy_version: String(row.policy_version || ''),
+          criteria_group: row.criteria_group ?? null,
+          criteria_profile_version: row.criteria_profile_version ?? null,
+          recipient_unchanged: row.recipient_unchanged ? 1 : 0,
+          created_at: String(row.created_at || new Date().toISOString()),
+        });
+      },
+
+      async listAutoPursueDecisionEvidence({ policyVersion } = {}) {
+        return database.prepare(`
+          SELECT * FROM deal_hunter_auto_pursue_decision_evidence
+          WHERE policy_version = ? ORDER BY created_at ASC, decision_event_id ASC
+        `).all(String(policyVersion || ''));
       },
 
       async getCurrentDealHunterOpportunityScore(opportunityId) {

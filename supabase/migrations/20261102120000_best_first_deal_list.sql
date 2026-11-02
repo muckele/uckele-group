@@ -595,3 +595,37 @@ revoke all on function public.list_deal_hunter_fresh_inbox_v1(
   text, integer, integer, text, text, text, text, timestamptz, text) from public, anon, authenticated;
 grant execute on function public.list_deal_hunter_fresh_inbox_v1(
   text, integer, integer, text, text, text, text, timestamptz, text) to service_role;
+
+-- Task 4: decision policy version and warm-up evidence.
+--
+-- pursue_cim_record_owner_decision_v1 already stores p_command->>'policyVersion'
+-- (any trimmed 1-120 character string) and includes it in the request digest, so
+-- the automatic-Pursue policy 'auto-pursue-v1' needs no function change. The HTTP
+-- owner route never forwards a policy version, so owner clicks stay
+-- 'owner-decision-v1'.
+--
+-- One evidence row per newly recorded pursue/pass decision, written by the
+-- application after the decision commits and idempotent on decision_event_id.
+-- Warm-up counts (owner decisions, auto-group decisions, pursue-unchanged rate)
+-- are computed from it. The row copies criteria_group / criteria_profile_version
+-- from the score at decision time; recipient_unchanged records that no recipient
+-- override was made. Additive; no existing object changes.
+create table if not exists public.deal_hunter_auto_pursue_decision_evidence (
+  decision_event_id text primary key
+    references public.deal_hunter_owner_decision_events(id) on delete restrict,
+  opportunity_id text not null,
+  action text not null check (action in ('pursue', 'pass')),
+  policy_version text not null
+    check (policy_version = btrim(policy_version) and char_length(policy_version) between 1 and 120),
+  criteria_group text,
+  criteria_profile_version text,
+  recipient_unchanged boolean not null,
+  created_at timestamptz not null
+);
+create index if not exists idx_auto_pursue_evidence_policy
+  on public.deal_hunter_auto_pursue_decision_evidence (policy_version, created_at);
+
+alter table public.deal_hunter_auto_pursue_decision_evidence enable row level security;
+revoke all on table public.deal_hunter_auto_pursue_decision_evidence
+  from public, anon, authenticated, service_role;
+grant select, insert on table public.deal_hunter_auto_pursue_decision_evidence to service_role;

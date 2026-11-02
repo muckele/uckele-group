@@ -3824,6 +3824,41 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityScoreRow(data);
     },
 
+    /** Warm-up evidence, one row per owner decision; idempotent on decision_event_id. */
+    async insertAutoPursueDecisionEvidence(row = {}) {
+      const { error } = await client
+        .from('deal_hunter_auto_pursue_decision_evidence')
+        .upsert({
+          decision_event_id: String(row.decision_event_id || ''),
+          opportunity_id: String(row.opportunity_id || ''),
+          action: String(row.action || ''),
+          policy_version: String(row.policy_version || ''),
+          criteria_group: row.criteria_group ?? null,
+          criteria_profile_version: row.criteria_profile_version ?? null,
+          recipient_unchanged: Boolean(row.recipient_unchanged),
+          created_at: String(row.created_at || new Date().toISOString()),
+        }, { onConflict: 'decision_event_id', ignoreDuplicates: true });
+      if (error) throw error;
+    },
+
+    async listAutoPursueDecisionEvidence({ policyVersion } = {}) {
+      const rows = [];
+      for (let from = 0; ; from += 1000) {
+        const { data, error } = await client
+          .from('deal_hunter_auto_pursue_decision_evidence')
+          .select('*')
+          .eq('policy_version', String(policyVersion || ''))
+          .order('created_at', { ascending: true })
+          .order('decision_event_id', { ascending: true })
+          .range(from, from + 999);
+        if (error) throw error;
+        rows.push(...(data || []));
+        if (!data || data.length < 1000) break;
+      }
+      // Match the SQLite storage shape so callers compare recipient_unchanged the same way.
+      return rows.map((row) => ({ ...row, recipient_unchanged: row.recipient_unchanged ? 1 : 0 }));
+    },
+
     async getCurrentDealHunterOpportunityScore(opportunityId) {
       const { data, error } = await client
         .from('deal_hunter_opportunity_scores')

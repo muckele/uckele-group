@@ -20529,3 +20529,24 @@ end;
 $$;
 revoke all privileges on function public.restore_current_unlinked_opportunity(jsonb) from public,anon,authenticated;
 grant execute on function public.restore_current_unlinked_opportunity(jsonb) to service_role;
+
+-- Best-first deal list, Task 4: warm-up evidence for owner decisions.
+create table if not exists public.deal_hunter_auto_pursue_decision_evidence (
+  decision_event_id text primary key
+    references public.deal_hunter_owner_decision_events(id) on delete restrict,
+  opportunity_id text not null,
+  action text not null check (action in ('pursue', 'pass')),
+  policy_version text not null
+    check (policy_version = btrim(policy_version) and char_length(policy_version) between 1 and 120),
+  criteria_group text,
+  criteria_profile_version text,
+  recipient_unchanged boolean not null,
+  created_at timestamptz not null
+);
+create index if not exists idx_auto_pursue_evidence_policy
+  on public.deal_hunter_auto_pursue_decision_evidence (policy_version, created_at);
+
+alter table public.deal_hunter_auto_pursue_decision_evidence enable row level security;
+revoke all on table public.deal_hunter_auto_pursue_decision_evidence
+  from public, anon, authenticated, service_role;
+grant select, insert on table public.deal_hunter_auto_pursue_decision_evidence to service_role;
