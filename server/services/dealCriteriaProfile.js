@@ -18,10 +18,21 @@ const stateNameCodes = Object.freeze({
   CONNECTICUT: 'CT',
 });
 
+const OBSERVED_TEXT_LIMIT = 200;
+
+// Strings are trimmed first, so blank or whitespace-only text is unknown rather
+// than Number('  ') === 0 (spec 4.2).
 function finiteNumber(value) {
-  if (value === null || value === undefined || value === '') return null;
-  const number = Number(value);
+  if (value === null || value === undefined) return null;
+  const text = typeof value === 'string' ? value.trim() : value;
+  if (text === '') return null;
+  const number = Number(text);
   return Number.isFinite(number) ? number : null;
+}
+
+// criteria_result is bounded JSON (spec 5): observed text never exceeds the limit.
+function boundedObserved(text) {
+  return text.length > OBSERVED_TEXT_LIMIT ? text.slice(0, OBSERVED_TEXT_LIMIT) : text;
 }
 
 export function getDealCriteriaProfile(config = getConfig()) {
@@ -74,14 +85,14 @@ function evaluateGeography(deal, profile) {
     }
     return profile.targetStates.some((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(text));
   });
-  return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed: fields.join(' | '), targetStates };
+  return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed: boundedObserved(fields.join(' | ')), targetStates };
 }
 
 function evaluateIndustry(deal, profile) {
   const observed = `${deal.name || ''} ${deal.industry || ''}`.replace(/\s+/g, ' ').trim();
   if (!observed) return { id: 'industry', outcome: 'unknown', observed: null };
   const pass = profile.trustedIndustryTerms.some((term) => containsTrustedIndustryTerm(observed.toLowerCase(), term));
-  return { id: 'industry', outcome: pass ? 'pass' : 'fail', observed };
+  return { id: 'industry', outcome: pass ? 'pass' : 'fail', observed: boundedObserved(observed) };
 }
 
 function evaluateGates(deal) {

@@ -86,3 +86,30 @@ test('unknown must-haves still state the limits', () => {
   assert.deepEqual(result.mustHaves.find((entry) => entry.id === 'profit').limit, { min: 300000, max: 750000 });
   assert.deepEqual(result.mustHaves.find((entry) => entry.id === 'multiple').limit, { max: 4 });
 });
+
+test('whitespace-only numbers are unknown, never zero (spec 4.2)', () => {
+  assert.equal(mustHave(evaluateDealCriteria(deal({ annualProfit: '  ' })), 'profit'), 'unknown');
+  assert.equal(mustHave(evaluateDealCriteria(deal({ annualProfit: '\t\n' })), 'profit'), 'unknown');
+  assert.equal(mustHave(evaluateDealCriteria(deal({ annualProfit: ' 450000 ' })), 'profit'), 'pass');
+  assert.equal(mustHave(evaluateDealCriteria(deal({ profitMultiple: ' ', askingPrice: 1200000 })), 'multiple'), 'pass',
+    'a blank multiple falls back to asking price over profit');
+  assert.equal(mustHave(evaluateDealCriteria(deal({ profitMultiple: ' ', askingPrice: ' ' })), 'multiple'),
+    'unknown');
+  const blank = evaluateDealCriteria(deal({ annualProfit: '  ' }));
+  assert.equal(blank.mustHaves.find((entry) => entry.id === 'profit').observed, null);
+  assert.deepEqual(blank.unknown, ['profit']);
+});
+
+test('observed text is bounded to 200 characters (spec 5)', () => {
+  const longName = `HVAC ${'x'.repeat(400)}`;
+  const longLocation = `Phoenix, AZ ${'y'.repeat(400)}`;
+  const result = evaluateDealCriteria(deal({ name: longName, industry: 'z'.repeat(400), location: longLocation,
+    state: 'AZ' }));
+  for (const id of ['geography', 'industry']) {
+    const entry = result.mustHaves.find((item) => item.id === id);
+    assert.equal(typeof entry.observed, 'string', id);
+    assert.equal(entry.observed.length, 200, id);
+    assert.equal(entry.outcome, 'pass', id);
+  }
+  assert.ok(JSON.stringify(result).length < 2000);
+});
