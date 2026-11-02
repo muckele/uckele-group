@@ -38,8 +38,16 @@ test('geography tokens and full state names', () => {
   }
 });
 
-test('geography falls back to state when location is empty', () => {
-  assert.equal(mustHave(evaluateDealCriteria(deal({ location: '', state: 'Nevada' })), 'geography'), 'pass');
+test('geography evaluates location and state together', () => {
+  for (const [location, state, outcome] of [
+    ['Greater Phoenix', 'AZ', 'pass'],
+    ['', 'Nevada', 'pass'],
+    ['Austin', 'TX', 'fail'],
+    ['', '', 'unknown'],
+    ['  ', ' ', 'unknown'],
+  ]) {
+    assert.equal(mustHave(evaluateDealCriteria(deal({ location, state })), 'geography'), outcome, `${location}/${state}`);
+  }
 });
 
 test('industry and gates', () => {

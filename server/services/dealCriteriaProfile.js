@@ -60,14 +60,16 @@ function evaluateMultiple(deal, profile) {
 }
 
 function evaluateGeography(deal, profile) {
-  const observed = String(deal.location || '').trim() || String(deal.state || '').trim();
-  if (!observed) return { id: 'geography', outcome: 'unknown', observed: null };
-  let text = observed.toUpperCase();
-  for (const [name, code] of Object.entries(stateNameCodes)) {
-    text = text.replace(new RegExp(`(^|[^A-Z])${name}(?=[^A-Z]|$)`, 'g'), `$1${code}`);
-  }
-  const pass = profile.targetStates.some((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(text));
-  return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed };
+  const fields = [deal.location, deal.state].map((value) => String(value || '').trim()).filter(Boolean);
+  if (fields.length === 0) return { id: 'geography', outcome: 'unknown', observed: null };
+  const pass = fields.some((field) => {
+    let text = field.toUpperCase();
+    for (const [name, code] of Object.entries(stateNameCodes)) {
+      text = text.replace(new RegExp(`(^|[^A-Z])${name}(?=[^A-Z]|$)`, 'g'), `$1${code}`);
+    }
+    return profile.targetStates.some((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(text));
+  });
+  return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed: fields.join(' | ') };
 }
 
 function evaluateIndustry(deal, profile) {
