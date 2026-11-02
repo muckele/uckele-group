@@ -139,7 +139,9 @@ test('pass writes warm-up evidence with the criteria group', async () => {
 test('auto-pursue-v1 is recorded as the decision and evidence policy', async () => {
   const id = await seed('opp-evidence-auto-policy');
   const result = await recordAcquisitionOwnerCommand({ ...command(id, 'pursue', { actor: 'automation-auto-pursue' }),
-    decisionPolicyVersion: 'auto-pursue-v1' });
+    decisionPolicyVersion: 'auto-pursue-v1',
+    autoPursueGuard: { since: new Date(Date.now() - 3_600_000).toISOString(),
+      until: new Date(Date.now() + 3_600_000).toISOString(), dailyCap: 1 } });
   assert.equal(result.status, 200);
   assert.equal((await evidenceFor(id, 'auto-pursue-v1')).length, 1);
   assert.equal((await evidenceFor(id)).length, 0);

@@ -41,10 +41,12 @@ const inboxAttempts = 3;
 const identityExceptionLimit = 5001;
 const commandModes = new Set(['canary', 'active']);
 
+/** Clamp to 1-10; only a missing value takes the fallback (an explicit value < 1 becomes 1). */
 function clampCap(value, fallback) {
+  if (value === undefined || value === null) return Math.max(1, Math.min(fallback, AUTO_PURSUE_MAXIMUM_CAP));
   const parsed = Math.trunc(Number(value));
-  const base = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-  return Math.max(1, Math.min(base, AUTO_PURSUE_MAXIMUM_CAP));
+  if (!Number.isFinite(parsed)) return Math.max(1, Math.min(fallback, AUTO_PURSUE_MAXIMUM_CAP));
+  return Math.max(1, Math.min(parsed, AUTO_PURSUE_MAXIMUM_CAP));
 }
 
 function configuredActiveCap(config = getConfig()) {
@@ -195,6 +197,10 @@ export async function setAutoPursueMode({
   if (reason !== undefined && reason !== null && (typeof reason !== 'string' || reason.length > 500)) {
     return { ok: false, status: 400, error: 'Reason must be a bounded string.' };
   }
+  if (dailyCap !== undefined && dailyCap !== null && (typeof dailyCap === 'boolean'
+    || !Number.isFinite(Number(dailyCap)) || String(dailyCap).trim() === '')) {
+    return { ok: false, status: 400, error: 'Daily cap must be a number from 1 to 10.' };
+  }
   if (typeof storage?.createAutoPursueActivation !== 'function') {
     return { ok: false, status: 503, error: 'Automatic Pursue activation storage is unavailable.' };
   }
@@ -327,12 +333,11 @@ function blockedEarlierToday(priorRuns) {
   return blocked;
 }
 
-async function recordAutomaticPursue({ storage, row, recipient, businessDate }) {
+async function recordAutomaticPursue({ storage, row, recipient, businessDate, dailyCap }) {
   const opportunityId = String(row.opportunity_id);
   const idempotencyKey = autoPursueIdempotencyKey(businessDate, opportunityId);
-  // Re-check immediately before recording: an owner decision made while earlier deals were
-  // processed must win. (A Pursue on an action-required enrollment counts as a retry, so
-  // recording over an owner decision would supersede it rather than conflict.)
+  // Cheap early re-check; the authoritative check is inside the locked automatic writer,
+  // which refuses when any owner decision exists, the day has ended, or the cap is full.
   const before = await storage.readPursueCimProjection({ opportunityId });
   if (!before || typeof before !== 'object') return { outcome: 'error', reason: 'authority_unavailable' };
   if (before.decision) return { outcome: 'skipped', reason: 'owner_decision_exists' };
@@ -341,9 +346,16 @@ async function recordAutomaticPursue({ storage, row, recipient, businessDate }) 
     expectedDiscoveryRevision: Number(row.discovery_revision),
     expectedMaterialRevision: Number(row.material_revision),
     recipientContactRef: recipient.recipientContactRef,
-    actor: AUTO_PURSUE_ACTOR, decisionPolicyVersion: AUTO_PURSUE_POLICY_VERSION, storage,
+    actor: AUTO_PURSUE_ACTOR, decisionPolicyVersion: AUTO_PURSUE_POLICY_VERSION,
+    autoPursueGuard: { ...ownerBusinessDateBounds(businessDate), dailyCap }, storage,
   });
   if (!result?.ok) {
+    // Refusals from the locked automatic writer.
+    if (result?.code === 'auto_pursue_owner_decision_exists') return { outcome: 'skipped', reason: 'owner_decision_exists' };
+    if (result?.code === 'auto_pursue_daily_cap_reached') return { outcome: 'stop', reason: 'daily_cap_reached' };
+    if (result?.code === 'auto_pursue_business_date_changed') {
+      return { outcome: 'stop', reason: 'business_date_changed' };
+    }
     if (result?.status === 409) {
       return { outcome: 'skipped', reason: result.code === 'stale_freshness_review'
         ? 'stale_revision' : 'owner_decision_exists' };
@@ -360,7 +372,9 @@ async function recordAutomaticPursue({ storage, row, recipient, businessDate }) 
   return { outcome: 'pursued', enrollmentState: result.enrollment?.state || null };
 }
 
-export async function runAutoPursue({ storage = getStorage(), now = new Date(), triggeredBy = 'cron' } = {}) {
+export async function runAutoPursue({
+  storage = getStorage(), now = new Date(), triggeredBy = 'cron', clock = () => new Date(),
+} = {}) {
   const at = new Date(now);
   const asOf = at.toISOString();
   const businessDate = ownerBusinessDate(at);
@@ -465,8 +479,10 @@ export async function runAutoPursue({ storage = getStorage(), now = new Date(), 
       const { row, recipient } = eligible[index];
       const opportunityId = String(row.opportunity_id);
       let already;
+      // The cap counts one owner business date; never record after that date has ended.
+      if (ownerBusinessDate(clock()) !== businessDate) reason = 'business_date_changed';
       try {
-        already = await countTodayCommands(storage, businessDate);
+        if (!reason) already = await countTodayCommands(storage, businessDate);
       } catch {
         reason = 'decision_count_unavailable';
       }
@@ -486,7 +502,7 @@ export async function runAutoPursue({ storage = getStorage(), now = new Date(), 
       }
       let outcome;
       try {
-        outcome = await recordAutomaticPursue({ storage, row, recipient, businessDate });
+        outcome = await recordAutomaticPursue({ storage, row, recipient, businessDate, dailyCap });
       } catch {
         outcome = { outcome: 'error', reason: 'command_error' };
       }
@@ -494,6 +510,11 @@ export async function runAutoPursue({ storage = getStorage(), now = new Date(), 
         commands += 1;
         items.push({ opportunityId, outcome: 'pursued', enrollmentState: outcome.enrollmentState });
         continue;
+      }
+      if (outcome.outcome === 'stop') {
+        reason = outcome.reason;
+        for (const remaining of eligible.slice(index)) skip(String(remaining.row.opportunity_id), reason);
+        break;
       }
       skip(opportunityId, outcome.reason, outcome.outcome === 'error' ? 'error' : 'skipped');
       if (outcome.outcome === 'error') {

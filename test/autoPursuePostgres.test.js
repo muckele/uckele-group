@@ -137,5 +137,55 @@ test('PostgreSQL automatic Pursue activation, runs, and blocker writer on fresh 
       /Invalid automatic Pursue blocker entries/);
     psqlFails(container, database, `set role anon;
       select public.set_deal_hunter_auto_pursue_blockers_v1('[]'::jsonb);`, /permission denied/);
+
+    // Locked automatic writer: owner decisions win, the cap and business day hold, replays pass.
+    for (const id of ['lock-watch', 'lock-a', 'lock-b', 'lock-date']) {
+      psql(container, database, `insert into public.deal_hunter_opportunities
+        (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+        values ('${id}', now(), now(), 'Lock ${id}', 'test');
+        insert into public.deal_hunter_opportunity_scores
+        (opportunity_id, scored_at, deal_key, name, fit_score, confidence, score_fingerprint, engine_version,
+          rules_version, profile_version, completeness_policy_version, current_triage_eligible, should_remove,
+          criteria_group, criteria_profile_version)
+        values ('${id}', now(), '${id}', 'Lock ${id}', 95, 'high', 'fp-${id}', 'test', 'test', 'test', 'test',
+          true, false, 'auto', 'uckele-criteria-v1');`);
+    }
+    const nowText = new Date().toISOString();
+    const command = (id, extra = {}) => JSON.stringify({ opportunityId: id, action: 'pursue',
+      idempotencyKey: `auto-${id}`, actor: 'automation-auto-pursue', policyVersion: 'auto-pursue-v1',
+      now: nowText, expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, ...extra });
+    const guard = (extra = {}) => JSON.stringify({ since: new Date(Date.now() - 3_600_000).toISOString(),
+      until: new Date(Date.now() + 3_600_000).toISOString(), dailyCap: 1, ...extra });
+    const autoDecision = (id, commandExtra = {}, guardExtra = {}) => JSON.parse(psql(container, database,
+      `set role service_role; select public.pursue_cim_record_auto_pursue_decision_v1(
+        '${command(id, commandExtra)}'::jsonb, '${guard(guardExtra)}'::jsonb);`));
+    const decisionCount = (id) => psql(container, database,
+      `select count(*) from public.deal_hunter_owner_decision_events where opportunity_id = '${id}';`);
+    psql(container, database, `set role service_role; select public.pursue_cim_record_owner_decision_v1(
+      '${JSON.stringify({ opportunityId: 'lock-watch', action: 'watch', idempotencyKey: 'owner-watch',
+    actor: 'owner', policyVersion: 'owner-decision-v1', now: nowText, expectedDiscoveryRevision: 0,
+    expectedMaterialRevision: 0 })}'::jsonb);`);
+    assert.equal(decisionCount('lock-watch'), '1');
+    const overWatch = autoDecision('lock-watch');
+    assert.equal(overWatch.conflict, true);
+    assert.equal(overWatch.reason, 'auto_pursue_owner_decision_exists');
+    assert.equal(decisionCount('lock-watch'), '1');
+    const first = autoDecision('lock-a');
+    assert.equal(first.applied, true, JSON.stringify(first));
+    assert.equal(first.decision.policy_version, 'auto-pursue-v1');
+    assert.equal(autoDecision('lock-a').replay, true);
+    assert.equal(decisionCount('lock-a'), '1');
+    assert.equal(autoDecision('lock-b').reason, 'auto_pursue_daily_cap_reached');
+    assert.equal(decisionCount('lock-b'), '0');
+    assert.equal(autoDecision('lock-date', {}, { dailyCap: 5,
+      since: new Date(Date.now() + 3_600_000).toISOString(),
+      until: new Date(Date.now() + 7_200_000).toISOString() }).reason, 'auto_pursue_business_date_changed');
+    assert.equal(decisionCount('lock-date'), '0');
+    assert.throws(() => autoDecision('lock-date', { actor: 'owner' }), /Invalid automatic Pursue decision command/);
+    assert.throws(() => autoDecision('lock-date', { policyVersion: 'owner-decision-v1' }),
+      /Invalid automatic Pursue decision command/);
+    assert.throws(() => autoDecision('lock-date', {}, { dailyCap: 11 }), /Invalid automatic Pursue guard/);
+    psqlFails(container, database, `set role anon; select public.pursue_cim_record_auto_pursue_decision_v1(
+      '${command('lock-date')}'::jsonb, '${guard()}'::jsonb);`, /permission denied/);
   }
 });

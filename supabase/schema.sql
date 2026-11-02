@@ -20677,3 +20677,67 @@ $$;
 revoke all on function public.set_deal_hunter_auto_pursue_blockers_v1(jsonb)
   from public, anon, authenticated;
 grant execute on function public.set_deal_hunter_auto_pursue_blockers_v1(jsonb) to service_role;
+
+-- Automatic Pursue (auto-pursue-v1) goes through the owner-decision writer under the
+-- same advisory lock (re-entrant), after refusing when any owner decision exists for the
+-- opportunity (so an owner Watch, Pass, or Pursue always wins), when the command instant
+-- is outside the guarded owner business day, or when that day's cap is reached. A replay
+-- of the same idempotency key is delegated unchanged. The locked writer itself is unchanged.
+create or replace function public.pursue_cim_record_auto_pursue_decision_v1(p_command jsonb, p_guard jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_opportunity_id text := p_command ->> 'opportunityId';
+  v_key text := p_command ->> 'idempotencyKey';
+  v_now timestamptz;
+  v_since timestamptz;
+  v_until timestamptz;
+  v_cap integer;
+  v_recorded bigint;
+begin
+  if p_command is null or pg_catalog.jsonb_typeof(p_command) <> 'object'
+    or p_guard is null or pg_catalog.jsonb_typeof(p_guard) <> 'object'
+    or p_command ->> 'action' is distinct from 'pursue'
+    or p_command ->> 'policyVersion' is distinct from 'auto-pursue-v1'
+    or p_command ->> 'actor' is distinct from 'automation-auto-pursue'
+    or v_opportunity_id is null or v_key is null or p_command ->> 'now' is null
+    or pg_catalog.jsonb_typeof(p_guard -> 'dailyCap') <> 'number'
+    or p_guard ->> 'since' is null or p_guard ->> 'until' is null
+  then
+    raise exception 'Invalid automatic Pursue decision command';
+  end if;
+  v_cap := (p_guard ->> 'dailyCap')::integer;
+  v_now := (p_command ->> 'now')::timestamptz;
+  v_since := (p_guard ->> 'since')::timestamptz;
+  v_until := (p_guard ->> 'until')::timestamptz;
+  if v_cap is null or v_cap not between 1 and 10 or v_since >= v_until then
+    raise exception 'Invalid automatic Pursue guard';
+  end if;
+  perform pg_catalog.pg_advisory_xact_lock(17499,48146);
+  if exists (select 1 from public.deal_hunter_owner_decision_events where idempotency_key = v_key) then
+    return public.pursue_cim_record_owner_decision_v1(p_command);
+  end if;
+  if exists (select 1 from public.deal_hunter_owner_decision_events
+    where opportunity_id = v_opportunity_id) then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'reason', 'auto_pursue_owner_decision_exists', 'decision', null, 'enrollment', null);
+  end if;
+  if v_now < v_since or v_now >= v_until then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'reason', 'auto_pursue_business_date_changed', 'decision', null, 'enrollment', null);
+  end if;
+  select pg_catalog.count(*) into v_recorded from public.deal_hunter_owner_decision_events
+    where policy_version = 'auto-pursue-v1' and created_at >= v_since and created_at < v_until;
+  if v_recorded >= v_cap then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'reason', 'auto_pursue_daily_cap_reached', 'decision', null, 'enrollment', null);
+  end if;
+  return public.pursue_cim_record_owner_decision_v1(p_command);
+end;
+$$;
+revoke all on function public.pursue_cim_record_auto_pursue_decision_v1(jsonb, jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_record_auto_pursue_decision_v1(jsonb, jsonb) to service_role;

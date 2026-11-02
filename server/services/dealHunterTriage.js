@@ -1151,6 +1151,7 @@ function publicPassDisposition(disposition = {}) {
 
 const OWNER_DECISION_POLICY_VERSION = 'owner-decision-v1';
 const AUTO_PURSUE_DECISION_POLICY_VERSION = 'auto-pursue-v1';
+const AUTO_PURSUE_ACTOR = 'automation-auto-pursue';
 const ownerCommandPolicyVersions = [OWNER_DECISION_POLICY_VERSION, AUTO_PURSUE_DECISION_POLICY_VERSION];
 
 /** True only when the chosen recipient is the single, unchanged default. Never throws. */
@@ -1202,7 +1203,7 @@ async function recordOwnerDecisionEvidence({
 export async function recordAcquisitionOwnerCommand({
   opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
   expectedMaterialRevision, reason, note, submissionId, recipientContactRef, actor,
-  decisionPolicyVersion = OWNER_DECISION_POLICY_VERSION,
+  decisionPolicyVersion = OWNER_DECISION_POLICY_VERSION, autoPursueGuard,
   storage = getStorage(),
   getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
 } = {}) {
@@ -1245,8 +1246,18 @@ export async function recordAcquisitionOwnerCommand({
       return { ok: false, status: 400, error: 'Invalid linked submission context.' };
     }
   }
+  const automatic = decisionPolicyVersion === AUTO_PURSUE_DECISION_POLICY_VERSION;
+  if (automatic && (action !== 'pursue' || actor !== AUTO_PURSUE_ACTOR
+    || !autoPursueGuard || typeof autoPursueGuard !== 'object'
+    || !Number.isFinite(Date.parse(autoPursueGuard.since)) || !Number.isFinite(Date.parse(autoPursueGuard.until))
+    || !Number.isSafeInteger(autoPursueGuard.dailyCap) || autoPursueGuard.dailyCap < 1
+    || autoPursueGuard.dailyCap > 10)) {
+    return { ok: false, status: 400,
+      error: 'Automatic Pursue requires the automation actor, a Pursue action, and a business-day cap guard.' };
+  }
   if (typeof storage.recordOwnerDecision !== 'function'
-    || typeof storage.getDealHunterOpportunityScore !== 'function') {
+    || typeof storage.getDealHunterOpportunityScore !== 'function'
+    || (automatic && typeof storage.recordAutoPursueDecision !== 'function')) {
     return { ok: false, status: 503, error: 'Owner command storage is unavailable.' };
   }
   const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
@@ -1259,7 +1270,7 @@ export async function recordAcquisitionOwnerCommand({
   }
   let result;
   try {
-    result = await storage.recordOwnerDecision({
+    const decisionCommand = {
       opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
       expectedMaterialRevision, actor: actor.trim(), policyVersion: decisionPolicyVersion,
       ...(recipientContactRef !== undefined
@@ -1267,12 +1278,23 @@ export async function recordAcquisitionOwnerCommand({
       now: new Date().toISOString(),
       ...(action === 'pass' ? { reason: normalizedReason, note: note?.trim() || '',
         submissionId: submissionId || '' } : {}),
-    });
+    };
+    // The automatic writer refuses, under the owner-decision lock, any opportunity that
+    // already has an owner decision, a command outside the guarded business day, or a full cap.
+    result = automatic
+      ? await storage.recordAutoPursueDecision(decisionCommand, {
+        since: new Date(autoPursueGuard.since).toISOString(),
+        until: new Date(autoPursueGuard.until).toISOString(), dailyCap: autoPursueGuard.dailyCap })
+      : await storage.recordOwnerDecision(decisionCommand);
   } catch (error) {
     if (error?.code === 'DEAL_HUNTER_FRESHNESS_STALE') {
       return { ok: false, status: 409, code: 'stale_freshness_review', error: error.message };
     }
     throw error;
+  }
+  if (result.conflict && typeof result.reason === 'string' && result.reason.startsWith('auto_pursue_')) {
+    return { ok: false, status: 409, code: result.reason,
+      error: 'Automatic Pursue was refused by the current owner decision or daily cap authority.' };
   }
   if (result.conflict) {
     const stale = result.reason === 'stale_revision';

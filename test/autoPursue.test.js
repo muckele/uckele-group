@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-auto-pursue-'));
 process.env.ADMIN_SESSION_SECRET = 'auto-pursue-secret';
@@ -26,6 +26,7 @@ const {
 } = await import('../server/services/autoPursue.js');
 
 const owner = 'owner@uckele.test';
+const RawDatabase = (await import('better-sqlite3')).default;
 let storageCount = 0;
 const seededIds = new WeakMap();
 
@@ -109,8 +110,32 @@ async function autoDecisions(storage) {
   return storage.countOwnerDecisionsByPolicy({ policyVersion: 'auto-pursue-v1', ...wide });
 }
 
+function allDecisionEvents(opportunityId) {
+  return withRawDatabase((raw) => raw.prepare(`SELECT actor, action, policy_version FROM deal_hunter_owner_decision_events
+    WHERE opportunity_id = ? ORDER BY created_at, id`).all(opportunityId));
+}
+
+function withRawDatabase(callback) {
+  const raw = new RawDatabase(path.join(tempDir, `run-${storageCount}.sqlite`), { readonly: true });
+  try {
+    return callback(raw);
+  } finally {
+    raw.close();
+  }
+}
+
 async function scoreRow(storage, opportunityId) {
   return storage.getDealHunterOpportunityScore(opportunityId);
+}
+
+/** Runs `action` with Date (only) mocked to start at `instant`; timers stay real. */
+async function atWallClock(instant, action) {
+  mock.timers.enable({ apis: ['Date'], now: instant.getTime() });
+  try {
+    return await action();
+  } finally {
+    mock.timers.reset();
+  }
 }
 
 const reasonFor = (result, opportunityId) => result.skipped.find((item) => item.opportunityId === opportunityId)?.reason;
@@ -231,9 +256,9 @@ test('active respects the configured cap and the next business date resets it', 
   assert.equal(first.commands, 3);
   assert.equal(first.skipped.filter((item) => item.reason === 'daily_cap_reached').length, 2);
   assert.equal(await autoDecisions(storage), 3);
-  // Decisions are stamped with the wall clock, so "tomorrow" sees none of today's.
+  // Decisions are stamped with the wall clock, so move the wall clock to tomorrow too.
   const tomorrow = new Date(today.getTime() + 86_400_000);
-  const second = await runAutoPursue({ storage, now: tomorrow });
+  const second = await atWallClock(tomorrow, () => runAutoPursue({ storage, now: tomorrow }));
   assert.equal(second.commands, 2);
   assert.equal(await autoDecisions(storage), 5);
 });
@@ -241,8 +266,13 @@ test('active respects the configured cap and the next business date resets it', 
 test('active daily cap is clamped to 1-10 and canary is forced to 1', async () => {
   const storage = await readyStorage();
   assert.equal((await setMode(storage, 'active', { dailyCap: 50 })).activation.dailyCap, 10);
-  assert.equal((await setMode(storage, 'active', { dailyCap: 0 })).activation.dailyCap, 3);
-  assert.equal((await setMode(storage, 'active', { dailyCap: -4 })).activation.dailyCap, 3);
+  // An explicit value below 1 resolves toward not acting (1); only an omitted cap uses the default 3.
+  assert.equal((await setMode(storage, 'active', { dailyCap: 0 })).activation.dailyCap, 1);
+  assert.equal((await setMode(storage, 'active', { dailyCap: -4 })).activation.dailyCap, 1);
+  assert.equal((await setMode(storage, 'active')).activation.dailyCap, 3);
+  assert.equal((await setMode(storage, 'active', { dailyCap: null })).activation.dailyCap, 3);
+  assert.equal((await setAutoPursueMode({ mode: 'active', dailyCap: 'many', confirmation: 'ACTIVATE AUTO PURSUE ACTIVE',
+    actor: owner, storage })).status, 400);
   assert.equal((await setMode(storage, 'active', { dailyCap: 7 })).activation.dailyCap, 7);
   assert.equal((await setMode(storage, 'canary', { dailyCap: 9 })).activation.dailyCap, 1);
   assert.equal((await setMode(storage, 'shadow', { dailyCap: 9 })).activation.dailyCap, 0);
@@ -280,7 +310,8 @@ test('crash after the first command does not duplicate it', async () => {
     expectedDiscoveryRevision: 0, expectedMaterialRevision: 0,
     recipientContactRef: (await (await import('../server/services/dealHunterBrokerMaterials.js'))
       .loadBrokerMaterialsAuthority({ opportunityId: 'opp-crash', storage })).recipientOptions[0].recipientContactRef,
-    actor: 'automation-auto-pursue', decisionPolicyVersion: 'auto-pursue-v1', storage });
+    actor: 'automation-auto-pursue', decisionPolicyVersion: 'auto-pursue-v1',
+    autoPursueGuard: { ...ownerBusinessDateBounds(ownerBusinessDate(now)), dailyCap: 2 }, storage });
   assert.ok([200, 409].includes(replay.status), JSON.stringify(replay));
   assert.equal(await autoDecisions(storage), 1);
 });
@@ -365,7 +396,8 @@ test('a deal blocked earlier in the business date is not retried that day', asyn
   assert.equal(reasonFor(later, 'opp-later'), 'blocked_earlier_today');
   assert.equal(later.commands, 0);
   assert.equal((await scoreRow(storage, 'opp-later')).auto_pursue_blocker ?? null, null);
-  const tomorrow = await runAutoPursue({ storage, now: new Date(now.getTime() + 86_400_000) });
+  const next = new Date(now.getTime() + 86_400_000);
+  const tomorrow = await atWallClock(next, () => runAutoPursue({ storage, now: next }));
   assert.equal(tomorrow.commands, 1);
 });
 
@@ -455,34 +487,103 @@ async function runWithOwnerActionAtRead(storage, readNumber, ownerAction) {
   }
 }
 
-test('owner Pursue landing between the final re-check and the command: neither errors, one live enrollment', async () => {
-  // Residual window (documented): the locked owner-decision writer treats a Pursue carrying a
-  // recipient reference over a queued/waiting Pursue without one as a recipient retry, so the
-  // runner's command supersedes the owner's enrollment for the same single recipient.
-  const storage = await readyStorage('canary');
-  await seedAuto(storage, 'opp-race-window');
-  await storage.appendOpportunityTimezoneRevision({ opportunityId: 'opp-race-window',
-    expectedPriorRevision: 0, idempotencyKey: 'race-window-timezone', state: 'verified',
-    ianaTimezone: 'America/Phoenix', evidenceType: 'operator-verified', evidenceId: 'race-window-evidence',
+function seedVerifiedTimezone(storage, opportunityId) {
+  return storage.appendOpportunityTimezoneRevision({ opportunityId,
+    expectedPriorRevision: 0, idempotencyKey: `${opportunityId}-timezone`, state: 'verified',
+    ianaTimezone: 'America/Phoenix', evidenceType: 'operator-verified', evidenceId: `${opportunityId}-evidence`,
     evidenceDigest: 'a'.repeat(64), resolverVersion: 'explicit-v1', datasetDigest: 'b'.repeat(64),
     actor: owner, now: new Date().toISOString() });
+}
+
+test('owner Pursue landing between the final re-check and the command leaves exactly one decision', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-race-window');
+  // A verified timezone lets the owner's enrollment settle as waiting-on-eligibility.
+  await seedVerifiedTimezone(storage, 'opp-race-window');
   // Read 1 is the blocker evaluation; read 2 is the re-check just before recording.
   const { result, ownerResult } = await runWithOwnerActionAtRead(storage, 2, () => recordAcquisitionOwnerCommand({
     opportunityId: 'opp-race-window', action: 'pursue', idempotencyKey: randomUUID(),
     expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, actor: owner, storage }));
   assert.equal(ownerResult().ok, true);
   assert.equal(result.ok, true);
-  assert.ok(result.commands <= 1);
-  assert.ok(await autoDecisions(storage) <= 1);
-  const Database = (await import('better-sqlite3')).default;
-  const raw = new Database(path.join(tempDir, `run-${storageCount}.sqlite`), { readonly: true });
-  try {
-    const live = raw.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_pursuit_enrollments
-      WHERE opportunity_id = ? AND state <> 'superseded'`).get('opp-race-window').count;
-    assert.equal(live, 1);
-  } finally {
-    raw.close();
-  }
+  assert.equal(result.commands, 0);
+  assert.equal(reasonFor(result, 'opp-race-window'), 'owner_decision_exists');
+  assert.equal(await autoDecisions(storage), 0);
+  assert.deepEqual(allDecisionEvents('opp-race-window'),
+    [{ actor: owner, action: 'pursue', policy_version: 'owner-decision-v1' }]);
+  const live = withRawDatabase((raw) => raw.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_pursuit_enrollments
+    WHERE opportunity_id = ? AND state <> 'superseded'`).get('opp-race-window').count);
+  assert.equal(live, 1);
+});
+
+test('owner Watch landing between the final re-check and the command is never overridden', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-race-window-watch');
+  const { result, ownerResult } = await runWithOwnerActionAtRead(storage, 2, () => recordAcquisitionOwnerCommand({
+    opportunityId: 'opp-race-window-watch', action: 'watch', idempotencyKey: randomUUID(),
+    expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, actor: owner, storage }));
+  assert.equal(ownerResult().status, 200);
+  assert.equal(result.ok, true);
+  assert.equal(result.commands, 0);
+  assert.equal(reasonFor(result, 'opp-race-window-watch'), 'owner_decision_exists');
+  assert.equal(await autoDecisions(storage), 0);
+  assert.deepEqual(allDecisionEvents('opp-race-window-watch'),
+    [{ actor: owner, action: 'watch', policy_version: 'owner-decision-v1' }]);
+});
+
+test('a run that crosses Pacific midnight stops before recording on the new business date', async () => {
+  const storage = await readyStorage('active', { dailyCap: 5 });
+  for (const id of ['opp-midnight-1', 'opp-midnight-2', 'opp-midnight-3']) await seedAuto(storage, id);
+  const now = new Date();
+  let ticks = 0;
+  // The first pre-command check is still today; every later check is after midnight.
+  const clock = () => { ticks += 1; return ticks === 1 ? now : new Date(now.getTime() + 86_400_000); };
+  const result = await runAutoPursue({ storage, now, clock });
+  assert.equal(result.ok, true);
+  assert.equal(result.commands, 1);
+  assert.equal(result.reason, 'business_date_changed');
+  assert.equal(result.skipped.filter((item) => item.reason === 'business_date_changed').length, 2);
+  assert.equal(await autoDecisions(storage), 1);
+  const [run] = await storage.listAutoPursueRuns({ businessDate: ownerBusinessDate(now) });
+  assert.equal(run.status, 'completed');
+  assert.equal(run.commands, 1);
+  assert.ok(run.completed_at);
+});
+
+test('the locked automatic Pursue writer refuses an existing decision, a full cap, and another business date', async () => {
+  const storage = await readyStorage();
+  const { loadBrokerMaterialsAuthority } = await import('../server/services/dealHunterBrokerMaterials.js');
+  const now = new Date();
+  const businessDate = ownerBusinessDate(now);
+  const guard = { ...ownerBusinessDateBounds(businessDate), dailyCap: 1 };
+  const command = async (opportunityId, extra = {}) => recordAcquisitionOwnerCommand({ opportunityId,
+    action: 'pursue', idempotencyKey: autoPursueIdempotencyKey(businessDate, opportunityId),
+    expectedDiscoveryRevision: 0, expectedMaterialRevision: 0,
+    recipientContactRef: (await loadBrokerMaterialsAuthority({ opportunityId, storage })).recipientOptions[0]
+      .recipientContactRef,
+    actor: 'automation-auto-pursue', decisionPolicyVersion: 'auto-pursue-v1', autoPursueGuard: guard, storage,
+    ...extra });
+  for (const id of ['opp-lock-watch', 'opp-lock-1', 'opp-lock-2', 'opp-lock-date']) await seedAuto(storage, id);
+  // A guard is mandatory for the automatic policy.
+  assert.equal((await command('opp-lock-1', { autoPursueGuard: undefined })).status, 400);
+  assert.equal((await recordAcquisitionOwnerCommand({ opportunityId: 'opp-lock-watch', action: 'watch',
+    idempotencyKey: randomUUID(), expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, actor: owner,
+    storage })).status, 200);
+  const overWatch = await command('opp-lock-watch');
+  assert.equal(overWatch.status, 409);
+  assert.equal(overWatch.code, 'auto_pursue_owner_decision_exists');
+  assert.equal((await command('opp-lock-1')).status, 200);
+  const overCap = await command('opp-lock-2');
+  assert.equal(overCap.status, 409);
+  assert.equal(overCap.code, 'auto_pursue_daily_cap_reached');
+  const yesterday = { ...ownerBusinessDateBounds(ownerBusinessDate(new Date(now.getTime() - 86_400_000))),
+    dailyCap: 10 };
+  const otherDate = await command('opp-lock-date', { autoPursueGuard: yesterday });
+  assert.equal(otherDate.status, 409);
+  assert.equal(otherDate.code, 'auto_pursue_business_date_changed');
+  assert.equal(await autoDecisions(storage), 1);
+  assert.deepEqual(allDecisionEvents('opp-lock-watch'),
+    [{ actor: owner, action: 'watch', policy_version: 'owner-decision-v1' }]);
 });
 
 test('owner Pass landing between the final re-check and the command maps the 409 to owner_decision_exists', async () => {
@@ -711,6 +812,10 @@ test('Supabase adapter: authoritative count, exclusive claim, activation RPC, an
       from: builder,
       async rpc(name, parameters) {
         rpcCalls.push({ name, parameters });
+        if (name === 'pursue_cim_record_auto_pursue_decision_v1') {
+          return { data: { applied: false, replay: false, conflict: true,
+            reason: 'auto_pursue_owner_decision_exists', decision: null, enrollment: null }, error: null };
+        }
         return name === 'set_deal_hunter_auto_pursue_blockers_v1' ? { data: 2, error: null }
           : { data: { id: parameters.p_activation.id, status: 'current', mode: parameters.p_activation.mode }, error: null };
       },
@@ -743,4 +848,10 @@ test('Supabase adapter: authoritative count, exclusive claim, activation RPC, an
   assert.deepEqual(rpcCalls.at(-1), { name: 'set_deal_hunter_auto_pursue_blockers_v1', parameters: { p_entries: [
     { opportunity_id: 'o1', blocker: 'suppressed', checked_at: '2026-11-02T18:00:00.000Z' },
     { opportunity_id: 'o2', blocker: null, checked_at: '2026-11-02T18:00:00.000Z' }] } });
+  const refused = await storage.recordAutoPursueDecision({ opportunityId: 'o1', action: 'pursue' },
+    { since: '2026-11-02T08:00:00.000Z', until: '2026-11-03T08:00:00.000Z', dailyCap: 3, extra: 'dropped' });
+  assert.equal(refused.reason, 'auto_pursue_owner_decision_exists');
+  assert.deepEqual(rpcCalls.at(-1), { name: 'pursue_cim_record_auto_pursue_decision_v1', parameters: {
+    p_command: { opportunityId: 'o1', action: 'pursue' },
+    p_guard: { since: '2026-11-02T08:00:00.000Z', until: '2026-11-03T08:00:00.000Z', dailyCap: 3 } } });
 });

@@ -1537,6 +1537,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
     },
 
+    /** Automatic Pursue through the owner-decision writer under the same lock (see the RPC). */
+    async recordAutoPursueDecision(command, guard = {}) {
+      const { data, error } = await client.rpc('pursue_cim_record_auto_pursue_decision_v1', {
+        p_command: command,
+        p_guard: { since: guard.since, until: guard.until, dailyCap: guard.dailyCap },
+      });
+      if (error) {
+        if (/FL01_STALE_REVIEW/.test(error.message || '')) {
+          const stale = new Error('Freshness changed since this opportunity was shown. Reload before acting.');
+          stale.code = 'DEAL_HUNTER_FRESHNESS_STALE'; stale.status = 409; throw stale;
+        }
+        throw error;
+      }
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['decision', 'enrollment'],
+        { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
+    },
+
     async materializePursuitCampaign(command) {
       const { data, error } = await client.rpc('pursue_cim_materialize_campaign_v2', {
         p_command: command,

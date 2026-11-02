@@ -550,6 +550,11 @@ test('Supabase migration and fresh schema isolate every current app table to the
     assert.match(bestFirstDealListMigration,
       new RegExp(`grant execute on function public\\.${fn}\\(jsonb\\) to service_role;`, 'i'));
   }
+  assert.match(bestFirstDealListMigration, /function public\.pursue_cim_record_auto_pursue_decision_v1[\s\S]*?security definer\s+set search_path = ''[\s\S]*?pg_advisory_xact_lock\(17499,48146\)/i);
+  assert.match(bestFirstDealListMigration,
+    /revoke all on function public\.pursue_cim_record_auto_pursue_decision_v1\(jsonb, jsonb\)\s+from public, anon, authenticated;/i);
+  assert.match(bestFirstDealListMigration,
+    /grant execute on function public\.pursue_cim_record_auto_pursue_decision_v1\(jsonb, jsonb\) to service_role;/i);
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactWriteBoundaryMigration, /create\s+policy/i, 'opportunity fact write boundary must not add public RLS policies');
