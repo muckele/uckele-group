@@ -5775,6 +5775,10 @@ export function createSqliteStorage(config, options = {}) {
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'opportunity_id', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'semantic_digest', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_semantic_digest', 'TEXT');
+  // Machine-owned owner-criteria result, written only by the machine score write.
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_profile_version', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_group', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_result', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunities', 'first_accepted_at', 'TEXT');
@@ -10520,6 +10524,9 @@ export function createSqliteStorage(config, options = {}) {
           missing_evidence: JSON.stringify(score.missing_evidence || []),
           confidence_reasons: JSON.stringify(score.confidence_reasons || []),
           summary: JSON.stringify(score.summary || {}),
+          criteria_profile_version: score.criteria_profile_version ? String(score.criteria_profile_version) : null,
+          criteria_group: score.criteria_group ? String(score.criteria_group) : null,
+          criteria_result: score.criteria_result ? JSON.stringify(score.criteria_result) : null,
           current_triage_eligible: 0,
         };
         // The score and the evidence describing it are replaced together, so no
@@ -10537,13 +10544,15 @@ export function createSqliteStorage(config, options = {}) {
               completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
               gate_count, score_fingerprint, semantic_digest, engine_version, rules_version, profile_version,
               completeness_policy_version, dimensions, gates, applied_caps, missing_evidence,
-              confidence_reasons, summary, current_triage_eligible
+              confidence_reasons, summary, criteria_profile_version, criteria_group, criteria_result,
+              current_triage_eligible
             ) VALUES (
               @opportunity_id, @created_at, @scored_at, @deal_key, @name, @state, @listing_url, @fit_score, @score_status, @confidence,
               @completeness_score, @contradiction_count, @missing_evidence_count, @should_remove, @high_fit,
               @gate_count, @score_fingerprint, @semantic_digest, @engine_version, @rules_version, @profile_version,
               @completeness_policy_version, @dimensions, @gates, @applied_caps, @missing_evidence,
-              @confidence_reasons, @summary, @current_triage_eligible
+              @confidence_reasons, @summary, @criteria_profile_version, @criteria_group, @criteria_result,
+              @current_triage_eligible
             )
             ON CONFLICT(opportunity_id) DO UPDATE SET
               scored_at = excluded.scored_at,
@@ -10571,7 +10580,10 @@ export function createSqliteStorage(config, options = {}) {
               applied_caps = excluded.applied_caps,
               missing_evidence = excluded.missing_evidence,
               confidence_reasons = excluded.confidence_reasons,
-              summary = excluded.summary
+              summary = excluded.summary,
+              criteria_profile_version = excluded.criteria_profile_version,
+              criteria_group = excluded.criteria_group,
+              criteria_result = excluded.criteria_result
           `).run(serialized);
           database.prepare('DELETE FROM deal_hunter_score_evidence WHERE opportunity_id = ?').run(opportunityId);
           const insertEvidence = database.prepare(`
@@ -10970,7 +10982,7 @@ export function createSqliteStorage(config, options = {}) {
           const batch = ids.slice(index, index + 500);
           rows.push(...database.prepare(`
             SELECT opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version,
-                   profile_version, completeness_policy_version, reviewed_at
+                   profile_version, completeness_policy_version, criteria_profile_version, reviewed_at
             FROM deal_hunter_opportunity_scores
             WHERE opportunity_id IN (${batch.map(() => '?').join(', ')})
           `).all(...batch));

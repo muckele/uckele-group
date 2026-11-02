@@ -6536,7 +6536,10 @@ create table if not exists public.deal_hunter_opportunity_scores (
   reviewed_by text,
   reviewed_fingerprint text,
   reviewed_semantic_digest text,
-  operator_updated_at timestamptz
+  operator_updated_at timestamptz,
+  criteria_profile_version text,
+  criteria_group text,
+  criteria_result jsonb
 );
 
 create table if not exists public.deal_hunter_score_evidence (
@@ -6604,7 +6607,8 @@ begin
     opportunity_id, created_at, scored_at, deal_key, name, state, listing_url, fit_score, score_status,
     confidence, completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
     gate_count, score_fingerprint, semantic_digest, engine_version, rules_version, profile_version,
-    completeness_policy_version, dimensions, gates, applied_caps, missing_evidence, confidence_reasons, summary
+    completeness_policy_version, dimensions, gates, applied_caps, missing_evidence, confidence_reasons, summary,
+    criteria_profile_version, criteria_group, criteria_result
   ) values (
     v_opportunity_id, v_scored_at, v_scored_at, nullif(p_score->>'deal_key', ''), nullif(p_score->>'name', ''),
     nullif(p_score->>'state', ''), nullif(p_score->>'listing_url', ''),
@@ -6617,7 +6621,9 @@ begin
     p_score->>'rules_version', p_score->>'profile_version', p_score->>'completeness_policy_version',
     coalesce(p_score->'dimensions', '[]'::jsonb), coalesce(p_score->'gates', '[]'::jsonb),
     coalesce(p_score->'applied_caps', '[]'::jsonb), coalesce(p_score->'missing_evidence', '[]'::jsonb),
-    coalesce(p_score->'confidence_reasons', '[]'::jsonb), coalesce(p_score->'summary', '{}'::jsonb)
+    coalesce(p_score->'confidence_reasons', '[]'::jsonb), coalesce(p_score->'summary', '{}'::jsonb),
+    nullif(p_score->>'criteria_profile_version', ''), nullif(p_score->>'criteria_group', ''),
+    nullif(p_score->'criteria_result', 'null'::jsonb)
   )
   on conflict (opportunity_id) do update set
     scored_at = excluded.scored_at,
@@ -6645,7 +6651,10 @@ begin
     applied_caps = excluded.applied_caps,
     missing_evidence = excluded.missing_evidence,
     confidence_reasons = excluded.confidence_reasons,
-    summary = excluded.summary
+    summary = excluded.summary,
+    criteria_profile_version = excluded.criteria_profile_version,
+    criteria_group = excluded.criteria_group,
+    criteria_result = excluded.criteria_result
   returning * into v_score;
 
   delete from public.deal_hunter_score_evidence where opportunity_id = v_opportunity_id;
