@@ -2901,6 +2901,7 @@ describe('Criteria-grouped Acquisition Inbox', () => {
     ['identity_unresolved', 'identity needs review'],
     ['suppressed', 'the broker opted out or bounced'],
     ['criteria_out_of_date', 'criteria out of date'],
+    ['criteria_stale', 'facts changed since scoring'],
     ['owner_decision_exists', 'you already decided on this deal'],
     ['authority_unavailable', 'broker details could not be checked'],
     ['some_future_code', 'not eligible right now'],

@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { autoPursueCriteriaStale } from '../server/services/autoPursue.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const integrationEnabled = process.env.DEAL_HUNTER_POSTGRES_INTEGRATION === '1';
@@ -139,6 +140,23 @@ test('PostgreSQL inbox places 75+ rows into criteria areas on fresh and upgraded
     assert.equal(criteriaRow.criteria_group, 'auto');
     assert.equal(criteriaRow.criteria_profile_version, 'uckele-criteria-v1');
     assert.ok('auto_pursue_blocker' in criteriaRow && 'criteria_result' in criteriaRow);
+    // The automatic-Pursue staleness check reads these from the same inbox row.
+    for (const key of ['scored_at', 'last_material_change_at', 'material_revision', 'name', 'state',
+      'industry', 'location', 'annual_profit', 'asking_price', 'profit_multiple', 'gates']) {
+      assert.ok(key in criteriaRow, key);
+    }
+    assert.equal(autoPursueCriteriaStale(criteriaRow), false, 'a freshly scored row is current');
+    psql(container, database, `update public.deal_hunter_opportunities
+      set material_revision = 1, last_material_change_at = now() + interval '1 hour'
+      where opportunity_id = '${criteriaId('auto')}';`);
+    const changedRow = areaRows('auto-pursue').rows[0];
+    assert.equal(changedRow.opportunity_id, criteriaId('auto'));
+    assert.equal(autoPursueCriteriaStale(changedRow), true, 'a material change after scoring is stale');
+    psql(container, database, `update public.deal_hunter_opportunities
+      set last_material_change_at = now() - interval '1 day'
+      where opportunity_id = '${criteriaId('auto')}';`);
+    assert.equal(autoPursueCriteriaStale(areaRows('auto-pursue').rows[0]), false,
+      'a material change before scoring is current');
     const firstReview = areaRows('your-review', 0, 5);
     const secondReview = areaRows('your-review', 5, 5);
     assert.equal(secondReview.anchorId, firstReview.lastId);

@@ -21,7 +21,7 @@ const { recordAcquisitionOwnerCommand } = await import('../server/services/dealH
 const { setCurrentOperatorOpportunityFact } = await import('../server/services/dealHunterOpportunityFacts.js');
 const { ownerBusinessDate } = await import('../server/services/dealHunterFreshInboxPolicy.js');
 const {
-  AUTO_PURSUE_CONFIRMATIONS, autoPursueIdempotencyKey, getAutoPursueStatus, getAutoPursueWarmup,
+  AUTO_PURSUE_CONFIRMATIONS, autoPursueCriteriaStale, autoPursueIdempotencyKey, getAutoPursueStatus, getAutoPursueWarmup,
   ownerBusinessDateBounds, runAutoPursue, setAutoPursueMode, summarizeAutoPursueWarmup,
 } = await import('../server/services/autoPursue.js');
 
@@ -383,6 +383,81 @@ test('each blocker skips the row', async () => {
   assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-b-stale' })).decision, null);
   assert.equal(result.commands, 1);
   assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-b-clean' })).decision.actor,
+    'automation-auto-pursue');
+});
+
+test('a criteria group is stale when facts changed after scoring or current facts break a must-have', () => {
+  const scoredAt = '2026-10-30T09:00:00.000Z';
+  const base = { scored_at: scoredAt, material_revision: 0, last_material_change_at: null,
+    name: 'HVAC Services', state: 'AZ', fit_score: 93, gates: [] };
+  assert.equal(autoPursueCriteriaStale(base), false, 'no change since scoring');
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 2,
+    last_material_change_at: '2026-10-29T09:00:00.000Z' }), false, 'change before scoring');
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 2,
+    last_material_change_at: scoredAt }), false, 'change at the scoring instant');
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 3,
+    last_material_change_at: '2026-10-31T09:00:00.000Z' }), true, 'change after scoring');
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 3,
+    last_material_change_at: '2026-10-31T09:00:00+00:00', scored_at: '2026-10-30T09:00:00+00:00' }), true,
+  'Postgres timestamp text');
+  // Fail closed when one timestamp indicates change and the other is missing or unparseable.
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 1,
+    last_material_change_at: '2026-10-29T09:00:00.000Z', scored_at: null }), true, 'missing scored_at');
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 1,
+    last_material_change_at: '2026-10-29T09:00:00.000Z', scored_at: 'yesterday' }), true, 'bad scored_at');
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 1,
+    last_material_change_at: 'not-a-time' }), true, 'bad change time');
+  assert.equal(autoPursueCriteriaStale({ ...base, material_revision: 1 }), true, 'revision without time');
+  assert.equal(autoPursueCriteriaStale({ ...base, scored_at: null }), false, 'no change, no scored_at');
+  // Current facts that now fail a must-have make the stored auto group stale.
+  assert.equal(autoPursueCriteriaStale({ ...base, annual_profit: '400000' }), false, 'profit still in range');
+  assert.equal(autoPursueCriteriaStale({ ...base, annual_profit: '900000' }), true, 'profit out of range');
+  assert.equal(autoPursueCriteriaStale({ ...base, annual_profit: '400000', asking_price: '2400000' }), true,
+    'multiple out of range');
+  assert.equal(autoPursueCriteriaStale({ ...base, name: 'Corner Bakery', industry: 'Bakery' }), true,
+    'industry no longer a target');
+  assert.equal(autoPursueCriteriaStale({ ...base, state: '', location: 'Austin, TX' }), true,
+    'location no longer a target');
+  assert.equal(autoPursueCriteriaStale({ ...base, annual_profit: '  ' }), false, 'blank profit is unknown');
+  // Without a current source observation the score's own name and state never block.
+  assert.equal(autoPursueCriteriaStale({ ...base, name: 'Criteria auto' }), false, 'no industry observation');
+  assert.equal(autoPursueCriteriaStale({ ...base, state: 'TX' }), false, 'no location observation');
+  assert.equal(autoPursueCriteriaStale({ ...base, name: 'Corner Bakery', industry: 'Commercial HVAC' }), false,
+    'industry observation still a target');
+  assert.equal(autoPursueCriteriaStale({ ...base, location: 'Greater Phoenix' }), false,
+    'location observation with a target state');
+  assert.equal(autoPursueCriteriaStale({ ...base, gates: [{ ruleId: 'franchise' }] }), true, 'a gate now applies');
+});
+
+test('the runner blocks a stale criteria group as criteria_stale and still pursues a fresh one', async () => {
+  const storage = await readyStorage('active', { dailyCap: 10 });
+  await seedAuto(storage, 'opp-stale-facts');
+  await seedAuto(storage, 'opp-stale-profit');
+  await seedAuto(storage, 'opp-fresh-facts');
+  const raw = new RawDatabase(path.join(tempDir, `run-${storageCount}.sqlite`));
+  try {
+    // seedAuto scores at 2026-10-30T09:00Z.
+    const material = raw.prepare(`UPDATE deal_hunter_opportunities SET material_revision = 1,
+      last_material_change_at = ? WHERE opportunity_id = ?`);
+    material.run('2026-10-31T09:00:00.000Z', 'opp-stale-facts');
+    material.run('2026-10-29T09:00:00.000Z', 'opp-fresh-facts');
+  } finally {
+    raw.close();
+  }
+  await storage.upsertDealHunterOpportunitySourceObservation({
+    id: 'opp-stale-profit-annual_profit', opportunity_id: 'opp-stale-profit', source_id: 'sheet-0',
+    source_name: 'Synthetic Sheet', source_record_id: 'row-opp-stale-profit', field: 'annual_profit',
+    value: '900000', observed_at: '2026-10-31T09:00:00.000Z', created_at: '2026-10-31T09:00:00.000Z',
+    updated_at: '2026-10-31T09:00:00.000Z',
+  });
+  const result = await runAutoPursue({ storage });
+  for (const id of ['opp-stale-facts', 'opp-stale-profit']) {
+    assert.equal(reasonFor(result, id), 'criteria_stale', id);
+    assert.equal((await scoreRow(storage, id)).auto_pursue_blocker, 'criteria_stale', id);
+    assert.equal((await storage.readPursueCimProjection({ opportunityId: id })).decision, null, id);
+  }
+  assert.equal(result.commands, 1);
+  assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-fresh-facts' })).decision.actor,
     'automation-auto-pursue');
 });
 

@@ -10,7 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { genericMailboxNames } from './cimAutomation.js';
-import { DEAL_CRITERIA_PROFILE_VERSION } from './dealCriteriaProfile.js';
+import { DEAL_CRITERIA_PROFILE_VERSION, evaluateDealCriteria } from './dealCriteriaProfile.js';
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import { ownerBusinessDate } from './dealHunterFreshInboxPolicy.js';
 import { recordAcquisitionOwnerCommand } from './dealHunterTriage.js';
@@ -274,6 +274,44 @@ function isGenericMailbox(address) {
   return genericMailboxNames.has(mailbox) || genericMailboxNames.has(firstSegment);
 }
 
+/** Milliseconds, null when absent, or NaN when present but unparseable. */
+function timestampOf(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+/**
+ * True when a stored `auto` group may rest on older facts than the deal has now, so
+ * it must not be acted on until the next score refresh regroups it:
+ * - a material change (profit, revenue, or asking price) was accepted after the score
+ *   was written. A change with no usable time, or a score with no usable scored_at
+ *   while a change exists, fails closed;
+ * - the inbox row's current source facts now fail a must-have (profit, multiple,
+ *   geography, industry, or a gate). A rule is re-read only from a current source
+ *   observation (industry, location, profit, multiple, asking price); the score's own
+ *   name and state only accompany those, so a missing observation never blocks here.
+ * latest_accepted_observation_at is deliberately not compared: it advances on every
+ * accepted import even when no value changed, and the score refresh skips (and does
+ * not re-stamp) an unchanged score, so it would block every re-imported deal.
+ */
+export function autoPursueCriteriaStale(row = {}) {
+  const changedAt = timestampOf(row.last_material_change_at);
+  if (changedAt !== null || Number(row.material_revision) > 0) {
+    const scoredAt = timestampOf(row.scored_at);
+    if (changedAt === null || Number.isNaN(changedAt) || scoredAt === null || Number.isNaN(scoredAt)
+      || changedAt > scoredAt) return true;
+  }
+  const observed = (value) => value !== null && value !== undefined && String(value).trim() !== '';
+  const current = evaluateDealCriteria({
+    name: observed(row.industry) ? row.name : '', industry: row.industry,
+    location: observed(row.location) ? row.location : '', state: observed(row.location) ? row.state : '',
+    annualProfit: row.annual_profit, profitMultiple: row.profit_multiple, askingPrice: row.asking_price,
+    fitScore: row.fit_score, gates: row.gates,
+  });
+  return current.failed.length > 0;
+}
+
 /**
  * The section 6.3 blocker for one current auto row, or '' when it may be Pursued.
  * Any read failure is reported as authority_unavailable: never automatic.
@@ -284,6 +322,7 @@ async function evaluateBlocker({ storage, row, identityExceptions, now }) {
     || !(Number(row.fit_score) >= autoFitFloor)) {
     return { blocker: 'criteria_out_of_date' };
   }
+  if (autoPursueCriteriaStale(row)) return { blocker: 'criteria_stale' };
   try {
     const projection = await storage.readPursueCimProjection({ opportunityId });
     if (!projection || typeof projection !== 'object') return { blocker: 'authority_unavailable' };
