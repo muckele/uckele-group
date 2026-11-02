@@ -187,5 +187,15 @@ test('PostgreSQL automatic Pursue activation, runs, and blocker writer on fresh 
     assert.throws(() => autoDecision('lock-date', {}, { dailyCap: 11 }), /Invalid automatic Pursue guard/);
     psqlFails(container, database, `set role anon; select public.pursue_cim_record_auto_pursue_decision_v1(
       '${command('lock-date')}'::jsonb, '${guard()}'::jsonb);`, /permission denied/);
+    // The Supabase adapter's prior-conversation check sends an escaped ILIKE pattern: it
+    // must match a mixed-case stored address and treat LIKE metacharacters literally.
+    const escapeLike = (value) => value.replace(/[\\%_]/g, (character) => `\\${character}`);
+    const matches = (stored, address) => psql(container, database,
+      `select '${stored}' ilike '${escapeLike(address.trim().toLowerCase())}';`);
+    assert.equal(matches('Pat.Broker@BrokerFirm.test', ' pat.broker@BROKERFIRM.test '), 't');
+    assert.equal(matches('o%k_x\\y@Broker.test', 'O%K_X\\Y@broker.test'), 't');
+    assert.equal(matches('oZk_x\\y@broker.test', 'o%k_x\\y@broker.test'), 'f');
+    assert.equal(matches('o%kZx\\y@broker.test', 'o%k_x\\y@broker.test'), 'f');
+    assert.equal(matches('other.pat.broker@brokerfirm.test', 'pat.broker@brokerfirm.test'), 'f');
   }
 });

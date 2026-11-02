@@ -3894,12 +3894,18 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return count;
     },
 
-    /** True when any Pursue campaign conversation already targets this recipient address. */
+    /**
+     * True when any Pursue campaign conversation already targets this recipient address,
+     * compared case-insensitively like SQLite's LOWER(recipient_address) = ?. LIKE
+     * metacharacters are escaped so the ILIKE is an exact match; PostgREST also reads
+     * '*' as a wildcard, which can only over-match and so fails toward prior_outreach.
+     */
     async hasPursueCimConversationForRecipient(recipientEmail) {
       const address = String(recipientEmail || '').trim().toLowerCase();
       if (!address) throw new Error('A recipient address is required.');
+      const pattern = address.replace(/[\\%_]/g, (character) => `\\${character}`);
       const { data, error } = await client.from('deal_hunter_broker_conversations')
-        .select('id').eq('recipient_address', address).limit(1);
+        .select('id').ilike('recipient_address', pattern).limit(1);
       if (error) throw error;
       return Array.isArray(data) && data.length > 0;
     },

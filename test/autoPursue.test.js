@@ -934,3 +934,36 @@ test('Supabase adapter: authoritative count, exclusive claim, activation RPC, an
     p_command: { opportunityId: 'o1', action: 'pursue' },
     p_guard: { since: '2026-11-02T08:00:00.000Z', until: '2026-11-03T08:00:00.000Z', dailyCap: 3 } } });
 });
+
+test('Supabase adapter: the prior-conversation check is a case-insensitive exact match', async () => {
+  const { createSupabaseStorage } = await import('../server/storage/supabase.js');
+  const calls = [];
+  const responses = [];
+  const builder = (table) => {
+    const chain = { table, steps: [] };
+    const proxy = new Proxy(chain, {
+      get(target, property) {
+        if (property === 'then') {
+          const response = responses.shift() || { data: null, error: null };
+          calls.push({ table, steps: target.steps });
+          return (resolve) => resolve(response);
+        }
+        return (...args) => { target.steps.push([property, ...args]); return proxy; };
+      },
+    });
+    return proxy;
+  };
+  const storage = createSupabaseStorage({ storage: { supabaseUrl: '', supabaseServiceRoleKey: '' } },
+    { client: { from: builder, async rpc() { return { data: null, error: null }; } } });
+  responses.push({ data: [{ id: 'conversation-1' }], error: null });
+  assert.equal(await storage.hasPursueCimConversationForRecipient('  Pat.Broker@BrokerFirm.test '), true);
+  assert.deepEqual(calls.at(-1), { table: 'deal_hunter_broker_conversations', steps: [
+    ['select', 'id'], ['ilike', 'recipient_address', 'pat.broker@brokerfirm.test'], ['limit', 1]] });
+  // LIKE metacharacters in the address are escaped so they match only themselves.
+  responses.push({ data: [], error: null });
+  assert.equal(await storage.hasPursueCimConversationForRecipient('o%k_x\\y@Broker.test'), false);
+  assert.deepEqual(calls.at(-1).steps[1], ['ilike', 'recipient_address', 'o\\%k\\_x\\\\y@broker.test']);
+  responses.push({ data: null, error: { code: '42501', message: 'permission denied' } });
+  await assert.rejects(storage.hasPursueCimConversationForRecipient('pat@brokerfirm.test'), { code: '42501' });
+  await assert.rejects(storage.hasPursueCimConversationForRecipient('  '));
+});
