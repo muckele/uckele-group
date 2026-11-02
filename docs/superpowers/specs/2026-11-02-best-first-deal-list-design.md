@@ -46,7 +46,7 @@ Profile version `uckele-criteria-v1`.
 |---|---|
 | Annual profit | 300,000 ≤ profit ≤ 750,000 |
 | Profit multiple | 0 < multiple ≤ 4.0 |
-| Geography | Location contains one of NY, CA, NJ, AZ, NV, CT, using the token rule in `cimAutomation.js` (`(^|[^A-Z])ST([^A-Z]|$)` on the upper-cased location) |
+| Geography | Location (or state field) contains one of NY, CA, NJ, AZ, NV, CT, using the token rule in `cimAutomation.js` (`(^|[^A-Z])ST([^A-Z]|$)` on the upper-cased location), after mapping the full state names New York, California, New Jersey, Arizona, Nevada, Connecticut to their codes |
 | Industry | Name or industry text contains a trusted term: hvac, plumbing, electrical, landscape, maintenance, repair, restoration, field service, commercial service, environmental, waste, pet, veterinary, healthcare service, professional service, property management (same matching as `containsTrustedIndustryTerm`) |
 | Not gated | No scoring gate (excluded category, franchise) |
 
@@ -118,8 +118,8 @@ It calls the same `recordAcquisitionOwnerCommand` path an owner click uses (`ser
 
 A separate durable capability `auto-pursue`, shipped **off**, with modes:
 
-- **off**: nothing recorded; the inbox shows the `auto` group as “Would Pursue automatically”;
-- **shadow**: the runner computes and stores what it would Pursue, records nothing, reports zero commands;
+- **off**: no Pursue recorded; the runner still evaluates §6.3 blockers so the inbox shows an accurate “Would Pursue automatically” group;
+- **shadow**: the runner computes and stores what it would Pursue, records no Pursue, reports zero commands;
 - **canary**: at most **1** automatic Pursue per owner business date;
 - **active**: at most the configured cap per owner business date (default **3**, maximum **10**).
 
@@ -137,7 +137,9 @@ Canary cannot be enabled until the owner's own decisions show automatic picks ma
 - at least **10** of those on opportunities whose `criteria_group` was `auto` at decision time;
 - at least **95%** of those `auto`-group decisions are Pursue with the loader-selected recipient unchanged.
 
-Decisions are read from the existing owner decision events; the criteria group at decision time is recorded in the decision event metadata by this work.
+The owner decision event table has no metadata column and its writer is a locked RPC, so the criteria group and recipient-unchanged flag at decision time are written to a separate additive table keyed by decision event id, immediately after the decision succeeds. A failed evidence write never fails the owner's command; it only means that decision does not count toward warm-up.
+
+The latest §6.3 blocker for each `auto` deal is stored on its score row (`auto_pursue_blocker`, written only by the runner) so the inbox can place blocked deals under Your review.
 
 ### 6.5 Runner trigger
 
