@@ -16,10 +16,15 @@ export const freshInboxDefaultAreaIds = Object.freeze([
 const criteriaAreaIds = Object.freeze(['auto-pursue', 'your-review', 'needs-info', 'near-miss']);
 const criteriaFitFloor = 75;
 
+const decidedOwnerActions = new Set(['watch', 'pursue']);
+
 // Placement of one 75+ row into at most one criteria area. A row scored under
 // another profile version is never trusted for auto-pursue or the other groups.
+// A deal whose latest owner decision (any policy, automatic included) is Watch or
+// Pursue is already decided and sits in no criteria area (spec 4.3).
 function criteriaAreaFor(row) {
   if (Number(row.fit_score || 0) < criteriaFitFloor) return null;
+  if (decidedOwnerActions.has(row.latest_owner_action)) return null;
   if (row.criteria_profile_version !== DEAL_CRITERIA_PROFILE_VERSION) return 'your-review';
   if (row.criteria_group === 'auto') return row.auto_pursue_blocker ? 'your-review' : 'auto-pursue';
   if (row.criteria_group === 'review') return 'your-review';
@@ -111,6 +116,7 @@ function foldRevision(rows, areaId, filtersKey, businessDate) {
       row.disposition_state, row.publication_state, row.publication_date,
       row.source_conflict_count, row.material_field, row.source_snapshot_updated_at,
       row.criteria_profile_version, row.criteria_group, row.auto_pursue_blocker,
+      row.latest_owner_action,
     ]);
     state = createHash('md5').update(`${state}${Buffer.byteLength(tuple)}:${tuple}`).digest('hex');
   }

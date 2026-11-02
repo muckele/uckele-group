@@ -1504,6 +1504,40 @@ test('below-review and sub-75 rows appear in no criteria area', () => {
   for (const id of criteriaAreaIds) assert.deepEqual(areaIds(result, id), []);
 });
 
+test('a Watched or Pursued row appears in no criteria area and keeps its other areas', () => {
+  const candidates = [
+    criteriaCandidate('auto-open', { criteria_group: 'auto' }),
+    criteriaCandidate('auto-watched', { criteria_group: 'auto', latest_owner_action: 'watch' }),
+    criteriaCandidate('auto-pursued', { criteria_group: 'auto', latest_owner_action: 'pursue' }),
+    criteriaCandidate('review-watched', { criteria_group: 'review', latest_owner_action: 'watch' }),
+    criteriaCandidate('info-pursued', { criteria_group: 'needs-info', latest_owner_action: 'pursue' }),
+    criteriaCandidate('miss-watched', { criteria_group: 'near-miss', latest_owner_action: 'watch' }),
+    criteriaCandidate('stale-pursued', { criteria_profile_version: 'uckele-criteria-v0',
+      latest_owner_action: 'pursue' }),
+    criteriaCandidate('blocked-watched', { criteria_group: 'auto', auto_pursue_blocker: 'generic_mailbox',
+      latest_owner_action: 'watch' }),
+    criteriaCandidate('priority-watched', { criteria_group: 'review', operator_priority: 'urgent',
+      latest_owner_action: 'watch' }),
+  ];
+  for (const id of criteriaAreaIds) {
+    const result = buildFreshInboxAreas(candidates, { area: id, asOf: criteriaAsOf });
+    assert.deepEqual(areaIds(result, id), id === 'auto-pursue' ? ['auto-open'] : [], id);
+  }
+  // Pre-existing areas keep their membership.
+  const all = buildFreshInboxAreas(candidates, { area: 'all-active', asOf: criteriaAsOf });
+  assert.equal(areaIds(all, 'all-active').length, candidates.length);
+  const priorities = buildFreshInboxAreas(candidates, { area: 'owner-priorities', asOf: criteriaAsOf });
+  assert.deepEqual(areaIds(priorities, 'owner-priorities'), ['priority-watched']);
+});
+
+test('the latest owner action is part of every area revision', () => {
+  const before = buildFreshInboxAreas([criteriaCandidate('a')], { area: 'all-active', asOf: criteriaAsOf });
+  const after = buildFreshInboxAreas([criteriaCandidate('a', { latest_owner_action: 'watch' })],
+    { area: 'all-active', asOf: criteriaAsOf });
+  assert.deepEqual(areaIds(before, 'all-active'), areaIds(after, 'all-active'));
+  assert.notEqual(before.areas[0].revision, after.areas[0].revision);
+});
+
 test('a criteria area can be requested alone and pages with a cursor', () => {
   const rows = ['x', 'y', 'z'].map((id, index) => criteriaCandidate(id,
     { criteria_group: 'review', fit_score: 90 - index }));
@@ -1570,6 +1604,42 @@ test('storage inbox rows carry criteria columns and criteria areas honour exclus
   assert.equal(served.areas[0].rows[0].criteriaGroup, 'review');
   assert.deepEqual(served.areas[0].rows[0].criteriaResult, result);
   assert.equal(served.areas[0].rows[0].criteriaCurrent, true);
+});
+
+test('storage inbox leaves Watched and Pursued deals out of the criteria areas', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-criteria-decided-'));
+  const sqlitePath = path.join(directory, 'criteria.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  const db = new Database(sqlitePath);
+  t.after(() => { db.close(); storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const result = { profileVersion: DEAL_CRITERIA_PROFILE_VERSION, group: 'auto',
+    mustHaves: [], failed: [], unknown: [] };
+  const ids = ['dec-open', 'dec-watched', 'dec-pursued', 'dec-rewatched', 'dec-review-watched'];
+  for (const id of ids) {
+    await seedOpportunity(storage, id);
+    await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: 92, confidence: 'high',
+      high_fit: true, criteria_profile_version: DEAL_CRITERIA_PROFILE_VERSION,
+      criteria_group: id === 'dec-review-watched' ? 'review' : 'auto', criteria_result: result }), []);
+  }
+  await storage.reconcileDealHunterCurrentScoreEligibility(ids);
+  const decide = (id, opportunityId, action, policy, at) => db.prepare(`INSERT INTO deal_hunter_owner_decision_events (
+      id, idempotency_key, request_digest, opportunity_id, action, actor,
+      expected_discovery_revision, expected_material_revision,
+      observed_discovery_revision, observed_material_revision, policy_version, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'owner', 0, 0, 0, 0, ?, ?)`)
+    .run(id, `key-${id}`, '1'.repeat(64), opportunityId, action, policy, at);
+  decide('d-watch', 'dec-watched', 'watch', 'owner-decision-v1', '2026-10-01T10:00:00.000Z');
+  decide('d-pursue', 'dec-pursued', 'pursue', 'auto-pursue-v1', '2026-10-01T10:00:00.000Z');
+  decide('d-pursue-2', 'dec-rewatched', 'pursue', 'owner-decision-v1', '2026-10-01T10:00:00.000Z');
+  decide('d-watch-2', 'dec-rewatched', 'watch', 'owner-decision-v1', '2026-10-02T10:00:00.000Z');
+  decide('d-watch-3', 'dec-review-watched', 'watch', 'owner-decision-v1', '2026-10-01T10:00:00.000Z');
+  const inbox = await storage.listDealHunterFreshInbox({ area: 'inbox' });
+  for (const area of ['auto-pursue', 'your-review', 'needs-info', 'near-miss']) {
+    const placed = inbox.areas.find((item) => item.id === area).rows.map((row) => row.opportunity_id);
+    assert.deepEqual(placed, area === 'auto-pursue' ? ['dec-open'] : [], area);
+  }
+  const all = await storage.listDealHunterFreshInbox({ area: 'all-active' });
+  assert.deepEqual(all.areas[0].rows.map((row) => row.opportunity_id).sort(), [...ids].sort());
 });
 
 test('a machine rescore keeps the runner-owned auto-Pursue columns', async (t) => {

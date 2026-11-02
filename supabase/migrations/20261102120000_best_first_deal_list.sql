@@ -136,7 +136,10 @@ alter table public.deal_hunter_opportunity_scores
 -- Placement mirrors server/services/dealHunterFreshInboxPolicy.js: a row is
 -- considered only at fit_score >= 75, and a criteria_profile_version other than
 -- the current 'uckele-criteria-v1' always lands in your-review, as does an
--- auto row carrying a blocker. Candidates still come from the base CTE, so
+-- auto row carrying a blocker. A deal whose latest owner decision (any
+-- policy, automatic Pursue included) is watch or pursue is already decided and
+-- sits in no criteria area (spec 4.3); latest_owner_action is also folded into
+-- every area revision. Candidates still come from the base CTE, so
 -- every existing exclusion (not current-eligible, should_remove, dismissed,
 -- non-active opportunity, filters) applies unchanged. Signature and ACL are
 -- unchanged; the function body is identical to supabase/schema.sql.
@@ -215,6 +218,9 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
       scores.operator_priority, scores.reviewed_at,
       scores.reviewed_discovery_revision, scores.reviewed_material_revision,
       scores.criteria_profile_version, scores.criteria_group, scores.auto_pursue_blocker,
+      (select decision.action from public.deal_hunter_owner_decision_events as decision
+        where decision.opportunity_id = scores.opportunity_id
+        order by decision.created_at desc, decision.id desc limit 1) as latest_owner_action,
       opportunity.first_accepted_at, opportunity.discovery_state,
       opportunity.discovery_revision, opportunity.material_revision,
       opportunity.last_material_change_at,
@@ -315,6 +321,7 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         and discovery_revision > reviewed_discovery_revision then
           case when recently_listed then 1 else 2 end else 6 end as discovery_group,
       case when fit_score < 75 then null
+        when latest_owner_action in ('watch', 'pursue') then null
         when criteria_profile_version is distinct from 'uckele-criteria-v1' then 'your-review'
         when criteria_group = 'auto' then
           case when nullif(auto_pursue_blocker, '') is not null then 'your-review'
@@ -411,7 +418,7 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         || ':' || source_conflict_count || ':' || coalesce(material_field, '')
         || ':' || coalesce(source_snapshot_updated_at::text, '')
         || ':' || coalesce(criteria_profile_version, '') || ':' || coalesce(criteria_group, '')
-        || ':' || coalesce(auto_pursue_blocker, '')
+        || ':' || coalesce(auto_pursue_blocker, '') || ':' || coalesce(latest_owner_action, '')
         order by ordinal) as revision
     from selected where area_id <> 'action-preview' or ordinal <= 3
     group by area_id

@@ -11435,6 +11435,9 @@ export function createSqliteStorage(config, options = {}) {
           scores.reviewed_material_revision, scores.score_fingerprint,
           scores.semantic_digest, scores.criteria_profile_version, scores.criteria_group,
           scores.criteria_result, scores.auto_pursue_blocker,
+          (SELECT decision.action FROM deal_hunter_owner_decision_events AS decision
+            WHERE decision.opportunity_id = scores.opportunity_id
+            ORDER BY decision.created_at DESC, decision.id DESC LIMIT 1) AS latest_owner_action,
           (SELECT MAX(source.updated_at)
             FROM deal_hunter_opportunity_source_observations AS source
             WHERE source.opportunity_id = scores.opportunity_id) AS source_snapshot_updated_at,

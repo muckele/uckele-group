@@ -302,7 +302,8 @@ test('crash after the first command does not duplicate it', async () => {
   await setMode(storage, 'active', { dailyCap: 2 });
   const rerun = await runAutoPursue({ storage, now });
   assert.equal(rerun.commands, 0);
-  assert.equal(reasonFor(rerun, 'opp-crash'), 'owner_decision_exists');
+  // The committed Pursue decided the deal, so it left the criteria areas and the rerun never sees it.
+  assert.equal(reasonFor(rerun, 'opp-crash'), undefined);
   assert.equal(await autoDecisions(storage), 1);
   // A replay of the same deterministic command also creates nothing new.
   const replay = await recordAcquisitionOwnerCommand({ opportunityId: 'opp-crash', action: 'pursue',
@@ -366,7 +367,6 @@ test('each blocker skips the row', async () => {
     'opp-b-generic': 'generic_mailbox',
     'opp-b-prior': 'prior_outreach',
     'opp-b-suppressed': 'suppressed',
-    'opp-b-watch': 'owner_decision_exists',
   };
   for (const [id, reason] of Object.entries(expected)) {
     assert.equal(reasonFor(result, id), reason, id);
@@ -374,6 +374,10 @@ test('each blocker skips the row', async () => {
     const projection = await storage.readPursueCimProjection({ opportunityId: id });
     assert.notEqual(projection.decision?.actor, 'automation-auto-pursue', id);
   }
+  // A Watched deal is decided and sits in no criteria area, so the runner never evaluates it.
+  assert.equal(reasonFor(result, 'opp-b-watch'), undefined);
+  assert.equal((await scoreRow(storage, 'opp-b-watch')).auto_pursue_blocker ?? null, null);
+  assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-b-watch' })).decision.action, 'watch');
   // Out-of-date criteria never reach the runner (they sit in Your review).
   assert.equal(reasonFor(result, 'opp-b-stale'), undefined);
   assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-b-stale' })).decision, null);

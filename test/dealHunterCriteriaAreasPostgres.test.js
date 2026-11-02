@@ -76,6 +76,10 @@ test('PostgreSQL inbox places 75+ rows into criteria areas on fresh and upgraded
       ['removed', 95, 'review', 'uckele-criteria-v1', null, true],
       ['dismissed', 96, 'review', 'uckele-criteria-v1', null, true],
       ['ineligible', 97, 'review', 'uckele-criteria-v1', null, false],
+      // Decided deals (latest owner decision watch or pursue, any policy) sit in no criteria area.
+      ['watched', 94, 'auto', 'uckele-criteria-v1', null, true],
+      ['pursued', 89, 'review', 'uckele-criteria-v1', null, true],
+      ['auto-pursued', 95, 'auto', 'uckele-criteria-v1', null, true],
       // Enough extra review rows that your-review spans more than one page.
       ...Array.from({ length: 8 }, (_, index) => [`fill-${index}`, 76, 'review',
         'uckele-criteria-v1', null, true]),
@@ -99,6 +103,16 @@ test('PostgreSQL inbox places 75+ rows into criteria areas on fresh and upgraded
     psql(container, database, `insert into public.deal_hunter_dispositions
       (id, deal_key, created_at, updated_at, disposition)
       values ('${randomUUID()}'::uuid, '${criteriaId('dismissed')}', now(), now(), 'dismissed');`);
+    const decide = (id, name, action, policy, at) => psql(container, database, `insert into
+      public.deal_hunter_owner_decision_events
+      (id, idempotency_key, request_digest, opportunity_id, action, actor,
+        expected_discovery_revision, expected_material_revision,
+        observed_discovery_revision, observed_material_revision, policy_version, created_at)
+      values ('${id}-${database}', '${id}-${database}', repeat('a', 64), '${criteriaId(name)}', '${action}',
+        'fixture-owner', 0, 0, 0, 0, '${policy}', '${at}');`);
+    decide('watch', 'watched', 'watch', 'owner-decision-v1', '2026-10-01T10:00:00Z');
+    decide('pursue', 'pursued', 'pursue', 'owner-decision-v1', '2026-10-01T10:00:00Z');
+    decide('auto', 'auto-pursued', 'pursue', 'auto-pursue-v1', '2026-10-01T10:00:00Z');
     const areaRows = (area, offset = 0, limit = 100) => JSON.parse(psql(container, database,
       `select public.list_deal_hunter_fresh_inbox_v1('${area}', ${offset}, ${limit});`)).areas[0];
     const ours = (area) => areaRows(area).rows.map((row) => row.opportunity_id)
@@ -110,6 +124,10 @@ test('PostgreSQL inbox places 75+ rows into criteria areas on fresh and upgraded
     assert.deepEqual(ours('near-miss'), ['miss']);
     assert.deepEqual(['auto-pursue', 'your-review', 'needs-info', 'near-miss'].flatMap(ours)
       .filter((name) => ['below', 'stale-low', 'removed', 'dismissed', 'ineligible'].includes(name)), []);
+    assert.deepEqual(['auto-pursue', 'your-review', 'needs-info', 'near-miss'].flatMap(ours)
+      .filter((name) => ['watched', 'pursued', 'auto-pursued'].includes(name)), []);
+    assert.deepEqual(ours('all-active').filter((name) => ['watched', 'pursued', 'auto-pursued'].includes(name))
+      .sort(), ['auto-pursued', 'pursued', 'watched']);
     const defaultInbox = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('inbox');"));
     assert.deepEqual(defaultInbox.areas.map((area) => area.id),
@@ -148,5 +166,15 @@ test('PostgreSQL inbox places 75+ rows into criteria areas on fresh and upgraded
     assert.equal(psql(container, database, `select auto_pursue_checked_at from
       public.deal_hunter_opportunity_scores where opportunity_id = '${criteriaId('auto')}';`),
     '2026-11-02T10:00:00Z');
+    // A later Watch takes a previously open auto deal out of the criteria areas and
+    // moves every area revision, so older cursors are refused.
+    psql(container, database, `update public.deal_hunter_opportunity_scores
+      set auto_pursue_blocker = null where opportunity_id = '${criteriaId('auto')}';`);
+    assert.deepEqual(ours('auto-pursue'), ['auto']);
+    const blockerClearedRevision = areaRows('all-active').revision;
+    decide('rewatch', 'auto', 'watch', 'owner-decision-v1', '2026-10-02T10:00:00Z');
+    assert.deepEqual(ours('auto-pursue'), []);
+    assert.equal(ours('your-review').includes('auto'), false);
+    assert.notEqual(areaRows('all-active').revision, blockerClearedRevision);
   }
 });
