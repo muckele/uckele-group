@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight, ExternalLink, Search } from 'lucide-react';
 import { NavLink, useNavigationType, useSearchParams } from 'react-router-dom';
 import OpportunityDrawer, { PassForm, safeListingUrl } from './OpportunityDrawer.jsx';
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
+import { AutoPursueModeBadge, CriteriaLine, NearMissConfirmDialog, NotAutomaticReason, isNearMiss } from './AcquisitionCriteria.jsx';
 
 const emptySummary = { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 };
 const summaryItems = [
@@ -55,7 +56,7 @@ function ActionButtons({ context = '', disabled, name, onAction }) {
   const accessibleName = (action) => `${action}${context ? ` ${context}` : ''} ${name}`;
   return (
     <div className="flex flex-wrap justify-center gap-1.5 md:justify-start">
-      <button aria-label={accessibleName('Pursue')} className={primaryButtonClass} disabled={disabled} onClick={(event) => onAction('pursue', event)} type="button">Pursue</button>
+      <button aria-label={accessibleName('Request SIM')} className={primaryButtonClass} disabled={disabled} onClick={(event) => onAction('pursue', event)} type="button">Request SIM</button>
       <button aria-label={accessibleName('Watch')} className={buttonClass} disabled={disabled} onClick={(event) => onAction('watch', event)} type="button">Watch</button>
       <button aria-label={accessibleName('Pass')} className={`${buttonClass} text-red-700`} disabled={disabled} onClick={(event) => onAction('pass', event)} type="button">Pass</button>
     </div>
@@ -146,7 +147,7 @@ function MorningBriefing({ actionsAllowed = false, digest, error = '', loading =
   );
 }
 
-function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, row }) {
+function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, row, showNotAutomatic = false }) {
   const reviewState = row.changedSinceReview ? 'Changed Since Review' : row.reviewed ? 'Reviewed' : 'Needs Review';
   const observed = formatDate(row.observationFreshness);
   const earnings = earningsPresentation(row.financials);
@@ -155,6 +156,8 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
       <div className="min-w-0">
         <button aria-label={`Open ${row.name}`} className="text-left text-base font-semibold text-ink underline decoration-transparent underline-offset-4 transition hover:text-moss hover:decoration-moss/30" onClick={onOpen} type="button">{row.name}</button>
         <p className="mt-1 text-sm text-ink/58">{row.geography?.label || row.state || 'Location not supplied'} · {row.industry || 'Industry not supplied'}</p>
+        <CriteriaLine row={row} />
+        {showNotAutomatic ? <NotAutomaticReason row={row} /> : null}
       </div>
       <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:col-start-1 lg:row-start-2 xl:col-start-2 xl:row-start-1">
       <div><p className="text-sm font-medium text-ink/58">Fit</p><p className="text-xl font-semibold tabular-nums text-ink">{row.fitScore}</p><p className="text-sm font-medium text-ink/58">{row.confidence} confidence</p></div>
@@ -289,6 +292,10 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const [cimReleaseState, setCimReleaseState] = useState(emptyCimReleaseState);
   const [passTarget, setPassTarget] = useState(null);
   const [pursueChoice, setPursueChoice] = useState(null);
+  const [autoPursueStatus, setAutoPursueStatus] = useState(null);
+  const [showNearMisses, setShowNearMisses] = useState(false);
+  const [nearMissTarget, setNearMissTarget] = useState(null);
+  const nearMissTriggerRef = useRef(null);
   const queueRequestRef = useRef({ generation: 0, controller: null });
   const queueQueryRef = useRef(null);
   const queueViewRef = useRef(view);
@@ -399,6 +406,24 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     window.addEventListener('focus', checkOnReturn);
     return () => { live = false; window.removeEventListener('focus', checkOnReturn); };
   }, [queue.areas, view]);
+
+  const hasAutoPursueArea = view === 'inbox' && Array.isArray(queue.areas)
+    && queue.areas.some((item) => item.id === 'auto-pursue');
+  useEffect(() => {
+    // The mode badge is informational: a failed status read leaves the group without a badge.
+    if (!hasAutoPursueArea) return undefined;
+    let live = true;
+    (async () => {
+      try {
+        const response = await fetch('/api/admin/deal-hunter/auto-pursue', { credentials: 'same-origin' });
+        const result = await response.json();
+        if (live) setAutoPursueStatus(response.ok && result?.success ? result : null);
+      } catch {
+        if (live) setAutoPursueStatus(null);
+      }
+    })();
+    return () => { live = false; };
+  }, [hasAutoPursueArea, queue.areas]);
 
   const loadCimRelease = useCallback(async (opportunityId, { preserveData = false } = {}) => {
     if (readOnly) {
@@ -584,6 +609,35 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     if (!actionsAllowed && passTarget) closeQueuePass(true);
   }, [actionsAllowed, closeQueuePass, passTarget]);
 
+  function openNearMissConfirm(row, trigger) {
+    if (!actionsAllowed) return;
+    nearMissTriggerRef.current = trigger || null;
+    setMutationError('');
+    setNearMissTarget({ row });
+  }
+
+  const closeNearMissConfirm = useCallback(() => {
+    setNearMissTarget(null);
+    const trigger = nearMissTriggerRef.current;
+    if (trigger?.isConnected && !trigger.disabled) trigger.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!actionsAllowed && nearMissTarget) setNearMissTarget(null);
+  }, [actionsAllowed, nearMissTarget]);
+
+  async function confirmNearMiss() {
+    if (!nearMissTarget) return;
+    await recordAction(nearMissTarget.row.opportunityId, 'pursue');
+    closeNearMissConfirm();
+  }
+
+  function handleRowAction(row, action, event) {
+    if (action === 'pass') openQueuePass(row, event.currentTarget);
+    else if (action === 'pursue' && isNearMiss(row)) openNearMissConfirm(row, event.currentTarget);
+    else recordAction(row.opportunityId, action);
+  }
+
   async function recordAction(opportunityId, action, pass = null) {
     if (!actionsAllowed) return false;
     if (selectionRef.current === opportunityId && (detail.error || detail.loading)) return false;
@@ -602,7 +656,8 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       const shownFreshness = selectionRef.current === opportunityId
         ? detail.data?.opportunity?.freshness
         : queue.rows.find((row) => row.opportunityId === opportunityId)?.freshness
-          || (passTarget?.opportunityId === opportunityId ? passTarget.freshness : null);
+          || (passTarget?.opportunityId === opportunityId ? passTarget.freshness : null)
+          || (nearMissTarget?.row.opportunityId === opportunityId ? nearMissTarget.row.freshness : null);
       if (!shownFreshness || !Number.isSafeInteger(shownFreshness.discoveryRevision)
         || !Number.isSafeInteger(shownFreshness.materialRevision)) {
         throw new Error('Current opportunity revisions are unavailable. Reload before recording a decision.');
@@ -1187,20 +1242,25 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const inboxAreas = Array.isArray(queue.areas) ? queue.areas : [];
   const renderInboxArea = (item) => {
     const preview = item.id === 'action-preview';
+    const nearMissCollapsed = item.id === 'near-miss' && area === 'inbox' && !showNearMisses && item.rows.length > 0;
     const heading = {
-      'action-preview': 'Needs Your Action', 'due-actions': 'Due actions',
+      'action-preview': 'Needs Your Action', 'auto-pursue': 'Pursuing automatically',
+      'your-review': 'Your review', 'needs-info': 'Needs info', 'near-miss': 'Near misses',
+      'due-actions': 'Due actions',
       'owner-priorities': 'Owner priorities', 'new-important': 'New & Important',
       updated: 'Updated since review', research: 'Research', 'all-active': 'All active',
     }[item.id] || 'Opportunities';
     return (
       <section aria-label={heading} className="mb-6 rounded-2xl border border-line bg-white" key={item.id}>
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-line/80 px-4 py-3">
-          <div><h3 className="text-lg font-semibold text-ink">{heading}</h3><p className="text-xs text-ink/58">{item.total} {item.total === 1 ? 'opportunity' : 'opportunities'}{preview ? ` · ${item.counts?.due || 0} due (${item.counts?.overdue || 0} overdue) · ${item.counts?.ownerPriority || 0} owner priorities (${item.counts?.urgent || 0} urgent)` : ''}</p></div>
-          <div className="flex flex-wrap gap-2">{preview ? <><button className={buttonClass} onClick={() => selectArea('due-actions')} type="button">View all due ({item.counts?.due || 0})</button><button className={buttonClass} onClick={() => selectArea('owner-priorities')} type="button">View all priorities ({item.counts?.ownerPriority || 0})</button></> : area === 'inbox' && item.id === 'new-important' ? <button className={buttonClass} onClick={() => selectArea('new-important')} type="button">View all New & Important</button> : <button className={buttonClass} onClick={() => selectArea('inbox')} type="button">Back to Inbox</button>}</div>
+          <div><div className="flex flex-wrap items-center gap-2"><h3 className="text-lg font-semibold text-ink">{heading}</h3>{item.id === 'auto-pursue' ? <AutoPursueModeBadge status={autoPursueStatus} /> : null}</div><p className="text-xs text-ink/58">{item.total} {item.total === 1 ? 'opportunity' : 'opportunities'}{preview ? ` · ${item.counts?.due || 0} due (${item.counts?.overdue || 0} overdue) · ${item.counts?.ownerPriority || 0} owner priorities (${item.counts?.urgent || 0} urgent)` : ''}</p></div>
+          <div className="flex flex-wrap gap-2">{preview ? <><button className={buttonClass} onClick={() => selectArea('due-actions')} type="button">View all due ({item.counts?.due || 0})</button><button className={buttonClass} onClick={() => selectArea('owner-priorities')} type="button">View all priorities ({item.counts?.ownerPriority || 0})</button></> : area === 'inbox' ? (item.id === 'new-important' ? <button className={buttonClass} onClick={() => selectArea('new-important')} type="button">View all New & Important</button> : null) : <button className={buttonClass} onClick={() => selectArea('inbox')} type="button">Back to Inbox</button>}</div>
         </div>
-        {item.rows.length === 0 ? <p className="p-4 text-sm text-ink/60">No opportunities in this area.</p> : preview
-          ? <ol aria-label="Action preview" className="divide-y divide-line/70">{item.rows.map((row) => <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-2" key={row.opportunityId}><div><button className="text-left text-sm font-semibold text-ink hover:text-moss" onClick={(event) => openDetail(row.opportunityId, event.currentTarget)} type="button">{row.name}</button><p className="text-xs text-ink/58">{row.freshness?.actionReason === 'broker_reply' ? 'Broker reply needs review' : row.freshness?.actionReason === 'materials_ready' ? 'Broker materials received' : row.freshness?.dueAction ? 'Due follow-up' : 'Owner priority'} · Fit {row.fitScore} · {formatLabel(row.operatorPriority)}</p></div><div className="flex flex-wrap items-center gap-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} />{!readOnly ? <ActionButtons disabled={Boolean(pendingId) || !actionsAllowed} name={row.name} onAction={(action, event) => action === 'pass' ? openQueuePass(row, event.currentTarget) : recordAction(row.opportunityId, action)} /> : null}</div></li>)}</ol>
-          : <ul aria-label={`${heading} opportunities`} className="divide-y divide-line/70">{item.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => action === 'pass' ? openQueuePass(row, event.currentTarget) : recordAction(row.opportunityId, action)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>}
+        {item.rows.length === 0 ? <p className="p-4 text-sm text-ink/60">No opportunities in this area.</p> : nearMissCollapsed
+          ? <div className="p-4"><button aria-expanded="false" className={buttonClass} onClick={() => setShowNearMisses(true)} type="button">Show near misses ({item.total})</button></div> : preview
+          ? <ol aria-label="Action preview" className="divide-y divide-line/70">{item.rows.map((row) => <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-2" key={row.opportunityId}><div><button className="text-left text-sm font-semibold text-ink hover:text-moss" onClick={(event) => openDetail(row.opportunityId, event.currentTarget)} type="button">{row.name}</button><p className="text-xs text-ink/58">{row.freshness?.actionReason === 'broker_reply' ? 'Broker reply needs review' : row.freshness?.actionReason === 'materials_ready' ? 'Broker materials received' : row.freshness?.dueAction ? 'Due follow-up' : 'Owner priority'} · Fit {row.fitScore} · {formatLabel(row.operatorPriority)}</p></div><div className="flex flex-wrap items-center gap-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} />{!readOnly ? <ActionButtons disabled={Boolean(pendingId) || !actionsAllowed} name={row.name} onAction={(action, event) => handleRowAction(row, action, event)} /> : null}</div></li>)}</ol>
+          : <ul aria-label={`${heading} opportunities`} className="divide-y divide-line/70">{item.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => handleRowAction(row, action, event)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} showNotAutomatic={item.id === 'your-review'} />)}</ul>}
+        {item.id === 'near-miss' && area === 'inbox' && showNearMisses && item.rows.length > 0 ? <div className="border-t border-line/80 px-4 py-3"><button aria-expanded="true" className={buttonClass} onClick={() => setShowNearMisses(false)} type="button">Hide near misses</button></div> : null}
         {area !== 'inbox' ? <div className="flex items-center justify-between border-t border-line/80 px-4 py-3"><button className={buttonClass} disabled={cursorHistory.length === 0 || loading} onClick={() => { setAreaCursor(cursorHistory.at(-1) || ''); setCursorHistory((current) => current.slice(0, -1)); }} type="button">Previous page</button><span className="text-xs text-ink/58">{item.total} total</span><button className={buttonClass} disabled={!item.nextCursor || loading} onClick={() => { setCursorHistory((current) => [...current, areaCursor]); setAreaCursor(item.nextCursor); }} type="button">Next page</button></div> : null}
       </section>
     );
@@ -1215,7 +1275,9 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         </header>
 
         <nav aria-label="Fresh Inbox areas" className="flex flex-wrap gap-2 border-b border-line/80 px-4 py-3 sm:px-5">{[
-          ['inbox', 'Default Inbox'], ['new-important', 'New & Important'], ['updated', 'Updated since review'],
+          ['inbox', 'Default Inbox'], ['auto-pursue', 'Pursuing automatically'], ['your-review', 'Your review'],
+          ['needs-info', 'Needs info'], ['near-miss', 'Near misses'],
+          ['new-important', 'New & Important'], ['updated', 'Updated since review'],
           ['research', 'Research'], ['all-active', 'All active'],
         ].map(([id, label]) => <button aria-current={view === 'inbox' && area === id ? 'page' : undefined} className={buttonClass} key={id} onClick={() => selectArea(id)} type="button">{label}</button>)}</nav>
 
@@ -1237,13 +1299,14 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           {mutationError && !selectedId && !passTarget ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{mutationError}</p> : null}
           {queueIsLastKnown ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50/70 p-3 text-sm font-semibold text-red-900">Last known queue — persisted rows are retained for reference, but current required-source authority is unavailable.</p> : null}
           {loading && queue.rows.length === 0 ? <p className="text-sm text-ink/62">Loading current opportunities…</p> : null}
-          {view === 'inbox' ? inboxAreas.map(renderInboxArea) : <>{!loading && !queueError && queue.rows.length === 0 ? <p className="rounded-xl border border-line bg-fog/60 p-4 text-sm text-ink/68">No opportunities in this view.</p> : null}<ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => action === 'pass' ? openQueuePass(row, event.currentTarget) : recordAction(row.opportunityId, action)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>{queue.totalPages > 1 ? <div className="mt-4 flex items-center justify-between"><button aria-label="Previous page" className={buttonClass} disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))} type="button"><ChevronLeft className="h-4 w-4" />Previous</button><p className="text-xs font-semibold text-ink/58">Page {queue.page || page} of {queue.totalPages}</p><button aria-label="Next page" className={buttonClass} disabled={page >= queue.totalPages || loading} onClick={() => setPage((current) => current + 1)} type="button">Next<ChevronRight className="h-4 w-4" /></button></div> : null}</>}
+          {view === 'inbox' ? inboxAreas.map(renderInboxArea) : <>{!loading && !queueError && queue.rows.length === 0 ? <p className="rounded-xl border border-line bg-fog/60 p-4 text-sm text-ink/68">No opportunities in this view.</p> : null}<ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => handleRowAction(row, action, event)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>{queue.totalPages > 1 ? <div className="mt-4 flex items-center justify-between"><button aria-label="Previous page" className={buttonClass} disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))} type="button"><ChevronLeft className="h-4 w-4" />Previous</button><p className="text-xs font-semibold text-ink/58">Page {queue.page || page} of {queue.totalPages}</p><button aria-label="Next page" className={buttonClass} disabled={page >= queue.totalPages || loading} onClick={() => setPage((current) => current + 1)} type="button">Next<ChevronRight className="h-4 w-4" /></button></div> : null}</>}
           {readOnly ? <p className="mt-4 text-sm font-semibold text-ink/62">Read-only access: decisions and verified-fact edits are unavailable.</p> : null}
         </div>
         <MorningBriefing actionsAllowed={actionsAllowed} digest={dailyDigest} error={queueError} loading={loading} onAction={(row, _action, event) => openDetail(row.opportunityId, event.currentTarget)} onOpen={(row, event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} />
       </div>
 
       {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly || detail.data?.archivedReadOnly === true} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onClose={closeDetail} onRestore={hasMatchingDetail ? () => restoreOpportunity(loadedDetailId) : undefined} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed || detail.data?.archivedReadOnly === true} /> : null}
+      {nearMissTarget ? <NearMissConfirmDialog name={nearMissTarget.row.name} onCancel={closeNearMissConfirm} onConfirm={confirmNearMiss} pending={pendingId === nearMissTarget.row.opportunityId} row={nearMissTarget.row} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );
