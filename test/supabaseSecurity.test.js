@@ -531,6 +531,25 @@ test('Supabase migration and fresh schema isolate every current app table to the
     bestFirstDealListMigration,
     /grant select, insert on table public\.deal_hunter_auto_pursue_decision_evidence to service_role;/i,
   );
+  for (const table of ['deal_hunter_auto_pursue_activations', 'deal_hunter_auto_pursue_runs']) {
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`alter table public\\.${table} enable row level security;`, 'i'));
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`revoke all on table public\\.${table}\\s+from public, anon, authenticated, service_role;`, 'i'));
+  }
+  // Activations are written only through the superseding RPC; service_role may read them.
+  assert.match(bestFirstDealListMigration,
+    /grant select on table public\.deal_hunter_auto_pursue_activations to service_role;/i);
+  assert.doesNotMatch(bestFirstDealListMigration,
+    /grant [^;]*(insert|update|delete)[^;]* on table public\.deal_hunter_auto_pursue_activations/i);
+  assert.match(bestFirstDealListMigration,
+    /grant select, insert, update on table public\.deal_hunter_auto_pursue_runs to service_role;/i);
+  for (const fn of ['create_deal_hunter_auto_pursue_activation_v1', 'set_deal_hunter_auto_pursue_blockers_v1']) {
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`revoke all on function public\\.${fn}\\(jsonb\\)\\s+from public, anon, authenticated;`, 'i'));
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`grant execute on function public\\.${fn}\\(jsonb\\) to service_role;`, 'i'));
+  }
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactWriteBoundaryMigration, /create\s+policy/i, 'opportunity fact write boundary must not add public RLS policies');

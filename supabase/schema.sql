@@ -20550,3 +20550,130 @@ alter table public.deal_hunter_auto_pursue_decision_evidence enable row level se
 revoke all on table public.deal_hunter_auto_pursue_decision_evidence
   from public, anon, authenticated, service_role;
 grant select, insert on table public.deal_hunter_auto_pursue_decision_evidence to service_role;
+
+-- Best-first deal list, Task 5: automatic Pursue activation, runs, and blockers.
+create table if not exists public.deal_hunter_auto_pursue_activations (
+  id text primary key check (id = btrim(id) and char_length(id) between 1 and 120),
+  mode text not null check (mode in ('off', 'shadow', 'canary', 'active')),
+  daily_cap integer not null check (daily_cap between 0 and 10),
+  actor text not null check (actor = btrim(actor) and char_length(actor) between 1 and 160),
+  reason text not null default '' check (char_length(reason) <= 500),
+  confirmation text not null,
+  status text not null check (status in ('current', 'superseded')),
+  created_at timestamptz not null,
+  superseded_at timestamptz,
+  constraint deal_hunter_auto_pursue_activations_mode_cap check (
+    (mode in ('off', 'shadow') and daily_cap = 0)
+    or (mode = 'canary' and daily_cap = 1)
+    or (mode = 'active' and daily_cap between 1 and 10)),
+  constraint deal_hunter_auto_pursue_activations_confirmation check (confirmation = case mode
+    when 'off' then 'SET AUTO PURSUE OFF'
+    when 'shadow' then 'ACTIVATE AUTO PURSUE SHADOW'
+    when 'canary' then 'ACTIVATE AUTO PURSUE CANARY'
+    when 'active' then 'ACTIVATE AUTO PURSUE ACTIVE' end)
+);
+create unique index if not exists idx_auto_pursue_activations_current
+  on public.deal_hunter_auto_pursue_activations (status) where status = 'current';
+
+create table if not exists public.deal_hunter_auto_pursue_runs (
+  id text primary key check (id = btrim(id) and char_length(id) between 1 and 120),
+  run_key text not null unique check (char_length(run_key) between 1 and 200),
+  business_date text not null check (business_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
+  mode text not null check (mode in ('off', 'shadow', 'canary', 'active')),
+  status text not null check (status in ('running', 'completed', 'failed')),
+  triggered_by text not null default '' check (char_length(triggered_by) <= 120),
+  commands integer not null default 0 check (commands between 0 and 10),
+  items jsonb not null default '[]'::jsonb check (jsonb_typeof(items) = 'array'),
+  reason text check (reason is null or char_length(reason) <= 120),
+  created_at timestamptz not null,
+  completed_at timestamptz
+);
+create index if not exists idx_auto_pursue_runs_business_date
+  on public.deal_hunter_auto_pursue_runs (business_date, created_at);
+
+alter table public.deal_hunter_auto_pursue_activations enable row level security;
+alter table public.deal_hunter_auto_pursue_runs enable row level security;
+revoke all on table public.deal_hunter_auto_pursue_activations
+  from public, anon, authenticated, service_role;
+revoke all on table public.deal_hunter_auto_pursue_runs
+  from public, anon, authenticated, service_role;
+grant select on table public.deal_hunter_auto_pursue_activations to service_role;
+grant select, insert, update on table public.deal_hunter_auto_pursue_runs to service_role;
+
+-- The only activation writer: supersedes the current row and inserts the new one
+-- in one transaction, serialized so two concurrent mode changes cannot both win.
+create or replace function public.create_deal_hunter_auto_pursue_activation_v1(p_activation jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_row public.deal_hunter_auto_pursue_activations%rowtype;
+  v_created_at timestamptz;
+begin
+  if p_activation is null or pg_catalog.jsonb_typeof(p_activation) <> 'object'
+    or pg_catalog.jsonb_typeof(p_activation -> 'daily_cap') <> 'number'
+    or p_activation ->> 'created_at' is null
+  then
+    raise exception 'Invalid automatic Pursue activation';
+  end if;
+  v_created_at := (p_activation ->> 'created_at')::timestamptz;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('deal_hunter_auto_pursue_activation'));
+  update public.deal_hunter_auto_pursue_activations
+    set status = 'superseded', superseded_at = v_created_at
+    where status = 'current';
+  insert into public.deal_hunter_auto_pursue_activations
+    (id, mode, daily_cap, actor, reason, confirmation, status, created_at, superseded_at)
+  values (p_activation ->> 'id', p_activation ->> 'mode', (p_activation ->> 'daily_cap')::integer,
+    p_activation ->> 'actor', coalesce(p_activation ->> 'reason', ''), p_activation ->> 'confirmation',
+    'current', v_created_at, null)
+  returning * into v_row;
+  return pg_catalog.to_jsonb(v_row);
+end;
+$$;
+revoke all on function public.create_deal_hunter_auto_pursue_activation_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.create_deal_hunter_auto_pursue_activation_v1(jsonb) to service_role;
+
+-- The only writer of the runner-owned score columns. Rows whose blocker is
+-- unchanged are left alone: the blocker is part of the inbox cursor revision.
+create or replace function public.set_deal_hunter_auto_pursue_blockers_v1(p_entries jsonb)
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_changed integer;
+begin
+  if p_entries is null or pg_catalog.jsonb_typeof(p_entries) <> 'array'
+    or pg_catalog.jsonb_array_length(p_entries) > 10000
+    or exists (
+      select 1 from pg_catalog.jsonb_array_elements(p_entries) as entry
+      where pg_catalog.jsonb_typeof(entry) <> 'object'
+        or coalesce(entry ->> 'opportunity_id', '') = ''
+        or pg_catalog.jsonb_typeof(entry -> 'blocker') not in ('string', 'null')
+        or (entry ->> 'blocker' is not null and entry ->> 'blocker' !~ '^[a-z_]{1,80}$')
+        or coalesce(entry ->> 'checked_at', '') = '')
+  then
+    raise exception 'Invalid automatic Pursue blocker entries';
+  end if;
+  update public.deal_hunter_opportunity_scores as scores
+    set auto_pursue_blocker = entry.blocker, auto_pursue_checked_at = entry.checked_at
+    from (
+      select distinct on (value ->> 'opportunity_id')
+        value ->> 'opportunity_id' as opportunity_id,
+        value ->> 'blocker' as blocker,
+        value ->> 'checked_at' as checked_at
+      from pg_catalog.jsonb_array_elements(p_entries)
+    ) as entry
+    where scores.opportunity_id = entry.opportunity_id
+      and scores.auto_pursue_blocker is distinct from entry.blocker;
+  get diagnostics v_changed = row_count;
+  return v_changed;
+end;
+$$;
+revoke all on function public.set_deal_hunter_auto_pursue_blockers_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.set_deal_hunter_auto_pursue_blockers_v1(jsonb) to service_role;

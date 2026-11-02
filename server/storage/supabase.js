@@ -3859,6 +3859,119 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return rows.map((row) => ({ ...row, recipient_unchanged: row.recipient_unchanged ? 1 : 0 }));
     },
 
+    /** Authoritative count of recorded owner decisions under one policy in [since, until). */
+    async countOwnerDecisionsByPolicy({ policyVersion, since, until } = {}) {
+      const policy = String(policyVersion || '');
+      if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+        throw new Error('countOwnerDecisionsByPolicy requires a policy version and an instant range.');
+      }
+      const { count, error } = await client
+        .from('deal_hunter_owner_decision_events')
+        .select('id', { count: 'exact', head: true })
+        .eq('policy_version', policy)
+        .gte('created_at', new Date(since).toISOString())
+        .lt('created_at', new Date(until).toISOString());
+      if (error) throw error;
+      if (!Number.isSafeInteger(count) || count < 0) throw new Error('Owner decision count is unavailable.');
+      return count;
+    },
+
+    /** True when any Pursue campaign conversation already targets this recipient address. */
+    async hasPursueCimConversationForRecipient(recipientEmail) {
+      const address = String(recipientEmail || '').trim().toLowerCase();
+      if (!address) throw new Error('A recipient address is required.');
+      const { data, error } = await client.from('deal_hunter_broker_conversations')
+        .select('id').eq('recipient_address', address).limit(1);
+      if (error) throw error;
+      return Array.isArray(data) && data.length > 0;
+    },
+
+    async getCurrentAutoPursueActivation() {
+      const { data, error } = await client.from('deal_hunter_auto_pursue_activations')
+        .select('*').eq('status', 'current').maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
+    /** Records a new current activation; the RPC supersedes the prior one in one transaction. */
+    async createAutoPursueActivation(activation = {}) {
+      const { data, error } = await client.rpc('create_deal_hunter_auto_pursue_activation_v1', {
+        p_activation: {
+          id: String(activation.id || randomUUID()),
+          mode: String(activation.mode || ''),
+          daily_cap: Number(activation.daily_cap),
+          actor: String(activation.actor || ''),
+          reason: String(activation.reason || ''),
+          confirmation: String(activation.confirmation || ''),
+          created_at: String(activation.created_at || new Date().toISOString()),
+        },
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || data.status !== 'current') {
+        throw new Error('Malformed automatic Pursue activation result');
+      }
+      return data;
+    },
+
+    /** Exclusive claim of a run key; a second claim of the same key returns claimed false. */
+    async claimAutoPursueRun(run = {}) {
+      const runKey = String(run.run_key || '');
+      const { data, error } = await client.from('deal_hunter_auto_pursue_runs').insert({
+        id: String(run.id || randomUUID()), run_key: runKey,
+        business_date: String(run.business_date || ''), mode: String(run.mode || ''),
+        status: 'running', triggered_by: String(run.triggered_by || ''), commands: 0, items: [],
+        created_at: String(run.created_at || new Date().toISOString()),
+      }).select('*').single();
+      if (!error) return { claimed: true, run: data };
+      if (!isUniqueViolation(error)) throw error;
+      const existing = await client.from('deal_hunter_auto_pursue_runs').select('*')
+        .eq('run_key', runKey).maybeSingle();
+      if (existing.error) throw existing.error;
+      return { claimed: false, run: existing.data ?? null };
+    },
+
+    async completeAutoPursueRun({ id, status = 'completed', commands = 0, items = [], reason = null,
+      completedAt } = {}) {
+      const { data, error } = await client.from('deal_hunter_auto_pursue_runs').update({
+        status: String(status), commands: Math.max(0, Math.trunc(Number(commands)) || 0),
+        items: Array.isArray(items) ? items : [],
+        reason: reason === null || reason === undefined ? null : String(reason),
+        completed_at: String(completedAt || new Date().toISOString()),
+      }).eq('id', String(id || '')).is('completed_at', null).select('*').maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
+    /** Runs newest first; one business date when given. */
+    async listAutoPursueRuns({ businessDate, limit = 100 } = {}) {
+      let query = client.from('deal_hunter_auto_pursue_runs').select('*');
+      if (businessDate) query = query.eq('business_date', String(businessDate));
+      const { data, error } = await query
+        .order('created_at', { ascending: false })
+        .order('completed_at', { ascending: false, nullsFirst: true })
+        .order('id', { ascending: false })
+        .limit(Math.max(1, Math.min(Math.trunc(Number(limit)) || 100, 1000)));
+      if (error) throw error;
+      return (data || []).map((row) => ({ ...row, commands: Number(row.commands || 0),
+        items: Array.isArray(row.items) ? row.items : [] }));
+    },
+
+    /** The only writer of the runner-owned blocker columns; returns the number of rows changed. */
+    async setDealHunterAutoPursueBlockers(entries = []) {
+      if (!Array.isArray(entries)) throw new Error('Blocker entries must be an array.');
+      const { data, error } = await client.rpc('set_deal_hunter_auto_pursue_blockers_v1', {
+        p_entries: entries.map((entry) => ({
+          opportunity_id: String(entry.opportunityId || ''),
+          blocker: entry.blocker ? String(entry.blocker) : null,
+          checked_at: String(entry.checkedAt || new Date().toISOString()),
+        })),
+      });
+      if (error) throw error;
+      const changed = typeof data === 'string' ? Number(data) : data;
+      if (!Number.isSafeInteger(changed) || changed < 0) throw new Error('Malformed blocker write result');
+      return changed;
+    },
+
     async getCurrentDealHunterOpportunityScore(opportunityId) {
       const { data, error } = await client
         .from('deal_hunter_opportunity_scores')
