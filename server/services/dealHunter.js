@@ -9245,6 +9245,18 @@ export function cimStage2DailyLimit(mode, policy) {
     : policy.caps.canaryDailyInitials;
 }
 
+// Up to 500 Stage 2 candidates each read the Pursue projection; bound how many run at once.
+export const STAGE2_PROJECTION_READ_CONCURRENCY = 10;
+
+/** Maps `items` in sequential chunks of `size` concurrent calls, preserving order. */
+export async function mapInChunks(items, size, mapper) {
+  const results = [];
+  for (let start = 0; start < items.length; start += size) {
+    results.push(...await Promise.all(items.slice(start, start + size).map(mapper)));
+  }
+  return results;
+}
+
 export async function runCimStage2Automation({
   mode = 'shadow', triggeredBy = 'admin', now = new Date(), storage = getStorage(),
 } = {}) {
@@ -9312,10 +9324,10 @@ export async function runCimStage2Automation({
     const [suppressions, opportunityClaims, pursueOwnerships] = await Promise.all([
       Promise.all(consideredDeals.map((deal) => storage.getActiveEmailSuppression?.(deal.brokerEmail) || null)),
       Promise.all(consideredDeals.map((deal) => storage.getDealHunterCimOpportunityClaim?.(deal.opportunityId) || null)),
-      Promise.all(consideredDeals.map(async (deal) => ({
+      mapInChunks(consideredDeals, STAGE2_PROJECTION_READ_CONCURRENCY, async (deal) => ({
         opportunityId: deal.opportunityId,
         ...await readPursueOwnership({ storage, opportunityId: deal.opportunityId }),
-      }))),
+      })),
     ]);
     const evaluated = evaluateCimAutomationCandidates({
       review,

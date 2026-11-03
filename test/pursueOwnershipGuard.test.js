@@ -484,6 +484,24 @@ test('Stage 2 skips a pursued candidate', async (t) => {
   assert.equal(providerCalls.length, 0);
 });
 
+test('Stage 2 projection reads run at most ten at a time and keep their order', async () => {
+  const { mapInChunks, STAGE2_PROJECTION_READ_CONCURRENCY } = await import('../server/services/dealHunter.js');
+  assert.equal(STAGE2_PROJECTION_READ_CONCURRENCY, 10);
+  let inFlight = 0;
+  let peak = 0;
+  const items = Array.from({ length: 37 }, (_, index) => index);
+  const results = await mapInChunks(items, STAGE2_PROJECTION_READ_CONCURRENCY, async (item) => {
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    inFlight -= 1;
+    return item * 2;
+  });
+  assert.equal(peak, 10);
+  assert.deepEqual(results, items.map((item) => item * 2));
+  assert.deepEqual(await mapInChunks([], 10, async () => 1), []);
+});
+
 test('Stage 2 does not add a Pursue reason for an unpursued candidate', async (t) => {
   const { storage } = testStorage(t);
   const { runCimStage2Automation } = await import('../server/services/dealHunter.js');
