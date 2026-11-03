@@ -998,19 +998,60 @@ test('Supabase adapter: the prior-conversation check is a case-insensitive exact
   await assert.rejects(storage.hasPursueCimConversationForRecipient('  '));
 });
 
-test('canary run without currentFingerprints blocks every auto row with criteria_stale', async () => {
-  const storage = await readyStorage('canary');
-  await seedAuto(storage, 'opp-fp-none-a');
-  await seedAuto(storage, 'opp-fp-none-b');
-  for (const currentFingerprints of [null, undefined]) {
-    const offsetMs = currentFingerprints === null ? 0 : 1000;
-    const result = await runAutoPursueRaw({ storage, currentFingerprints, now: new Date(Date.now() + offsetMs) });
-    assert.equal(result.commands, 0);
-    assert.equal(reasonFor(result, 'opp-fp-none-a'), 'criteria_stale');
-    assert.equal(reasonFor(result, 'opp-fp-none-b'), 'criteria_stale');
+async function areaIds(storage, area) {
+  const result = await storage.listDealHunterFreshInbox({ area, limit: 100, asOf: new Date().toISOString() });
+  const section = (result?.areas || []).find((item) => item.id === area);
+  return (section?.rows || []).map((row) => String(row.opportunity_id)).sort();
+}
+
+test('shadow and canary runs without a fingerprint map skip as fingerprints_unavailable and evaluate no rows', async () => {
+  for (const mode of ['shadow', 'canary', 'active']) {
+    const storage = await readyStorage(mode, mode === 'active' ? { dailyCap: 3 } : undefined);
+    const ids = [`opp-fp-none-${mode}-a`, `opp-fp-none-${mode}-b`];
+    for (const id of ids) await seedAuto(storage, id);
+    const writes = [];
+    const original = storage.setDealHunterAutoPursueBlockers;
+    storage.setDealHunterAutoPursueBlockers = async (entries) => { writes.push(entries); return original(entries); };
+    const areasBefore = await areaIds(storage, 'auto-pursue');
+    assert.deepEqual(areasBefore, ids);
+    let offsetMs = 0;
+    for (const currentFingerprints of [null, undefined, 'not-a-map']) {
+      offsetMs += 1000;
+      const result = await runAutoPursueRaw({ storage, currentFingerprints, now: new Date(Date.now() + offsetMs) });
+      assert.equal(result.ok, true, mode);
+      assert.equal(result.status, 200, mode);
+      assert.equal(result.reason, 'fingerprints_unavailable', mode);
+      assert.equal(result.commands, 0, mode);
+      assert.deepEqual(result.skipped, [], mode);
+      assert.deepEqual(result.wouldPursue, [], mode);
+    }
+    assert.equal(writes.length, 0, `${mode}: no blocker writes`);
+    for (const id of ids) assert.equal((await scoreRow(storage, id)).auto_pursue_blocker ?? null, null, id);
+    assert.deepEqual(await areaIds(storage, 'auto-pursue'), ids, `${mode}: inbox areas unchanged`);
+    assert.deepEqual(await areaIds(storage, 'your-review'), [], `${mode}: nothing moved to review`);
+    assert.equal(await autoDecisions(storage), 0);
+    const runs = await storage.listAutoPursueRuns({ limit: 10 });
+    assert.equal(runs.length, 3, mode);
+    for (const run of runs) {
+      assert.equal(run.status, 'completed', mode);
+      assert.ok(run.completed_at, mode);
+      assert.equal(run.reason, 'fingerprints_unavailable', mode);
+      assert.deepEqual(run.items, [], mode);
+    }
   }
-  assert.equal((await scoreRow(storage, 'opp-fp-none-a')).auto_pursue_blocker, 'criteria_stale');
-  assert.equal(await autoDecisions(storage), 0);
+});
+
+test('a cron run without fingerprints does not stop a same-day sheet-sync run from Pursuing in canary', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-fp-cron-first');
+  const cron = await runAutoPursueRaw({ storage, triggeredBy: 'cron', currentFingerprints: null });
+  assert.equal(cron.reason, 'fingerprints_unavailable');
+  const sync = await runAutoPursueRaw({ storage, triggeredBy: 'sheet-sync',
+    currentFingerprints: { 'opp-fp-cron-first': 'fp-opp-fp-cron-first' }, now: new Date(Date.now() + 1000) });
+  assert.equal(sync.commands, 1);
+  assert.equal(reasonFor(sync, 'opp-fp-cron-first'), undefined, 'no blocked_earlier_today');
+  assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-fp-cron-first' })).decision.actor,
+    'automation-auto-pursue');
 });
 
 test('canary run with matching fingerprint Pursues the row', async () => {

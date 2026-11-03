@@ -334,6 +334,11 @@ export function autoPursueCriteriaStale(row = {}) {
   return current.failed.length > 0;
 }
 
+/** True when the caller supplied a fingerprint map (possibly empty) from a refresh just run. */
+function fingerprintMapSupplied(currentFingerprints) {
+  return Boolean(currentFingerprints) && typeof currentFingerprints === 'object' && !Array.isArray(currentFingerprints);
+}
+
 /**
  * True when a refresh just run confirms the stored score still describes the deal as built
  * from live sources now. The fingerprint cannot be recomputed from stored rows, so a missing
@@ -496,6 +501,13 @@ export async function runAutoPursue({
     items.push({ opportunityId, outcome, reason: why });
   };
   try {
+    // Without a refresh's fingerprints no row can be confirmed current, so an automatic
+    // decision is impossible. Evaluate nothing: per-row criteria_stale blockers here would
+    // stop that day's sheet-sync run (blocked_earlier_today) and move auto rows to review.
+    if (mode !== 'off' && !fingerprintMapSupplied(currentFingerprints)) {
+      reason = 'fingerprints_unavailable';
+      return { ok: true, status: 200, mode, ...base, runKey, reason };
+    }
     let candidates;
     let identityExceptions;
     try {
