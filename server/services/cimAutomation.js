@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import { PURSUE_OWNERSHIP_REFUSAL_MESSAGE } from './pursueOwnership.js';
 import {
   getCimIdentityOperationsStatus,
   logicalCimTouchesForRecipient,
@@ -878,7 +879,7 @@ export function assessCimStage2StaticCandidate(deal = {}, { policy = getCimStage
 
 export function evaluateCimAutomationCandidates({
   review = {}, scoredDeals = [], status = {}, requests = [], events = [], suppressions = [],
-  recipientClaims = [], opportunityClaims = [], now = new Date(),
+  recipientClaims = [], opportunityClaims = [], pursueOwnerships = [], now = new Date(),
 } = {}) {
   const policy = status.policy?.policyHash ? status.policy : getCimStage2Policy();
   const latestDecision = status.metrics?.latestHumanByDeal instanceof Map ? status.metrics.latestHumanByDeal : new Map();
@@ -899,6 +900,9 @@ export function evaluateCimAutomationCandidates({
   const suppressionSet = new Set(suppressions.map((item) => normalizeEmail(item.normalized_email || item.email)).filter(Boolean));
   const recipientClaimSet = new Set(recipientClaims.map((item) => normalizeEmail(item.recipient_email)).filter(Boolean));
   const opportunityClaimSet = new Set(opportunityClaims.map((item) => normalizeText(item.opportunity_id, 160)).filter(Boolean));
+  const pursueOwnershipByOpportunity = new Map(pursueOwnerships
+    .filter((item) => item?.owned && item.reason)
+    .map((item) => [normalizeText(item.opportunityId, 160), item.reason]));
   const exceptions = [];
   const eligible = [];
   const nowMs = now.getTime();
@@ -926,6 +930,9 @@ export function evaluateCimAutomationCandidates({
     if (touches30Days >= policy.caps.recipient30Days) reasons.push(reason('recipient_30_day_cap', 'The rolling 30-day logical-touch cap is reached.'));
     if (recipientClaimSet.has(email)) reasons.push(reason('recipient_claim_pending', 'Another recipient transmission claim is pending.'));
     if (opportunityClaimSet.has(opportunityId)) reasons.push(reason('opportunity_claim_pending', 'Another canonical opportunity claim is pending.'));
+    if (pursueOwnershipByOpportunity.has(opportunityId)) {
+      reasons.push(reason(pursueOwnershipByOpportunity.get(opportunityId), PURSUE_OWNERSHIP_REFUSAL_MESSAGE));
+    }
     if (suppressionSet.has(email) || adverse) reasons.push(reason('recipient_suppressed', 'The recipient has a suppression or adverse delivery state.'));
     if (replied) reasons.push(reason('reply_state_ambiguous', 'The opportunity has a reply and requires human review.'));
     if ((latestOpportunityDecision.get(opportunityId) || latestDecision.get(deal.dealKey))?.decision === 'rejected') {
