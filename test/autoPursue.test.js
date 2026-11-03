@@ -252,6 +252,23 @@ test('canary records at most one pursue per business date across reruns', async 
   assert.equal(status.latestRun.commands, 0);
 });
 
+test('status falls back to the opportunity id when a name lookup fails, but a failed decision list fails closed', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-name-fallback');
+  const now = new Date();
+  assert.equal((await runAutoPursue({ storage, now })).commands, 1);
+  const original = storage.getDealHunterOpportunity;
+  storage.getDealHunterOpportunity = async () => { throw new Error('opportunity read failed'); };
+  const status = await getAutoPursueStatus({ storage, now });
+  assert.deepEqual(status.todayPursued, [{ opportunityId: 'opp-name-fallback', name: 'opp-name-fallback' }]);
+  assert.equal(status.todayCommands, 1);
+  storage.getDealHunterOpportunity = original;
+  assert.deepEqual((await getAutoPursueStatus({ storage, now })).todayPursued,
+    [{ opportunityId: 'opp-name-fallback', name: 'Deal opp-name-fallback' }]);
+  storage.listOwnerDecisionsByPolicy = async () => { throw new Error('decision list failed'); };
+  await assert.rejects(getAutoPursueStatus({ storage, now }), /decision list failed/);
+});
+
 test('automatic Pursue uses the automation actor, the policy version, and the single recipient', async () => {
   const storage = await readyStorage('canary');
   await seedAuto(storage, 'opp-actor');

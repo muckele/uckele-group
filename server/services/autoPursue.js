@@ -183,7 +183,13 @@ async function listTodayPursued(storage, businessDate) {
   });
   return Promise.all((Array.isArray(decisions) ? decisions : []).slice(0, TODAY_PURSUED_LIMIT).map(async (decision) => {
     const opportunityId = String(decision.opportunity_id);
-    const opportunity = await storage.getDealHunterOpportunity(opportunityId);
+    // The name is display only: a failed lookup shows the id rather than failing the status.
+    let opportunity = null;
+    try {
+      opportunity = await storage.getDealHunterOpportunity(opportunityId);
+    } catch {
+      opportunity = null;
+    }
     return { opportunityId, name: String(opportunity?.canonical_name || '').trim() || opportunityId };
   }));
 }
