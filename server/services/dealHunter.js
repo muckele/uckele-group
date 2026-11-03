@@ -10065,10 +10065,18 @@ async function sendCimRequestForScoredDeal({
     // Re-check after the legacy opportunity claim and before any request row or
     // provider work: a Pursue decision that landed after the pre-check refuses
     // here, and a later Pursue send sees this claim and refuses on its side.
-    // Like the other post-claim refusals, the recipient claim and locks are
-    // released in `finally`.
+    // On refusal the just-taken opportunity claim is released so Pursue can
+    // proceed; the recipient claim and locks are released in `finally`.
     const postClaimPursueOwnership = await readPursueOwnership({ storage, opportunityId: deal.opportunityId });
     if (postClaimPursueOwnership.owned) {
+      try {
+        await storage.releaseDealHunterCimOpportunityClaim?.({
+          opportunityId: deal.opportunityId,
+          requestId: pendingRecord.id,
+        });
+      } catch (error) {
+        console.warn(`[deal-hunter] CIM opportunity claim release after Pursue refusal failed: ${normalizeText(error?.message, 300)}`);
+      }
       return pursueOwnershipRefusal(postClaimPursueOwnership.reason, {
         deal: publicDeal(attachCimRequestStatus([deal], dealRequests)[0]),
       });

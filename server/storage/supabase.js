@@ -4736,6 +4736,20 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return { claimed: Boolean(data?.claimed), reason: data?.reason || '', claim: data?.claim || null };
     },
 
+    async releaseDealHunterCimOpportunityClaim({ opportunityId = '', requestId = '' } = {}) {
+      if (!opportunityId || !requestId) return { released: false };
+      // Only an exact claim that never produced a request row can be released:
+      // a claim backing durable legacy history stays in place.
+      const { data: requestRows, error: requestError } = await client.from('deal_hunter_cim_requests')
+        .select('id').eq('id', requestId).limit(1);
+      if (requestError) throw requestError;
+      if ((requestRows || []).length > 0) return { released: false };
+      const { data, error } = await client.from('deal_hunter_cim_opportunity_claims').delete()
+        .eq('opportunity_id', opportunityId).eq('request_id', requestId).select('opportunity_id');
+      if (error) throw error;
+      return { released: (data || []).length > 0 };
+    },
+
     async getDealHunterCimOpportunityClaim(opportunityId) {
       if (!opportunityId) return null;
       const { data, error } = await client.from('deal_hunter_cim_opportunity_claims').select('*')

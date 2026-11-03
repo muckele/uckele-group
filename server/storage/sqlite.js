@@ -14282,6 +14282,21 @@ export function createSqliteStorage(config, options = {}) {
       return transaction.immediate();
     },
 
+    async releaseDealHunterCimOpportunityClaim({ opportunityId = '', requestId = '' } = {}) {
+      if (!opportunityId || !requestId) return { released: false };
+      // Only an exact claim that never produced a request row can be released:
+      // a claim backing durable legacy history stays in place.
+      return database.transaction(() => {
+        if (database.prepare('SELECT 1 FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(requestId)) {
+          return { released: false };
+        }
+        const changes = database.prepare(`
+          DELETE FROM deal_hunter_cim_opportunity_claims WHERE opportunity_id = ? AND request_id = ?
+        `).run(opportunityId, requestId).changes;
+        return { released: changes > 0 };
+      }).immediate();
+    },
+
     async getDealHunterCimOpportunityClaim(opportunityId) {
       if (!opportunityId) return null;
       const row = database.prepare(`SELECT * FROM deal_hunter_cim_opportunity_claims WHERE opportunity_id = ? LIMIT 1`).get(opportunityId);

@@ -99,6 +99,23 @@ function recordOwnerDecisionRow(sqlitePath, opportunityId, action = 'pursue') {
   }
 }
 
+// Mirrors the legacy-evidence half of Pursue's lifecycle_conflict check
+// (pursueCimSqliteTransitions.js priorRequest/priorClaim), which is internal SQL.
+function pursueLifecycleLegacyEvidence(sqlitePath, opportunityId) {
+  const database = new Database(sqlitePath, { readonly: true });
+  try {
+    const priorRequest = database.prepare(`SELECT 1 FROM deal_hunter_cim_requests
+      WHERE opportunity_id = ? OR deal_key IN (SELECT deal_key
+        FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?) LIMIT 1`)
+      .get(opportunityId, opportunityId);
+    const priorClaim = database.prepare(`SELECT 1 FROM deal_hunter_cim_opportunity_claims
+      WHERE opportunity_id = ? LIMIT 1`).get(opportunityId);
+    return { priorRequest: Boolean(priorRequest), priorClaim: Boolean(priorClaim) };
+  } finally {
+    database.close();
+  }
+}
+
 const followUpSettings = {
   enabled: true,
   firstDelayHours: 1,
@@ -513,4 +530,76 @@ test('race: Pursue decision recorded after legacy pre-checks but before claim is
     'no outbound communication was prepared');
   assert.equal(await storage.getDealHunterCimRecipientClaim(claimed.command.recipientEmail), null,
     'the durable recipient claim is released');
+  assert.equal(await storage.getDealHunterCimOpportunityClaim(deal.opportunityId), null,
+    'the legacy opportunity claim taken in the race is released');
+  assert.deepEqual(pursueLifecycleLegacyEvidence(sqlitePath, deal.opportunityId), { priorRequest: false, priorClaim: false },
+    'Pursue\'s lifecycle_conflict check no longer sees any legacy request or claim');
+});
+
+test('race refusal still refuses when releasing the legacy opportunity claim fails', async (t) => {
+  const { storage, sqlitePath } = testStorage(t);
+  const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  const deal = await reviewedDeal(storage);
+  const claimDealHunterCimOpportunity = storage.claimDealHunterCimOpportunity.bind(storage);
+  storage.claimDealHunterCimOpportunity = async (command) => {
+    const result = await claimDealHunterCimOpportunity(command);
+    recordOwnerDecisionRow(sqlitePath, command.opportunityId, 'pursue');
+    return result;
+  };
+  let releaseAttempts = 0;
+  storage.releaseDealHunterCimOpportunityClaim = async () => {
+    releaseAttempts += 1;
+    throw new Error('release storage offline');
+  };
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (message) => warnings.push(String(message));
+  let result;
+  try {
+    result = await sendDealHunterCimRequest({
+      dealKey: deal.dealKey,
+      snapshotToken: deal.cimRequest.snapshotToken,
+      requestedBy: 'race-release-failure-admin',
+      storage,
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(releaseAttempts, 1);
+  assert.ok(warnings.some((message) => /opportunity claim release after Pursue refusal failed/.test(message)));
+  assert.equal(result.status, 409);
+  assert.equal(result.code, 'pursue_owns_opportunity');
+  assert.equal(result.error, refusalCopy);
+  assert.equal(providerCalls.length, 0);
+  assert.equal((await storage.listDealHunterCimRequests({ dealKeys: [deal.dealKey], limit: 100 })).length, 0);
+});
+
+test('SQLite opportunity-claim release deletes only an exact claim with no request row', async (t) => {
+  const { storage } = testStorage(t);
+  const deal = await reviewedDeal(storage);
+  const nowIso = new Date().toISOString();
+  const claim = (requestId) => storage.claimDealHunterCimOpportunity({
+    opportunityId: deal.opportunityId, requestId, recipientEmail: 'erin@example.com', nowIso, metadata: {},
+  });
+
+  assert.equal((await claim('release-request-1')).claimed, true);
+  assert.deepEqual(await storage.releaseDealHunterCimOpportunityClaim({
+    opportunityId: deal.opportunityId, requestId: 'other-request' }), { released: false });
+  assert.deepEqual(await storage.releaseDealHunterCimOpportunityClaim({
+    opportunityId: 'other-opportunity', requestId: 'release-request-1' }), { released: false });
+  assert.deepEqual(await storage.releaseDealHunterCimOpportunityClaim({ opportunityId: deal.opportunityId }),
+    { released: false });
+  assert.ok(await storage.getDealHunterCimOpportunityClaim(deal.opportunityId));
+  assert.deepEqual(await storage.releaseDealHunterCimOpportunityClaim({
+    opportunityId: deal.opportunityId, requestId: 'release-request-1' }), { released: true });
+  assert.equal(await storage.getDealHunterCimOpportunityClaim(deal.opportunityId), null);
+
+  const initial = await scheduledLegacyRequest(storage, deal);
+  const durableClaim = await storage.getDealHunterCimOpportunityClaim(deal.opportunityId);
+  assert.equal(durableClaim?.request_id, initial.id);
+  assert.deepEqual(await storage.releaseDealHunterCimOpportunityClaim({
+    opportunityId: deal.opportunityId, requestId: initial.id }), { released: false },
+  'a claim backing a durable request row is never released');
+  assert.equal((await storage.getDealHunterCimOpportunityClaim(deal.opportunityId))?.request_id, initial.id);
 });
