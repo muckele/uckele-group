@@ -4500,6 +4500,8 @@ export function createSqliteStorage(config, options = {}) {
         created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
         FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT
       );
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_owner_decision_events_opportunity_created
+        ON deal_hunter_owner_decision_events(opportunity_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS deal_hunter_pursuit_enrollments (
         id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),

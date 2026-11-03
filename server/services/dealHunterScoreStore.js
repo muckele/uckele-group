@@ -285,6 +285,7 @@ export async function refreshOpportunityScores({
         error: deferredScoringError(collected.review),
         review: collected.review,
         counts: { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 },
+        currentFingerprints: {},
         errors: [],
         rulesVersion: DEAL_SCORING_RULES_VERSION,
         engineVersion: DEAL_SCORING_ENGINE_VERSION,
@@ -336,9 +337,14 @@ export async function refreshOpportunityScores({
   const counts = { considered: scoped.length, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 };
   const errors = [];
   const evaluated = [];
+  // The fingerprint of each considered deal as built from live sources now. It cannot be
+  // recomputed from stored rows, so automatic Pursue compares its stored fingerprint to this.
+  const currentFingerprints = {};
   for (const deal of scoped) {
     try {
-      evaluated.push({ deal, result: scoreOpportunity(deal) });
+      const result = scoreOpportunity(deal);
+      evaluated.push({ deal, result });
+      currentFingerprints[deal.opportunityId] = result.fingerprint;
     } catch (error) {
       counts.failed += 1;
       errors.push({ opportunityId: deal.opportunityId, error: normalizeText(error.message, 500) });
@@ -429,6 +435,7 @@ export async function refreshOpportunityScores({
       providerCalls: authoritativeReview.providerCalls,
     } : {}),
     counts,
+    currentFingerprints,
     errors: errors.slice(0, 100),
     eligibilityReconciliation,
     rulesVersion: DEAL_SCORING_RULES_VERSION,

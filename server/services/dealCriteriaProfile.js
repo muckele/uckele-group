@@ -32,7 +32,9 @@ function finiteNumber(value) {
 
 // criteria_result is bounded JSON (spec 5): observed text never exceeds the limit.
 function boundedObserved(text) {
-  return text.length > OBSERVED_TEXT_LIMIT ? text.slice(0, OBSERVED_TEXT_LIMIT) : text;
+  // By code point, so a surrogate pair is never cut in half.
+  const points = Array.from(text);
+  return points.length > OBSERVED_TEXT_LIMIT ? points.slice(0, OBSERVED_TEXT_LIMIT).join('') : text;
 }
 
 export function getDealCriteriaProfile(config = getConfig()) {

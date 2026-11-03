@@ -121,6 +121,16 @@ test('observed text is bounded to 200 characters (spec 5)', () => {
   assert.ok(JSON.stringify(result).length < 2000);
 });
 
+test('observed text truncation keeps a surrogate pair whole', () => {
+  const location = `${'a'.repeat(199)}😀bbb`;
+  const result = evaluateDealCriteria(deal({ location, state: '' }));
+  const { observed } = result.mustHaves.find((item) => item.id === 'geography');
+  assert.equal(observed, `${'a'.repeat(199)}😀`);
+  assert.equal(Array.from(observed).length, 200);
+  assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(observed), false, 'no lone high surrogate');
+  assert.equal(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(observed), false, 'no lone low surrogate');
+});
+
 test('every criteria version literal hard-coded in SQL is the current profile version', () => {
   for (const file of ['supabase/schema.sql', 'supabase/migrations/20261102120000_best_first_deal_list.sql']) {
     const sql = fs.readFileSync(path.join(root, file), 'utf8');

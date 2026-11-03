@@ -1175,27 +1175,27 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   ];
   const ownerCommands = [
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-1',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-1',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'watch', idempotencyKey: 'owner-decision-1',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-2',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-3',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 1, expectedMaterialRevision: 0 },
   ];
   const ownerStopCommands = [
     { opportunityId: 'opp-parity', action: 'watch', idempotencyKey: 'owner-watch-parity',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-parity', action: 'pass', idempotencyKey: 'owner-pass-parity',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', reason: 'not a fit', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', reason: 'not a fit', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
   ];
   const campaignCommand = { opportunityId: 'opp-decision', expectedEnrollmentRowVersion: 1,
@@ -1245,7 +1245,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           where event_type='owner-decision' and opportunity_id='${opportunityId}';`));
         const ownerCommand = { opportunityId, action,
           idempotencyKey: `p4a-race-${database}-${stage}-${action}`, actor: 'fixture-owner',
-          policyVersion: 'owner-v1', now, expectedDiscoveryRevision: 0,
+          policyVersion: 'owner-decision-v1', now, expectedDiscoveryRevision: 0,
           expectedMaterialRevision: 0,
           ...(action === 'pass' ? { reason: 'not a fit', note: 'Owner declined.' } : {}) };
         const committedRpc = (name, command) => new Promise((resolve, reject) => {
@@ -1305,7 +1305,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       for (const action of ['watch', 'pass']) {
         const command = { opportunityId, action,
           idempotencyKey: `p4a-${database}-${stage}-${action}`, actor: 'fixture-owner',
-          policyVersion: 'owner-v1', now, expectedDiscoveryRevision: 0,
+          policyVersion: 'owner-decision-v1', now, expectedDiscoveryRevision: 0,
           expectedMaterialRevision: 0,
           ...(action === 'pass' ? { reason: 'not a fit', note: 'Owner declined.' } : {}) };
         const payload = JSON.stringify(command).replaceAll("'", "''");
@@ -1709,10 +1709,10 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
          observed_discovery_revision,observed_material_revision,policy_version,created_at)
       values
         ('p9-order-decision-early','p9-order-idem-early',repeat('1',64),
-          'p9-order-early','pursue','fixture',0,0,0,0,'owner-v1',
+          'p9-order-early','pursue','fixture',0,0,0,0,'owner-decision-v1',
           '2026-09-25T19:00:01.000Z'),
         ('p9-order-decision-late','p9-order-idem-late',repeat('2',64),
-          'p9-order-late','pursue','fixture',0,0,0,0,'owner-v1',
+          'p9-order-late','pursue','fixture',0,0,0,0,'owner-decision-v1',
           '2026-09-25T19:00:03.000Z');
       insert into public.deal_hunter_pursuit_enrollments
         (id,decision_event_id,opportunity_id,state,authority_digest,created_at,updated_at)
@@ -1977,7 +1977,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       (opportunity_id, created_at, updated_at, canonical_name, identity_version)
       values ('opp-owner-race', '${now}', '${now}', 'Synthetic owner race', 'cim-identity-v1');`);
     const concurrentOwnerCommand = { opportunityId: 'opp-owner-race', action: 'pursue',
-      idempotencyKey: 'p4a-postgres-owner-race', actor: 'fixture-owner', policyVersion: 'owner-v1',
+      idempotencyKey: 'p4a-postgres-owner-race', actor: 'fixture-owner', policyVersion: 'owner-decision-v1',
       now, expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 };
     const runConcurrentOwner = () => new Promise((resolve, reject) => {
       const payload = JSON.stringify(concurrentOwnerCommand).replaceAll("'", "''");
@@ -2053,7 +2053,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         when (new.opportunity_id = 'opp-pass-rollback' and new.reviewed_at is not null)
         execute function public.p4a_fail_pass_review();`);
     const rollbackPass = { opportunityId: 'opp-pass-rollback', action: 'pass',
-      idempotencyKey: 'p4a-pass-rollback', actor: 'fixture-owner', policyVersion: 'owner-v1',
+      idempotencyKey: 'p4a-pass-rollback', actor: 'fixture-owner', policyVersion: 'owner-decision-v1',
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0,
       reason: 'not a fit', now };
     const rejectedPass = rejectedSql(container, database, `set role service_role;
@@ -3445,7 +3445,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
          expected_discovery_revision, expected_material_revision, observed_discovery_revision,
          observed_material_revision, policy_version, created_at)
       values ('decision-safety', 'key-safety', repeat('a',64), 'opp-safety', 'pursue',
-        'fixture', 0, 0, 0, 0, 'policy-v1', '${now}');
+        'fixture', 0, 0, 0, 0, 'owner-decision-v1', '${now}');
       insert into public.deal_hunter_pursuit_enrollments
         (id, decision_event_id, opportunity_id, state, authority_digest, created_at, updated_at)
       values ('enrollment-safety', 'decision-safety', 'opp-safety',
