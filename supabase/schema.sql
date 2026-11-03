@@ -20905,8 +20905,8 @@ begin
   v_cadence_version := v_cadence#>>'{expiryDerivation,cadencePolicyVersion}';
   if v_touch.kind='weekday-follow-up'
     and pg_catalog.split_part(v_touch.logical_slot,':',1)
-      <>case when v_cadence_version='deal-hunter-cim-cadence-v3'
-        then 'business' else 'calendar' end
+      <>(case when v_cadence_version='deal-hunter-cim-cadence-v3'
+        then 'business' else 'calendar' end)
   then raise exception 'Invalid current Pursue CIM cadence touch'; end if;
   v_send_time := v_cadence#>>'{expiryDerivation,sendTime}';
   if v_send_time is null

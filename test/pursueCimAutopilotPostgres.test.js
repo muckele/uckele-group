@@ -331,7 +331,7 @@ test('cadence v3 migration is mirrored exactly, follows v2, and branches on the 
   // Repeating slot keys and the next touch follow the stamped version.
   assert.match(migration, /logical_slot~'\^\(calendar\|business\):/);
   assert.match(migration, /then 'business:' else 'calendar:' end/);
-  assert.match(migration, /then 'business' else 'calendar' end\s+then raise exception 'Invalid current Pursue CIM cadence touch'/);
+  assert.match(migration, /then 'business' else 'calendar' end\)\s+then raise exception 'Invalid current Pursue CIM cadence touch'/);
   assert.match(migration, /'cadencePolicyVersion',120\)\s+<>v_cadence_version/);
   assert.match(migration, /v_raw := \(v_date\+v_send_clock\) at time zone v_timezone\.iana_timezone/);
   assert.match(migration, /v_due>=v_expiry/);
