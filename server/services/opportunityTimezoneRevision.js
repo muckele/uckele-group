@@ -3,6 +3,7 @@ import {
   EXPLICIT_TIMEZONE_VERSION,
   STRUCTURED_SOURCE_TIMEZONE_VERSION,
   TIMEZONE_DATASET_DIGEST,
+  derivedTimezoneEvidenceDigest,
   resolveLocationTimezone,
   resolveOpportunityTimezone,
   timezoneEvidenceDigest,
@@ -129,8 +130,8 @@ export async function appendDerivedOpportunityTimezoneRevision({ storage, opport
   const readLatest = async () =>
     (await storage.readPursuitEnrollmentAuthority({ opportunityId, now }))?.timezone ?? null;
   const evidenceId = `target-state:${resolved.state}`;
-  const evidenceDigest = timezoneEvidenceDigest({ opportunityId,
-    ianaTimezone: resolved.ianaTimezone, evidenceType: DERIVED_EVIDENCE_TYPE, evidenceId });
+  // Spec 3.2: the digest covers the normalized inputs, so re-deriving from unchanged inputs is a no-op.
+  const evidenceDigest = derivedTimezoneEvidenceDigest({ opportunityId, state, location });
   const latest = await readLatest();
   if (sendable(latest)) return { written: false, reason: 'timezone_already_set' };
   if (latest?.evidence_digest === evidenceDigest) return { written: false, reason: 'same_evidence' };

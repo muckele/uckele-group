@@ -59,6 +59,20 @@ export function resolveLocationTimezone({ state, location } = {}) {
     resolverVersion: TIMEZONE_RESOLVER_VERSION };
 }
 
+/**
+ * Evidence digest for a derived (target-state) revision. It covers the normalized inputs the
+ * resolver read, not its result, so changed inputs that derive the same zone are new evidence:
+ * the state field's target-state code(s), the collapsed lower-case location text, and the
+ * resolver version.
+ */
+export function derivedTimezoneEvidenceDigest({ opportunityId, state, location } = {}) {
+  const stateCodes = [...targetStatesIn(collapse(state), targetStateCodes)].sort();
+  const locationText = collapse(location).toLowerCase();
+  return createHash('sha256').update(JSON.stringify([
+    'target-state-timezone-evidence:v1', opportunityId, TIMEZONE_RESOLVER_VERSION, stateCodes, locationText,
+  ])).digest('hex');
+}
+
 function authority(fact, evidenceType, opportunityId) {
   if (!fact) return null;
   if (typeof opportunityId !== 'string' || !opportunityId

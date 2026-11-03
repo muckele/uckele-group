@@ -3,7 +3,7 @@ import test from 'node:test';
 import { appendDerivedOpportunityTimezoneRevision, appendExplicitOpportunityTimezoneRevision,
   appendStructuredSourceTimezoneRevision } from '../server/services/opportunityTimezoneRevision.js';
 
-import { TIMEZONE_DATASET_DIGEST, timezoneEvidenceDigest }
+import { TIMEZONE_DATASET_DIGEST, derivedTimezoneEvidenceDigest, timezoneEvidenceDigest }
   from '../server/services/opportunityTimezone.js';
 
 const key = 'a5bf9b63-495b-40f4-865f-942767d851b5';
@@ -109,8 +109,11 @@ test('derived timezone writer appends a derived target-state revision with exact
   assert.equal(command.ianaTimezone, 'America/Phoenix');
   assert.equal(command.evidenceType, 'target-state');
   assert.equal(command.evidenceId, 'target-state:AZ');
-  assert.equal(command.evidenceDigest, timezoneEvidenceDigest({ opportunityId: 'opp-1',
-    ianaTimezone: 'America/Phoenix', evidenceType: 'target-state', evidenceId: 'target-state:AZ' }));
+  assert.equal(command.evidenceDigest, derivedTimezoneEvidenceDigest({ opportunityId: 'opp-1',
+    state: 'AZ', location: 'Scottsdale, AZ' }));
+  assert.notEqual(command.evidenceDigest, timezoneEvidenceDigest({ opportunityId: 'opp-1',
+    ianaTimezone: 'America/Phoenix', evidenceType: 'target-state', evidenceId: 'target-state:AZ' }),
+  'the digest covers the inputs, not the derived result');
   assert.equal(command.resolverVersion, 'target-state-v1');
   assert.equal(command.datasetDigest, TIMEZONE_DATASET_DIGEST);
   assert.equal(command.actor, 'system-timezone-resolver');
@@ -141,9 +144,71 @@ test('derived timezone writer is a no-op when latest is derived', async () => {
   assert.equal(state.commands.length, 0);
 });
 
+test('derived timezone evidence digest covers the normalized inputs and the resolver version', () => {
+  const digest = (state, location, opportunityId = 'opp-1') =>
+    derivedTimezoneEvidenceDigest({ opportunityId, state, location });
+  assert.match(digest('AZ', 'Scottsdale, AZ'), /^[0-9a-f]{64}$/);
+  // Whitespace and case do not change the normalized inputs; a full state name normalizes to its code.
+  assert.equal(digest(' az ', '  scottsdale,   AZ '), digest('AZ', 'Scottsdale, AZ'));
+  assert.equal(digest('Arizona', 'Scottsdale, AZ'), digest('AZ', 'Scottsdale, AZ'));
+  // Different inputs that derive the same zone are different evidence.
+  assert.notEqual(digest('AZ', 'Tucson, AZ'), digest('AZ', 'Scottsdale, AZ'));
+  assert.notEqual(digest('', 'Scottsdale, AZ'), digest('AZ', 'Scottsdale, AZ'));
+  assert.notEqual(digest('AZ', 'Scottsdale, AZ', 'opp-2'), digest('AZ', 'Scottsdale, AZ'));
+});
+
+/** A stateful revision log so two calls see each other's writes. */
+function persistentDerivedStorage({ conflictOnce = null } = {}) {
+  const log = [];
+  const state = { reads: 0, commands: [] };
+  const latest = () => log.at(-1) || null;
+  return { log, state, storage: {
+    readPursuitEnrollmentAuthority: async () => { state.reads += 1; return { timezone: latest() }; },
+    appendOpportunityTimezoneRevision: async (command) => {
+      state.commands.push(command);
+      if (conflictOnce) {
+        // Another writer lands a non-sendable revision first.
+        log.push(conflictOnce); conflictOnce = null;
+        return { applied: false, replay: false, staleRevision: true, timezoneRevision: latest() };
+      }
+      if (Number(latest()?.revision ?? 0) !== command.expectedPriorRevision) {
+        return { applied: false, replay: false, staleRevision: true, timezoneRevision: latest() };
+      }
+      log.push({ revision: command.expectedPriorRevision + 1, state: command.state,
+        iana_timezone: command.ianaTimezone, evidence_digest: command.evidenceDigest });
+      return { applied: true, replay: false, staleRevision: false, timezoneRevision: latest() };
+    },
+  } };
+}
+
+test('two derived calls with identical inputs: the second sees the derived revision and writes nothing', async () => {
+  const { storage, state, log } = persistentDerivedStorage();
+  assert.deepEqual(await appendDerivedOpportunityTimezoneRevision({ storage, ...derivedInput }),
+    { written: true, reason: 'written' });
+  assert.deepEqual(await appendDerivedOpportunityTimezoneRevision({ storage, ...derivedInput }),
+    { written: false, reason: 'timezone_already_set' });
+  assert.equal(state.commands.length, 1);
+  assert.equal(log.length, 1);
+  assert.equal(log[0].evidence_digest, derivedTimezoneEvidenceDigest(derivedInput));
+});
+
+test('two derived calls with identical inputs: after a stale conflict the second builds on the latest revision', async () => {
+  const { storage, state, log } = persistentDerivedStorage({ conflictOnce: { revision: 1, state: 'missing',
+    iana_timezone: null, evidence_digest: 'c'.repeat(64) } });
+  assert.deepEqual(await appendDerivedOpportunityTimezoneRevision({ storage, ...derivedInput }),
+    { written: false, reason: 'stale_timezone_revision' });
+  assert.deepEqual(await appendDerivedOpportunityTimezoneRevision({ storage, ...derivedInput }),
+    { written: true, reason: 'written' });
+  assert.equal(state.commands.length, 2);
+  assert.equal(state.commands[1].expectedPriorRevision, 1);
+  assert.equal(state.commands[0].evidenceDigest, state.commands[1].evidenceDigest, 'same inputs, same evidence');
+  assert.equal(log.at(-1).state, 'derived');
+  assert.equal(log.at(-1).revision, 2);
+});
+
 test('derived timezone writer is a no-op on an identical evidence digest', async () => {
-  const evidenceDigest = timezoneEvidenceDigest({ opportunityId: 'opp-1',
-    ianaTimezone: 'America/Phoenix', evidenceType: 'target-state', evidenceId: 'target-state:AZ' });
+  const evidenceDigest = derivedTimezoneEvidenceDigest({ opportunityId: 'opp-1', state: 'AZ',
+    location: 'Scottsdale, AZ' });
   const { storage, state } = derivedStorage({ latest: { revision: 3, state: 'ambiguous',
     iana_timezone: null, evidence_digest: evidenceDigest } });
   const result = await appendDerivedOpportunityTimezoneRevision({ storage, ...derivedInput });
