@@ -7,8 +7,8 @@ const now = new Date('2026-11-03T15:30:00.000Z');
 function healthyReview(overrides = {}) {
   return {
     sources: [
-      { id: 'sheet-0', name: 'Sheet', fetched: true, required: true, rowCount: 40 },
-      { id: 'sheet-1', name: 'Sheet 2', fetched: true, required: true, rowCount: 12 },
+      { id: 'sheet-0', name: 'Sheet', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 40 },
+      { id: 'sheet-1', name: 'Sheet 2', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 12 },
     ],
     ...overrides,
   };
@@ -75,8 +75,8 @@ test('unhealthy required sheet records autoPursue skipped required_source_failed
       status: 200,
       review: healthyReview({
         sources: [
-          { id: 'sheet-0', fetched: true, required: true, rowCount: 40 },
-          { id: 'sheet-1', fetched: false, required: true, rowCount: 0, error: 'HTTP 500' },
+          { id: 'sheet-0', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 40 },
+          { id: 'sheet-1', fetched: false, required: true, sourceRole: 'required-primary', rowCount: 0, error: 'HTTP 500' },
         ],
       }),
       currentFingerprints: { 'opp-1': 'fp-1' },
@@ -143,7 +143,7 @@ test('sheet error text is capped at 300 chars', async () => {
     refresh: async () => ({
       ok: true,
       status: 200,
-      review: { sources: [{ id: 'sheet-0', fetched: false, required: true, rowCount: 0, error: `boom ${'x'.repeat(900)}` }] },
+      review: { sources: [{ id: 'sheet-0', fetched: false, required: true, sourceRole: 'required-primary', rowCount: 0, error: `boom ${'x'.repeat(900)}` }] },
       currentFingerprints: {},
     }),
     autoPursue: async () => ({}),
@@ -159,7 +159,7 @@ test('a sheet with no rows is unhealthy, matching the existing required-source r
     refresh: async () => ({
       ok: true,
       status: 200,
-      review: { sources: [{ id: 'sheet-0', fetched: true, required: true, rowCount: 0 }] },
+      review: { sources: [{ id: 'sheet-0', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 0 }] },
       currentFingerprints: {},
     }),
     autoPursue: async () => ({}),
@@ -175,10 +175,34 @@ test('a source that names itself sourceId is read as well as id', async () => {
     refresh: async () => ({
       ok: true,
       status: 200,
-      review: { sources: [{ sourceId: 'sheet-0', fetched: true, required: true, rowCount: 5, durationMs: 90 }] },
+      review: { sources: [{ sourceId: 'sheet-0', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 5, durationMs: 90 }] },
       currentFingerprints: {},
     }),
     autoPursue: async () => ({ status: 200 }),
   });
   assert.deepEqual(result.sheets, [{ sourceId: 'sheet-0', fetched: true, rowCount: 5, error: null, durationMs: 90 }]);
+});
+
+test('a failing optional sheet does not block automatic Pursue when the required sheet is healthy', async () => {
+  const calls = [];
+  const result = await runDealHunterSheetSync({
+    storage: storageWithGroups({}),
+    now,
+    refresh: async () => ({
+      ok: true,
+      status: 200,
+      review: {
+        sources: [
+          { id: 'sheet-0', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 40 },
+          { id: 'sheet-1', fetched: false, required: false, sourceRole: 'optional', rowCount: 0, error: 'HTTP 404' },
+        ],
+      },
+      currentFingerprints: { 'opp-1': 'fp-1' },
+    }),
+    autoPursue: async (input) => { calls.push(input); return { ok: true, status: 200, mode: 'shadow', runKey: 'k' }; },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.requiredSourcesHealthy, true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(result.sheets[1], { sourceId: 'sheet-1', fetched: false, rowCount: 0, error: 'HTTP 404' });
 });

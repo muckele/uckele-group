@@ -104,26 +104,32 @@ export function startDealHunterSheetSyncScheduler({
       error = boundedSheetSyncError(cause) || 'The sheet sync threw.';
     }
     const ok = !error;
+    // An ok attempt has already run automatic Pursue. Finish the date in this process before the
+    // completion write, so a write that throws or is refused can never lead to a second run here
+    // once the pending claim goes stale. A restart in that window can still replay it; the daily
+    // Pursue cap bounds that.
+    if (ok) finishedDates.add(dateKey);
     const finishedAt = now();
     const finishedIso = (finishedAt instanceof Date && Number.isFinite(finishedAt.getTime()) ? finishedAt : at).toISOString();
-    const transition = await activeStorage.transitionScheduledJob({
-      jobKey,
-      claimToken,
-      expectedStatuses: ['pending'],
-      status: ok ? 'completed' : 'failed',
-      nowIso: finishedIso,
-      ...(ok ? { completedAt: finishedIso } : { lastError: error }),
-      metadataPatch: sheetSyncMetadata(result, { ok, error }),
-    });
-    if (ok) {
-      // Automatic Pursue already ran on this attempt, so the date is finished here whether or not
-      // the completion write landed; a stale pending claim must not run it a second time in-process.
-      finishedDates.add(dateKey);
-      if (!(transition.applied ?? transition.claimed)) {
-        logger.error(`[deal-hunter:sheet-sync] completion not recorded date=${dateKey} reason=${transition.reason || 'unknown'}`);
-      } else {
-        logger.log(`[deal-hunter:sheet-sync] completed date=${dateKey}`);
-      }
+    let transition;
+    try {
+      transition = await activeStorage.transitionScheduledJob({
+        jobKey,
+        claimToken,
+        expectedStatuses: ['pending'],
+        status: ok ? 'completed' : 'failed',
+        nowIso: finishedIso,
+        ...(ok ? { completedAt: finishedIso } : { lastError: error }),
+        metadataPatch: sheetSyncMetadata(result, { ok, error }),
+      });
+    } catch (cause) {
+      logger.error(`[deal-hunter:sheet-sync] ${ok ? 'completion' : 'failure'} not recorded date=${dateKey}: ${boundedSheetSyncError(cause)}`);
+      return;
+    }
+    if (!(transition.applied ?? transition.claimed)) {
+      logger.error(`[deal-hunter:sheet-sync] ${ok ? 'completion' : 'failure'} not recorded date=${dateKey} reason=${transition.reason || 'unknown'}`);
+    } else if (ok) {
+      logger.log(`[deal-hunter:sheet-sync] completed date=${dateKey}`);
     } else {
       logger.error(`[deal-hunter:sheet-sync] failed date=${dateKey}: ${error}`);
     }

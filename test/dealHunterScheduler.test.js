@@ -942,7 +942,7 @@ test('sheet sync retry success after failure calls autoPursue exactly once that 
     return {
       ok: true,
       status: 200,
-      review: { sources: [{ id: 'sheet-0', fetched: healthy, required: true, rowCount: healthy ? 9 : 0, ...(healthy ? {} : { error: 'HTTP 503' }) }] },
+      review: { sources: [{ id: 'sheet-0', fetched: healthy, required: true, sourceRole: 'required-primary', rowCount: healthy ? 9 : 0, ...(healthy ? {} : { error: 'HTTP 503' }) }] },
       currentFingerprints: { 'opp-1': 'fp' },
     };
   };
@@ -990,3 +990,48 @@ test('sheet sync schedules its own check timer and stop clears it', async (t) =>
   await harness.timers[1].fn();
   assert.equal(harness.timers.length, 2, 'a stopped scheduler schedules nothing further');
 });
+
+for (const [label, wrap] of [
+  ['throws', (storage) => {
+    const original = storage.transitionScheduledJob.bind(storage);
+    storage.transitionScheduledJob = async (input) => {
+      if (input.status === 'completed') throw new Error('database is locked');
+      return original(input);
+    };
+  }],
+  ['is refused', (storage) => {
+    const original = storage.transitionScheduledJob.bind(storage);
+    storage.transitionScheduledJob = async (input) => {
+      if (input.status === 'completed') return { applied: false, claimed: false, reason: 'not-owner', run: null };
+      return original(input);
+    };
+  }],
+]) {
+  test(`sheet sync runs automatic Pursue exactly once when the completion write ${label}`, async (t) => {
+    let pursues = 0;
+    const refresh = async () => ({
+      ok: true,
+      status: 200,
+      review: { sources: [{ id: 'sheet-0', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 9 }] },
+      currentFingerprints: { 'opp-1': 'fp' },
+    });
+    const autoPursue = async () => { pursues += 1; return { ok: true, status: 200, mode: 'shadow', runKey: 'k' }; };
+    const harness = sheetSyncHarness(t, {
+      start: '2026-11-03T15:30:00.000Z',
+      run: (input) => runDealHunterSheetSync({ ...input, refresh, autoPursue }),
+    });
+    wrap(harness.storage);
+    const scheduler = harness.start();
+    await scheduler.tick();
+    assert.equal(pursues, 1);
+    assert.ok(harness.logs.some((line) => line.includes('completion not recorded')), 'the failure is logged');
+    assert.equal((await harness.job('2026-11-03')).status, 'pending', 'the claim was never completed');
+
+    // Well past the 60 minute stale cutoff and the 30 minute retry interval, still before noon.
+    for (const iso of ['2026-11-03T16:30:00.000Z', '2026-11-03T17:45:00.000Z', '2026-11-03T19:30:00.000Z']) {
+      harness.set(iso);
+      await scheduler.tick();
+    }
+    assert.equal(pursues, 1, 'a stale reclaim must not run Pursue a second time');
+  });
+}

@@ -23,8 +23,10 @@ function isSheetSource(source) {
   return sourceId(source).startsWith('sheet-');
 }
 
+// The same rule the score store applies when it proves a complete authoritative set. An optional
+// sheet that fails is reported in `sheets` but must not block automatic Pursue.
 function isRequiredSource(source) {
-  return source?.required === true || source?.sourceRole === 'required-primary' || isSheetSource(source);
+  return source?.required === true && source?.sourceRole === 'required-primary';
 }
 
 // The same test the existing review code applies: not fetched, errored or empty is unhealthy.
