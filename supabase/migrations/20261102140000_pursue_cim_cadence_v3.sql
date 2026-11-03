@@ -137,6 +137,9 @@ begin
   v_send_clock := v_send_time::time;
   v_expiry := public.pursue_cim_required_instant_v1(v_cadence,'localExpiryAt');
   if v_touch.kind='initial' then
+    -- The expected derivation is rebuilt stamped v3. A v2-stamped campaign's initial touch is
+    -- never re-validated: an accepted transmission is only replayed, so this path is not reached
+    -- for it. If it ever were, the derivation comparison below fails closed.
     v_expected_expiry := public.pursue_cim_expected_initial_expiry_v1(
       v_observed,v_timezone.iana_timezone);
     v_expected_expiry := pg_catalog.jsonb_set(v_expected_expiry,
