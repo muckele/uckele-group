@@ -928,6 +928,14 @@ test('Supabase adapter: authoritative count, exclusive claim, activation RPC, an
   assert.deepEqual(calls.at(-1), { table: 'deal_hunter_owner_decision_events', steps: [
     ['select', 'id', { count: 'exact', head: true }], ['eq', 'policy_version', 'auto-pursue-v1'],
     ['gte', 'created_at', '2026-11-02T08:00:00.000Z'], ['lt', 'created_at', '2026-11-03T08:00:00.000Z']] });
+  responses.push({ data: [{ opportunity_id: 'opp-a', created_at: '2026-11-02T20:00:00.000Z' }], error: null });
+  assert.deepEqual(await storage.listOwnerDecisionsByPolicy({ policyVersion: 'auto-pursue-v1',
+    since: '2026-11-02T08:00:00.000Z', until: '2026-11-03T08:00:00.000Z', limit: 10 }),
+  [{ opportunity_id: 'opp-a', created_at: '2026-11-02T20:00:00.000Z' }]);
+  assert.deepEqual(calls.at(-1), { table: 'deal_hunter_owner_decision_events', steps: [
+    ['select', 'opportunity_id,created_at'], ['eq', 'policy_version', 'auto-pursue-v1'],
+    ['gte', 'created_at', '2026-11-02T08:00:00.000Z'], ['lt', 'created_at', '2026-11-03T08:00:00.000Z'],
+    ['order', 'created_at', { ascending: false }], ['order', 'id', { ascending: false }], ['limit', 10]] });
   responses.push({ count: null, error: null });
   await assert.rejects(storage.countOwnerDecisionsByPolicy({ policyVersion: 'auto-pursue-v1',
     since: '2026-11-02T08:00:00.000Z', until: '2026-11-03T08:00:00.000Z' }));

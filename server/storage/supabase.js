@@ -3894,6 +3894,25 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return count;
     },
 
+    /** Recorded owner decisions under one policy in [since, until), newest first. */
+    async listOwnerDecisionsByPolicy({ policyVersion, since, until, limit = 10 } = {}) {
+      const policy = String(policyVersion || '');
+      if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+        throw new Error('listOwnerDecisionsByPolicy requires a policy version and an instant range.');
+      }
+      const { data, error } = await client
+        .from('deal_hunter_owner_decision_events')
+        .select('opportunity_id,created_at')
+        .eq('policy_version', policy)
+        .gte('created_at', new Date(since).toISOString())
+        .lt('created_at', new Date(until).toISOString())
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(Math.min(Math.max(Math.trunc(Number(limit)) || 10, 1), 100));
+      if (error) throw error;
+      return data || [];
+    },
+
     /**
      * True when any Pursue campaign conversation already targets this recipient address,
      * compared case-insensitively like SQLite's LOWER(recipient_address) = ?. LIKE

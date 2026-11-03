@@ -10996,6 +10996,21 @@ export function createSqliteStorage(config, options = {}) {
         `).get(policy, new Date(since).toISOString(), new Date(until).toISOString()).count);
       },
 
+      /** Recorded owner decisions under one policy in [since, until), newest first. */
+      async listOwnerDecisionsByPolicy({ policyVersion, since, until, limit = 10 } = {}) {
+        const policy = String(policyVersion || '');
+        if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+          throw new Error('listOwnerDecisionsByPolicy requires a policy version and an instant range.');
+        }
+        return database.prepare(`
+          SELECT opportunity_id, created_at FROM deal_hunter_owner_decision_events
+          WHERE policy_version = ?
+            AND julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?)
+          ORDER BY julianday(created_at) DESC, id DESC LIMIT ?
+        `).all(policy, new Date(since).toISOString(), new Date(until).toISOString(),
+          Math.min(Math.max(Math.trunc(Number(limit)) || 10, 1), 100));
+      },
+
       /** True when any Pursue campaign conversation already targets this recipient address. */
       async hasPursueCimConversationForRecipient(recipientEmail) {
         const address = String(recipientEmail || '').trim().toLowerCase();

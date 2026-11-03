@@ -171,15 +171,33 @@ async function countTodayCommands(storage, businessDate) {
   return count;
 }
 
+const TODAY_PURSUED_LIMIT = 10;
+
+/** Today's automatic Pursue decisions, newest first, so the owner can stop one from the inbox. */
+async function listTodayPursued(storage, businessDate) {
+  if (typeof storage?.listOwnerDecisionsByPolicy !== 'function') {
+    throw new Error('Owner decision list is unavailable.');
+  }
+  const decisions = await storage.listOwnerDecisionsByPolicy({
+    policyVersion: AUTO_PURSUE_POLICY_VERSION, ...ownerBusinessDateBounds(businessDate), limit: TODAY_PURSUED_LIMIT,
+  });
+  return Promise.all((Array.isArray(decisions) ? decisions : []).slice(0, TODAY_PURSUED_LIMIT).map(async (decision) => {
+    const opportunityId = String(decision.opportunity_id);
+    const opportunity = await storage.getDealHunterOpportunity(opportunityId);
+    return { opportunityId, name: String(opportunity?.canonical_name || '').trim() || opportunityId };
+  }));
+}
+
 export async function getAutoPursueStatus({ storage = getStorage(), now = new Date() } = {}) {
   const businessDate = ownerBusinessDate(now);
   const { mode, dailyCap } = await readActivation(storage);
-  const [todayCommands, warmup, runs] = await Promise.all([
+  const [todayCommands, todayPursued, warmup, runs] = await Promise.all([
     countTodayCommands(storage, businessDate),
+    listTodayPursued(storage, businessDate),
     getAutoPursueWarmup({ storage }),
     storage.listAutoPursueRuns({ limit: 1 }),
   ]);
-  return { mode, dailyCap, todayCommands, warmup, latestRun: publicRun(runs?.[0] || null), businessDate };
+  return { mode, dailyCap, todayCommands, todayPursued, warmup, latestRun: publicRun(runs?.[0] || null), businessDate };
 }
 
 export async function setAutoPursueMode({

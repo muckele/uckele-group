@@ -293,6 +293,8 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const [passTarget, setPassTarget] = useState(null);
   const [pursueChoice, setPursueChoice] = useState(null);
   const [autoPursueStatus, setAutoPursueStatus] = useState(null);
+  const [autoPursueReloads, setAutoPursueReloads] = useState(0);
+  const [autoStop, setAutoStop] = useState({ pendingId: '', error: '', stoppedIds: [] });
   const [showNearMisses, setShowNearMisses] = useState(false);
   const [nearMissTarget, setNearMissTarget] = useState(null);
   const nearMissTriggerRef = useRef(null);
@@ -423,7 +425,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       }
     })();
     return () => { live = false; };
-  }, [hasAutoPursueArea, queue.areas]);
+  }, [hasAutoPursueArea, queue.areas, autoPursueReloads]);
 
   const loadCimRelease = useCallback(async (opportunityId, { preserveData = false } = {}) => {
     if (readOnly) {
@@ -800,6 +802,40 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     } finally {
       mutationPendingRef.current = false;
       setPendingId('');
+    }
+  }
+
+  async function stopAutoPursued({ opportunityId, name }) {
+    if (readOnly || autoStop.pendingId) return;
+    if (!window.confirm(`Stop the SIM request to ${name}? No more emails will be sent.`)) return;
+    const failure = 'Unable to stop the SIM request.';
+    setAutoStop((current) => ({ ...current, pendingId: opportunityId, error: '' }));
+    const base = `/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/cim-release`;
+    try {
+      const reportResponse = await fetch(base, { credentials: 'same-origin' });
+      const report = await reportResponse.json();
+      if (!reportResponse.ok) throw new Error(report.error || failure);
+      const authority = report?.actions;
+      if (!authority?.canStop) {
+        setAutoStop((current) => ({ ...current, pendingId: '', error: `${name} can no longer be stopped.` }));
+        return;
+      }
+      const response = await fetch(`${base}/stop`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          campaignId: authority.campaignId,
+          expectedRowVersion: authority.expectedRowVersion,
+          expectedTerminalRevision: authority.expectedTerminalRevision,
+          idempotencyKey: globalThis.crypto.randomUUID(),
+          reason: 'Owner stopped the automatic SIM request from the inbox.',
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || failure);
+      setAutoStop((current) => ({ pendingId: '', error: '', stoppedIds: [...current.stoppedIds, opportunityId] }));
+      setAutoPursueReloads((count) => count + 1);
+    } catch (stopError) {
+      setAutoStop((current) => ({ ...current, pendingId: '', error: stopError.message || failure }));
     }
   }
 
@@ -1256,6 +1292,11 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           <div><div className="flex flex-wrap items-center gap-2"><h3 className="text-lg font-semibold text-ink">{heading}</h3>{item.id === 'auto-pursue' ? <AutoPursueModeBadge status={autoPursueStatus} /> : null}</div><p className="text-xs text-ink/58">{item.total} {item.total === 1 ? 'opportunity' : 'opportunities'}{preview ? ` · ${item.counts?.due || 0} due (${item.counts?.overdue || 0} overdue) · ${item.counts?.ownerPriority || 0} owner priorities (${item.counts?.urgent || 0} urgent)` : ''}</p></div>
           <div className="flex flex-wrap gap-2">{preview ? <><button className={buttonClass} onClick={() => selectArea('due-actions')} type="button">View all due ({item.counts?.due || 0})</button><button className={buttonClass} onClick={() => selectArea('owner-priorities')} type="button">View all priorities ({item.counts?.ownerPriority || 0})</button></> : area === 'inbox' ? (item.id === 'new-important' ? <button className={buttonClass} onClick={() => selectArea('new-important')} type="button">View all New & Important</button> : null) : <button className={buttonClass} onClick={() => selectArea('inbox')} type="button">Back to Inbox</button>}</div>
         </div>
+        {item.id === 'auto-pursue' && autoPursueStatus?.todayPursued?.length ? <div className="border-b border-line/80 px-4 py-3">
+          <p className="text-xs font-semibold text-ink/70">SIM requested automatically today</p>
+          <ul aria-label="SIM requests sent today" className="mt-2 space-y-1">{autoPursueStatus.todayPursued.map((entry) => <li className="flex flex-wrap items-center justify-between gap-2 text-sm text-ink" key={entry.opportunityId}><span>{entry.name}</span>{autoStop.stoppedIds.includes(entry.opportunityId) ? <span className="text-xs font-semibold text-ink/58">Stopped</span> : !readOnly ? <button aria-label={`Stop SIM request to ${entry.name}`} className={`${buttonClass} text-red-700`} disabled={Boolean(autoStop.pendingId)} onClick={() => stopAutoPursued(entry)} type="button">{autoStop.pendingId === entry.opportunityId ? 'Stopping…' : 'Stop'}</button> : null}</li>)}</ul>
+          {autoStop.error ? <p className="mt-2 text-xs font-semibold text-red-800" role="alert">{autoStop.error}</p> : null}
+        </div> : null}
         {item.rows.length === 0 ? <p className="p-4 text-sm text-ink/60">No opportunities in this area.</p> : nearMissCollapsed
           ? <div className="p-4"><button aria-expanded="false" className={buttonClass} onClick={() => setShowNearMisses(true)} type="button">Show near misses ({item.total})</button></div> : preview
           ? <ol aria-label="Action preview" className="divide-y divide-line/70">{item.rows.map((row) => <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-2" key={row.opportunityId}><div><button className="text-left text-sm font-semibold text-ink hover:text-moss" onClick={(event) => openDetail(row.opportunityId, event.currentTarget)} type="button">{row.name}</button><p className="text-xs text-ink/58">{row.freshness?.actionReason === 'broker_reply' ? 'Broker reply needs review' : row.freshness?.actionReason === 'materials_ready' ? 'Broker materials received' : row.freshness?.dueAction ? 'Due follow-up' : 'Owner priority'} · Fit {row.fitScore} · {formatLabel(row.operatorPriority)}</p></div><div className="flex flex-wrap items-center gap-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} />{!readOnly ? <ActionButtons disabled={Boolean(pendingId) || !actionsAllowed} name={row.name} onAction={(action, event) => handleRowAction(row, action, event)} /> : null}</div></li>)}</ol>
