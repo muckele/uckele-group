@@ -55,6 +55,8 @@ const operatorFactIdempotencyMigrationPath = path.join(root,
   'supabase/migrations/20261014130000_operator_fact_idempotency.sql');
 const fl04cCapacityMigrationPath = path.join(root,
   'supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql');
+const cadenceV3MigrationPath = path.join(root,
+  'supabase/migrations/20261102140000_pursue_cim_cadence_v3.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -298,6 +300,42 @@ test('P6D v2 cadence correction is additive, mirrored, bounded, and calendar-exa
   assert.doesNotMatch(migration, /while extract\(isodow from v_date\) in \(6,7\)/);
   assert.match(migration, /v_due := v_raw/);
   assert.match(migration, /v_due>=v_expiry/);
+});
+
+test('cadence v3 migration is mirrored exactly, follows v2, and branches on the stamped version', () => {
+  const migration = fs.readFileSync(cadenceV3MigrationPath, 'utf8').trim();
+  const v2 = fs.readFileSync(p6dV2MigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact cadence v3 block');
+  assert.ok(schema.indexOf(migration) > schema.indexOf(v2),
+    'cadence v3 must replace the cadence v2 functions in the fresh schema');
+  for (const name of ['pursue_cim_expected_initial_expiry_v1', 'pursue_cim_validate_accepted_cadence_v1']) {
+    const last = schema.lastIndexOf(`create or replace function public.${name}(`);
+    assert.ok(last > schema.indexOf(migration)
+      && last < schema.indexOf(migration) + migration.length,
+    `no later fresh-schema block may redefine ${name}`);
+  }
+  // Same names and signatures as the functions it replaces.
+  assert.match(migration, /create or replace function public\.pursue_cim_expected_initial_expiry_v1\(\s+p_accepted timestamptz, p_timezone text\)/);
+  assert.match(migration, /create or replace function public\.pursue_cim_validate_accepted_cadence_v1\(p_command jsonb\)/);
+  assert.match(migration, /revoke all on function public\.pursue_cim_validate_accepted_cadence_v1\(jsonb\)\s+from public, anon, authenticated, service_role;/);
+  // New acceptances stamp v3; both versions are accepted and nothing else.
+  assert.match(migration, /'cadencePolicyVersion','deal-hunter-cim-cadence-v3'/);
+  assert.doesNotMatch(migration, /'cadencePolicyVersion','deal-hunter-cim-cadence-v2'/);
+  assert.match(migration, /coalesce\(v_cadence#>>'\{expiryDerivation,cadencePolicyVersion\}',''\)\s+not in \('deal-hunter-cim-cadence-v2','deal-hunter-cim-cadence-v3'\)/);
+  assert.doesNotMatch(migration, /is distinct from 'deal-hunter-cim-cadence-v2'/);
+  // v3 counts Mon-Fri for every follow-up; v2 keeps calendar days after follow-up-1.
+  assert.match(migration, /if v_kind='follow-up-1' or v_cadence_version='deal-hunter-cim-cadence-v3' then\s+v_remaining := 2;\s+while v_remaining>0 loop\s+v_date := v_date\+1;\s+if extract\(isodow from v_date\) between 1 and 5 then/);
+  assert.match(migration, /\selse\s+v_date := v_date\+2;\s+end if;/);
+  assert.equal((migration.match(/::date\+2/g) || []).length, 0);
+  // Repeating slot keys and the next touch follow the stamped version.
+  assert.match(migration, /logical_slot~'\^\(calendar\|business\):/);
+  assert.match(migration, /then 'business:' else 'calendar:' end/);
+  assert.match(migration, /then 'business' else 'calendar' end\s+then raise exception 'Invalid current Pursue CIM cadence touch'/);
+  assert.match(migration, /'cadencePolicyVersion',120\)\s+<>v_cadence_version/);
+  assert.match(migration, /v_raw := \(v_date\+v_send_clock\) at time zone v_timezone\.iana_timezone/);
+  assert.match(migration, /v_due>=v_expiry/);
+  assert.doesNotMatch(migration, /drop function|grant execute/i);
 });
 
 test('P7A PostgreSQL inbound resolver is additive, mirrored, read-only, and service-role constrained', () => {
@@ -782,6 +820,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactGuardMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactIdempotencyMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(fl04cCapacityMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(cadenceV3MigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -1079,6 +1118,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactGuardMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactIdempotencyMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(fl04cCapacityMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(cadenceV3MigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -3121,6 +3161,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       'weekday-follow-up'];
     const chainObservedAt = [chain.nextTouch.due_at, '2026-10-01T12:00:07.000Z',
       '2026-10-03T12:00:07.000Z', '2026-10-22T12:00:00.000Z'];
+    const v3Stages = [];
+    let v3Thursday = null;
     for (const [index, expectedKind] of chainKinds.entries()) {
       assert.equal(chain.nextTouch.kind, expectedKind, `${chainDatabase}:${expectedKind}`);
       const stageTransmissionId = `p6d-chain-transmission-${index + 1}`;
@@ -3221,7 +3263,53 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         assert.match(bindingRejection.stderr,
           /Ineligible Pursue CIM outcome cannot advance cadence/);
       }
+      if (index === 1) {
+        // follow-up-2 accepted Thursday 2026-10-01 05:00 America/Los_Angeles. Under v3 the
+        // next touch is Monday 2026-10-05 08:00; a v2-stamped campaign keeps Saturday.
+        const campaignId = context.members[0].campaign.id;
+        const v2Context = structuredClone(context);
+        v2Context.members[0].campaign.expiry_derivation = {
+          ...context.members[0].campaign.expiry_derivation,
+          cadencePolicyVersion: 'deal-hunter-cim-cadence-v2' };
+        const v2Cadence = deriveAcceptedCimCadence(v2Context, chainObservedAt[index]);
+        const stampCampaign = (version) => `update public.deal_hunter_cim_campaigns
+          set expiry_derivation=pg_catalog.jsonb_set(expiry_derivation,
+            '{cadencePolicyVersion}',pg_catalog.to_jsonb('${version}'::text))
+          where id='${campaignId}';`;
+        const finalize = (command) => `set role service_role;
+          select public.pursue_cim_finalize_with_cadence_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);`;
+        v3Thursday = {
+          context, stageCadence, v2Cadence,
+          v2Result: JSON.parse(psql(container, chainDatabase, `begin;
+            ${stampCampaign('deal-hunter-cim-cadence-v2')}
+            ${finalize({ ...stageCommand, cadence: v2Cadence })}
+            rollback;`)),
+          saturdayForgery: rejectedSql(container, chainDatabase, `begin;
+            ${finalize({ ...stageCommand, cadence: { ...stageCadence,
+              nextTouch: { ...v2Cadence.nextTouch,
+                cadencePolicyVersion: 'deal-hunter-cim-cadence-v3' } } })}
+            rollback;`),
+          v2CadenceOnV3Campaign: rejectedSql(container, chainDatabase, `begin;
+            ${finalize({ ...stageCommand, cadence: v2Cadence })}
+            rollback;`),
+          unknownVersion: rejectedSql(container, chainDatabase, `begin;
+            ${stampCampaign('deal-hunter-cim-cadence-v4')}
+            ${finalize({ ...stageCommand, cadence: { ...stageCadence,
+              expiryDerivation: { ...stageCadence.expiryDerivation,
+                cadencePolicyVersion: 'deal-hunter-cim-cadence-v4' } } })}
+            rollback;`),
+        };
+      }
       if (index === 3) {
+        v3Thursday.calendarSlotOnV3Campaign = rejectedSql(container, chainDatabase, `begin;
+          update public.deal_hunter_cim_campaign_touches
+            set logical_slot='calendar:'||pg_catalog.split_part(logical_slot,':',2)
+            where id='${chain.nextTouch.id}';
+          set role service_role;
+          select public.pursue_cim_finalize_with_cadence_v1(
+            '${JSON.stringify(stageCommand).replaceAll("'", "''")}'::jsonb);
+          rollback;`);
         const calendarIdentityRejection = rejectedSql(container, chainDatabase, `begin;
           update public.deal_hunter_cim_campaign_touches set ordinal=3
             where id='${chain.nextTouch.id}';
@@ -3236,7 +3324,50 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       }
       chain = committedCadenceRpc('pursue_cim_finalize_with_cadence_v1', stageCommand);
       assert.equal(chain.applied, true, chainDatabase);
+      v3Stages.push({ observedAt: chainObservedAt[index], js: stageCadence.nextTouch,
+        sql: chain.nextTouch });
     }
+    await t.test(`v3 accepted cadence validates in Postgres for the Thursday→Monday case (${database})`, () => {
+      const sqlInstant = (value) => new Date(value).toISOString();
+      assert.equal(v3Thursday.context.members[0].timezone.iana_timezone, 'America/Los_Angeles');
+      assert.equal(v3Thursday.context.members[0].campaign.expiry_derivation.cadencePolicyVersion,
+        'deal-hunter-cim-cadence-v3', 'the PostgreSQL initial acceptance stamps v3');
+      // JS and SQL agree on every stage of the v3 sequence.
+      for (const { observedAt, js, sql } of v3Stages) {
+        if (js === null) { assert.equal(sql, null, observedAt); continue; }
+        assert.deepEqual({ id: sql.id, logicalSlot: sql.logical_slot, kind: sql.kind,
+          ordinal: Number(sql.ordinal), dueAt: sqlInstant(sql.due_at), dueLocal: sql.due_local }, {
+          id: js.id, logicalSlot: js.logicalSlot, kind: js.kind, ordinal: js.ordinal,
+          dueAt: js.dueAt, dueLocal: js.dueLocal }, observedAt);
+        assert.equal(js.cadencePolicyVersion, 'deal-hunter-cim-cadence-v3', observedAt);
+      }
+      assert.deepEqual(v3Stages.map(({ js }) => js && [js.kind, js.logicalSlot, js.dueLocal]), [
+        ['follow-up-2', 'follow-up-2', '2026-10-01T08:00:00'],
+        ['follow-up-3', 'follow-up-3', '2026-10-05T08:00:00'],
+        ['weekday-follow-up', 'business:2026-10-06', '2026-10-06T08:00:00'],
+        null,
+      ]);
+      // Thursday acceptance: Monday 08:00 PDT under v3.
+      assert.equal(sqlInstant(v3Stages[1].sql.due_at), '2026-10-05T15:00:00.000Z');
+      // v2-stamped campaign: the same acceptance keeps the v2 Saturday date in PostgreSQL.
+      assert.equal(v3Thursday.v2Cadence.nextTouch.dueLocal, '2026-10-03T08:00:00');
+      assert.equal(v3Thursday.v2Result.applied, true);
+      assert.equal(sqlInstant(v3Thursday.v2Result.nextTouch.due_at), '2026-10-03T15:00:00.000Z');
+      assert.equal(v3Thursday.v2Result.nextTouch.id, v3Thursday.v2Cadence.nextTouch.id);
+      // A v3 campaign refuses v2 dates and v2 authority; an unknown version fails closed.
+      assert.notEqual(v3Thursday.saturdayForgery.status, 0);
+      assert.match(v3Thursday.saturdayForgery.stderr,
+        /Pursue CIM next slot does not match accepted cadence/);
+      assert.notEqual(v3Thursday.v2CadenceOnV3Campaign.status, 0);
+      assert.match(v3Thursday.v2CadenceOnV3Campaign.stderr,
+        /Pursue CIM campaign expiry authority mismatch/);
+      assert.notEqual(v3Thursday.unknownVersion.status, 0);
+      assert.match(v3Thursday.unknownVersion.stderr,
+        /Accepted Pursue CIM cadence authority mismatch/);
+      assert.notEqual(v3Thursday.calendarSlotOnV3Campaign.status, 0);
+      assert.match(v3Thursday.calendarSlotOnV3Campaign.stderr,
+        /Invalid current Pursue CIM cadence touch/);
+    });
     assert.equal(chain.nextTouch, null,
       `${chainDatabase}: calendar progression must stop at local expiry`);
     assert.deepEqual(JSON.parse(psql(container, chainDatabase, `select jsonb_build_object(
