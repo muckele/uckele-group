@@ -57,6 +57,16 @@ const fl04cCapacityMigrationPath = path.join(root,
   'supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql');
 const cadenceV3MigrationPath = path.join(root,
   'supabase/migrations/20261102140000_pursue_cim_cadence_v3.sql');
+// Migrations between the FL04C capacity and cadence v3 files. The best-first deal list one
+// adds pursue_cim_record_auto_pursue_decision_v1, so the P1C upgrade database replays them
+// in order to match the fresh schema's function inventory.
+const preCadenceV3MigrationPaths = [
+  '20261018120000_atomic_crm_restore.sql',
+  '20261019120000_operator_financial_facts.sql',
+  '20261019130000_current_unlinked_restore.sql',
+  '20261102120000_best_first_deal_list.sql',
+  '20261102130000_mvp_send_readiness_guards.sql',
+].map((name) => path.join(root, 'supabase/migrations', name));
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -1119,6 +1129,9 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactGuardMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactIdempotencyMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(fl04cCapacityMigrationPath, 'utf8'));
+  for (const migrationFile of preCadenceV3MigrationPaths) {
+    psql(container, 'pursue_cim_upgrade', fs.readFileSync(migrationFile, 'utf8'));
+  }
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(cadenceV3MigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
@@ -3067,7 +3080,20 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       join public.deal_hunter_cim_campaigns c on c.id=t.campaign_id
       join public.deal_hunter_broker_conversations v on v.id=c.conversation_id
       where m.transmission_id='${acceptedFinalizationCommand.transmissionId}' limit 1;`;
+    // The capacity RPCs read the wall clock, but the fixture campaign was accepted at the
+    // pinned parity instant, so its 28-local-day window closed on 2026-10-23. Inside each
+    // rolled-back probe, re-derive the expiry from an initial accepted now so the fence
+    // under test, not the expiry gate, decides the outcome on any date.
+    const anchorCampaignExpiryToNow = `update public.deal_hunter_cim_campaigns c
+      set initial_accepted_at=pg_catalog.clock_timestamp(),
+        local_expiry_at=(e.expiry->>'localExpiryAt')::timestamptz,
+        expiry_derivation=e.expiry->'expiryDerivation'
+      from (select public.pursue_cim_expected_initial_expiry_v1(
+        pg_catalog.clock_timestamp(),'America/Los_Angeles') expiry) e
+      where c.id=(select campaign_id from public.deal_hunter_cim_campaign_touches
+        where id='${chain.nextTouch.id}');`;
     const prepareCampaignCapacity = psql(container, chainDatabase, `begin;
+      ${anchorCampaignExpiryToNow}
       set role service_role;
       select public.pursue_cim_record_capability_activation_v1(
         '${JSON.stringify(followUpActivation)}'::jsonb
@@ -3097,6 +3123,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       claimOwner: 'fl04c-capacity-renew-test', actor: 'fixture',
     };
     const renewCapacityOutput = psql(container, chainDatabase, `begin;
+      ${anchorCampaignExpiryToNow}
       set role service_role;
       select public.pursue_cim_record_capability_activation_v1(
         '${JSON.stringify(followUpActivation)}'::jsonb
