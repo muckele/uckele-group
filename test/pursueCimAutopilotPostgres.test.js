@@ -1337,7 +1337,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
          expected_discovery_revision, expected_material_revision, observed_discovery_revision,
          observed_material_revision, policy_version, created_at)
       values ('decision-parity', 'idem-parity', repeat('a',64), 'opp-parity', 'pursue',
-        'fixture', 0, 0, 0, 0, 'v1', '${now}');
+        'fixture', 0, 0, 0, 0, 'owner-decision-v1', '${now}');
       insert into public.deal_hunter_pursuit_enrollments
         (id, decision_event_id, opportunity_id, state, reason_code, authority_digest,
          created_at, updated_at, row_version)
@@ -1411,7 +1411,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
            expected_discovery_revision, expected_material_revision,
            observed_discovery_revision, observed_material_revision, policy_version, created_at)
         values ('decision-p7b-${suffix}', 'idem-p7b-${suffix}', repeat('a',64),
-          'opp-p7b-${suffix}', 'pursue', 'fixture', 0, 0, 0, 0, 'v1', '${now}');
+          'opp-p7b-${suffix}', 'pursue', 'fixture', 0, 0, 0, 0, 'owner-decision-v1', '${now}');
         insert into public.deal_hunter_pursuit_enrollments
           (id, decision_event_id, opportunity_id, state, reason_code, authority_digest,
            created_at, updated_at)

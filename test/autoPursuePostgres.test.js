@@ -175,7 +175,7 @@ test('PostgreSQL automatic Pursue activation, runs, and blocker writer on fresh 
     psqlFails(container, database, insertEvent('guard-action', 'auto-pursue-v1', 'automation-auto-pursue', 'watch'),
       /auto_pursue_actor_check/);
     psqlFails(container, database, insertEvent('guard-policy', 'owner-v1', 'owner', 'pursue'),
-      /policy_version_check/);
+      /policy_version_allowed_check/);
     // (A valid automatic event is covered by the locked writer below; adding one here would use the cap.)
     psql(container, database, insertEvent('guard-ok-owner', 'owner-decision-v1', 'owner', 'watch'));
     assert.equal(psql(container, database, `select count(*) from pg_indexes

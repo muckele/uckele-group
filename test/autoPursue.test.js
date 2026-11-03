@@ -995,7 +995,8 @@ test('canary run without currentFingerprints blocks every auto row with criteria
   await seedAuto(storage, 'opp-fp-none-a');
   await seedAuto(storage, 'opp-fp-none-b');
   for (const currentFingerprints of [null, undefined]) {
-    const result = await runAutoPursueRaw({ storage, currentFingerprints, now: new Date(Date.now() + 1000 * (currentFingerprints === null ? 0 : 1)) });
+    const offsetMs = currentFingerprints === null ? 0 : 1000;
+    const result = await runAutoPursueRaw({ storage, currentFingerprints, now: new Date(Date.now() + offsetMs) });
     assert.equal(result.commands, 0);
     assert.equal(reasonFor(result, 'opp-fp-none-a'), 'criteria_stale');
     assert.equal(reasonFor(result, 'opp-fp-none-b'), 'criteria_stale');

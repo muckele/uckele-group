@@ -18,6 +18,8 @@ begin
 end;
 $$;
 
+-- The base table's inline length check is auto-named ..._policy_version_check, so the
+-- allowed-values check needs its own name or the existence test below would skip it.
 -- Only the two known decision policies exist, and an automatic-policy event can only be
 -- an automatic Pursue recorded by the automation actor.
 do $$
@@ -25,10 +27,10 @@ begin
   if not exists (
     select 1 from pg_catalog.pg_constraint
     where conrelid = 'public.deal_hunter_owner_decision_events'::regclass
-      and conname = 'deal_hunter_owner_decision_events_policy_version_check'
+      and conname = 'deal_hunter_owner_decision_events_policy_version_allowed_check'
   ) then
     alter table public.deal_hunter_owner_decision_events
-      add constraint deal_hunter_owner_decision_events_policy_version_check
+      add constraint deal_hunter_owner_decision_events_policy_version_allowed_check
       check (policy_version in ('owner-decision-v1', 'auto-pursue-v1'));
   end if;
   if not exists (
