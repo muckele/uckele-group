@@ -819,7 +819,11 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       if (!reportResponse.ok) throw new Error(report.error || failure);
       const authority = report?.actions;
       if (!authority?.canStop) {
-        setAutoStop((current) => ({ ...current, pendingId: '', error: `${name} can no longer be stopped.` }));
+        // No campaign yet (enrollment waiting or action required): nothing has been scheduled to stop.
+        const message = report?.campaign
+          ? `${name} can no longer be stopped.`
+          : `No email is scheduled yet for ${name}; open the deal to review it.`;
+        setAutoStop((current) => ({ ...current, pendingId: '', error: message }));
         return;
       }
       if (!authority.campaignId || !Number.isSafeInteger(authority.expectedRowVersion)

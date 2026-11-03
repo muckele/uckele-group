@@ -3133,12 +3133,27 @@ describe('Criteria-grouped Acquisition Inbox', () => {
 
     test('says so when the campaign can no longer be stopped', async () => {
       const writes = [];
-      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' }, actions: { canStop: false } } });
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' },
+        campaign: { id: 'campaign-1', state: 'completed', generation: 1 }, actions: { canStop: false } } });
       vi.spyOn(window, 'confirm').mockReturnValue(true);
       renderInbox({ initialView: 'inbox' });
       const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
       fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
       expect(await within(auto).findByRole('alert')).toHaveTextContent('Pursued Air can no longer be stopped');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('says no email is scheduled yet when the release has no campaign', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' }, campaign: null,
+        enrollment: { state: 'waiting' }, actions: { canStop: false } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent(
+        'No email is scheduled yet for Pursued Air; open the deal to review it.');
+      expect(within(auto).getByRole('alert')).not.toHaveTextContent('can no longer be stopped');
       expect(writes).toHaveLength(0);
     });
 

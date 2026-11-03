@@ -426,6 +426,8 @@ describe('Opportunity drawer', () => {
           onClose={vi.fn()} />);
         if (visible) {
           expect(pickerGroup()).toBeVisible();
+          expect(screen.getByText('No sendable timezone is on record, so the first email cannot be scheduled. '
+            + 'After you set one, click Request SIM again to schedule the email.')).toBeVisible();
           expect(within(pickerGroup()).getAllByRole('button').map((button) => button.textContent))
             .toEqual(timezoneNames);
         } else {
@@ -450,6 +452,8 @@ describe('Opportunity drawer', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Confirm timezone' }));
 
       await waitFor(() => expect(onTimezoneSet).toHaveBeenCalledTimes(1));
+      expect(screen.getByText('Timezone saved. Click Request SIM again to schedule the email.'))
+        .toHaveAttribute('role', 'status');
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [url, init] = fetchMock.mock.calls[0];
       expect(url).toBe('/api/admin/deal-hunter/triage/opp-1/timezone');

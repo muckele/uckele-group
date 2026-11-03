@@ -251,7 +251,7 @@ function TimezonePicker({ expectedPriorRevision, onSet, opportunityId, pending =
   return (
     <div className="mt-4 rounded-xl border border-sky-200 bg-white p-3">
       <p className="text-xs font-semibold text-sky-950" id="cim-timezone-label">Set timezone</p>
-      <p className="mt-1 text-xs text-ink/65">No sendable timezone is on record, so the first email cannot be scheduled.</p>
+      <p className="mt-1 text-xs text-ink/65">No sendable timezone is on record, so the first email cannot be scheduled. After you set one, click Request SIM again to schedule the email.</p>
       <div aria-labelledby="cim-timezone-label" className="mt-2 flex flex-wrap gap-2" role="group">
         {timezoneChoices.map((zone) => <button aria-pressed={choice === zone} className={`${secondaryButton} min-h-8 px-3 py-1 text-xs`} disabled={pending || saving} key={zone} onClick={() => { setChoice(zone); setError(''); }} type="button">{zone}</button>)}
       </div>
@@ -267,6 +267,8 @@ function TimezonePicker({ expectedPriorRevision, onSet, opportunityId, pending =
 
 function CimReleaseCard({ error = '', loading = false, onStop, onTimezoneSet, opportunityId = '', pending = false,
   readOnly = false, release }) {
+  // Setting a timezone does not resume a blocked enrollment; the owner must request again.
+  const [timezoneSavedFor, setTimezoneSavedFor] = useState('');
   if (!release && !loading && !error) return null;
   const transmission = release?.transmission;
   const addressing = transmission?.addressing;
@@ -303,7 +305,9 @@ function CimReleaseCard({ error = '', loading = false, onStop, onTimezoneSet, op
         {!readOnly && opportunityId && (!release.timezoneAuthority
           || ['missing', 'ambiguous'].includes(release.timezoneAuthority.state))
           ? <TimezonePicker expectedPriorRevision={release.timezoneAuthority?.revision ?? 0}
-            key={opportunityId} onSet={onTimezoneSet} opportunityId={opportunityId} pending={pending} /> : null}
+            key={opportunityId} onSet={() => { setTimezoneSavedFor(opportunityId); onTimezoneSet?.(); }}
+            opportunityId={opportunityId} pending={pending} /> : null}
+        {timezoneSavedFor && timezoneSavedFor === opportunityId ? <p aria-live="polite" className="mt-4 rounded-lg border border-moss/20 bg-white p-3 text-sm font-medium text-moss" role="status">Timezone saved. Click Request SIM again to schedule the email.</p> : null}
         {!readOnly && release.actions?.canStop && onStop ? <button className={`${secondaryButton} mt-4 text-red-700`} disabled={pending} onClick={() => onStop({
           campaignId: release.actions.campaignId,
           expectedRowVersion: release.actions.expectedRowVersion,
