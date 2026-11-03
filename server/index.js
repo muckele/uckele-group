@@ -6,6 +6,7 @@ import {
   startDealHunterCimStage2Scheduler,
   startDealHunterDailyEmailScheduler,
 } from './services/dealHunterScheduler.js';
+import { startDealHunterSheetSyncScheduler } from './services/dealHunterSheetSyncScheduler.js';
 import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler } from './services/submissions.js';
 import { startBackupScheduler } from './services/backups.js';
 import { cleanupExpiredAuthRecords, startAuthCleanupScheduler } from './services/auth.js';
@@ -27,6 +28,7 @@ const server = app.listen(config.server.port, host, () => {
   console.log(`Uckele Group backend listening on ${host}:${config.server.port}`);
   schedulers = [
     startDealHunterDailyEmailScheduler(),
+    startDealHunterSheetSyncScheduler(),
     startDealHunterCimStage2Scheduler(),
     startDealHunterCimFollowUpScheduler(),
     startSecureDocumentCleanupScheduler(),

@@ -11200,7 +11200,7 @@ export function createSqliteStorage(config, options = {}) {
           const batch = ids.slice(index, index + 500);
           rows.push(...database.prepare(`
             SELECT opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version,
-                   profile_version, completeness_policy_version, criteria_profile_version, reviewed_at
+                   profile_version, completeness_policy_version, criteria_profile_version, criteria_group, reviewed_at
             FROM deal_hunter_opportunity_scores
             WHERE opportunity_id IN (${batch.map(() => '?').join(', ')})
           `).all(...batch));

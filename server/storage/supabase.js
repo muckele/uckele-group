@@ -4071,7 +4071,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           .from('deal_hunter_opportunity_scores')
           .select(
             'opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, '
-            + 'profile_version, completeness_policy_version, criteria_profile_version, reviewed_at',
+            + 'profile_version, completeness_policy_version, criteria_profile_version, criteria_group, reviewed_at',
           )
           .in('opportunity_id', batch);
         if (error) throw error;

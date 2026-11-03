@@ -87,9 +87,55 @@ function isDailyDealHunterJob(job = {}) {
     || String(job.job_key || '').startsWith('daily-deal-hunter-email:');
 }
 
+function isSheetSyncJob(job = {}) {
+  return job.job_name === 'deal-hunter-sheet-sync'
+    || String(job.job_key || '').startsWith('deal-hunter-sheet-sync:');
+}
+
+function boundedCount(value) {
+  return Math.max(0, Math.trunc(Number(value) || 0));
+}
+
+// Job history shows what the daily Sheet sync did without exposing claim tokens or sheet URLs.
+function projectSheetSyncMetadata(job = {}) {
+  const metadata = job.metadata && typeof job.metadata === 'object' && !Array.isArray(job.metadata)
+    ? job.metadata
+    : {};
+  const pursue = metadata.autoPursue && typeof metadata.autoPursue === 'object' && !Array.isArray(metadata.autoPursue)
+    ? metadata.autoPursue
+    : {};
+  const groupCounts = {};
+  if (metadata.groupCounts && typeof metadata.groupCounts === 'object' && !Array.isArray(metadata.groupCounts)) {
+    for (const [group, count] of Object.entries(metadata.groupCounts).slice(0, 20)) {
+      groupCounts[boundedText(group, 40)] = boundedCount(count);
+    }
+  }
+  return {
+    ok: metadata.ok === true,
+    scoredCount: boundedCount(metadata.scoredCount),
+    durationMs: Number.isFinite(Number(metadata.durationMs)) ? boundedCount(metadata.durationMs) : null,
+    requiredSourcesHealthy: metadata.requiredSourcesHealthy === true,
+    groupCounts,
+    sheets: (Array.isArray(metadata.sheets) ? metadata.sheets : []).slice(0, 20).map((sheet) => ({
+      sourceId: boundedText(sheet?.sourceId, 80),
+      fetched: sheet?.fetched === true,
+      rowCount: boundedCount(sheet?.rowCount),
+      error: boundedText(sheet?.error, 300),
+    })),
+    autoPursue: {
+      runKey: boundedText(pursue.runKey, 120),
+      status: Number.isFinite(Number(pursue.status)) ? boundedCount(pursue.status) : null,
+      mode: boundedText(pursue.mode, 20),
+      skipped: boundedText(pursue.skipped, 80),
+      error: boundedText(pursue.error, 300),
+    },
+  };
+}
+
 function sanitizeScheduledJob(job = {}) {
   const daily = isDailyDealHunterJob(job) ? projectDailyDealHunterJobStatus(job) : null;
   return {
+    ...(isSheetSyncJob(job) ? { sheetSync: projectSheetSyncMetadata(job) } : {}),
     job_key: boundedText(job.job_key, 240),
     job_name: boundedText(job.job_name, 120),
     status: boundedText(daily?.status || job.status, 40),
