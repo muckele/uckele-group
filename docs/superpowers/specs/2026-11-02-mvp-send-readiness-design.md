@@ -157,7 +157,7 @@ New module `server/services/dealHunterSheetSync.js` exports `runDealHunterSheetS
    - `scoredCount`;
    - `groupCounts` (rows per criteria group after the sync);
    - `requiredSourcesHealthy`.
-3. **Automatic Pursue.** If every required sheet fetched and scoring was not deferred, call `runAutoPursue({ storage, now, triggeredBy: 'sheet-sync' })`.
+3. **Automatic Pursue.** If every required sheet fetched and scoring was not deferred, call `runAutoPursue({ storage, now, triggeredBy: 'sheet-sync', currentFingerprints })`, passing the refresh result's map (§6.1).
    - Record `{ runKey, status, mode }`, or the error text if it threw. An automatic Pursue failure does not fail the sync.
    - Otherwise record `autoPursue: { skipped: 'required_source_failed' }`.
 
@@ -188,8 +188,11 @@ These use a fake clock and an injected runner.
 ## 6. Pre-canary hardening (parked from PR #84)
 
 1. **Stale facts by fingerprint.**
-   - When automatic Pursue evaluates a row, it computes the deal's current score-input fingerprint with the same function the score store uses to decide whether a stored score is current. It compares that with the fingerprint stored on the score row.
-   - A mismatch blocks with `criteria_stale`. The next sync rescores the deal, which clears the block if the deal still qualifies. There is no in-memory rescoring; blocking is the conservative choice.
+   - A score fingerprint is computed by the scorer from the deal as built from live sources. It cannot be recomputed from stored rows alone.
+   - `refreshOpportunityScores` therefore adds `currentFingerprints: { [opportunityId]: fingerprint }` to its result, covering every candidate it considered (scored or already current).
+   - `runAutoPursue` accepts an optional `currentFingerprints`. In `canary` and `active` modes, a row may be Pursued only when that map was supplied and its entry equals the row's stored `score_fingerprint`. A missing map, a missing entry or a mismatch blocks with `criteria_stale`.
+   - Shadow mode records the same blocker, which makes it visible during shadow runs.
+   - The daily job (§5) supplies the map from the refresh it just ran. A run without a fresh refresh (for example the existing cron route) therefore cannot take an automatic decision.
    - The existing time and material-revision check stays as a second condition.
 2. **Safe truncation.** `observed` text in criteria results is truncated by code points (`Array.from(text).slice(0, 200).join('')`), never inside a surrogate pair.
 3. **Stop from the inbox.**
@@ -224,7 +227,7 @@ Every new check fails closed: no email and no automatic decision. The only cost 
 
 ## 9. Delivery
 
-One branch, one PR, five tasks in this order, each implemented by a sub-agent and reviewed before the next:
+One branch, one PR, tasks in this order, each implemented by a sub-agent and reviewed before the next (the plan may split a section across tasks):
 
 1. Hardening (§6)
 2. Cadence v3 (§2)
