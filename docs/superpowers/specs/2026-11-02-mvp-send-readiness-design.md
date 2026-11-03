@@ -223,7 +223,7 @@ Every new check fails closed: no email and no automatic decision. The only cost 
 
 - Apply the new Supabase migrations before deploying the app.
 - To start the daily job, set `DEAL_HUNTER_SHEET_SYNC_ENABLED=true`. Automatic Pursue stays in whatever mode the owner set (default off).
-- Timezones for target-state deals are now derived automatically when a deal is pursued. The owner can override any of them from the drawer.
+- Timezones for target-state deals are now derived automatically when a deal is pursued. The owner can set the timezone from the drawer when it is missing or ambiguous.
 
 ## 9. Delivery
 
