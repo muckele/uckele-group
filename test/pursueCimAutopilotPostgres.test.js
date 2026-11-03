@@ -120,6 +120,7 @@ const expectedP1cFunctions = [
   'pursue_cim_read_projection_v1',
   'pursue_cim_reconcile_transmission_v1',
   'pursue_cim_reconcile_with_cadence_v1',
+  'pursue_cim_record_auto_pursue_decision_v1',
   'pursue_cim_record_boundary_rejection_v1',
   'pursue_cim_record_capability_activation_v1',
   'pursue_cim_record_owner_decision_v1',
