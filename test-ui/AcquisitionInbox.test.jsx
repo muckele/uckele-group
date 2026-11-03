@@ -3090,10 +3090,12 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       stubStopFetch();
       renderInbox({ initialView: 'inbox' });
       const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
-      const list = await within(auto).findByRole('list', { name: 'SIM requests sent today' });
+      const list = await within(auto).findByRole('list', { name: 'SIM requested automatically today' });
       expect(within(list).getByText('Pursued Air')).toBeVisible();
       expect(within(list).getByText('Pursued Heat')).toBeVisible();
       expect(within(list).getByRole('button', { name: 'Stop SIM request to Pursued Air' })).toBeEnabled();
+      expect(within(list).getAllByRole('button')).toHaveLength(2);
+      expect(within(list).getAllByText('Stop SIM request')).toHaveLength(2);
       expect(within(list).getByRole('button', { name: 'Stop SIM request to Pursued Heat' })).toBeEnabled();
     });
 
@@ -3138,6 +3140,28 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
       expect(await within(auto).findByRole('alert')).toHaveTextContent('Pursued Air can no longer be stopped');
       expect(writes).toHaveLength(0);
+    });
+
+    test('refuses to stop without revision-bound authority', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' },
+        actions: { canStop: true, campaignId: 'campaign-1', expectedRowVersion: 4 } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Unable to stop the Pursue CIM campaign.');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('does not treat a stop response without a report as success', async () => {
+      stubStopFetch({ stopResult: jsonResponse({ success: true, ok: true }) });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Unable to stop the Pursue CIM campaign.');
+      expect(within(auto).queryByText('Stopped')).not.toBeInTheDocument();
     });
 
     test('shows the server error when the stop is rejected', async () => {

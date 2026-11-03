@@ -294,6 +294,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const [pursueChoice, setPursueChoice] = useState(null);
   const [autoPursueStatus, setAutoPursueStatus] = useState(null);
   const [autoPursueReloads, setAutoPursueReloads] = useState(0);
+  const autoStopInFlightRef = useRef(false);
   const [autoStop, setAutoStop] = useState({ pendingId: '', error: '', stoppedIds: [] });
   const [showNearMisses, setShowNearMisses] = useState(false);
   const [nearMissTarget, setNearMissTarget] = useState(null);
@@ -806,9 +807,10 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   }
 
   async function stopAutoPursued({ opportunityId, name }) {
-    if (readOnly || autoStop.pendingId) return;
+    if (readOnly || autoStopInFlightRef.current) return;
     if (!window.confirm(`Stop the SIM request to ${name}? No more emails will be sent.`)) return;
-    const failure = 'Unable to stop the SIM request.';
+    const failure = 'Unable to stop the Pursue CIM campaign.';
+    autoStopInFlightRef.current = true;
     setAutoStop((current) => ({ ...current, pendingId: opportunityId, error: '' }));
     const base = `/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/cim-release`;
     try {
@@ -820,6 +822,8 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         setAutoStop((current) => ({ ...current, pendingId: '', error: `${name} can no longer be stopped.` }));
         return;
       }
+      if (!authority.campaignId || !Number.isSafeInteger(authority.expectedRowVersion)
+        || !Number.isSafeInteger(authority.expectedTerminalRevision)) throw new Error(failure);
       const response = await fetch(`${base}/stop`, {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -831,11 +835,13 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         }),
       });
       const result = await response.json();
-      if (!response.ok || !result.success) throw new Error(result.error || failure);
+      if (!response.ok || !result.success || !result.report) throw new Error(result.error || failure);
       setAutoStop((current) => ({ pendingId: '', error: '', stoppedIds: [...current.stoppedIds, opportunityId] }));
       setAutoPursueReloads((count) => count + 1);
     } catch (stopError) {
       setAutoStop((current) => ({ ...current, pendingId: '', error: stopError.message || failure }));
+    } finally {
+      autoStopInFlightRef.current = false;
     }
   }
 
@@ -1294,7 +1300,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         </div>
         {item.id === 'auto-pursue' && autoPursueStatus?.todayPursued?.length ? <div className="border-b border-line/80 px-4 py-3">
           <p className="text-xs font-semibold text-ink/70">SIM requested automatically today</p>
-          <ul aria-label="SIM requests sent today" className="mt-2 space-y-1">{autoPursueStatus.todayPursued.map((entry) => <li className="flex flex-wrap items-center justify-between gap-2 text-sm text-ink" key={entry.opportunityId}><span>{entry.name}</span>{autoStop.stoppedIds.includes(entry.opportunityId) ? <span className="text-xs font-semibold text-ink/58">Stopped</span> : !readOnly ? <button aria-label={`Stop SIM request to ${entry.name}`} className={`${buttonClass} text-red-700`} disabled={Boolean(autoStop.pendingId)} onClick={() => stopAutoPursued(entry)} type="button">{autoStop.pendingId === entry.opportunityId ? 'Stopping…' : 'Stop'}</button> : null}</li>)}</ul>
+          <ul aria-label="SIM requested automatically today" className="mt-2 space-y-1">{autoPursueStatus.todayPursued.map((entry) => <li className="flex flex-wrap items-center justify-between gap-2 text-sm text-ink" key={entry.opportunityId}><span>{entry.name}</span>{autoStop.stoppedIds.includes(entry.opportunityId) ? <span className="text-xs font-semibold text-ink/58">Stopped</span> : !readOnly ? <button aria-label={`Stop SIM request to ${entry.name}`} className={`${buttonClass} text-red-700`} disabled={Boolean(autoStop.pendingId)} onClick={() => stopAutoPursued(entry)} type="button">{autoStop.pendingId === entry.opportunityId ? 'Stopping…' : 'Stop SIM request'}</button> : null}</li>)}</ul>
           {autoStop.error ? <p className="mt-2 text-xs font-semibold text-red-800" role="alert">{autoStop.error}</p> : null}
         </div> : null}
         {item.rows.length === 0 ? <p className="p-4 text-sm text-ink/60">No opportunities in this area.</p> : nearMissCollapsed
