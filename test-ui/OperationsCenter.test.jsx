@@ -234,12 +234,13 @@ describe('Operations Center partial failures', () => {
             { sourceId: 'sheet-1', fetched: true, rowCount: 12, error: '' },
           ],
           groupCounts: { auto: 3, review: 30, 'needs-info': 5, 'near-miss': 2 },
-          autoPursue: { runKey: 'k', status: 200, mode: 'shadow', skipped: '', error: '' },
+          autoPursue: { runKey: 'k', status: 200, mode: 'shadow', skipped: '', error: '', commands: 0,
+            reason: 'warmup_not_ready', duplicateInvocation: false },
         },
       }]);
       const summary = screen.getByTestId('sheet-sync-summary');
       expect(within(summary).getByText('sheet-0: fetched 40 rows · sheet-1: fetched 12 rows')).toBeVisible();
-      expect(within(summary).getByText('Automatic Pursue: shadow · 200')).toBeVisible();
+      expect(within(summary).getByText('Automatic Pursue: shadow · 0 decisions · warmup_not_ready')).toBeVisible();
       expect(within(summary).getByText('auto 3 · review 30 · needs-info 5 · near-miss 2')).toBeVisible();
     });
 
@@ -261,6 +262,16 @@ describe('Operations Center partial failures', () => {
       expect(within(summary).getByText('sheet-0: failed: HTTP 500')).toBeVisible();
       expect(within(summary).getByText('Automatic Pursue: skipped: required_source_failed')).toBeVisible();
       expect(screen.getAllByTestId('sheet-sync-summary')).toHaveLength(1);
+    });
+
+    test('shows a duplicate automatic Pursue invocation with its decisions count', () => {
+      renderRuns([{
+        job_key: 'deal-hunter-sheet-sync:2026-11-06', job_name: 'deal-hunter-sheet-sync', status: 'completed',
+        updated_at: '2026-11-06T15:31:00.000Z', attempt_count: 1, last_error: '',
+        sheetSync: { ok: true, sheets: [], groupCounts: {}, autoPursue: { runKey: 'k', status: 200, mode: 'canary',
+          skipped: '', error: '', commands: 1, reason: 'run_in_progress', duplicateInvocation: true } },
+      }]);
+      expect(screen.getByText('Automatic Pursue: canary · 1 decision · run_in_progress · duplicate invocation')).toBeVisible();
     });
 
     test('shows an automatic Pursue error without the raw text', () => {

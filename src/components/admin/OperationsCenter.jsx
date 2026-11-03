@@ -53,7 +53,16 @@ function formatStatus(value) {
 function pursueOutcomeText(pursue = {}) {
   if (pursue.skipped) return `skipped: ${pursue.skipped}`;
   if (pursue.error) return 'error';
-  const parts = [pursue.mode, pursue.status].filter((part) => part !== undefined && part !== null && part !== '');
+  const commands = pursue.commands === undefined || pursue.commands === null ? null : Number(pursue.commands);
+  const parts = [
+    pursue.mode,
+    Number.isFinite(commands) ? `${commands} ${commands === 1 ? 'decision' : 'decisions'}` : null,
+    pursue.reason,
+    pursue.duplicateInvocation ? 'duplicate invocation' : null,
+    // The HTTP status adds nothing on success; show it only when the run was refused.
+    pursue.status !== undefined && pursue.status !== null && pursue.status !== '' && Number(pursue.status) !== 200
+      ? `HTTP ${pursue.status}` : null,
+  ].filter((part) => part !== undefined && part !== null && part !== '');
   return parts.length > 0 ? parts.join(' · ') : '';
 }
 

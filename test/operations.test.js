@@ -647,7 +647,8 @@ test('job history shows deal-hunter-sheet-sync metadata', async () => {
           { sourceId: 'sheet-0', fetched: true, rowCount: 40, error: null, url: 'https://private.example/sheet' },
           { sourceId: 'sheet-1', fetched: false, rowCount: 0, error: 'HTTP 500' },
         ],
-        autoPursue: { runKey: 'auto-pursue:2026-09-05:shadow:0', status: 200, mode: 'shadow', internal: 'PRIVATE' },
+        autoPursue: { runKey: 'auto-pursue:2026-09-05:shadow:0', status: 200, mode: 'shadow', internal: 'PRIVATE',
+          commands: 0, reason: 'warmup_not_ready', duplicateInvocation: true },
       },
     }]),
   });
@@ -663,7 +664,8 @@ test('job history shows deal-hunter-sheet-sync metadata', async () => {
       { sourceId: 'sheet-0', fetched: true, rowCount: 40, error: '' },
       { sourceId: 'sheet-1', fetched: false, rowCount: 0, error: 'HTTP 500' },
     ],
-    autoPursue: { runKey: 'auto-pursue:2026-09-05:shadow:0', status: 200, mode: 'shadow', skipped: '', error: '' },
+    autoPursue: { runKey: 'auto-pursue:2026-09-05:shadow:0', status: 200, mode: 'shadow', skipped: '', error: '',
+      reason: 'warmup_not_ready', duplicateInvocation: true, commands: 0 },
   });
   assert.equal(Object.hasOwn(run, 'metadata'), false);
   const serialized = JSON.stringify(operations);
@@ -688,6 +690,9 @@ test('job history projects a skipped automatic Pursue and leaves other jobs with
     ]),
   });
   assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.skipped, 'required_source_failed');
+  assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.reason, '');
+  assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.duplicateInvocation, false);
+  assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.commands, null, 'no run, no decisions count');
   assert.equal(operations.scheduler.runs[0].sheetSync.ok, false);
   assert.equal(Object.hasOwn(operations.scheduler.runs[1], 'sheetSync'), false);
 });

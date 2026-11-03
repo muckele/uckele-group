@@ -141,7 +141,9 @@ export async function runDealHunterSheetSync({
       runKey: pursue?.runKey ?? null,
       status: pursue?.status ?? null,
       mode: pursue?.mode ?? null,
+      commands: Math.max(0, Math.trunc(Number(pursue?.commands) || 0)),
       ...(pursue?.reason ? { reason: String(pursue.reason).slice(0, 120) } : {}),
+      ...(pursue?.duplicateInvocation === true ? { duplicateInvocation: true } : {}),
     };
   } catch (error) {
     result.autoPursue = { error: boundedError(error) || 'Automatic Pursue threw.' };

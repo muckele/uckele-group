@@ -45,7 +45,8 @@ test('healthy sync calls autoPursue once with currentFingerprints and triggeredB
     refresh: healthyRefresh(),
     autoPursue: async (input) => {
       calls.push(input);
-      return { ok: true, status: 200, mode: 'shadow', runKey: 'auto-pursue:2026-11-03:shadow:0' };
+      return { ok: true, status: 200, mode: 'shadow', runKey: 'auto-pursue:2026-11-03:shadow:0', commands: 0,
+        reason: 'warmup_not_ready', duplicateInvocation: false, skipped: [{ opportunityId: 'opp-1' }] };
     },
   });
   assert.equal(calls.length, 1);
@@ -62,7 +63,18 @@ test('healthy sync calls autoPursue once with currentFingerprints and triggeredB
     { sourceId: 'sheet-1', fetched: true, rowCount: 12, error: null },
   ]);
   assert.equal(result.durationMs, 250);
-  assert.deepEqual(result.autoPursue, { runKey: 'auto-pursue:2026-11-03:shadow:0', status: 200, mode: 'shadow' });
+  assert.deepEqual(result.autoPursue, { runKey: 'auto-pursue:2026-11-03:shadow:0', status: 200, mode: 'shadow',
+    commands: 0, reason: 'warmup_not_ready' });
+});
+
+test('sync records a duplicate invocation and the decisions count from automatic Pursue', async () => {
+  const result = await runDealHunterSheetSync({
+    storage: storageWithGroups({ 'opp-1': 'auto' }), now, refresh: healthyRefresh(),
+    autoPursue: async () => ({ ok: true, status: 200, mode: 'canary', runKey: 'k', commands: 2,
+      duplicateInvocation: true, reason: 'run_in_progress' }),
+  });
+  assert.deepEqual(result.autoPursue, { runKey: 'k', status: 200, mode: 'canary', commands: 2,
+    reason: 'run_in_progress', duplicateInvocation: true });
 });
 
 test('unhealthy required sheet records autoPursue skipped required_source_failed and ok false', async () => {

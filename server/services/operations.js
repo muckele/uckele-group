@@ -128,6 +128,11 @@ function projectSheetSyncMetadata(job = {}) {
       mode: boundedText(pursue.mode, 20),
       skipped: boundedText(pursue.skipped, 80),
       error: boundedText(pursue.error, 300),
+      reason: boundedText(pursue.reason, 120),
+      duplicateInvocation: pursue.duplicateInvocation === true,
+      // Decisions the run recorded; null when no run was attempted (sync skipped or threw).
+      commands: pursue.commands === undefined || pursue.commands === null || !Number.isFinite(Number(pursue.commands))
+        ? null : boundedCount(pursue.commands),
     },
   };
 }

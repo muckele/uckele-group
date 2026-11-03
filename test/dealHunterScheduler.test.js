@@ -964,7 +964,7 @@ test('sheet sync retry success after failure calls autoPursue exactly once that 
   assert.equal(pursues, 1);
   const job = await harness.job('2026-11-03');
   assert.equal(job.status, 'completed');
-  assert.deepEqual(job.metadata.autoPursue, { runKey: 'k', status: 200, mode: 'shadow' });
+  assert.deepEqual(job.metadata.autoPursue, { runKey: 'k', status: 200, mode: 'shadow', commands: 0 });
 });
 
 test('sheet sync disabled flag starts no timer', async (t) => {
