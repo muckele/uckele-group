@@ -16,7 +16,7 @@ export function stoppedRestoreAuthoritySql(submissionId, opportunityId) {
       (id,idempotency_key,request_digest,opportunity_id,action,actor,expected_discovery_revision,
        expected_material_revision,observed_discovery_revision,observed_material_revision,policy_version,created_at)
       VALUES ('retained-decision','11111111-3333-4333-8333-111111111111',${digest},${opportunity},
-        'pursue','fixture-owner',0,0,0,0,'synthetic',${at});
+        'pursue','fixture-owner',0,0,0,0,'owner-decision-v1',${at});
     INSERT INTO deal_hunter_pursuit_enrollments
       (id,decision_event_id,opportunity_id,state,reason_code,authority_digest,created_at,updated_at)
       VALUES ('retained-enrollment','retained-decision',${opportunity},'campaign-created','crm_archived',${digest},${at},${at});
