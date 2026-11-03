@@ -1,5 +1,8 @@
 import { getConfig } from '../config.js';
-import { containsTrustedIndustryTerm, trustedIndustryTerms, trustedTargetStates } from './cimAutomation.js';
+import { containsTrustedIndustryTerm, trustedIndustryTerms } from './cimAutomation.js';
+import { stateNameCodes, targetStatesIn, trustedTargetStates } from './targetStates.js';
+
+export { stateNameCodes, targetStatesIn };
 
 export const DEAL_CRITERIA_PROFILE_VERSION = 'uckele-criteria-v1';
 
@@ -8,28 +11,6 @@ const MAXIMUM_ANNUAL_PROFIT = 750000;
 const MAXIMUM_PROFIT_MULTIPLE = 4.0;
 const REVIEW_FLOOR = 75;
 const AUTOMATIC_FLOOR_MINIMUM = 90;
-
-export const stateNameCodes = Object.freeze({
-  'NEW YORK': 'NY',
-  CALIFORNIA: 'CA',
-  'NEW JERSEY': 'NJ',
-  ARIZONA: 'AZ',
-  NEVADA: 'NV',
-  CONNECTICUT: 'CT',
-});
-
-/**
- * Distinct target-state codes named in free text, by 2-letter code or full state name, in the
- * order the target list gives them. Shared by the criteria geography check and the timezone
- * resolver so both read a deal's state the same way.
- */
-export function targetStatesIn(text, targetStates = trustedTargetStates) {
-  let upper = String(text ?? '').toUpperCase();
-  for (const [name, code] of Object.entries(stateNameCodes)) {
-    upper = upper.replace(new RegExp(`(^|[^A-Z])${name}(?=[^A-Z]|$)`, 'g'), `$1${code}`);
-  }
-  return targetStates.filter((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(upper));
-}
 
 const OBSERVED_TEXT_LIMIT = 200;
 

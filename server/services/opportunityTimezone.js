@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { targetStatesIn } from './dealCriteriaProfile.js';
+import { targetStatesIn } from './targetStates.js';
 
 export const TIMEZONE_RESOLVER_VERSION = 'target-state-v1';
 // Every target state sits wholly in one zone except the exception places below, which the

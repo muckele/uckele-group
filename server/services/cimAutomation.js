@@ -3,6 +3,7 @@ import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { PURSUE_OWNERSHIP_REFUSAL_MESSAGE } from './pursueOwnership.js';
+import { trustedTargetStates } from './targetStates.js';
 import {
   getCimIdentityOperationsStatus,
   logicalCimTouchesForRecipient,
@@ -34,7 +35,7 @@ export const trustedIndustryTerms = [
   'field service', 'commercial service', 'environmental', 'waste', 'pet', 'veterinary',
   'healthcare service', 'professional service', 'property management',
 ];
-export const trustedTargetStates = ['NY', 'CA', 'NJ', 'AZ', 'NV', 'CT'];
+export { trustedTargetStates };
 const automationModes = new Set(['off', 'shadow', 'canary', 'active']);
 
 function normalizeText(value = '', maxLength = 1000) {
