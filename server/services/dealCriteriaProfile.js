@@ -9,7 +9,7 @@ const MAXIMUM_PROFIT_MULTIPLE = 4.0;
 const REVIEW_FLOOR = 75;
 const AUTOMATIC_FLOOR_MINIMUM = 90;
 
-const stateNameCodes = Object.freeze({
+export const stateNameCodes = Object.freeze({
   'NEW YORK': 'NY',
   CALIFORNIA: 'CA',
   'NEW JERSEY': 'NJ',
@@ -17,6 +17,19 @@ const stateNameCodes = Object.freeze({
   NEVADA: 'NV',
   CONNECTICUT: 'CT',
 });
+
+/**
+ * Distinct target-state codes named in free text, by 2-letter code or full state name, in the
+ * order the target list gives them. Shared by the criteria geography check and the timezone
+ * resolver so both read a deal's state the same way.
+ */
+export function targetStatesIn(text, targetStates = trustedTargetStates) {
+  let upper = String(text ?? '').toUpperCase();
+  for (const [name, code] of Object.entries(stateNameCodes)) {
+    upper = upper.replace(new RegExp(`(^|[^A-Z])${name}(?=[^A-Z]|$)`, 'g'), `$1${code}`);
+  }
+  return targetStates.filter((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(upper));
+}
 
 const OBSERVED_TEXT_LIMIT = 200;
 
@@ -80,13 +93,7 @@ function evaluateGeography(deal, profile) {
   const fields = [deal.location, deal.state].map((value) => String(value || '').trim()).filter(Boolean);
   const targetStates = [...profile.targetStates];
   if (fields.length === 0) return { id: 'geography', outcome: 'unknown', observed: null, targetStates };
-  const pass = fields.some((field) => {
-    let text = field.toUpperCase();
-    for (const [name, code] of Object.entries(stateNameCodes)) {
-      text = text.replace(new RegExp(`(^|[^A-Z])${name}(?=[^A-Z]|$)`, 'g'), `$1${code}`);
-    }
-    return profile.targetStates.some((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(text));
-  });
+  const pass = fields.some((field) => targetStatesIn(field, profile.targetStates).length > 0);
   return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed: boundedObserved(fields.join(' | ')), targetStates };
 }
 

@@ -4,9 +4,15 @@ import {
   createDeterministicClock,
   createDeterministicNonceSource,
 } from './fixtures/pursueCimHarness.js';
+import { createHash } from 'node:crypto';
 import {
   validateIanaTimezone,
+  resolveLocationTimezone,
   resolveOpportunityTimezone,
+  TARGET_STATE_TIMEZONES,
+  TIMEZONE_DATASET_DIGEST,
+  TIMEZONE_EXCEPTIONS,
+  TIMEZONE_RESOLVER_VERSION,
   selectCampaignTimezoneAuthority,
   evaluateCampaignTimezoneChange,
 } from '../server/services/opportunityTimezone.js';
@@ -63,8 +69,9 @@ test('P3 scenario 26/27: IANA authority uses evidence precedence and never guess
     'America/New_York');
   assert.equal(resolveOpportunityTimezone({ opportunityId: 'opp-2', operator, source }).reasonCode,
     'timezone_missing');
-  assert.equal(resolveOpportunityTimezone({ opportunityId: 'opp-1', location: { state: 'CA' } }).reasonCode,
-    'timezone_ambiguous');
+  assert.deepEqual(resolveOpportunityTimezone({ opportunityId: 'opp-1', location: { state: 'CA' } }),
+    { eligible: true, ianaTimezone: 'America/Los_Angeles', state: 'CA',
+      resolverVersion: 'target-state-v1' });
   assert.equal(resolveOpportunityTimezone({ opportunityId: 'opp-1' }).reasonCode, 'timezone_missing');
   assert.equal(resolveOpportunityTimezone({ opportunityId: 'opp-1', location: {} }).reasonCode,
     'timezone_missing');
@@ -345,4 +352,80 @@ test('missing cadencePolicyVersion for a follow-up throws', () => {
     readyAt: '2026-11-05T18:00:00.000Z' });
   assert.equal(initial.dueAt, '2026-11-05T18:00:00.000Z');
   assert.equal(initial.cadencePolicyVersion, CIM_CADENCE_POLICY_VERSION);
+});
+
+const derived = (ianaTimezone, state) => ({ eligible: true, ianaTimezone, state,
+  resolverVersion: 'target-state-v1' });
+const ineligible = (reasonCode) => ({ eligible: false, reasonCode,
+  resolverVersion: 'target-state-v1' });
+
+test('target-state resolver maps each of the six states by code', () => {
+  const zones = { NY: 'America/New_York', NJ: 'America/New_York', CT: 'America/New_York',
+    CA: 'America/Los_Angeles', NV: 'America/Los_Angeles', AZ: 'America/Phoenix' };
+  for (const [code, zone] of Object.entries(zones)) {
+    assert.deepEqual(resolveLocationTimezone({ state: code }), derived(zone, code));
+    assert.deepEqual(resolveLocationTimezone({ state: code.toLowerCase() }), derived(zone, code));
+  }
+  assert.equal(TIMEZONE_RESOLVER_VERSION, 'target-state-v1');
+  assert.deepEqual(TARGET_STATE_TIMEZONES, zones);
+  assert.equal(Object.isFrozen(TARGET_STATE_TIMEZONES), true);
+  assert.equal(Object.isFrozen(TIMEZONE_EXCEPTIONS), true);
+});
+
+test('target-state resolver maps each of the six states by full name', () => {
+  const names = { 'New York': ['NY', 'America/New_York'], 'New Jersey': ['NJ', 'America/New_York'],
+    Connecticut: ['CT', 'America/New_York'], California: ['CA', 'America/Los_Angeles'],
+    Nevada: ['NV', 'America/Los_Angeles'], Arizona: ['AZ', 'America/Phoenix'] };
+  for (const [name, [code, zone]] of Object.entries(names)) {
+    assert.deepEqual(resolveLocationTimezone({ state: name }), derived(zone, code));
+  }
+  assert.deepEqual(resolveLocationTimezone({ state: '  new   york ' }),
+    derived('America/New_York', 'NY'));
+});
+
+test('target-state resolver reads a state named only in the location text', () => {
+  assert.deepEqual(resolveLocationTimezone({ location: 'Scottsdale, Arizona' }),
+    derived('America/Phoenix', 'AZ'));
+  assert.deepEqual(resolveLocationTimezone({ state: '', location: 'Albany, NY' }),
+    derived('America/New_York', 'NY'));
+  assert.deepEqual(resolveLocationTimezone({ state: 'NY', location: 'Albany, New York' }),
+    derived('America/New_York', 'NY'));
+});
+
+test('target-state resolver treats disagreeing inputs as ambiguous even when zones match', () => {
+  assert.deepEqual(resolveLocationTimezone({ state: 'CA', location: 'Reno, NV' }),
+    ineligible('timezone_ambiguous'));
+  assert.deepEqual(resolveLocationTimezone({ state: 'TX', location: 'Reno, NV' }),
+    ineligible('timezone_ambiguous'));
+  assert.deepEqual(resolveLocationTimezone({ state: 'NY/NJ' }), ineligible('timezone_ambiguous'));
+});
+
+test('target-state resolver refuses the exception towns', () => {
+  for (const location of ['West Wendover, NV', 'JACKPOT, Nevada', 'Window Rock, AZ',
+    'Tuba City, AZ', 'Kayenta, AZ', 'Chinle, AZ', 'Navajo County, AZ']) {
+    assert.deepEqual(resolveLocationTimezone({ location }), ineligible('timezone_ambiguous'),
+      location);
+  }
+  assert.deepEqual(resolveLocationTimezone({ state: 'NV', location: 'West  Wendover' }),
+    ineligible('timezone_ambiguous'));
+});
+
+test('target-state resolver reports missing for out-of-scope or empty inputs', () => {
+  assert.deepEqual(resolveLocationTimezone({ state: 'TX' }), ineligible('timezone_missing'));
+  assert.deepEqual(resolveLocationTimezone({ state: 'TX', location: 'Austin, TX' }),
+    ineligible('timezone_missing'));
+  assert.deepEqual(resolveLocationTimezone({}), ineligible('timezone_missing'));
+  assert.deepEqual(resolveLocationTimezone({ state: '  ', location: null }),
+    ineligible('timezone_missing'));
+  assert.deepEqual(resolveLocationTimezone(), ineligible('timezone_missing'));
+});
+
+test('timezone dataset digest is the sha256 of the canonical mapping', () => {
+  assert.equal(TIMEZONE_DATASET_DIGEST, createHash('sha256').update(JSON.stringify({
+    zones: TARGET_STATE_TIMEZONES, exceptions: TIMEZONE_EXCEPTIONS })).digest('hex'));
+  assert.notEqual(TIMEZONE_DATASET_DIGEST, '0'.repeat(64));
+  assert.deepEqual(TIMEZONE_EXCEPTIONS, {
+    NV: ['west wendover', 'jackpot'],
+    AZ: ['navajo', 'window rock', 'tuba city', 'kayenta', 'chinle'],
+  });
 });
