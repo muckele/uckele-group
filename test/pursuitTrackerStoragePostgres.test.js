@@ -32,7 +32,8 @@ const { createServiceRoleClient, dockerCommand, openSession, startDisposableSupa
 const { HEALTHY_SOURCE_SNAPSHOT, START, autoPursuedAndSent, brokerReplies, createWorld, pacific, pollAt } =
   await import('./fixtures/pursueCimEndToEndFixture.js');
 const { PURSUIT_TRACKER_SCENARIOS } = await import('./fixtures/pursuitTrackerScenarios.js');
-const { pursuitStageRequestDigest } = await import('../server/storage/pursuitTrackerStorageContract.js');
+const { PURSUIT_CIM_DOCUMENT_TYPES, pursuitStageRequestDigest } =
+  await import('../server/storage/pursuitTrackerStorageContract.js');
 
 fs.writeFileSync(process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH, JSON.stringify(HEALTHY_SOURCE_SNAPSHOT));
 
@@ -133,6 +134,8 @@ test('anon and authenticated cannot read the table or execute the RPC', { ...gat
         /permission denied/);
       await assert.rejects(query(`set role ${role};
         select public.pursuit_tracker_record_event_v1('{}'::jsonb);`), /permission denied/);
+      await assert.rejects(query(`set role ${role};
+        select public.pursuit_tracker_list_v1('{}'::jsonb);`), /permission denied/);
     }
     // service_role reads the table and writes it only through the RPC.
     assert.equal(await query('set role service_role; select count(*) from public.deal_hunter_pursuit_stage_events;'),
@@ -144,6 +147,12 @@ test('anon and authenticated cannot read the table or execute the RPC', { ...gat
     }
     await assert.rejects(query(`set role service_role;
       select public.pursuit_tracker_record_event_v1('{}'::jsonb);`), /Invalid pursuit stage event/);
+    assert.equal(await query(`set role service_role; select public.pursuit_tracker_list_v1('{}'::jsonb);`), '[]');
+    for (const bad of [`'[]'`, `'{"opportunityIds":"x"}'`, `'{"opportunityIds":[1]}'`, `'{"opportunityIds":["a b"]}'`,
+      `jsonb_build_object('opportunityIds', (select jsonb_agg('o' || n) from generate_series(1, 201) n))`]) {
+      await assert.rejects(query(`set role service_role; select public.pursuit_tracker_list_v1(${bad}::jsonb);`),
+        /Invalid pursuit bundle list/);
+    }
   });
 
 test('the tracker migration is mirrored exactly at the end of the fresh schema', () => {
@@ -152,7 +161,7 @@ test('the tracker migration is mirrored exactly at the end of the fresh schema',
   const start = schema.indexOf(migration);
   assert.ok(start >= 0, 'the fresh schema must contain the exact tracker block');
   assert.equal(schema.slice(start + migration.length).trim(), '', 'the tracker block is the end of the schema');
-  assert.deepEqual(migrationFunctionNames(migration), ['pursuit_tracker_record_event_v1',
+  assert.deepEqual(migrationFunctionNames(migration), ['pursuit_tracker_list_v1', 'pursuit_tracker_record_event_v1',
     'pursuit_tracker_reject_event_mutation_v1']);
   assert.match(migration, /alter table public\.deal_hunter_pursuit_stage_events enable row level security;/);
   assert.match(migration, /revoke all on table public\.deal_hunter_pursuit_stage_events\s+from public, anon, authenticated, service_role;/);
@@ -162,6 +171,18 @@ test('the tracker migration is mirrored exactly at the end of the fresh schema',
   assert.match(rpc, /^create or replace function public\.pursuit_tracker_record_event_v1\(p_command jsonb\)/);
   assert.match(rpc, /security definer\s+set search_path = public/);
   assert.match(rpc, /grant execute on function public\.pursuit_tracker_record_event_v1\(jsonb\) to service_role;/);
+});
+
+test('the list RPC is stable, security definer, service_role only and spells the CIM document types', () => {
+  const migration = fs.readFileSync(migrationPath, 'utf8');
+  const rpc = migration.slice(migration.indexOf('create or replace function public.pursuit_tracker_list_v1('));
+  assert.match(rpc, /^create or replace function public\.pursuit_tracker_list_v1\(p_command jsonb\)\s+returns jsonb\s+language plpgsql\s+stable\s+security definer\s+set search_path = public/);
+  assert.doesNotMatch(rpc, /security invoker/i);
+  assert.match(rpc, /revoke all on function public\.pursuit_tracker_list_v1\(jsonb\)\s+from public, anon, authenticated;/);
+  assert.match(rpc, /grant execute on function public\.pursuit_tracker_list_v1\(jsonb\) to service_role;/);
+  assert.doesNotMatch(rpc, /primary_submission_id/);
+  assert.match(rpc, new RegExp(`doc\\.document_type in \\(${PURSUIT_CIM_DOCUMENT_TYPES.map((type) => `'${type}'`)
+    .join(',\\s*')}\\)`));
 });
 
 test('migration and schema.sql define identical functions', { ...gated, timeout: 180_000 }, async (t) => {

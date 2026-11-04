@@ -1,6 +1,7 @@
 // Pursued deals tracker Task 1: the owner event table and its stage-event writes on real SQLite.
 // The scenarios live in test/fixtures/pursuitTrackerScenarios.js and also run on gated Postgres
 // (test/pursuitTrackerStoragePostgres.test.js).
+import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,6 +41,12 @@ function createSqliteBackend(t) {
     run: async (sql, ...params) => { database.prepare(sql).run(...params); },
   };
 }
+
+test('the bundle spells the CIM document types of the materials policy', async () => {
+  const { cimDocumentTypes } = await import('../server/services/acquisitionMaterials.js');
+  const { PURSUIT_CIM_DOCUMENT_TYPES } = await import('../server/storage/pursuitTrackerStorageContract.js');
+  assert.deepEqual([...PURSUIT_CIM_DOCUMENT_TYPES].sort(), [...cimDocumentTypes].sort());
+});
 
 for (const [name, scenario] of PURSUIT_TRACKER_SCENARIOS) {
   test(name, (t) => scenario(t, createSqliteBackend));

@@ -10,7 +10,8 @@ import {
   validateGmailSentIdentityLookup, validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
 import {
-  normalizePursuitStageEventRow, PURSUIT_STAGE_EVENT_CONFLICTS, validatePursuitStageEventCommand,
+  normalizePursuitBundle, normalizePursuitStageEventRow, PURSUIT_STAGE_EVENT_CONFLICTS,
+  validatePursuitBundleListCommand, validatePursuitStageEventCommand,
 } from './pursuitTrackerStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -4348,6 +4349,21 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
       return { applied: data.applied, replay: data.replay, conflict: data.conflict ?? null,
         event: normalizePursuitStageEventRow(data.event) };
+    },
+
+    /**
+     * The evidence each pursued deal's tracker row is folded from (spec 2026-11-04 §4.4), from one
+     * read-only RPC statement. Members are every opportunity with a pursue decision, whatever its
+     * status now; `opportunityIds` (at most 200) narrows the list.
+     */
+    async listPursuitBundles(command = {}) {
+      const { opportunityIds } = validatePursuitBundleListCommand(command);
+      const { data, error } = await client.rpc('pursuit_tracker_list_v1', {
+        p_command: opportunityIds === null ? {} : { opportunityIds },
+      });
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed pursuit bundle list result');
+      return data.map(normalizePursuitBundle);
     },
 
     async getCurrentAutoPursueActivation() {

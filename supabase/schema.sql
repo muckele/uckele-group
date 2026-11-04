@@ -24756,3 +24756,104 @@ $$;
 revoke all on function public.pursuit_tracker_record_event_v1(jsonb)
   from public, anon, authenticated;
 grant execute on function public.pursuit_tracker_record_event_v1(jsonb) to service_role;
+
+-- Reads the evidence each pursued deal's tracker row is folded from. Members are every
+-- opportunity with at least one pursue decision, whatever its status now; `opportunityIds`
+-- (at most 200) narrows the list. The bundle holds every owner decision, the latest campaign
+-- generation with its conversation's Gmail thread, that conversation's Gmail rows (pending ones
+-- too), the CIM-type secure documents and the diligence / pipeline stage fields of the
+-- campaign's crm_submission_id (never primary_submission_id), and the owner events, oldest first.
+create or replace function public.pursuit_tracker_list_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public
+as $$
+declare
+  v_ids text[];
+begin
+  if p_command is null or pg_catalog.jsonb_typeof(p_command) <> 'object' then
+    raise exception 'Invalid pursuit bundle list';
+  end if;
+  if p_command -> 'opportunityIds' is not null and pg_catalog.jsonb_typeof(p_command -> 'opportunityIds') <> 'null' then
+    if pg_catalog.jsonb_typeof(p_command -> 'opportunityIds') <> 'array'
+      or pg_catalog.jsonb_array_length(p_command -> 'opportunityIds') > 200
+      or exists (
+        select 1 from pg_catalog.jsonb_array_elements(p_command -> 'opportunityIds') as item(value)
+        where pg_catalog.jsonb_typeof(item.value) <> 'string' or (item.value #>> '{}') !~ '^[A-Za-z0-9_-]{1,240}$')
+    then
+      raise exception 'Invalid pursuit bundle list';
+    end if;
+    select coalesce(pg_catalog.array_agg(item.value #>> '{}'), '{}'::text[]) into v_ids
+      from pg_catalog.jsonb_array_elements(p_command -> 'opportunityIds') as item(value);
+  end if;
+
+  return coalesce((
+    select pg_catalog.jsonb_agg(bundle.value order by bundle.opportunity_id)
+    from (
+      select o.opportunity_id,
+        pg_catalog.jsonb_build_object(
+          'opportunity_id', o.opportunity_id,
+          'name', o.canonical_name,
+          'opportunity_status', o.status,
+          'decisions', coalesce((
+            select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('id', d.id, 'action', d.action,
+              'created_at', d.created_at) order by d.created_at, d.id)
+            from public.deal_hunter_owner_decision_events d where d.opportunity_id = o.opportunity_id),
+            '[]'::jsonb),
+          'campaign', (
+            select pg_catalog.jsonb_build_object('id', c.id, 'state', c.state, 'reason_code', c.reason_code,
+              'crm_submission_id', c.crm_submission_id, 'conversation_id', c.conversation_id,
+              'gmail_thread_id', conversation.gmail_thread_id)
+            from public.deal_hunter_cim_campaigns c
+            left join public.deal_hunter_broker_conversations conversation on conversation.id = c.conversation_id
+            where c.opportunity_id = o.opportunity_id order by c.generation desc limit 1),
+          'replies', coalesce((
+            select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('gmail_message_id', r.gmail_message_id,
+              'classification', r.classification, 'processed_at', r.processed_at, 'message_at', r.message_at)
+              order by r.processed_at, r.gmail_message_id)
+            from public.deal_hunter_gmail_reply_messages r
+            where r.conversation_id = (
+              select c.conversation_id from public.deal_hunter_cim_campaigns c
+              where c.opportunity_id = o.opportunity_id order by c.generation desc limit 1)), '[]'::jsonb),
+          'documents', coalesce((
+            select pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object('id', doc.id,
+              'document_type', doc.document_type, 'original_name', doc.original_name,
+              'size_bytes', doc.size_bytes, 'created_at', doc.created_at) order by doc.created_at, doc.id)
+            from public.secure_documents doc
+            where doc.submission_id = (
+              select c.crm_submission_id from public.deal_hunter_cim_campaigns c
+              where c.opportunity_id = o.opportunity_id order by c.generation desc limit 1)
+              and doc.document_type in ('cim', 'teaser', 'prospectus', 'offering_memorandum',
+                'offering_materials', 'data_room', 'broker_materials')), '[]'::jsonb),
+          'crm', (
+            select pg_catalog.jsonb_build_object(
+              'diligence_stage', case when pg_catalog.jsonb_typeof(s.metadata #> '{diligence,stage}') = 'string'
+                then s.metadata #>> '{diligence,stage}' end,
+              'diligence_updated_at', case when pg_catalog.jsonb_typeof(s.metadata #> '{diligence,updated_at}') = 'string'
+                then s.metadata #>> '{diligence,updated_at}' end,
+              'pipeline_stage', case when pg_catalog.jsonb_typeof(s.metadata #> '{acquisitionCommand,pipelineStage}') = 'string'
+                then s.metadata #>> '{acquisitionCommand,pipelineStage}' end,
+              'pipeline_updated_at', case when pg_catalog.jsonb_typeof(s.metadata #> '{acquisitionCommand,updatedAt}') = 'string'
+                then s.metadata #>> '{acquisitionCommand,updatedAt}' end)
+            from public.contact_submissions s
+            where s.id = (
+              select c.crm_submission_id from public.deal_hunter_cim_campaigns c
+              where c.opportunity_id = o.opportunity_id order by c.generation desc limit 1)),
+          'events', coalesce((
+            select pg_catalog.jsonb_agg(pg_catalog.to_jsonb(e) - 'request_digest' order by e.created_at, e.id)
+            from public.deal_hunter_pursuit_stage_events e where e.opportunity_id = o.opportunity_id),
+            '[]'::jsonb)
+        ) as value
+      from public.deal_hunter_opportunities o
+      where (v_ids is null or o.opportunity_id = any(v_ids))
+        and exists (select 1 from public.deal_hunter_owner_decision_events d
+          where d.opportunity_id = o.opportunity_id and d.action = 'pursue')
+    ) as bundle
+  ), '[]'::jsonb);
+end;
+$$;
+revoke all on function public.pursuit_tracker_list_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursuit_tracker_list_v1(jsonb) to service_role;

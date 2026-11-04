@@ -17,6 +17,16 @@ export const PURSUIT_STAGE_REQUEST_DIGEST_PREFIX = 'pursuit-stage-request:v1';
 export const PURSUIT_STAGE_EVENT_CONFLICTS = Object.freeze([null, 'idempotency_conflict', 'pursuit_stage_changed',
   'not_pursued', 'opportunity_not_active', 'unknown_reply']);
 
+/** The most opportunities one `listPursuitBundles` call may name. */
+export const PURSUIT_BUNDLE_MAX_IDS = 200;
+/**
+ * The `secure_documents.document_type` values that count as a CIM (the set of
+ * server/services/acquisitionMaterials.js; a test pins them equal). The Postgres RPC spells
+ * the same list.
+ */
+export const PURSUIT_CIM_DOCUMENT_TYPES = Object.freeze(['cim', 'teaser', 'prospectus', 'offering_memorandum',
+  'offering_materials', 'data_room', 'broker_materials']);
+
 const idPattern = /^[A-Za-z0-9_-]{1,240}$/;
 // The client idempotency key format of dealHunterTriage.js (owner decisions).
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -47,6 +57,17 @@ function oneOf(value, values, name) {
 
 function optionalInstant(value) {
   return value === null || value === undefined ? null : new Date(value).toISOString();
+}
+
+// CRM metadata is free-form JSON: an instant that does not parse is not an instant.
+function lenientInstant(value) {
+  if (typeof value !== 'string') return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? new Date(time).toISOString() : null;
+}
+
+function optionalString(value) {
+  return typeof value === 'string' ? value : null;
 }
 
 /**
@@ -116,5 +137,57 @@ export function normalizePursuitStageEventRow(row) {
     actor: row.actor,
     policyVersion: row.policy_version,
     createdAt: optionalInstant(row.created_at),
+  };
+}
+
+/**
+ * The normalized `listPursuitBundles` command: `opportunityIds` is absent (every pursued deal) or
+ * at most 200 distinct opportunity ids.
+ */
+export function validatePursuitBundleListCommand(command = {}) {
+  if (!command || typeof command !== 'object') throw invalid('command');
+  if (command.opportunityIds === undefined || command.opportunityIds === null) return { opportunityIds: null };
+  const { opportunityIds } = command;
+  if (!Array.isArray(opportunityIds) || opportunityIds.length > PURSUIT_BUNDLE_MAX_IDS) {
+    throw invalid('opportunityIds');
+  }
+  return { opportunityIds: [...new Set(opportunityIds.map((value) => id(value, 'opportunityIds')))] };
+}
+
+/**
+ * One pursued deal's evidence from either adapter (spec 2026-11-04 §4.4). The raw shape is
+ * snake_case rows: `{ opportunity_id, name, opportunity_status, decisions, campaign, replies,
+ * documents, crm, events }`; `events` are `deal_hunter_pursuit_stage_events` rows.
+ */
+export function normalizePursuitBundle(raw) {
+  const campaign = raw.campaign ?? null;
+  const crm = raw.crm ?? null;
+  return {
+    opportunityId: raw.opportunity_id,
+    name: raw.name,
+    opportunityStatus: raw.opportunity_status,
+    decisions: (raw.decisions ?? []).map((row) => ({ id: row.id, action: row.action,
+      createdAt: optionalInstant(row.created_at) })),
+    campaign: campaign && {
+      id: campaign.id,
+      state: campaign.state,
+      reasonCode: campaign.reason_code ?? null,
+      crmSubmissionId: campaign.crm_submission_id ?? null,
+      conversationId: campaign.conversation_id,
+      gmailThreadId: campaign.gmail_thread_id ?? null,
+    },
+    replies: (raw.replies ?? []).map((row) => ({ gmailMessageId: row.gmail_message_id,
+      classification: row.classification, processedAt: optionalInstant(row.processed_at),
+      messageAt: optionalInstant(row.message_at) })),
+    documents: (raw.documents ?? []).map((row) => ({ id: row.id, documentType: row.document_type,
+      originalName: row.original_name, sizeBytes: Number(row.size_bytes),
+      createdAt: optionalInstant(row.created_at) })),
+    crm: crm && {
+      diligenceStage: optionalString(crm.diligence_stage),
+      diligenceUpdatedAt: lenientInstant(crm.diligence_updated_at),
+      pipelineStage: optionalString(crm.pipeline_stage),
+      pipelineUpdatedAt: lenientInstant(crm.pipeline_updated_at),
+    },
+    events: (raw.events ?? []).map(normalizePursuitStageEventRow),
   };
 }

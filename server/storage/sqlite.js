@@ -48,9 +48,29 @@ import {
   validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
 import {
-  normalizePursuitStageEventRow, PURSUIT_GENESIS, PURSUIT_TRACKER_POLICY_VERSION,
-  validatePursuitStageEventCommand,
+  normalizePursuitBundle, normalizePursuitStageEventRow, PURSUIT_CIM_DOCUMENT_TYPES, PURSUIT_GENESIS,
+  PURSUIT_TRACKER_POLICY_VERSION, validatePursuitBundleListCommand, validatePursuitStageEventCommand,
 } from './pursuitTrackerStorageContract.js';
+
+/** The four CRM stage fields a pursuit bundle reads; a value that is not a string is absent. */
+function pursuitCrmFields(metadataJson) {
+  let metadata = null;
+  try {
+    metadata = JSON.parse(metadataJson);
+  } catch {
+    metadata = null;
+  }
+  const field = (parent, key) => {
+    const value = metadata?.[parent]?.[key];
+    return typeof value === 'string' ? value : null;
+  };
+  return {
+    diligence_stage: field('diligence', 'stage'),
+    diligence_updated_at: field('diligence', 'updated_at'),
+    pipeline_stage: field('acquisitionCommand', 'pipelineStage'),
+    pipeline_updated_at: field('acquisitionCommand', 'updatedAt'),
+  };
+}
 
 function cimSafetyDigest(...parts) {
   const framed = parts.map((part) => {
@@ -11499,6 +11519,60 @@ ${cimCapacityConsumeTriggerSql}
           return { applied: true, replay: false, conflict: null, event: normalizePursuitStageEventRow(
             database.prepare('SELECT * FROM deal_hunter_pursuit_stage_events WHERE id = ?').get(event.id)) };
         }).immediate();
+      },
+
+      /**
+       * The evidence each pursued deal's tracker row is folded from (spec 2026-11-04 §4.4).
+       * Members are every opportunity with at least one pursue decision, whatever its status now;
+       * the fold decides who is listed. `opportunityIds` (at most 200) narrows the list. One read
+       * transaction, so a bundle is a consistent snapshot.
+       */
+      async listPursuitBundles(command = {}) {
+        const { opportunityIds } = validatePursuitBundleListCommand(command);
+        return database.transaction(() => {
+          const members = database.prepare(`
+            SELECT o.opportunity_id, o.canonical_name AS name, o.status AS opportunity_status
+            FROM deal_hunter_opportunities o
+            WHERE EXISTS (SELECT 1 FROM deal_hunter_owner_decision_events d
+              WHERE d.opportunity_id = o.opportunity_id AND d.action = 'pursue')
+            ORDER BY o.opportunity_id
+          `).all().filter((member) => opportunityIds === null || opportunityIds.includes(member.opportunity_id));
+          const decisions = database.prepare(`
+            SELECT id, action, created_at FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?
+            ORDER BY julianday(created_at), id`);
+          const campaigns = database.prepare(`
+            SELECT campaign.id, campaign.state, campaign.reason_code, campaign.crm_submission_id,
+              campaign.conversation_id, conversation.gmail_thread_id
+            FROM deal_hunter_cim_campaigns campaign
+            LEFT JOIN deal_hunter_broker_conversations conversation ON conversation.id = campaign.conversation_id
+            WHERE campaign.opportunity_id = ? ORDER BY campaign.generation DESC LIMIT 1`);
+          const replies = database.prepare(`
+            SELECT gmail_message_id, classification, processed_at, message_at
+            FROM deal_hunter_gmail_reply_messages WHERE conversation_id = ?
+            ORDER BY julianday(processed_at), gmail_message_id`);
+          const documents = database.prepare(`
+            SELECT id, document_type, original_name, size_bytes, created_at FROM secure_documents
+            WHERE submission_id = ? AND document_type IN (${PURSUIT_CIM_DOCUMENT_TYPES.map(() => '?').join(', ')})
+            ORDER BY julianday(created_at), id`);
+          const submissions = database.prepare('SELECT metadata FROM contact_submissions WHERE id = ?');
+          const events = database.prepare(`
+            SELECT * FROM deal_hunter_pursuit_stage_events WHERE opportunity_id = ?
+            ORDER BY julianday(created_at), id`);
+          return members.map((member) => {
+            const campaign = campaigns.get(member.opportunity_id) ?? null;
+            const submissionId = campaign?.crm_submission_id ?? null;
+            const submission = submissionId === null ? undefined : submissions.get(submissionId);
+            return normalizePursuitBundle({
+              ...member,
+              decisions: decisions.all(member.opportunity_id),
+              campaign,
+              replies: campaign ? replies.all(campaign.conversation_id) : [],
+              documents: submissionId === null ? [] : documents.all(submissionId, ...PURSUIT_CIM_DOCUMENT_TYPES),
+              crm: submission ? pursuitCrmFields(submission.metadata) : null,
+              events: events.all(member.opportunity_id),
+            });
+          });
+        })();
       },
 
       async getCurrentAutoPursueActivation() {
