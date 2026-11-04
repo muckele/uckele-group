@@ -2,6 +2,7 @@ import { getCimProviderReconciliationConfig, getConfig } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { createCimProviderBoundaryAuthorization } from './cimProviderBoundary.js';
 import { cimRfcMessageId } from './cimMailProvider.js';
+import { RFC_MESSAGE_ID } from './rfc5322.js';
 import { deriveAcceptedCimCadence } from './pursueCimCadence.js';
 import { sendPreparedMessage } from './delivery.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
@@ -218,6 +219,33 @@ async function storeGmailThread(storage, { conversationId, gmailThreadId, now })
   }
 }
 
+/**
+ * Gmail may give a sent message its own Message-ID instead of ours. After an accepted Gmail
+ * send the real one is read back and stored as the communication's message id, which
+ * follow-ups reply to, the reply poller recognizes as ours, and findSent searches first. A
+ * failed read keeps ours: nothing changes. Never throws.
+ */
+async function storeSentMessageId(storage, { mailProvider, transmissionId, providerMessageId, now }) {
+  if (typeof mailProvider?.readMessageId !== 'function'
+    || typeof storage?.setCimCommunicationMessageId !== 'function'
+    || typeof providerMessageId !== 'string' || !providerMessageId) return null;
+  let messageId;
+  try {
+    messageId = await mailProvider.readMessageId({ messageId: providerMessageId });
+  } catch {
+    return { stored: false, code: 'gmail_message_id_unread' };
+  }
+  try {
+    const result = await storage.setCimCommunicationMessageId({ transmissionId, messageId,
+      now: now instanceof Date ? now.toISOString() : new Date(now).toISOString() });
+    if (result?.conflict) console.warn('[pursue-cim] gmail_message_id_conflict: the stored Message-ID is kept');
+    return { stored: result?.applied === true || result?.replay === true };
+  } catch {
+    console.warn('[pursue-cim] gmail_message_id_store_failed');
+    return { stored: false, code: 'gmail_message_id_store_failed' };
+  }
+}
+
 export async function finalizeAuthorizedCimTransmission({
   storage,
   finalGateResult,
@@ -319,12 +347,18 @@ export async function finalizeAuthorizedCimTransmission({
   await testHooks.beforeFinalization?.({ command, providerResult, outcome });
   const durableResult = await storage.finalizeCimTransmission(command);
   await testHooks.afterFinalization?.({ command, providerResult, outcome, durableResult });
-  const gmailThread = outcome.category === 'accepted' && outcome.provider === 'gmail'
-    && (durableResult?.applied || durableResult?.existing)
+  const gmailAccepted = outcome.category === 'accepted' && outcome.provider === 'gmail'
+    && (durableResult?.applied || durableResult?.existing);
+  const gmailThread = gmailAccepted
     ? await storeGmailThread(storage, { conversationId: transmission.conversation_id,
       gmailThreadId: providerResult.providerThreadId, now })
     : undefined;
-  return { providerResult, outcome, durableResult, ...(gmailThread ? { gmailThread } : {}) };
+  const gmailMessageId = gmailAccepted
+    ? await storeSentMessageId(storage, { mailProvider, transmissionId: transmission.id,
+      providerMessageId: outcome.providerMessageId, now })
+    : undefined;
+  return { providerResult, outcome, durableResult, ...(gmailThread ? { gmailThread } : {}),
+    ...(gmailMessageId ? { gmailMessageId } : {}) };
 }
 
 async function reconcileUnsureGmailSend({ storage, transmission, authorizationId, writerPath,
@@ -336,7 +370,7 @@ async function reconcileUnsureGmailSend({ storage, transmission, authorizationId
     const current = durable?.transmission;
     if (current?.state !== 'provider-pending') return null;
     const reconciled = await reconcileCimProviderTransmission({ storage, transmission: current,
-      readProviderEvidence: createCimGmailReconciliationLookup({ mailProvider,
+      readProviderEvidence: createCimGmailReconciliationLookup({ mailProvider, storage,
         clock: () => new Date(now) }),
       providerProfile, actor, now, configOverride });
     if (!reconciled.resolved || reconciled.outcome !== 'accepted') return null;
@@ -525,13 +559,25 @@ function normalizeProviderCandidates(candidates, provider = 'resend') {
   });
 }
 
+/** The stored real Message-ID of a transmission's sent message, or null. */
+async function storedMessageId(storage, transmission) {
+  if (typeof storage?.listGmailConversationSentIdentities !== 'function'
+    || typeof transmission?.conversation_id !== 'string' || !transmission.conversation_id) return null;
+  const identities = await storage.listGmailConversationSentIdentities({
+    conversationIds: [transmission.conversation_id] });
+  const value = identities.find((identity) => identity.transmissionId === transmission.id)?.rfcMessageId;
+  return typeof value === 'string' && RFC_MESSAGE_ID.test(value) ? value : null;
+}
+
 /**
  * The Gmail reconciliation reader for reconcileCimProviderTransmission (spec §5.7): searches
- * the owner's mailbox for our own `<{transmissionId}@{sender domain}>` Message-ID through
- * `mailProvider.findSent`. Found is acceptance; not found is unresolved, never rejection. A
- * failed search throws, so nothing is inferred from it.
+ * the owner's mailbox through `mailProvider.findSent` for the Message-ID Gmail gave the message
+ * when it is stored (given `storage`), then for our own `<{transmissionId}@{sender domain}>`.
+ * Found is acceptance; not found is unresolved, never rejection. A failed search throws, so
+ * nothing is inferred from it.
  */
-export function createCimGmailReconciliationLookup({ mailProvider, clock = () => new Date() } = {}) {
+export function createCimGmailReconciliationLookup({ mailProvider, clock = () => new Date(),
+  storage = null } = {}) {
   if (typeof mailProvider?.findSent !== 'function') {
     throw new Error('A Gmail mail provider with findSent is required');
   }
@@ -540,10 +586,19 @@ export function createCimGmailReconciliationLookup({ mailProvider, clock = () =>
     if (stableCanonicalJson(binding) !== stableCanonicalJson(expected)) {
       throw new Error('Gmail lookup does not match the immutable transmission');
     }
-    const rfcMessageId = cimRfcMessageId(transmission.id, expected.fromAddress);
-    if (!rfcMessageId) throw new Error('Gmail lookup has no valid Message-ID');
+    const ours = cimRfcMessageId(transmission.id, expected.fromAddress);
+    if (!ours) throw new Error('Gmail lookup has no valid Message-ID');
     const observedAt = new Date(clock()).toISOString();
-    const found = await mailProvider.findSent({ rfcMessageId });
+    // The Message-ID Gmail actually gave the message, when it was read back and stored, is
+    // searched first; our own is the fallback.
+    const stored = await storedMessageId(storage, transmission);
+    let rfcMessageId = ours;
+    let found = { found: false };
+    for (const candidate of stored && stored !== ours ? [stored, ours] : [ours]) {
+      rfcMessageId = candidate;
+      found = await mailProvider.findSent({ rfcMessageId: candidate });
+      if (found?.found === true) break;
+    }
     const candidates = found?.found === true && boundedProviderMessageId(found.messageId)
       ? [{ provider: 'gmail', providerMessageId: found.messageId,
         evidenceId: `gmail-message:${found.messageId}`,

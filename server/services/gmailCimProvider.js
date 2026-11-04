@@ -271,6 +271,23 @@ export function createGmailCimProvider({ storage, config, fetcher = defaultFetch
       return { found: true, messageId: first.id, threadId };
     },
 
+    /**
+     * The Message-ID header Gmail gave a sent message (it may replace ours). Throws a coded
+     * error when it cannot be read; the caller then keeps our own Message-ID.
+     */
+    async readMessageId({ messageId } = {}) {
+      if (typeof messageId !== 'string' || !GMAIL_ID.test(messageId)) throw gmailError('invalid_message');
+      const token = await accessToken();
+      const url = new URL(`${API}/messages/${encodeURIComponent(messageId)}`);
+      url.searchParams.set('format', 'metadata');
+      url.searchParams.set('metadataHeaders', 'Message-ID');
+      const response = await gmailRequest(fetcher, token, url);
+      if (!response.ok || !response.body) throw gmailError('gmail_message_read_failed');
+      const value = String(headerValue(response.body.payload?.headers, 'Message-ID') ?? '').trim();
+      if (!RFC_MESSAGE_ID.test(value) || value.length > 998) throw gmailError('gmail_message_read_failed');
+      return value;
+    },
+
     async listThreadChanges({ checkpoint, threadIds = [], withBodyPrefix = false } = {}) {
       const wanted = [...new Set((Array.isArray(threadIds) ? threadIds : [])
         .filter((id) => typeof id === 'string' && GMAIL_ID.test(id)))];

@@ -303,6 +303,37 @@ test('findSent finds by rfc822msgid and returns threadId', async (t) => {
   await assert.rejects(gmail.findSent({ rfcMessageId: 'tx\r\nBcc: x' }), { code: 'invalid_message' });
 });
 
+test('readMessageId reads the sent message Message-ID header through format=metadata', async (t) => {
+  const storage = openStorage(t);
+  const config = makeConfig();
+  await connect(storage, config);
+  const google = fakeGoogle((call) => {
+    if (call.url.pathname === '/gmail/v1/users/me/messages/msg-sent') {
+      return json(200, { id: 'msg-sent', threadId: 'thread-1', payload: { headers: [
+        { name: 'Message-Id', value: '<CAGmail-real-1@mail.gmail.com>' }] } });
+    }
+    if (call.url.pathname === '/gmail/v1/users/me/messages/msg-no-header') {
+      return json(200, { id: 'msg-no-header', threadId: 'thread-1', payload: { headers: [] } });
+    }
+    if (call.url.pathname === '/gmail/v1/users/me/messages/msg-broken') return json(500, {});
+    return undefined;
+  });
+  const gmail = provider({ storage, config, google });
+  assert.equal(await gmail.readMessageId({ messageId: 'msg-sent' }), '<CAGmail-real-1@mail.gmail.com>');
+  const [read] = google.gmailCalls();
+  assert.equal(read.method, 'GET');
+  assert.equal(read.url.searchParams.get('format'), 'metadata');
+  assert.deepEqual(read.url.searchParams.getAll('metadataHeaders'), ['Message-ID']);
+  for (const messageId of ['msg-no-header', 'msg-broken']) {
+    await assert.rejects(gmail.readMessageId({ messageId }), (error) => {
+      assert.equal(error.code, 'gmail_message_read_failed');
+      assertNoSecrets(error.message);
+      return true;
+    }, messageId);
+  }
+  await assert.rejects(gmail.readMessageId({ messageId: '../x' }), { code: 'invalid_message' });
+});
+
 function gmailMessage(id, threadId, headers, extra = {}) {
   return {
     id, threadId, historyId: '205', internalDate: String(Date.parse('2026-11-03T14:30:00.000Z')),

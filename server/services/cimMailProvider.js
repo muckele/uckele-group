@@ -52,6 +52,8 @@
  *     When the checkpoint is missing or expired, `checkpointExpired` is true and `messages` holds
  *     every message of the requested threads; process idempotently by message id.
  *     Throws a code-only error on failure, so the caller never advances its checkpoint.
+ *   readMessageId({ messageId }) -> string (optional) the Message-ID header the provider gave
+ *     an accepted message, which may differ from ours; throws a code-only error when unread.
  */
 export const CIM_MAIL_PROVIDER_METHODS = Object.freeze(['readiness', 'send', 'findSent', 'listThreadChanges']);
 export const CIM_SEND_OUTCOMES = Object.freeze(['accepted', 'definitive-failure', 'ambiguous', 'quota',

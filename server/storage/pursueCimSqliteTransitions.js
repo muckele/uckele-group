@@ -3310,7 +3310,8 @@ export function createPursueCimSqliteTransitions(database, {
         .get(touch.opportunity_id, campaign.timezone_revision) ?? null : null;
       const activation = currentActivationChain(database, 'fl04c-followup', at);
       const initial = campaign ? database.prepare(`
-        SELECT tr.id AS transmissionId, tr.from_address AS fromAddress, comm.subject AS subject
+        SELECT tr.id AS transmissionId, tr.from_address AS fromAddress, comm.subject AS subject,
+          comm.message_id AS messageId
         FROM deal_hunter_cim_campaign_touches AS it
         JOIN deal_hunter_cim_transmission_touches AS m
           ON m.touch_id = it.id AND m.cancelled_at IS NULL

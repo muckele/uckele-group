@@ -16,6 +16,7 @@ import {
   createCimGmailReconciliationLookup,
   reconcileCimProviderTransmission,
 } from '../server/services/pursueCimProvider.js';
+import { cimRfcMessageId } from '../server/services/cimMailProvider.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { MINUTE, createSenderFixture } from './fixtures/pursueCimSenderFixture.js';
 import { BROKER, SENDER } from './fixtures/pursueCimGmailGateFixture.js';
@@ -629,4 +630,92 @@ test('a not-connected run is recorded as completed with its reason', async (t) =
   assert.equal(row.status, 'completed', JSON.stringify(row));
   assert.equal(row.metadata.stoppedFor, 'gmail_not_connected');
   assert.equal(row.metadata.processed, 0);
+});
+
+/** A sender world whose Gmail replaces our Message-ID with its own on every accepted send. */
+async function rewrittenWorld(t, { failRead = false } = {}) {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805,
+    campaigns: [{ suffix: 'a', dueAt: MONDAY_0800, dueLocal: '2030-10-28T08:00:00' }] });
+  fixture.mailProvider.rewriteMessageIds();
+  if (failRead) fixture.mailProvider.failReadMessageIdNext();
+  const sent = await fixture.run();
+  assert.equal(sent.sentInitial, 1, JSON.stringify(sent));
+  const [initial] = fixture.mailProvider.sent;
+  const transmission = fixture.database.prepare(`SELECT * FROM deal_hunter_cim_transmissions
+    WHERE id = ?`).get(initial.transmissionId);
+  const messageIdOf = (transmissionId) => fixture.database.prepare(`SELECT c.message_id
+    FROM deal_hunter_cim_transmissions tr JOIN crm_communications c ON c.id = tr.communication_id
+    WHERE tr.id = ?`).get(transmissionId).message_id;
+  const sendFollowUp = async () => {
+    const touch = fixture.touches(fixture.campaigns.a.campaignId)
+      .find((row) => row.kind !== 'initial' && row.state === 'scheduled');
+    fixture.clock.set(new Date(Date.parse(touch.due_at) + 30_000).toISOString());
+    const summary = await fixture.run();
+    assert.equal(summary.sentFollowUps, 1, JSON.stringify(summary));
+    return fixture.mailProvider.sent.at(-1);
+  };
+  return { ...fixture, initial, transmission, ours: cimRfcMessageId(initial.transmissionId, SENDER),
+    messageIdOf, sendFollowUp };
+}
+
+test('Gmail rewrote our Message-ID: the real one is stored, followed up to, recognized as ours, and found', async (t) => {
+  const world = await rewrittenWorld(t);
+  const { initial, ours } = world;
+  assert.notEqual(initial.rfcMessageId, ours);
+  assert.equal(initial.requestedRfcMessageId, ours);
+  // The communication keeps the Message-ID Gmail actually sent.
+  assert.equal(world.messageIdOf(initial.transmissionId), initial.rfcMessageId);
+
+  // The follow-up threads to the real Message-ID.
+  const followUp = await world.sendFollowUp();
+  assert.equal(followUp.threadId, initial.threadId);
+  assert.equal(followUp.inReplyTo, initial.rfcMessageId);
+  assert.deepEqual(followUp.references, [initial.rfcMessageId]);
+  assert.equal(world.messageIdOf(followUp.transmissionId), followUp.rfcMessageId);
+
+  // The reply poller reads both sent copies as ours, not as owner replies.
+  await world.storage.saveGmailConnection({ emailAddress: SENDER, refreshTokenCiphertext: CIPHERTEXT,
+    grantedScopes: SCOPES, historyCheckpoint: '0', connectedBy: 'owner',
+    now: world.clock.peek().toISOString() });
+  const poll = await runPursueCimReplyPoll({ storage: world.storage, mailProvider: world.mailProvider,
+    now: world.clock });
+  assert.deepEqual([poll.processed, poll.ownerReplied, poll.responded], [2, 0, 0], JSON.stringify(poll));
+  assert.deepEqual(world.database.prepare(`SELECT classification FROM deal_hunter_gmail_reply_messages`)
+    .all().map(({ classification }) => classification), ['ours', 'ours']);
+  assert.equal(world.row('deal_hunter_cim_campaigns', world.campaigns.a.campaignId).state, 'active-follow-up');
+
+  // findSent searches the stored Message-ID first, so the sent initial is found. (The proof is
+  // captured at the lookup: the initial is already accepted, so nothing is reconciled.)
+  const lookup = createCimGmailReconciliationLookup({ mailProvider: world.mailProvider,
+    storage: world.storage, clock: () => world.clock.peek() });
+  let proof;
+  await assert.rejects(reconcileCimProviderTransmission({ storage: world.storage,
+    transmission: world.transmission, providerProfile: 'production-gmail-v1', actor: 'owner',
+    now: world.clock.peek(), configOverride: world.config,
+    readProviderEvidence: async (input) => {
+      proof = await lookup(input);
+      throw new Error('proof captured');
+    } }), /proof captured/);
+  assert.equal(proof.outcome, 'accepted', JSON.stringify(proof));
+  assert.deepEqual(proof.candidates.map(({ providerMessageId }) => providerMessageId),
+    [initial.messageId]);
+  // Without the stored Message-ID, our own is searched and Gmail has no message with it.
+  const oursOnly = createCimGmailReconciliationLookup({ mailProvider: world.mailProvider,
+    clock: () => world.clock.peek() });
+  await assert.rejects(reconcileCimProviderTransmission({ storage: world.storage,
+    transmission: world.transmission, providerProfile: 'production-gmail-v1', actor: 'owner',
+    now: world.clock.peek(), configOverride: world.config,
+    readProviderEvidence: async (input) => {
+      proof = await oursOnly(input);
+      throw new Error('proof captured');
+    } }), /proof captured/);
+  assert.equal(proof.outcome, 'unresolved');
+});
+
+test('a failed read of the sent Message-ID keeps ours and changes nothing', async (t) => {
+  const world = await rewrittenWorld(t, { failRead: true });
+  assert.equal(world.messageIdOf(world.initial.transmissionId), null);
+  assert.equal(world.row('deal_hunter_cim_campaigns', world.campaigns.a.campaignId).state, 'active-follow-up');
+  const followUp = await world.sendFollowUp();
+  assert.equal(followUp.inReplyTo, world.ours);
 });

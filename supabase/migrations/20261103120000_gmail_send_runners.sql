@@ -2242,7 +2242,7 @@ begin
     'activation', (select pg_catalog.to_jsonb(a) from public.deal_hunter_cim_capability_activations a
       where a.id = v_activation_id),
     'initial', (select pg_catalog.jsonb_build_object('transmissionId', tr.id,
-        'fromAddress', tr.from_address, 'subject', comm.subject)
+        'fromAddress', tr.from_address, 'subject', comm.subject, 'messageId', comm.message_id)
       from public.deal_hunter_cim_campaign_touches it
       join public.deal_hunter_cim_transmission_touches m
         on m.touch_id = it.id and m.cancelled_at is null
@@ -3232,6 +3232,51 @@ $$;
 revoke all on function public.deal_hunter_gmail_list_pending_reply_conversations_v1()
   from public, anon, authenticated;
 grant execute on function public.deal_hunter_gmail_list_pending_reply_conversations_v1() to service_role;
+
+-- Stores the Message-ID Gmail actually gave an accepted Gmail transmission's sent message (it
+-- may replace ours) as its communication's message id: follow-ups reply to it, the reply
+-- poller recognizes it as ours, and findSent searches it first. Never overwrites another id.
+create or replace function public.deal_hunter_gmail_set_communication_message_id_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_now timestamptz := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_transmission_id text := public.pursue_cim_required_text_v1(p_command, 'transmissionId', 240);
+  v_message_id text := p_command ->> 'messageId';
+  v_transmission public.deal_hunter_cim_transmissions%rowtype;
+  v_current text;
+begin
+  if pg_catalog.jsonb_typeof(p_command -> 'messageId') is distinct from 'string'
+    or pg_catalog.char_length(v_message_id) > 998
+    or v_message_id !~ '^<[!-;=?-~]+@[!-;=?-~]+>$' then
+    raise exception 'Invalid messageId';
+  end if;
+  select * into v_transmission from public.deal_hunter_cim_transmissions
+    where id = v_transmission_id;
+  if not found then raise exception 'Unknown Pursue CIM transmission'; end if;
+  if v_transmission.state <> 'accepted' or v_transmission.provider is distinct from 'gmail' then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true);
+  end if;
+  select message_id into v_current from public.crm_communications
+    where id = v_transmission.communication_id for update;
+  if not found then raise exception 'Unknown Pursue CIM communication'; end if;
+  if v_current = v_message_id then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', true, 'conflict', false);
+  end if;
+  if v_current is not null and v_current <> '' then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true);
+  end if;
+  update public.crm_communications set message_id = v_message_id
+    where id = v_transmission.communication_id;
+  return pg_catalog.jsonb_build_object('applied', true, 'replay', false, 'conflict', false);
+end;
+$$;
+revoke all on function public.deal_hunter_gmail_set_communication_message_id_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_gmail_set_communication_message_id_v1(jsonb) to service_role;
 
 -- Records a Gmail message once (the first classification wins). A pending row is settled by
 -- recording it again with applied = true; a settled row never returns to pending. 'applied' in

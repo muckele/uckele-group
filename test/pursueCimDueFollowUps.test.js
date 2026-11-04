@@ -340,7 +340,8 @@ test('anything the payload would reject stops the follow-up before it is claimed
   const unsafeStorage = Object.create(unsafe.storage, { readCimFollowUpAuthority: { value:
     async (command) => {
       const durable = await unsafe.storage.readCimFollowUpAuthority(command);
-      return { ...durable, initial: { ...durable.initial, fromAddress: 'owner@localhost' } };
+      return { ...durable, initial: { ...durable.initial, fromAddress: 'owner@localhost',
+        messageId: null } };
     } } });
   await unclaimed(unsafe, await dueCandidate(unsafe), { storage: unsafeStorage });
 
@@ -392,8 +393,10 @@ test('follow-up authority reads the durable touch, campaign, chain and stop sign
   assert.deepEqual(authority.recipient, { address: BROKER,
     fingerprint: fixtureRecipientFingerprint(ids.opportunityId), firstName: 'Jordan',
     displayName: 'Jordan Lee' });
+  // The initial's Message-ID as Gmail sent it (read back after acceptance; here our own).
   assert.deepEqual(authority.initial, { transmissionId: fixture.initialTransmissionId,
-    fromAddress: SENDER, subject: 'CIM / NDA request for Acme Plumbing' });
+    fromAddress: SENDER, subject: 'CIM / NDA request for Acme Plumbing',
+    messageId: `<${fixture.initialTransmissionId}@uckele.example.test>` });
   assert.deepEqual(authority.terminal, { replyReceived: false, materialsReceived: false,
     advancedDiligence: false, suppressed: false, unsafeDelivery: false, providerPending: false,
     providerAmbiguous: false });

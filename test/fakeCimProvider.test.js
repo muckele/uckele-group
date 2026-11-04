@@ -105,3 +105,19 @@ test('fake provider records sends, honors failNext/quotaNext, and returns inject
   fake.setReadinessReasons(['gmail_token_invalid']);
   assert.deepEqual(await fake.readiness(), { ready: false, reasons: ['gmail_token_invalid'] });
 });
+
+test('fake provider can rewrite Message-IDs as Gmail may: findSent and readMessageId see the real header', async () => {
+  const fake = createFakeCimProvider({ now: () => new Date(at) });
+  fake.rewriteMessageIds();
+  const sent = await fake.send(message('tx-9'));
+  assert.equal(sent.rfcMessageId, '<tx-9@domain.com>', 'the result names the Message-ID we asked for');
+  const actual = fake.sent[0].rfcMessageId;
+  assert.match(actual, /^<gmail-rewritten-\d+@mail\.gmail\.com>$/);
+  assert.equal(fake.sent[0].requestedRfcMessageId, '<tx-9@domain.com>');
+  assert.equal(await fake.readMessageId({ messageId: sent.messageId }), actual);
+  assert.deepEqual(await fake.findSent({ rfcMessageId: '<tx-9@domain.com>' }), { found: false });
+  assert.equal((await fake.findSent({ rfcMessageId: actual })).messageId, sent.messageId);
+  fake.failReadMessageIdNext();
+  await assert.rejects(fake.readMessageId({ messageId: sent.messageId }), { code: 'gmail_message_read_failed' });
+  await assert.rejects(fake.readMessageId({ messageId: 'unknown' }), { code: 'gmail_message_read_failed' });
+});

@@ -19,6 +19,7 @@ import { nextCimTouchKind } from './pursueCimCadence.js';
 import { PURSUE_FOLLOW_UP_PAYLOAD_VERSION } from './pursueCimFinalGate.js';
 import { PURSUE_CIM_IN_REPLY_TO_TAG } from './pursueCimProvider.js';
 import { renderPursueCimEmail } from './pursueCimTemplates.js';
+import { RFC_MESSAGE_ID } from './rfc5322.js';
 
 const MAX_TAG_LENGTH = 120;
 // Broker-materials blockers that mean the materials and recipient state is unknown, so the
@@ -60,9 +61,15 @@ function gmailSenderAddress(config) {
 }
 
 // The initial's RFC Message-ID the follow-up replies to, or null when there is none.
+/**
+ * The initial's Message-ID to reply to: the one Gmail actually gave it when that was read back
+ * and stored (Gmail may replace ours), else our own `<{transmissionId}@{sender domain}>`.
+ */
 function initialMessageId(initial) {
-  return initial?.transmissionId && initial.subject
-    ? cimRfcMessageId(initial.transmissionId, initial.fromAddress) : null;
+  if (!initial?.transmissionId || !initial.subject) return null;
+  const stored = typeof initial.messageId === 'string' ? initial.messageId.trim() : '';
+  return stored && RFC_MESSAGE_ID.test(stored) ? stored
+    : cimRfcMessageId(initial.transmissionId, initial.fromAddress);
 }
 
 /**

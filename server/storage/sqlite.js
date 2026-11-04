@@ -40,7 +40,8 @@ import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRest
 import {
   SEND_CONTROL_AUDIT_EVENT, SEND_CONTROL_AUDIT_SOURCE, normalizeGmailConnectionRow,
   normalizeOpenGmailConversationRow, normalizeSendControlRow, normalizeSendControlRows,
-  sendControlConflictError, validateConversationGmailThread, validateGmailCheckpointUpdate,
+  sendControlConflictError, validateCimCommunicationMessageId,
+  validateConversationGmailThread, validateGmailCheckpointUpdate,
   validateGmailTokenCheck, validateRevokeGmailConnection, validateSaveGmailConnection,
   validateSetPursueSendControl, normalizeGmailReplyMessageRow, normalizeGmailSentIdentityRow,
   validateGmailReplyMessage, validateGmailReplyMessageLookup, validateGmailSentIdentityLookup,
@@ -11261,6 +11262,33 @@ ${cimCapacityConsumeTriggerSql}
             UPDATE deal_hunter_broker_conversations SET gmail_thread_id = ?, updated_at = ?
             WHERE id = ? AND gmail_thread_id IS NULL
           `).run(gmailThreadId, now, conversationId);
+          return { applied: true, replay: false, conflict: false };
+        }).immediate();
+      },
+
+      /**
+       * Stores the Message-ID Gmail actually gave an accepted Gmail transmission's sent message
+       * as its communication's message id (follow-up threading, reply recognition, findSent).
+       * Never overwrites a different stored id.
+       */
+      async setCimCommunicationMessageId(command = {}) {
+        const { transmissionId, messageId } = validateCimCommunicationMessageId(command);
+        return database.transaction(() => {
+          const row = database.prepare(`
+            SELECT tr.state, tr.provider, c.id AS communication_id, c.message_id
+            FROM deal_hunter_cim_transmissions tr
+            JOIN crm_communications c ON c.id = tr.communication_id
+            WHERE tr.id = ?
+          `).get(transmissionId);
+          if (!row) throw new Error('Unknown Pursue CIM transmission');
+          if (row.state !== 'accepted' || row.provider !== 'gmail') {
+            return { applied: false, replay: false, conflict: true };
+          }
+          if (row.message_id === messageId) return { applied: false, replay: true, conflict: false };
+          if (row.message_id) return { applied: false, replay: false, conflict: true };
+          database.prepare(`
+            UPDATE crm_communications SET message_id = ? WHERE id = ? AND message_id IS NULL
+          `).run(messageId, row.communication_id);
           return { applied: true, replay: false, conflict: false };
         }).immediate();
       },

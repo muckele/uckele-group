@@ -29,7 +29,8 @@ function invalidMessage() {
  * @param {string} [options.senderAddress] the mailbox address; its domain names our Message-IDs
  * @param {string} [options.name]
  * @returns provider & { sent[], attempts[], injectReply(threadId, message), failNext(outcome, opts?),
- *   quotaNext(), expireCheckpointNext(), setReadinessReasons(reasons) }
+ *   quotaNext(), expireCheckpointNext(), setReadinessReasons(reasons), rewriteMessageIds(),
+ *   failReadMessageIdNext() }
  */
 export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com', name = 'fake' } = {}) {
   const clock = typeof now === 'function' ? now : () => (now === undefined ? new Date() : new Date(now));
@@ -42,6 +43,9 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
   let historyCounter = 0;
   let expireNext = false;
   let readinessReasons = [];
+  // Gmail may replace a client Message-ID with its own; when on, every accepted send gets one.
+  let rewriteDomain = null;
+  let failReadNext = false;
 
   function addToMailbox(message) {
     historyCounter += 1;
@@ -100,8 +104,11 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
       const messageId = `fake-msg-${sequence}`;
       const thread = threadId || `fake-thread-${sequence}`;
       const referenceList = Array.isArray(references) ? references : (references ? [references] : []);
+      // The Message-ID the sent message actually carries in the mailbox.
+      const headerMessageId = rewriteDomain ? `<gmail-rewritten-${sequence}@${rewriteDomain}>` : rfcMessageId;
       sent.push({ transmissionId, to, from, subject, text, html: html ?? null, threadId: thread,
-        inReplyTo: inReplyTo ?? null, references: referenceList, rfcMessageId, messageId, sentAt: at });
+        inReplyTo: inReplyTo ?? null, references: referenceList, rfcMessageId: headerMessageId,
+        requestedRfcMessageId: rfcMessageId, messageId, sentAt: at });
       addToMailbox({
         id: messageId,
         threadId: thread,
@@ -109,7 +116,7 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
         labelIds: ['SENT'],
         headers: {
           from: formatMailboxHeader(from),
-          messageId: rfcMessageId,
+          messageId: headerMessageId,
           inReplyTo: inReplyTo ?? null,
           references: referenceList.length ? referenceList.join(' ') : null,
           contentType: html ? 'multipart/alternative' : 'text/plain; charset=UTF-8',
@@ -124,6 +131,23 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
       if (typeof rfcMessageId !== 'string' || !RFC_MESSAGE_ID.test(rfcMessageId)) throw invalidMessage();
       const match = sent.find((record) => record.rfcMessageId === rfcMessageId);
       return match ? { found: true, messageId: match.messageId, threadId: match.threadId } : { found: false };
+    },
+
+    /** The Message-ID header of a message in the mailbox, by its Gmail id. */
+    async readMessageId({ messageId } = {}) {
+      if (failReadNext) {
+        failReadNext = false;
+        const error = new Error('gmail_message_read_failed');
+        error.code = 'gmail_message_read_failed';
+        throw error;
+      }
+      const stored = mailbox.find((message) => message.id === messageId);
+      if (!stored?.headers?.messageId) {
+        const error = new Error('gmail_message_read_failed');
+        error.code = 'gmail_message_read_failed';
+        throw error;
+      }
+      return stored.headers.messageId;
     },
 
     async listThreadChanges({ checkpoint, threadIds = [], withBodyPrefix = false } = {}) {
@@ -166,6 +190,16 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
     /** The next listThreadChanges reports an expired checkpoint and returns whole threads. */
     expireCheckpointNext() {
       expireNext = true;
+    },
+
+    /** From now on Gmail gives every accepted send its own Message-ID (as `domain` ids). */
+    rewriteMessageIds({ domain = 'mail.gmail.com' } = {}) {
+      rewriteDomain = domain;
+    },
+
+    /** The next readMessageId fails. */
+    failReadMessageIdNext() {
+      failReadNext = true;
     },
 
     setReadinessReasons(reasons = []) {

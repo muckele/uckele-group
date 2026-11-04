@@ -307,6 +307,8 @@ const START = pacific('2030-01-07', '06:30');
 /** 90+ deal → auto-Pursue active → initial in window → 2 follow-ups → broker reply → responded. */
 async function autoPursueReplyStops(t, createBackend) {
   const world = await createWorld(t, createBackend, { start: START });
+  // Gmail gives every sent message its own Message-ID; the loop must follow the real one.
+  world.mailProvider.rewriteMessageIds();
   await ownerTurnsSendingOn(world);
   await ownerActivatesAutoPursue(world);
   const id = await seedDeal(world, { opportunityId: 'opp-auto', name: 'Acme Plumbing', fitScore: 93,
@@ -337,6 +339,18 @@ async function autoPursueReplyStops(t, createBackend) {
   campaign = await world.campaignFor(id);
   assert.equal(campaign.state, 'active-follow-up');
   assert.equal((await world.conversation(campaign.conversation_id)).gmail_thread_id, initial.threadId);
+  // The communication keeps the Message-ID Gmail actually gave the initial, never overwritten.
+  assert.notEqual(initial.rfcMessageId, initial.requestedRfcMessageId);
+  const communicationMessageId = async (transmissionId) => (await world.one(`SELECT c.message_id
+    FROM deal_hunter_cim_transmissions tr JOIN crm_communications c ON c.id = tr.communication_id
+    WHERE tr.id = ?`, transmissionId)).message_id;
+  assert.equal(await communicationMessageId(initial.transmissionId), initial.rfcMessageId);
+  const at = world.clock.peek().toISOString();
+  assert.deepEqual(await world.storage.setCimCommunicationMessageId({ transmissionId: initial.transmissionId,
+    messageId: initial.rfcMessageId, now: at }), { applied: false, replay: true, conflict: false });
+  assert.deepEqual(await world.storage.setCimCommunicationMessageId({ transmissionId: initial.transmissionId,
+    messageId: '<other@mail.gmail.com>', now: at }), { applied: false, replay: false, conflict: true });
+  assert.equal(await communicationMessageId(initial.transmissionId), initial.rfcMessageId);
   assert.deepEqual(await world.scheduled(campaign), [['follow-up-1', pacific('2030-01-09', '08:00')]]);
 
   // A run the next day sends nothing; follow-up 1 goes out two business days later at 08:00.

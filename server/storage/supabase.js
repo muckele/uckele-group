@@ -2,6 +2,7 @@ import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRest
 import {
   normalizeGmailConnectionRow, normalizeOpenGmailConversationRow, normalizeSendControlRow,
   normalizeSendControlRows, sendControlConflictError, validateCimProviderRelease,
+  validateCimCommunicationMessageId,
   validateConversationGmailThread,
   validateGmailCheckpointUpdate, validateGmailTokenCheck, validateRevokeGmailConnection,
   validateSaveGmailConnection, validateSetPursueSendControl, normalizeGmailReplyMessageRow,
@@ -4281,6 +4282,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .order('gmail_message_id', { ascending: true }).limit(limit);
       if (error) throw error;
       return (data || []).map(normalizeGmailReplyMessageRow);
+    },
+
+    /**
+     * Stores the Message-ID Gmail actually gave an accepted Gmail transmission's sent message
+     * as its communication's message id. Never overwrites a different stored id.
+     */
+    async setCimCommunicationMessageId(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_set_communication_message_id_v1', {
+        p_command: validateCimCommunicationMessageId(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean'
+        || typeof data.conflict !== 'boolean') {
+        throw new Error('Malformed Gmail communication Message-ID result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict };
     },
 
     /** Every conversation with a Gmail reply whose effect is still pending, distinct, uncapped. */

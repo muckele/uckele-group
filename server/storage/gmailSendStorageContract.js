@@ -135,6 +135,19 @@ export function validateConversationGmailThread(command = {}) {
     now: instant(command.now) };
 }
 
+// An RFC 5322 Message-ID as rfc5322.js accepts it.
+const rfcMessageIdPattern = /^<[!-;=?-~]+@[!-;=?-~]+>$/;
+
+/** The Message-ID Gmail actually gave an accepted transmission's sent message. */
+export function validateCimCommunicationMessageId(command = {}) {
+  const messageId = command.messageId;
+  if (typeof messageId !== 'string' || messageId.length > 998 || !rfcMessageIdPattern.test(messageId)) {
+    throw invalid('messageId');
+  }
+  return { transmissionId: text(command.transmissionId, 'transmissionId', 240), messageId,
+    now: instant(command.now) };
+}
+
 /** One connection row in the same shape from both adapters; scopes are an array. */
 export function normalizeGmailConnectionRow(row) {
   if (!row) return null;

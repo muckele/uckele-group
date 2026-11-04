@@ -211,7 +211,7 @@ export async function reconcileUnrecordedPursueSends({ storage, mailProvider, pr
       if (!providerProfile || authorization?.provider_profile !== providerProfile) continue;
       const at = instant();
       const reconciled = await reconcileCimProviderTransmission({ storage, transmission,
-        readProviderEvidence: createCimGmailReconciliationLookup({ mailProvider,
+        readProviderEvidence: createCimGmailReconciliationLookup({ mailProvider, storage,
           clock: () => at }),
         providerProfile, actor, now: at, configOverride: config });
       if (reconciled.resolved && reconciled.outcome === 'accepted') {
