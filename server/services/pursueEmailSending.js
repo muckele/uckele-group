@@ -3,7 +3,7 @@
 //
 // The status never carries token material: the Gmail part is projected from four connection
 // fields, and Job history rows are reduced to their status, instants, counts and codes.
-import { PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE } from '../config.js';
+import { PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE, cimProviderUsesGmail } from '../config.js';
 import { createGmailCimProvider } from './gmailCimProvider.js';
 import { CONTACT_POLICY_VERSION, contactPolicyDigest } from './pursueCimContactPolicy.js';
 import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
@@ -14,7 +14,11 @@ import {
   renderPursueCimWordingPreview,
   senderSignatureComplete,
 } from './pursueCimTemplates.js';
-import { PURSUE_GMAIL_CAPABILITY_POLICY, syncPursueGmailCapabilities } from './pursueGmailCapabilities.js';
+import {
+  PURSUE_GMAIL_CAPABILITY_POLICY,
+  pursueGmailCapabilitiesInSync,
+  syncPursueGmailCapabilities,
+} from './pursueGmailCapabilities.js';
 
 export const EMAIL_SENDING_CONTROL_KEYS = Object.freeze(['live_sending', 'contact_rule', 'wording_approval']);
 
@@ -30,6 +34,30 @@ function codeOrNull(value) {
 function instantOrNull(value) {
   const parsed = Date.parse(value ?? '');
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+/**
+ * The provider profile Live sending applies to: the configured CIM profile when it sends
+ * through Gmail (production-gmail-v1, or controlled-mailbox-v1 with the gmail mailbox provider
+ * for the owner's controlled test, Ruling S), else production-gmail-v1.
+ */
+export function activeGmailProviderProfile(config) {
+  const profile = config?.dealHunter?.cimProvider;
+  return cimProviderUsesGmail(config) && profile?.profile ? profile.profile
+    : PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE;
+}
+
+/** True when the server is configured to send Pursue email through Gmail at all. */
+function gmailSendingConfigured(config) {
+  return cimProviderUsesGmail(config) && config?.dealHunter?.cimProvider?.enabled === true;
+}
+
+async function capabilitiesInSync({ storage, enabled, providerProfile, now }) {
+  try {
+    return await pursueGmailCapabilitiesInSync({ storage, enabled, providerProfile, now });
+  } catch {
+    return false;
+  }
 }
 
 function controlView(control = {}) {
@@ -75,17 +103,26 @@ async function latestRun(storage, jobName, countNames) {
 export async function getEmailSendingStatus({ storage, config, now = new Date(), fetcher, includePreview = false }) {
   const sender = config?.dealHunter?.sender ?? {};
   const [connection, controls] = await Promise.all([storage.getGmailConnection(), storage.getPursueSendControls()]);
+  const providerProfile = activeGmailProviderProfile(config);
   const readiness = await readPursueCimProviderReadiness({
     storage,
     config,
     now,
-    providerProfile: PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE,
+    providerProfile,
     mailProvider: createGmailCimProvider({ storage, config, now, ...(fetcher ? { fetcher } : {}) }),
   });
   // Readiness may have just refreshed the token; show the connection as it is now.
   const gmailRow = connection ? (await storage.getGmailConnection()) ?? connection : null;
   const wordingApproval = controls.wordingApproval ?? {};
   const approved = wordingApproval.enabled === true;
+  const liveSending = controlView(controls.liveSending);
+  const inSync = await capabilitiesInSync({ storage, enabled: liveSending.enabled, providerProfile,
+    now: new Date(now).toISOString() });
+  // The card's readiness adds what the sender would also stop on: Gmail sending not configured
+  // on the server, or a Live sending control whose capability chain was not applied.
+  const reasons = [...readiness.reasons];
+  if (!gmailSendingConfigured(config)) reasons.push('provider_not_gmail');
+  if (!inSync) reasons.push('live_sending_not_applied');
   const [senderRun, replyPoller] = await Promise.all([
     latestRun(storage, PURSUE_CIM_SENDER_JOB_NAME, SENDER_COUNTS),
     latestRun(storage, PURSUE_CIM_REPLY_POLLER_JOB_NAME, POLLER_COUNTS),
@@ -107,8 +144,8 @@ export async function getEmailSendingStatus({ storage, config, now = new Date(),
       ...(includePreview ? { preview: renderPursueCimWordingPreview(sender) } : {}),
     },
     contactRule: controlView(controls.contactRule),
-    liveSending: controlView(controls.liveSending),
-    readiness: { ready: readiness.ready === true, reasons: [...readiness.reasons] },
+    liveSending: { ...liveSending, providerProfile, capabilitiesInSync: inSync },
+    readiness: { ready: readiness.ready === true && reasons.length === 0, reasons },
     lastRuns: { sender: senderRun, replyPoller },
   };
 }
@@ -173,14 +210,25 @@ export async function changeEmailSendingControl({ storage, config, command, acto
     throw error;
   }
   if (command.controlKey === 'live_sending') {
+    const providerProfile = activeGmailProviderProfile(config);
+    // On records the chain under the active Gmail profile. Off withdraws it there and under
+    // production-gmail-v1 (the release of prepared sends runs on every off, Ruling T).
+    const profiles = command.enabled ? [providerProfile]
+      : [...new Set([providerProfile, PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE])];
     try {
-      await syncPursueGmailCapabilities({ storage, enabled: command.enabled, actor, now: at });
+      for (const profile of profiles) {
+        await syncPursueGmailCapabilities({ storage, enabled: command.enabled, actor, now: at,
+          providerProfile: profile });
+      }
     } catch {
       return { ...refusal(500, 'live_sending_sync_failed', command.enabled
         ? 'Live sending was saved as on, but its sending permissions were not fully recorded, so nothing will send yet. Use Try again to finish.'
         : 'Live sending is off, so nothing will send. Some sending permissions were not withdrawn yet. Use Try again to finish.'),
-      control: controlView(control) };
+      control: { ...controlView(control), providerProfile, capabilitiesInSync: false } };
     }
+    return { ok: true, status: 200, control: { ...controlView(control), providerProfile,
+      capabilitiesInSync: await capabilitiesInSync({ storage, enabled: command.enabled,
+        providerProfile, now: at }) } };
   }
   return { ok: true, status: 200, control: controlView(control) };
 }

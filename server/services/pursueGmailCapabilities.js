@@ -76,12 +76,11 @@ export async function syncPursueGmailCapabilities({ storage, enabled, actor, now
     // reservation can only be renewed under the same activation), so it could never be sent
     // under the chain the next "on" records. Each is cancelled before the provider and its
     // touch returns to scheduled, to be prepared again under the new chain.
-    let released = 0;
-    if (withdrawn.length > 0) {
-      released = (await storage.releasePreparedCimTransmissions({ reasonCode: 'live_sending_off',
-        actor: actor.trim(), now: at })).released;
-    }
-    return { applied: withdrawn.length > 0, withdrawn, released };
+    // Ruling T: the release runs on every off, not only when a link was withdrawn now. It is
+    // idempotent, so an off whose release failed after its withdraw is finished by a retry.
+    const { released } = await storage.releasePreparedCimTransmissions({
+      reasonCode: 'live_sending_off', actor: actor.trim(), now: at });
+    return { applied: withdrawn.length > 0 || released > 0, withdrawn, released };
   }
 
   const activations = {};
@@ -120,4 +119,28 @@ export async function syncPursueGmailCapabilities({ storage, enabled, actor, now
     parent = result.activation;
   }
   return { applied, activations };
+}
+
+/**
+ * Whether the capability chain under `providerProfile` matches the Live sending control: on
+ * needs the whole chain current and correctly linked; off needs no chain link current. A
+ * mismatch is what a Live sending change that failed after its control write leaves behind.
+ */
+export async function pursueGmailCapabilitiesInSync({ storage, enabled, now,
+  providerProfile = PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE } = {}) {
+  const at = requiredInstant(now);
+  if (typeof storage?.listCurrentCimCapabilityActivations !== 'function') return false;
+  const current = new Map((await storage.listCurrentCimCapabilityActivations())
+    .map((row) => [row.capability, row]));
+  if (!enabled) {
+    return PURSUE_GMAIL_CAPABILITY_CHAIN.every((capability) =>
+      current.get(capability)?.provider_profile !== providerProfile);
+  }
+  let parent = null;
+  for (const capability of PURSUE_GMAIL_CAPABILITY_CHAIN) {
+    const row = current.get(capability);
+    if (!intact(row, parent, providerProfile, at)) return false;
+    parent = row;
+  }
+  return true;
 }

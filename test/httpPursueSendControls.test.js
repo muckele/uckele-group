@@ -142,8 +142,11 @@ test('viewer gets status without preview and cannot change controls', async () =
     assert.equal(emailSending.wording.approvedDigest, null);
     assert.equal(Object.hasOwn(emailSending.wording, 'preview'), false);
     assert.equal(emailSending.readiness.ready, false);
+    // This server has no Gmail CIM provider profile configured, so the card says so too.
     assert.deepEqual(emailSending.readiness.reasons,
-      ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off']);
+      ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off', 'provider_not_gmail']);
+    assert.equal(emailSending.liveSending.capabilitiesInSync, true);
+    assert.equal(emailSending.liveSending.providerProfile, 'production-gmail-v1');
     assert.equal(emailSending.liveSending.enabled, false);
     assert.equal(emailSending.contactRule.enabled, false);
     assert.deepEqual(emailSending.lastRuns, { sender: null, replyPoller: null });
@@ -357,4 +360,51 @@ test('approving wording is refused while the signature is incomplete', async () 
   assert.equal(result.status, 409);
   assert.equal(result.code, 'signature_incomplete');
   assert.equal((await getStorage().getPursueSendControls()).wordingApproval.revision, before.revision);
+});
+
+test('status reports a Live sending control out of sync with its capability chain, in both directions', async () => {
+  const storage = getStorage();
+  await withServer(async (origin) => {
+    const cookie = await admin(origin);
+    const read = async () => (await get(origin, statusPath, cookie)).json.emailSending;
+    const { liveSending } = await storage.getPursueSendControls();
+    assert.equal(liveSending.enabled, false);
+
+    // Off, but a chain link is still current (an off whose withdraw failed).
+    const { syncPursueGmailCapabilities } = await import('../server/services/pursueGmailCapabilities.js');
+    await syncPursueGmailCapabilities({ storage, enabled: true, actor: 'admin', now: new Date().toISOString() });
+    let status = await read();
+    assert.equal(status.liveSending.enabled, false);
+    assert.equal(status.liveSending.capabilitiesInSync, false);
+    assert.ok(status.readiness.reasons.includes('live_sending_not_applied'));
+    assert.equal(status.readiness.ready, false);
+
+    // Re-applying the current control (same state, current revision) repairs it.
+    const reapply = await post(origin, controlsPath, cookie, { controlKey: 'live_sending', enabled: false,
+      expectedRevision: liveSending.revision });
+    assert.equal(reapply.status, 200);
+    assert.equal(reapply.json.control.capabilitiesInSync, true);
+    status = await read();
+    assert.equal(status.liveSending.capabilitiesInSync, true);
+    assert.ok(!status.readiness.reasons.includes('live_sending_not_applied'));
+
+    // On, but the chain is broken (an on whose capability sync failed part way).
+    const on = await post(origin, controlsPath, cookie, { controlKey: 'live_sending', enabled: true,
+      expectedRevision: liveSending.revision + 1 });
+    assert.equal(on.json.control.capabilitiesInSync, true);
+    const initial = (await storage.listCurrentCimCapabilityActivations())
+      .find((row) => row.capability === 'fl04b-initial');
+    await storage.withdrawCimCapabilityActivation({ id: initial.id, actor: 'admin', reason: 'test',
+      now: new Date().toISOString() });
+    status = await read();
+    assert.equal(status.liveSending.enabled, true);
+    assert.equal(status.liveSending.capabilitiesInSync, false);
+    assert.ok(status.readiness.reasons.includes('live_sending_not_applied'));
+    const repaired = await post(origin, controlsPath, cookie, { controlKey: 'live_sending', enabled: true,
+      expectedRevision: liveSending.revision + 2 });
+    assert.equal(repaired.json.control.capabilitiesInSync, true);
+    assert.equal((await read()).liveSending.capabilitiesInSync, true);
+    await post(origin, controlsPath, cookie, { controlKey: 'live_sending', enabled: false,
+      expectedRevision: liveSending.revision + 3 });
+  });
 });

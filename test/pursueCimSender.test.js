@@ -702,3 +702,33 @@ test('Live sending off and on again: a prepared follow-up is prepared again and 
   assert.equal((await fixture.run()).sentFollowUps, 0);
   assert.equal(fixture.mailProvider.sent.length, 2);
 });
+
+test('Live sending off whose release failed is finished by a retry: the prepared follow-up is released', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, campaigns: [due('a')] });
+  await sendInitial(fixture);
+  const touch = scheduledFollowUp(fixture, 'a');
+  fixture.clock.set(at(touch.due_at, 30_000));
+  const [candidate] = await fixture.storage.listDueCimFollowUpTouches({
+    now: fixture.clock.peek().toISOString() });
+  const prepared = await runCimFollowUpPreparation({ storage: fixture.storage, candidate,
+    clock: fixture.clock, actor: 'crashed-worker', claimTokenDigest: fill('9'),
+    loadAuthority: (input) => loadPursueFollowUpAuthority({ ...input, config: fixture.config,
+      loadMemberAuthority: fixture.loadMemberAuthority }),
+    buildPayload: (input) => buildPursueFollowUpPayload({ ...input, config: fixture.config }) });
+  assert.equal(prepared.prepared, true);
+  await setSendControl(fixture.storage, 'live_sending', false);
+  // The withdraw succeeds, then the release fails (as if the process died there).
+  await assert.rejects(syncPursueGmailCapabilities({
+    storage: crashingOnce(fixture.storage, 'releasePreparedCimTransmissions'),
+    enabled: false, actor: 'owner', now: fixture.clock().toISOString() }), /synthetic process death/);
+  assert.equal(fixture.count('deal_hunter_cim_capability_activations', "status = 'current'"), 0);
+  assert.equal(fixture.row('deal_hunter_cim_transmissions', prepared.transmission.id).state, 'prepared');
+  // Try again: nothing is left to withdraw, and the release still runs (Ruling T).
+  const retry = await syncPursueGmailCapabilities({ storage: fixture.storage, enabled: false,
+    actor: 'owner', now: fixture.clock().toISOString() });
+  assert.deepEqual(retry.withdrawn, []);
+  assert.equal(retry.released, 1);
+  assert.equal(fixture.row('deal_hunter_cim_transmissions', prepared.transmission.id).state,
+    'cancelled-before-provider');
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', touch.id).state, 'scheduled');
+});

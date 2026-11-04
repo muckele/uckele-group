@@ -15,6 +15,8 @@ export const READINESS_SENTENCES = Object.freeze({
   contact_rule_off: 'The contact rule is off.',
   live_sending_off: 'Live sending is off.',
   signature_incomplete: 'Your name, title, phone, or mailing address is missing from settings.',
+  provider_not_gmail: "The server isn't set to send through Gmail yet (see the Gmail setup runbook).",
+  live_sending_not_applied: 'Live sending needs to be re-applied — use Try again.',
 });
 
 // The `gmail` query value the connect callback redirects back with.
@@ -167,7 +169,6 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
   const [pendingAction, setPendingAction] = useState(null);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState(null);
-  const [retryAction, setRetryAction] = useState(null);
   const [redirectResult] = useState(() => connectResult(connectResultCode ?? undefined));
   const triggerRef = useRef(null);
   const activeRef = useRef(true);
@@ -200,7 +201,6 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
   function open(action, event) {
     triggerRef.current = event?.currentTarget || null;
     setNotice(null);
-    setRetryAction(null);
     setPendingAction(action);
   }
 
@@ -224,12 +224,7 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
       });
       const result = await response.json().catch(() => ({}));
       if (!activeRef.current) return;
-      if (response.ok && result.success) {
-        setRetryAction(null);
-      } else if (result.code === 'live_sending_sync_failed' && result.control) {
-        setNotice({ tone: 'warn', text: result.error });
-        setRetryAction({ ...action, expectedRevision: Number(result.control.revision) || 0, reason });
-      } else {
+      if (!response.ok || !result.success) {
         setNotice({ tone: 'warn', text: result.error || 'The change was not saved. Try again.' });
       }
     } catch {
@@ -280,7 +275,6 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
       {notice ? (
         <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900" role="status">
           <p>{notice.text}</p>
-          {retryAction && !readOnly ? <button className={`${secondaryButton} mt-2`} disabled={saving} onClick={() => send(retryAction, retryAction.reason)} type="button">Try again</button> : null}
         </div>
       ) : null}
       {loadError ? (
@@ -341,7 +335,16 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
           </Row>
           <Row label="Live sending">
             <p><strong className="text-ink">{liveSending.enabled ? 'On' : 'Off'}</strong></p>
+            {liveSending.providerProfile ? <p className="text-xs text-ink/60">Sending setup: {liveSending.providerProfile === 'controlled-mailbox-v1' ? 'controlled test (one allowed recipient)' : 'production'}</p> : null}
             {liveSending.changedAt ? <p className="text-xs text-ink/60">{liveSending.enabled ? 'Turned on' : 'Turned off'} by {liveSending.changedBy || 'Not recorded'} on {formatDate(liveSending.changedAt)}</p> : null}
+            {liveSending.capabilitiesInSync === false ? (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-amber-950" role="status">
+                <p>{liveSending.enabled
+                  ? 'Live sending is on, but it was not fully applied, so nothing is being sent. Live sending needs to be re-applied.'
+                  : 'Live sending is off, but it was not fully applied. Nothing is sent while it is off. Live sending needs to be re-applied.'}</p>
+                {!readOnly ? <button className={`${secondaryButton} mt-2`} disabled={controlsDisabled} onClick={() => send({ kind: 'live_sending', enabled: liveSending.enabled, expectedRevision: Number(liveSending.revision) || 0 }, '')} type="button">Try again</button> : null}
+              </div>
+            ) : null}
             {!readOnly ? <button className={liveSending.enabled ? dangerButton : primaryButton} disabled={controlsDisabled} onClick={(event) => open({ kind: 'live_sending', enabled: !liveSending.enabled, expectedRevision: Number(liveSending.revision) || 0 }, event)} type="button">{liveSending.enabled ? 'Turn off Live sending' : 'Turn on Live sending'}</button> : null}
           </Row>
           <Row label="Readiness">

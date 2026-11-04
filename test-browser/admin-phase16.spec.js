@@ -2027,7 +2027,7 @@ test('an authenticated administrator can reach the Operations Center', async ({ 
 test('Email sending card shows readiness and gates Live sending behind confirmation', async ({ page }) => {
   await mockAuthenticatedAdmin(page);
   const control = (overrides = {}) => ({ enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0, ...overrides });
-  let liveSending = control({ revision: 2 });
+  let liveSending = control({ revision: 2, providerProfile: 'production-gmail-v1', capabilitiesInSync: true });
   const controlPosts = [];
   await page.route('**/api/admin/deal-hunter/email-sending', async (route) => {
     await route.fulfill({
@@ -2054,7 +2054,7 @@ test('Email sending card shows readiness and gates Live sending behind confirmat
     const body = route.request().postDataJSON();
     controlPosts.push(body);
     liveSending = control({ enabled: body.enabled, changedAt: '2026-11-03T18:00:00.000Z', changedBy: 'phase16-admin',
-      revision: body.expectedRevision + 1 });
+      revision: body.expectedRevision + 1, providerProfile: 'production-gmail-v1', capabilitiesInSync: true });
     await route.fulfill({ contentType: 'application/json', status: 200, body: JSON.stringify({ success: true, control: liveSending }) });
   });
 
@@ -2062,6 +2062,7 @@ test('Email sending card shows readiness and gates Live sending behind confirmat
   const card = page.getByRole('region', { name: 'Email sending' });
   await expect(card.getByText('owner@uckele.test')).toBeVisible();
   await expect(card.getByText('Live sending is off.')).toBeVisible();
+  await expect(card.getByText('Sending setup: production')).toBeVisible();
 
   const turnOn = card.getByRole('button', { name: 'Turn on Live sending' });
   await turnOn.click();

@@ -51,8 +51,11 @@ function temporaryPath(t, prefix) {
  * @param {object} options
  * @param {string} options.start  the clock's first instant
  * @param {Array<{suffix: string, dueAt: string, dueLocal: string}>} options.campaigns
+ * @param {object} [options.config]  sender config (default: production-gmail-v1)
+ * @param {string} [options.providerProfile]  the profile Live sending records its chain under
  */
-export async function createSenderFixture(t, { start, campaigns }) {
+export async function createSenderFixture(t, { start, campaigns, config: configOverride,
+  providerProfile } = {}) {
   const clock = controlledClock(start);
   const sqlitePath = temporaryPath(t, 'pursue-sender');
   const storage = createSqliteStorage({ storage: { sqlitePath },
@@ -76,9 +79,9 @@ export async function createSenderFixture(t, { start, campaigns }) {
     updated_by, metadata) VALUES ('global', ?, 0, 'fixture-owner', '{}')`).run(start);
   await enableSendControls(storage, { now: start });
   const capabilities = await syncPursueGmailCapabilities({ storage, enabled: true,
-    actor: 'fixture-owner', now: start });
+    actor: 'fixture-owner', now: start, ...(providerProfile ? { providerProfile } : {}) });
   const mailProvider = createFakeCimProvider({ now: () => clock.peek(), senderAddress: SENDER });
-  const config = gmailConfig();
+  const config = configOverride || gmailConfig();
   const loadMemberAuthority = async ({ opportunityId }) => fixtureMemberAuthority(opportunityId);
   const submissionOf = (opportunityId) => Object.values(seeded)
     .find((ids) => ids.opportunityId === opportunityId)?.submissionId;

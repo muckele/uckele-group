@@ -111,14 +111,17 @@ means only people in your Workspace can use it, and Google does not need to revi
 
    - Sending stays paused, and **Approve wording** stays greyed out, until the name, title,
      phone and mailing address are all set.
-3. Leave these **off** for now. You turn them on in Part C, step 6:
+3. Leave these **off** for now. You turn them on in Part C, step 5 (the controlled test), and
+   they stay on for step 6:
 
    | Setting | Value for now | What it does when `true` |
    | --- | --- | --- |
    | `DEAL_HUNTER_PURSUE_SENDER_ENABLED` | `false` | Runs the sender every 15 minutes: first emails, follow-ups, and closing campaigns at day 28. |
    | `DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED` | `false` | Checks Gmail every 5 minutes for replies, and stops follow-ups when a broker replies. |
    | `DEAL_HUNTER_CIM_PROVIDER_ENABLED` | `false` | Lets any CIM email reach a mail provider at all. |
-   | `DEAL_HUNTER_CIM_PROVIDER_PROFILE` | empty | Which sending setup to use: `controlled-mailbox-v1` for the test in Part C, step 5, then `production-gmail-v1` for real sending. |
+   | `DEAL_HUNTER_CIM_PROVIDER_PROFILE` | empty | Which sending setup to use: `controlled-mailbox-v1` for the test in step 5, then `production-gmail-v1` for real sending in step 6. |
+   | `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` | empty | Only for step 5: `gmail` sends the controlled test through your connected Gmail. |
+   | `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS` | empty | Only for step 5: the one test inbox the controlled test may email. |
 
 ---
 
@@ -171,33 +174,67 @@ Follow Part A and Part B above. Restart or redeploy so the app picks up the new 
 
 ### 5. Send one controlled test to yourself
 
-This proves a real email, a follow-up and a reply all work, using only an address you control.
-Ask your engineer to run it with you.
+This proves that a real email, a follow-up and a reply all work, through the real sender and
+reply checks. While the controlled test setup is on, the app can email **only** your test inbox:
+an email to any other address is refused before it reaches Gmail.
 
-1. Set these settings (on Fly, with `fly secrets set`):
+You need a test inbox you can read and reply from. Use a different address from the sending
+address (a personal address works).
+
+1. Set these settings (on Fly, with `fly secrets set`), replacing the address with your test inbox:
 
    ```
-   DEAL_HUNTER_CIM_PROVIDER_ENABLED=true
-   DEAL_HUNTER_CIM_PROVIDER_PROFILE=controlled-mailbox-v1
-   DEAL_HUNTER_CIM_MAILBOX_PROVIDER=gmail
-   DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS=<an address you control, not the sending address>
+   fly secrets set \
+     DEAL_HUNTER_CIM_PROVIDER_ENABLED=true \
+     DEAL_HUNTER_CIM_PROVIDER_PROFILE=controlled-mailbox-v1 \
+     DEAL_HUNTER_CIM_MAILBOX_PROVIDER=gmail \
+     DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS=my-test-inbox@example.com \
+     DEAL_HUNTER_PURSUE_SENDER_ENABLED=true \
+     DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=true
    ```
 
-2. Your engineer runs the controlled-mailbox test (`npm run cim:p10b`, prepare then execute)
-   to that one address, through the connected Gmail. Reply detection needs the reply checks on
-   during the test (`DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=true`).
-3. Check that address:
-   - the first email arrived from the sending address;
-   - the follow-up arrived **in the same thread**.
-4. Reply to the thread from that address. Your engineer confirms the test campaign shows as
-   responded and that no more follow-ups are sent.
-5. When the test passes, clear `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` and
-   `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS`. If it fails, stop here: leave Live sending off
-   and the sender setting `false`.
+   - Put exactly one address in `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS`. With none, or more
+     than one, nothing is sent.
+2. In the **Email sending** card, click **Turn on Live sending** and confirm.
+   - The Live sending part says **Sending setup: controlled test (one allowed recipient)**.
+   - Readiness should say **Ready to send.** If it doesn't, fix what it lists first.
+3. Pick one test listing in the Deal Hunter Inbox. You can use a real listing you don't plan to
+   pursue, or add one for the test.
+   1. Open the listing.
+   2. Under **Broker & Seller**, set **Broker email** to your test inbox and save it.
+   3. Click **Request SIM**.
+4. Wait for the first email.
+   - The sender runs every 15 minutes, and sends only on weekdays between 08:00 and 17:00 in the
+     listing's local time.
+   - Check your test inbox: the email comes from the sending address, with your signature.
+   - **Last runs** in the card shows `1 initial email`.
+5. Wait for the follow-up.
+   - It is due 2 business days later at 08:00 local time.
+   - To avoid the wait, ask your engineer to move that follow-up's due time to now.
+   - Check your test inbox: the follow-up arrives **in the same thread** as the first email.
+6. Reply to that thread from your test inbox.
+   - Within about 5 minutes, **Last runs** shows the reply check with `1 replies`, and the
+     listing's campaign shows as responded.
+   - No more follow-ups are sent. You can check again after the next follow-up's due date.
+7. Finish the test and switch to real sending:
+   1. Click **Turn off Live sending** and confirm.
+   2. Change the sending setup to production and remove the test-only settings:
 
-### 6. Turn on Live sending and the schedulers
+      ```
+      fly secrets set DEAL_HUNTER_CIM_PROVIDER_PROFILE=production-gmail-v1
+      fly secrets unset DEAL_HUNTER_CIM_MAILBOX_PROVIDER DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS
+      ```
 
-1. Set these settings:
+   3. Leave `DEAL_HUNTER_PURSUE_SENDER_ENABLED` and `DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED` on.
+      With Live sending off, the sender sends nothing.
+
+**If any check fails:** click **Turn off Live sending**, set
+`DEAL_HUNTER_PURSUE_SENDER_ENABLED=false` and `DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=false`,
+and contact your engineer. Don't go on to step 6.
+
+### 6. Turn on Live sending for real
+
+1. Check that these settings are in place from step 5:
 
    ```
    DEAL_HUNTER_CIM_PROVIDER_ENABLED=true
@@ -206,11 +243,13 @@ Ask your engineer to run it with you.
    DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=true
    ```
 
-2. In the **Email sending** card, click **Turn on Live sending** and confirm. The card shows who
-   turned it on and when.
+   `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` and `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS` must be unset.
+2. In the **Email sending** card, click **Turn on Live sending** and confirm.
+   - The card shows who turned it on and when.
+   - The Live sending part says **Sending setup: production**.
 3. The card's readiness should now say **Ready to send.** If it doesn't, it lists what is
    missing; fix those first.
-4. Within 15 minutes, **Last runs** shows a sender line, and within 5 minutes a reply-checks line.
+4. **Last runs** shows a new sender line within 15 minutes, and a new reply-checks line within 5 minutes.
 5. Automatic Pursue still decides which deals get emails. Move it from `shadow` to `canary` to
    `active` in the Deal Hunter Inbox on your own schedule. In `shadow` nothing is sent.
 
@@ -225,9 +264,10 @@ Ask your engineer to run it with you.
 - **To disconnect Gmail:** click **Disconnect** and confirm. Sending and reply checks stop until
   you connect again. You can also remove the app's access at
   <https://myaccount.google.com/permissions>; the card then says to reconnect.
-- **"Live sending was saved … Use Try again to finish."** The switch was saved, but its sending
-  permissions were not fully updated. Nothing extra is sent in this state. Click **Try again** in
-  the card. If it keeps failing, leave Live sending off and contact your engineer.
+- **"Live sending needs to be re-applied."** The switch was saved, but its sending permissions
+  were not fully updated, for example after a brief database error. Nothing extra is sent in
+  this state. Click **Try again** under Live sending. It re-applies the current setting. If it
+  keeps failing, turn Live sending off and contact your engineer.
 - **"This setting changed since the card loaded."** Someone else (or another tab) changed it.
   The card reloads; check the new state and try again if you still want the change.
 
@@ -243,3 +283,5 @@ What each readiness sentence means:
 | The contact rule is off. | Click **Turn on contact rule**. |
 | Live sending is off. | Click **Turn on Live sending** when you're ready. |
 | Your name, title, phone, or mailing address is missing from settings. | Set the signature settings from Part B, then approve the wording again. |
+| The server isn't set to send through Gmail yet (see the Gmail setup runbook). | Set `DEAL_HUNTER_CIM_PROVIDER_ENABLED=true` and the sending setup (`DEAL_HUNTER_CIM_PROVIDER_PROFILE`) from step 5 or step 6. |
+| Live sending needs to be re-applied — use Try again. | Click **Try again** under Live sending. |

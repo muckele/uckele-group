@@ -207,27 +207,75 @@ describe('Email sending card', () => {
     expect(fetchMock.mock.calls.filter(([url]) => url === statusUrl).length).toBeGreaterThanOrEqual(2);
   });
 
-  test('a failed Live sending sync offers Try again with the new revision', async () => {
+  test('a failed Live sending sync shows the server message and a Try again derived from the reloaded status', async () => {
     let attempts = 0;
-    const fetchMock = stubFetch(status({ liveSending: control({ revision: 1 }) }), { onPost: () => {
+    const outOfSync = status({ liveSending: control({ enabled: true, revision: 2, capabilitiesInSync: false }),
+      readiness: { ready: false, reasons: ['live_sending_not_applied'] } });
+    const fetchMock = stubFetch(status({ liveSending: control({ revision: 1, capabilitiesInSync: true }) }), { onPost: () => {
       attempts += 1;
       if (attempts === 1) {
-        return { response: jsonResponse({ success: false, code: 'live_sending_sync_failed',
+        return { next: outOfSync, response: jsonResponse({ success: false, code: 'live_sending_sync_failed',
           error: 'Live sending was saved as on, but its sending permissions were not fully recorded, so nothing will send yet. Use Try again to finish.',
-          control: control({ enabled: true, revision: 2 }) }, { ok: false, status: 500 }) };
+          control: control({ enabled: true, revision: 2, capabilitiesInSync: false }) }, { ok: false, status: 500 }) };
       }
-      return { response: jsonResponse({ success: true, control: control({ enabled: true, revision: 3 }) }) };
+      return { next: status({ liveSending: control({ enabled: true, revision: 3, capabilitiesInSync: true }),
+        readiness: { ready: true, reasons: [] } }),
+      response: jsonResponse({ success: true, control: control({ enabled: true, revision: 3, capabilitiesInSync: true }) }) };
     } });
     render(<EmailSendingCard />);
 
     fireEvent.click(await screen.findByRole('button', { name: 'Turn on Live sending' }));
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Turn on Live sending' }));
     expect(await screen.findByText(/not fully recorded/)).toBeVisible();
+    expect(await screen.findByText(/Live sending is on, but it was not fully applied/)).toBeVisible();
+    expect(screen.getByText('Live sending needs to be re-applied — use Try again.')).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     await waitFor(() => expect(posts(fetchMock)).toHaveLength(2));
     expect(JSON.parse(posts(fetchMock)[1][1].body)).toEqual({ controlKey: 'live_sending', enabled: true,
       expectedRevision: 2, reason: '' });
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument());
+    expect(await screen.findByText('Ready to send.')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+  });
+
+  test.each([
+    [true, /Live sending is on, but it was not fully applied/],
+    [false, /Live sending is off, but it was not fully applied/],
+  ])('after a reload, an out-of-sync Live sending (on=%s) shows the re-apply prompt and Try again re-applies it', async (enabled, prompt) => {
+    const fetchMock = stubFetch(status({
+      liveSending: control({ enabled, revision: 6, capabilitiesInSync: false }),
+      readiness: { ready: false, reasons: ['live_sending_not_applied'] },
+    }), { onPost: () => ({ next: status({ liveSending: control({ enabled, revision: 7, capabilitiesInSync: true }) }) }) });
+    render(<EmailSendingCard />);
+
+    expect(await screen.findByText(prompt)).toBeVisible();
+    expect(screen.queryByText('Ready to send.')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(posts(fetchMock)).toHaveLength(1));
+    expect(JSON.parse(posts(fetchMock)[0][1].body)).toEqual({ controlKey: 'live_sending', enabled,
+      expectedRevision: 6, reason: '' });
+    await waitFor(() => expect(screen.queryByText(prompt)).not.toBeInTheDocument());
+  });
+
+  test('a viewer sees the out-of-sync prompt without a Try again button', async () => {
+    const viewerStatus = status({ liveSending: control({ enabled: true, capabilitiesInSync: false }),
+      readiness: { ready: false, reasons: ['live_sending_not_applied'] } });
+    delete viewerStatus.wording.preview;
+    stubFetch(viewerStatus);
+    render(<EmailSendingCard readOnly />);
+    expect(await screen.findByText(/Live sending is on, but it was not fully applied/)).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+  });
+
+  test('shows which sending setup Live sending applies to', async () => {
+    stubFetch(status({ liveSending: control({ providerProfile: 'controlled-mailbox-v1', capabilitiesInSync: true }) }));
+    render(<EmailSendingCard />);
+    expect(await screen.findByText('Sending setup: controlled test (one allowed recipient)')).toBeVisible();
+  });
+
+  test('says when the server is not set to send through Gmail', async () => {
+    stubFetch(status({ readiness: { ready: false, reasons: ['provider_not_gmail'] } }));
+    render(<EmailSendingCard />);
+    expect(await screen.findByText("The server isn't set to send through Gmail yet (see the Gmail setup runbook).")).toBeVisible();
   });
 
   test('approve wording is disabled while the signature is incomplete', async () => {
