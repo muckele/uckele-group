@@ -127,6 +127,10 @@ const gmailSendRunnersMigrationUrl = new URL(
   '../supabase/migrations/20261103120000_gmail_send_runners.sql',
   import.meta.url,
 );
+const pursuingTrackerMigrationUrl = new URL(
+  '../supabase/migrations/20261105120000_pursuing_tracker.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -491,7 +495,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   );
   const bestFirstDealListMigration = fs.readFileSync(bestFirstDealListMigrationUrl, 'utf8');
   const gmailSendRunnersMigration = fs.readFileSync(gmailSendRunnersMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${pursueCimFollowUpCapacityMigration}\n${bestFirstDealListMigration}\n${gmailSendRunnersMigration}`;
+  const pursuingTrackerMigration = fs.readFileSync(pursuingTrackerMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${pursueCimFollowUpCapacityMigration}\n${bestFirstDealListMigration}\n${gmailSendRunnersMigration}\n${pursuingTrackerMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -571,6 +576,14 @@ test('Supabase migration and fresh schema isolate every current app table to the
     assert.doesNotMatch(gmailSendRunnersMigration,
       new RegExp(`grant [^;]*(insert|update|delete)[^;]* on table public\\.${table}`, 'i'));
   }
+  // The Pursued deals tracker's owner events are read by service_role and written only through its RPC.
+  assert.doesNotMatch(pursuingTrackerMigration, /create\s+policy/i);
+  assert.match(pursuingTrackerMigration,
+    /revoke all on table public\.deal_hunter_pursuit_stage_events\s+from public, anon, authenticated, service_role;/i);
+  assert.match(pursuingTrackerMigration,
+    /grant select on table public\.deal_hunter_pursuit_stage_events to service_role;/i);
+  assert.doesNotMatch(pursuingTrackerMigration,
+    /grant [^;]*(insert|update|delete)[^;]* on table public\.deal_hunter_pursuit_stage_events/i);
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactWriteBoundaryMigration, /create\s+policy/i, 'opportunity fact write boundary must not add public RLS policies');

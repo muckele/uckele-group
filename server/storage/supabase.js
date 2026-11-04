@@ -9,6 +9,9 @@ import {
   normalizeGmailSentIdentityRow, validateGmailReplyMessage, validateGmailReplyMessageLookup,
   validateGmailSentIdentityLookup, validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
+import {
+  normalizePursuitStageEventRow, PURSUIT_STAGE_EVENT_CONFLICTS, validatePursuitStageEventCommand,
+} from './pursuitTrackerStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
@@ -4320,6 +4323,31 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         throw new Error('Malformed Gmail reply message result');
       }
       return { applied: data.applied, replay: data.replay };
+    },
+
+    async getPursuitStageEventByIdempotencyKey(key) {
+      const { data, error } = await client.from('deal_hunter_pursuit_stage_events').select('*')
+        .eq('idempotency_key', String(key)).maybeSingle();
+      if (error) throw error;
+      return normalizePursuitStageEventRow(data);
+    },
+
+    /**
+     * Appends one Pursued deals tracker owner event through the RPC, which locks the
+     * opportunity row and then checks the key, membership, predecessor and acknowledged reply.
+     */
+    async recordPursuitStageEvent(command = {}) {
+      const event = validatePursuitStageEventCommand(command);
+      if (event.kind === 'sim-intake') throw new TypeError('Invalid kind');
+      const { data, error } = await client.rpc('pursuit_tracker_record_event_v1', { p_command: event });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean'
+        || !PURSUIT_STAGE_EVENT_CONFLICTS.includes(data.conflict ?? null)
+        || (data.applied || data.replay) !== Boolean(data.event)) {
+        throw new Error('Malformed pursuit stage event result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict ?? null,
+        event: normalizePursuitStageEventRow(data.event) };
     },
 
     async getCurrentAutoPursueActivation() {

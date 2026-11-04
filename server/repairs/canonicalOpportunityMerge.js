@@ -382,6 +382,16 @@ const relationshipInventoryEntries = [
     scannerPath: 'dependentState.records.pursueCimAuthorities',
     reason: inertPursueCimAuthorityBlockingReason,
   }),
+  // The Pursued deals tracker's owner events exist only on an opportunity with a pursue
+  // decision, which already blocks the legacy merge.
+  ...relationshipEntries({
+    table: 'deal_hunter_pursuit_stage_events',
+    columns: ['acknowledged_reply_id', 'idempotency_key', 'opportunity_id', 'previous_event_id',
+      'secure_document_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
   ...relationshipEntries({
     table: 'deal_hunter_cim_campaigns',
     columns: [

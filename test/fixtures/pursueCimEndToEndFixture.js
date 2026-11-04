@@ -87,7 +87,7 @@ function installClock(t, startIso) {
 }
 
 /** Pacific wall time `HH:MM` on `date` (YYYY-MM-DD) in January, as an ISO instant (PST, UTC-8). */
-function pacific(date, time) {
+export function pacific(date, time) {
   const [hour, minute] = time.split(':').map(Number);
   const [year, month, day] = date.split('-').map(Number);
   return new RealDate(RealDate.UTC(year, month - 1, day, hour + 8, minute)).toISOString();
@@ -105,7 +105,7 @@ const iso = (value) => (value === null || value === undefined ? value : new Real
  * A world on one backend. `createBackend(t)` returns `{ storage, all(sql, ...params),
  * run(sql, ...params) }` with `?` placeholders; it is created after the clock is installed.
  */
-async function createWorld(t, createBackend, { start, config: initialConfig = gmailConfig() }) {
+export async function createWorld(t, createBackend, { start, config: initialConfig = gmailConfig() }) {
   const clock = installClock(t, start);
   const backend = await createBackend(t);
   const { storage } = backend;
@@ -264,18 +264,18 @@ function autoPursueRuns(world) {
     triggeredBy: 'sheet-sync', currentFingerprints: fingerprints });
 }
 
-async function sendAt(world, at) {
+export async function sendAt(world, at) {
   world.clock.set(at);
   return world.send();
 }
 
-async function pollAt(world, at) {
+export async function pollAt(world, at) {
   world.clock.set(at);
   return world.poll();
 }
 
 /** The broker answers in the campaign's Gmail thread, to our latest email. */
-async function brokerReplies(world, campaign, { body, from = `Jordan Lee <${BROKER_EMAIL}>` }) {
+export async function brokerReplies(world, campaign, { body, from = `Jordan Lee <${BROKER_EMAIL}>` }) {
   const { gmail_thread_id: threadId } = await world.conversation(campaign.conversation_id);
   const ours = world.mailProvider.sent.filter((message) => message.threadId === threadId);
   return world.mailProvider.injectReply(threadId, {
@@ -293,7 +293,7 @@ function expectedEmail(world, { kind, followUpNumber, isFinal = false, name }) {
 }
 
 /** Sets up sending, automatic Pursue picks a 90+ deal, and its initial goes out Monday 08:05. */
-async function autoPursuedAndSent(world, { opportunityId = 'opp-auto', name = 'Acme Plumbing' } = {}) {
+export async function autoPursuedAndSent(world, { opportunityId = 'opp-auto', name = 'Acme Plumbing' } = {}) {
   await ownerTurnsSendingOn(world);
   await ownerActivatesAutoPursue(world);
   await seedDeal(world, { opportunityId, name, fitScore: 93, criteriaGroup: 'auto' });
@@ -304,7 +304,7 @@ async function autoPursuedAndSent(world, { opportunityId = 'opp-auto', name = 'A
   return world.campaignFor(opportunityId);
 }
 
-const START = pacific('2030-01-07', '06:30');
+export const START = pacific('2030-01-07', '06:30');
 
 /** 90+ deal → auto-Pursue active → initial in window → 2 follow-ups → broker reply → responded. */
 async function autoPursueReplyStops(t, createBackend) {

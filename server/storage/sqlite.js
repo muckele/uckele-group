@@ -47,6 +47,10 @@ import {
   validateGmailReplyMessage, validateGmailReplyMessageLookup, validateGmailSentIdentityLookup,
   validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
+import {
+  normalizePursuitStageEventRow, PURSUIT_GENESIS, PURSUIT_TRACKER_POLICY_VERSION,
+  validatePursuitStageEventCommand,
+} from './pursuitTrackerStorageContract.js';
 
 function cimSafetyDigest(...parts) {
   const framed = parts.map((part) => {
@@ -4588,6 +4592,47 @@ export function createSqliteStorage(config, options = {}) {
       CREATE INDEX IF NOT EXISTS idx_deal_hunter_owner_decision_events_opportunity_created
         ON deal_hunter_owner_decision_events(opportunity_id, created_at DESC);
 
+      -- The Pursued deals tracker's owner events: an append-only chain per opportunity. The
+      -- non-null 'genesis' sentinel makes UNIQUE(opportunity_id, previous_event_id) serialize
+      -- appends. No free-text column, so no email content can be stored here.
+      CREATE TABLE IF NOT EXISTS deal_hunter_pursuit_stage_events (
+        id TEXT NOT NULL PRIMARY KEY
+          CHECK(length(id) BETWEEN 1 AND 240 AND id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) BETWEEN 1 AND 240
+          AND idempotency_key NOT GLOB '*[^A-Za-z0-9_-]*'),
+        request_digest TEXT NOT NULL CHECK(length(request_digest) = 64
+          AND request_digest NOT GLOB '*[^0-9a-f]*'),
+        opportunity_id TEXT NOT NULL,
+        previous_event_id TEXT NOT NULL CHECK(length(previous_event_id) BETWEEN 1 AND 240
+          AND previous_event_id NOT GLOB '*[^A-Za-z0-9_-]*' AND previous_event_id <> id),
+        kind TEXT NOT NULL CHECK(kind IN ('reply-type', 'stage-move', 'sim-intake', 'acknowledge')),
+        reply_type TEXT CHECK(reply_type IS NULL OR reply_type IN (
+          'nda-requested', 'sim-received', 'not-available', 'question', 'other')),
+        from_stage TEXT NOT NULL CHECK(from_stage IN ('cim-requested', 'broker-replied', 'nda-sent',
+          'cim-received', 'financial-review', 'loi-candidate', 'passed')),
+        stage TEXT NOT NULL CHECK(stage IN ('cim-requested', 'broker-replied', 'nda-sent',
+          'cim-received', 'financial-review', 'loi-candidate', 'passed')),
+        acknowledged_reply_id TEXT CHECK(acknowledged_reply_id IS NULL
+          OR (length(acknowledged_reply_id) BETWEEN 1 AND 240
+            AND acknowledged_reply_id NOT GLOB '*[^A-Za-z0-9_-]*')),
+        acknowledged_processed_at TEXT
+          CHECK(acknowledged_processed_at IS NULL OR julianday(acknowledged_processed_at) IS NOT NULL),
+        secure_document_id TEXT CHECK(secure_document_id IS NULL
+          OR (length(secure_document_id) BETWEEN 1 AND 240
+            AND secure_document_id NOT GLOB '*[^A-Za-z0-9_-]*')),
+        actor TEXT NOT NULL CHECK(actor = trim(actor) AND length(actor) BETWEEN 1 AND 200),
+        policy_version TEXT NOT NULL CHECK(policy_version = 'pursuit-tracker-v1'),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        CHECK((kind = 'reply-type') = (reply_type IS NOT NULL)),
+        CHECK(kind <> 'acknowledge' OR (acknowledged_reply_id IS NOT NULL AND stage = from_stage)),
+        CHECK((acknowledged_reply_id IS NULL) = (acknowledged_processed_at IS NULL)),
+        CHECK((kind = 'sim-intake') = (secure_document_id IS NOT NULL)),
+        UNIQUE(opportunity_id, previous_event_id),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT
+      );
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_pursuit_stage_events_opportunity_created
+        ON deal_hunter_pursuit_stage_events(opportunity_id, created_at DESC);
+
       CREATE TABLE IF NOT EXISTS deal_hunter_pursuit_enrollments (
         id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         decision_event_id TEXT NOT NULL UNIQUE,
@@ -5064,6 +5109,20 @@ ${cimCapacityConsumeTriggerSql}
         WHERE id = NEW.id OR idempotency_key = NEW.idempotency_key
       )
       BEGIN SELECT RAISE(ABORT, 'owner decision evidence is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_pursuit_stage_events_no_update
+      BEFORE UPDATE ON deal_hunter_pursuit_stage_events
+      BEGIN SELECT RAISE(ABORT, 'pursuit stage evidence is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_pursuit_stage_events_no_delete
+      BEFORE DELETE ON deal_hunter_pursuit_stage_events
+      BEGIN SELECT RAISE(ABORT, 'pursuit stage evidence is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_pursuit_stage_events_no_replace
+      BEFORE INSERT ON deal_hunter_pursuit_stage_events
+      WHEN EXISTS (
+        SELECT 1 FROM deal_hunter_pursuit_stage_events
+        WHERE id = NEW.id OR idempotency_key = NEW.idempotency_key
+          OR (opportunity_id = NEW.opportunity_id AND previous_event_id = NEW.previous_event_id)
+      )
+      BEGIN SELECT RAISE(ABORT, 'pursuit stage evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_timezone_revisions_no_update
       BEFORE UPDATE ON deal_hunter_opportunity_timezone_revisions
       BEGIN SELECT RAISE(ABORT, 'timezone revision evidence is immutable'); END;
@@ -11371,6 +11430,75 @@ ${cimCapacityConsumeTriggerSql}
           SELECT DISTINCT conversation_id FROM deal_hunter_gmail_reply_messages WHERE applied = 0
           ORDER BY conversation_id
         `).all().map((row) => row.conversation_id);
+      },
+
+      async getPursuitStageEventByIdempotencyKey(key) {
+        return normalizePursuitStageEventRow(database.prepare(`
+          SELECT * FROM deal_hunter_pursuit_stage_events WHERE idempotency_key = ?
+        `).get(String(key)));
+      },
+
+      /**
+       * Appends one Pursued deals tracker owner event (spec 2026-11-04 §4.3). In one write
+       * transaction: the idempotency key (replay or conflict), an active opportunity, a latest
+       * owner decision of pursue, the predecessor (null appends after the latest event), and the
+       * acknowledged reply, whose processed_at is copied from the latest campaign's conversation.
+       */
+      async recordPursuitStageEvent(command = {}) {
+        const event = validatePursuitStageEventCommand(command);
+        if (event.kind === 'sim-intake') throw new TypeError('Invalid kind');
+        return database.transaction(() => {
+          const refused = (conflict) => ({ applied: false, replay: false, conflict, event: null });
+          const existing = database.prepare(`
+            SELECT * FROM deal_hunter_pursuit_stage_events WHERE idempotency_key = ?
+          `).get(event.idempotencyKey);
+          if (existing) {
+            return existing.request_digest === event.requestDigest
+              ? { applied: false, replay: true, conflict: null, event: normalizePursuitStageEventRow(existing) }
+              : refused('idempotency_conflict');
+          }
+          const opportunity = database.prepare(`
+            SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ?
+          `).get(event.opportunityId);
+          if (!opportunity) return refused('not_pursued');
+          if (opportunity.status !== 'active') return refused('opportunity_not_active');
+          const decision = database.prepare(`
+            SELECT action FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?
+            ORDER BY julianday(created_at) DESC, id DESC LIMIT 1
+          `).get(event.opportunityId);
+          if (decision?.action !== 'pursue') return refused('not_pursued');
+          const latest = database.prepare(`
+            SELECT e.id FROM deal_hunter_pursuit_stage_events e
+            WHERE e.opportunity_id = ? AND NOT EXISTS (
+              SELECT 1 FROM deal_hunter_pursuit_stage_events next
+              WHERE next.opportunity_id = e.opportunity_id AND next.previous_event_id = e.id)
+            ORDER BY julianday(e.created_at) DESC, e.id DESC LIMIT 1
+          `).get(event.opportunityId)?.id ?? PURSUIT_GENESIS;
+          if (event.expectedPreviousEventId !== null && event.expectedPreviousEventId !== latest) {
+            return refused('pursuit_stage_changed');
+          }
+          let acknowledgedProcessedAt = null;
+          if (event.acknowledgedReplyId !== null) {
+            const reply = database.prepare(`
+              SELECT reply.processed_at FROM deal_hunter_gmail_reply_messages reply
+              WHERE reply.gmail_message_id = ? AND reply.conversation_id = (
+                SELECT campaign.conversation_id FROM deal_hunter_cim_campaigns campaign
+                WHERE campaign.opportunity_id = ? ORDER BY campaign.generation DESC LIMIT 1)
+            `).get(event.acknowledgedReplyId, event.opportunityId);
+            if (!reply) return refused('unknown_reply');
+            acknowledgedProcessedAt = reply.processed_at;
+          }
+          database.prepare(`
+            INSERT INTO deal_hunter_pursuit_stage_events (id, idempotency_key, request_digest,
+              opportunity_id, previous_event_id, kind, reply_type, from_stage, stage, acknowledged_reply_id,
+              acknowledged_processed_at, secure_document_id, actor, policy_version, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+          `).run(event.id, event.idempotencyKey, event.requestDigest, event.opportunityId, latest, event.kind,
+            event.replyType, event.fromStage, event.stage, event.acknowledgedReplyId, acknowledgedProcessedAt,
+            event.actor, PURSUIT_TRACKER_POLICY_VERSION, event.now);
+          return { applied: true, replay: false, conflict: null, event: normalizePursuitStageEventRow(
+            database.prepare('SELECT * FROM deal_hunter_pursuit_stage_events WHERE id = ?').get(event.id)) };
+        }).immediate();
       },
 
       async getCurrentAutoPursueActivation() {
