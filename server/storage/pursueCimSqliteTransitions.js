@@ -5,6 +5,7 @@ import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
 import { deriveAcceptedCimCadence } from '../services/pursueCimCadence.js';
 import { cimFollowUpCapacityWindow } from '../services/pursueCimFollowUpCapacity.js';
+import { CONTACT_POLICY_VERSION, contactPolicyDigest } from '../services/pursueCimContactPolicy.js';
 
 const cimWriterCapabilities = new Map([
   ['pursue-cim-initial', 'fl04b-initial'],
@@ -249,6 +250,19 @@ const activationPredecessor = Object.freeze({
   'fl04c-followup': 'fl04b-initial',
   'fl04c-batch': 'fl04c-followup',
 });
+
+/**
+ * True when a campaign command's permission basis is the standing contact rule as it is on
+ * now: same policy version, same control revision, and that revision's policy digest.
+ */
+function contactRuleBasisCurrent(database, command) {
+  if (command.permissionVersion !== CONTACT_POLICY_VERSION) return false;
+  const control = database.prepare(`SELECT enabled, revision FROM deal_hunter_pursue_send_controls
+    WHERE control_key = 'contact_rule'`).get();
+  if (!control || control.enabled !== 1 || control.revision !== command.permissionRevision) return false;
+  const policyDigest = contactPolicyDigest({ contactRule: { revision: control.revision } });
+  return command.permissionDigest === policyDigest && command.policyHash === policyDigest;
+}
 
 function currentActivationChain(database, capability, now) {
   const activation = database.prepare(`
@@ -3204,11 +3218,11 @@ export function createPursueCimSqliteTransitions(database, {
             && (score.reviewed_semantic_digest
               ? score.reviewed_semantic_digest === score.semantic_digest
               : !score.reviewed_fingerprint || score.reviewed_fingerprint === score.score_fingerprint)
-            && activation?.id === permissionVersion
-            && activation.permission_basis_digest === command.permissionDigest
-            && activation.permission_revision === command.permissionRevision
-            && activation.cohort_digest === permissionScope
-            && activation.policy_hash === command.policyHash
+            && (contactRuleBasisCurrent(database, command) || (activation?.id === permissionVersion
+              && activation.permission_basis_digest === command.permissionDigest
+              && activation.permission_revision === command.permissionRevision
+              && activation.cohort_digest === permissionScope
+              && activation.policy_hash === command.policyHash))
             && timezone?.revision === command.timezoneRevision
             && ['verified', 'derived'].includes(timezone?.state)
             && enrollment?.state === 'campaign-created'
@@ -3272,11 +3286,12 @@ export function createPursueCimSqliteTransitions(database, {
         const activation = currentActivationChain(database, 'fl04b-enrollment', now);
         const globalAuthority = database.prepare(`SELECT revision FROM deal_hunter_cim_global_authority
           WHERE id = 'global'`).get();
-        if (!activation || activation.id !== permissionVersion
+        if ((!contactRuleBasisCurrent(database, command) && (!activation
+          || activation.id !== permissionVersion
           || activation.permission_basis_digest !== command.permissionDigest
           || activation.permission_revision !== command.permissionRevision
           || activation.cohort_digest !== permissionScope
-          || activation.policy_hash !== command.policyHash
+          || activation.policy_hash !== command.policyHash))
           || !enrollment || enrollment.opportunity_id !== opportunityId
           || !['queued', 'waiting-on-eligibility'].includes(enrollment.state)
           || enrollment.row_version !== expectedEnrollmentRowVersion

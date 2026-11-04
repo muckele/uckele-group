@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { contactPolicyDigest } from '../server/services/pursueCimContactPolicy.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -142,8 +143,11 @@ test('the Gmail send runner migration is mirrored exactly at the end of the fres
     'deal_hunter_gmail_save_connection_v1',
     'deal_hunter_gmail_set_conversation_thread_v1',
     'deal_hunter_gmail_update_checkpoint_v1',
+    'deal_hunter_pursue_contact_rule_basis_v1',
     'deal_hunter_pursue_set_send_control_v1',
     'pursue_cim_finalize_transmission_p7a',
+    'pursue_cim_materialize_campaign_v1',
+    'pursue_cim_materialize_campaign_v2',
     'pursue_cim_reconcile_transmission_p7a',
     'pursue_cim_resolve_inbound_v1',
   ]);
@@ -340,6 +344,30 @@ test('PostgreSQL Gmail connection, send controls, threads and gmail provider out
         metadata: { controlKey: 'contact_rule', revision: 2, policyVersion: 'listing-broker-inquiry-v1',
           valueDigest: null, reason: 'pause' } },
     ]);
+
+    // The standing contact rule is a campaign permission basis only while it is on, at its
+    // current revision, with that revision's policy digest as the service computes it.
+    const ruleBasis = (revision, overrides = {}) => psql(container, database, `set role service_role;
+      select public.deal_hunter_pursue_contact_rule_basis_v1($json$${JSON.stringify({
+    permissionVersion: 'listing-broker-inquiry-v1', permissionRevision: revision,
+    permissionDigest: contactPolicyDigest({ contactRule: { revision } }),
+    policyHash: contactPolicyDigest({ contactRule: { revision } }), ...overrides })}$json$::jsonb);`);
+    assert.equal(ruleBasis(2), 'f', `${database} rule off`);
+    const ruleOn = await storage.setPursueSendControl({ controlKey: 'contact_rule', enabled: true,
+      policyVersion: 'listing-broker-inquiry-v1', expectedRevision: 2, actor: 'owner',
+      reason: 'standing rule again', now: later });
+    assert.equal(ruleOn.revision, 3);
+    assert.equal(ruleBasis(3), 't', `${database} rule on`);
+    assert.equal(ruleBasis(2), 'f', `${database} stale revision`);
+    assert.equal(ruleBasis(3, { permissionRevision: '3' }), 'f', `${database} text revision`);
+    assert.equal(ruleBasis(3, { permissionDigest: hex('other') }), 'f', `${database} digest`);
+    assert.equal(ruleBasis(3, { policyHash: hex('other') }), 'f', `${database} policy hash`);
+    assert.equal(ruleBasis(3, { permissionVersion: 'activation-enrollment' }), 'f',
+      `${database} activation basis`);
+    await storage.setPursueSendControl({ controlKey: 'contact_rule', enabled: false,
+      policyVersion: 'listing-broker-inquiry-v1', expectedRevision: 3, actor: 'owner',
+      reason: 'pause again', now: later });
+    assert.equal(ruleBasis(4), 'f', `${database} rule off again`);
 
     // provider outcome accepts gmail and still rejects unknown providers
     const finalize = (provider) => `select public.pursue_cim_finalize_transmission_v1('${JSON.stringify({

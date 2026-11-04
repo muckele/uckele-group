@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 import { deriveAcceptedCimCadence } from '../server/services/pursueCimCadence.js';
 import { calculateCampaignExpiry } from '../server/services/cimCampaignPolicy.js';
+import { CONTACT_POLICY_VERSION, contactPolicyDigest } from '../server/services/pursueCimContactPolicy.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -2230,6 +2231,41 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       assert.equal(JSON.parse(output.at(-2)).actionRequired, true, `${database}: ${label}`);
       assert.deepEqual(JSON.parse(output.at(-1)), { conversations: 0, campaigns: 0,
         touches: 0, enrollment: 'queued' }, `${database}: ${label}`);
+    }
+    if (database === 'pursue_cim_fresh') {
+      // The standing contact rule allocates without the fl04b-enrollment activation, and only
+      // at its current revision. Fresh schema only: the P1C upgrade stops before that migration.
+      const ruleDigest = contactPolicyDigest({ contactRule: { revision: 1 } });
+      const ruleCommand = JSON.stringify({ ...postgresCampaignCommands[0],
+        permissionVersion: CONTACT_POLICY_VERSION, permissionDigest: ruleDigest,
+        permissionRevision: 1, policyHash: ruleDigest }).replaceAll("'", "''");
+      const withdrawActivation = `select public.pursue_cim_withdraw_capability_activation_v1(
+        '{"id":"activation-enrollment","actor":"fixture","reason":"contact rule","now":"${now}"}'::jsonb);`;
+      const setRule = (enabled, expectedRevision) => `select public.deal_hunter_pursue_set_send_control_v1(
+        '${JSON.stringify({ controlKey: 'contact_rule', enabled, valueDigest: null,
+    policyVersion: CONTACT_POLICY_VERSION, expectedRevision, actor: 'fixture', reason: 'synthetic',
+    now })}'::jsonb);`;
+      for (const [label, mutation, allocated] of [
+        ['rule-on', `${withdrawActivation} ${setRule(true, 0)}`, true],
+        ['rule-never-set', withdrawActivation, false],
+        ['rule-off', `${withdrawActivation} ${setRule(true, 0)} ${setRule(false, 1)}`, false],
+        ['rule-stale-revision', `${withdrawActivation} ${setRule(true, 0)} ${setRule(false, 1)}
+          ${setRule(true, 2)}`, false],
+      ]) {
+        const output = psql(container, database, `begin; ${mutation}
+          select public.pursue_cim_materialize_campaign_v2('${ruleCommand}'::jsonb);
+          select jsonb_build_object(
+            'campaigns', (select count(*) from public.deal_hunter_cim_campaigns
+              where opportunity_id='opp-decision'),
+            'permission', (select jsonb_build_object('version', permission_version,
+              'digest', permission_digest, 'revision', permission_revision)
+              from public.deal_hunter_cim_campaigns where opportunity_id='opp-decision'));
+          rollback;`).split('\n').filter((line) => line.startsWith('{'));
+        assert.equal(JSON.parse(output.at(-2)).applied, allocated, `${database}: ${label}`);
+        assert.deepEqual(JSON.parse(output.at(-1)), allocated
+          ? { campaigns: 1, permission: { version: CONTACT_POLICY_VERSION, digest: ruleDigest, revision: 1 } }
+          : { campaigns: 0, permission: null }, `${database}: ${label}`);
+      }
     }
     const raceDatabase = `p4b_race_${database.endsWith('fresh') ? 'f' : 'u'}`;
     run(dockerCommand, ['exec', container, 'createdb', '-U', 'postgres',

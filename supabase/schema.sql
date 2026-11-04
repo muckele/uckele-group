@@ -21945,3 +21945,381 @@ $$;
 revoke all on function public.pursue_cim_resolve_inbound_v1(jsonb)
   from public, anon, authenticated;
 grant execute on function public.pursue_cim_resolve_inbound_v1(jsonb) to service_role;
+
+-- The standing listing-broker contact rule (listing-broker-inquiry-v1) is a campaign
+-- permission basis beside the fl04b-enrollment activation. True when the command names the
+-- rule, the rule is on, and the command carries its current revision and that revision's
+-- policy digest: sha256 of {"policyVersion":"listing-broker-inquiry-v1","revision":N}.
+-- Callers hold the CIM writer lock, which the send-control writer also takes.
+create or replace function public.deal_hunter_pursue_contact_rule_basis_v1(p_command jsonb)
+returns boolean
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  v_control public.deal_hunter_pursue_send_controls%rowtype;
+  v_digest text;
+begin
+  if p_command ->> 'permissionVersion' is distinct from 'listing-broker-inquiry-v1'
+    or pg_catalog.jsonb_typeof(p_command -> 'permissionRevision') is distinct from 'number' then
+    return false;
+  end if;
+  select * into v_control from public.deal_hunter_pursue_send_controls
+    where control_key = 'contact_rule';
+  if v_control.control_key is null or not v_control.enabled
+    or v_control.revision::text <> p_command ->> 'permissionRevision' then
+    return false;
+  end if;
+  v_digest := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+    '{"policyVersion":"listing-broker-inquiry-v1","revision":' || v_control.revision::text || '}',
+    'UTF8')), 'hex');
+  return p_command ->> 'permissionDigest' = v_digest and p_command ->> 'policyHash' = v_digest;
+end;
+$$;
+revoke all on function public.deal_hunter_pursue_contact_rule_basis_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_pursue_contact_rule_basis_v1(jsonb) to service_role;
+
+-- Campaign materialization accepts the contact rule basis. These redefine, with only the
+-- permission check changed, the bodies from 20260925120000 (v1) and 20261001130000 (v2).
+create or replace function public.pursue_cim_materialize_campaign_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_opportunity_id text;
+  v_enrollment_id text;
+  v_policy text;
+  v_template text;
+  v_permission text;
+  v_permission_scope text;
+  v_recipient_authority text;
+  v_address text;
+  v_sender_policy text;
+  v_reply_policy text;
+  v_thread_key text;
+  v_batching_policy text;
+  v_cadence_policy text;
+  v_due_local text;
+  v_actor text;
+  v_template_digest text := p_command ->> 'templateDigest';
+  v_permission_digest text := p_command ->> 'permissionDigest';
+  v_recipient_fingerprint text := p_command ->> 'recipientFingerprint';
+  v_reply_alias_digest text := p_command ->> 'replyAliasTokenDigest';
+  v_freshness_digest text := p_command ->> 'freshnessAuthorityDigest';
+  v_crm_text text := p_command ->> 'crmSubmissionId';
+  v_crm_id uuid;
+  v_enrollment_expected bigint;
+  v_generation bigint;
+  v_permission_revision bigint;
+  v_canonical_revision bigint;
+  v_crm_revision bigint;
+  v_discovery bigint;
+  v_material bigint;
+  v_timezone_revision bigint;
+  v_now timestamptz;
+  v_due timestamptz;
+  v_campaign_id text;
+  v_conversation_id text;
+  v_touch_id text;
+  v_current public.deal_hunter_cim_campaigns%rowtype;
+  v_campaign public.deal_hunter_cim_campaigns%rowtype;
+  v_touch public.deal_hunter_cim_campaign_touches%rowtype;
+  v_enrollment public.deal_hunter_pursuit_enrollments%rowtype;
+  v_decision public.deal_hunter_owner_decision_events%rowtype;
+  v_opportunity public.deal_hunter_opportunities%rowtype;
+  v_timezone public.deal_hunter_opportunity_timezone_revisions%rowtype;
+  v_conversation public.deal_hunter_broker_conversations%rowtype;
+  v_crm public.contact_submissions%rowtype;
+  v_same boolean;
+begin
+  v_opportunity_id := public.pursue_cim_required_text_v1(p_command,'opportunityId',200);
+  v_enrollment_id := public.pursue_cim_required_text_v1(p_command,'enrollmentId',240);
+  v_policy := public.pursue_cim_required_text_v1(p_command,'policyVersion',120);
+  v_template := public.pursue_cim_required_text_v1(p_command,'templateVersion',120);
+  v_permission := public.pursue_cim_required_text_v1(p_command,'permissionVersion',120);
+  v_permission_scope := public.pursue_cim_required_text_v1(p_command,'permissionScope',240);
+  v_recipient_authority := public.pursue_cim_required_text_v1(p_command,'recipientAuthorityId',240);
+  v_address := public.pursue_cim_required_text_v1(p_command,'recipientAddress',320);
+  v_sender_policy := public.pursue_cim_required_text_v1(p_command,'senderPolicyVersion',120);
+  v_reply_policy := public.pursue_cim_required_text_v1(p_command,'replyPolicyVersion',120);
+  v_thread_key := public.pursue_cim_required_text_v1(p_command,'rfcThreadKey',500);
+  v_batching_policy := public.pursue_cim_required_text_v1(p_command,'batchingPolicyVersion',120);
+  v_cadence_policy := public.pursue_cim_required_text_v1(p_command,'cadencePolicyVersion',120);
+  v_due_local := public.pursue_cim_required_text_v1(p_command,'dueLocal',120);
+  v_actor := public.pursue_cim_required_text_v1(p_command,'actor',200);
+  v_enrollment_expected := public.pursue_cim_required_revision_v1(p_command,'expectedEnrollmentRowVersion');
+  v_generation := public.pursue_cim_required_revision_v1(p_command,'generation');
+  v_permission_revision := public.pursue_cim_required_revision_v1(p_command,'permissionRevision');
+  v_canonical_revision := public.pursue_cim_required_revision_v1(p_command,'canonicalRevision');
+  v_crm_revision := public.pursue_cim_required_revision_v1(p_command,'crmOwnershipRevision');
+  v_discovery := public.pursue_cim_required_revision_v1(p_command,'expectedDiscoveryRevision');
+  v_material := public.pursue_cim_required_revision_v1(p_command,'expectedMaterialRevision');
+  v_timezone_revision := public.pursue_cim_required_revision_v1(p_command,'timezoneRevision');
+  if v_template_digest !~ '^[0-9a-f]{64}$'
+    or v_permission_digest !~ '^[0-9a-f]{64}$'
+    or v_recipient_fingerprint !~ '^[0-9a-f]{64}$'
+    or v_reply_alias_digest !~ '^[0-9a-f]{64}$'
+    or v_freshness_digest !~ '^[0-9a-f]{64}$'
+    or pg_catalog.jsonb_typeof(p_command -> 'dueAt') <> 'string'
+    or pg_catalog.jsonb_typeof(p_command -> 'now') <> 'string'
+  then
+    raise exception 'Invalid Pursue CIM campaign authority input';
+  end if;
+  v_due := public.pursue_cim_required_instant_v1(p_command, 'dueAt');
+  v_now := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_campaign_id := public.pursue_cim_digest_v1(
+    pg_catalog.to_jsonb('cim-campaign:v1'::text), pg_catalog.to_jsonb(v_opportunity_id),
+    pg_catalog.to_jsonb(v_generation), pg_catalog.to_jsonb(v_policy));
+  v_conversation_id := public.pursue_cim_digest_v1(
+    pg_catalog.to_jsonb('cim-conversation:v1'::text),
+    pg_catalog.to_jsonb(v_recipient_fingerprint), pg_catalog.to_jsonb(v_sender_policy));
+  v_touch_id := public.pursue_cim_digest_v1(
+    pg_catalog.to_jsonb('cim-touch:v1'::text), pg_catalog.to_jsonb(v_campaign_id),
+    pg_catalog.to_jsonb('initial'::text), pg_catalog.to_jsonb(v_cadence_policy));
+  select * into v_opportunity from public.deal_hunter_opportunities
+    where opportunity_id = v_opportunity_id for update;
+  select * into v_current from public.deal_hunter_cim_campaigns
+    where opportunity_id = v_opportunity_id order by generation desc limit 1 for update;
+  if found then
+    v_same := v_current.id = v_campaign_id and v_current.enrollment_id = v_enrollment_id
+      and v_current.template_digest = v_template_digest
+      and v_current.permission_digest = v_permission_digest
+      and v_current.recipient_fingerprint = v_recipient_fingerprint
+      and v_current.timezone_revision = v_timezone_revision;
+    select * into v_touch from public.deal_hunter_cim_campaign_touches
+      where campaign_id = v_current.id and logical_slot = 'initial';
+    return pg_catalog.jsonb_build_object('applied', false, 'existing', v_same,
+      'actionRequired', not v_same, 'campaign', pg_catalog.to_jsonb(v_current),
+      'initialTouch', case when found then pg_catalog.to_jsonb(v_touch) else null end);
+  end if;
+  if v_generation <> 1 then
+    return pg_catalog.jsonb_build_object('applied', false, 'existing', false,
+      'actionRequired', true, 'campaign', null, 'initialTouch', null);
+  end if;
+  select * into v_enrollment from public.deal_hunter_pursuit_enrollments
+    where id = v_enrollment_id for update;
+  if v_enrollment.id is not null then
+    select * into v_decision from public.deal_hunter_owner_decision_events
+      where id = v_enrollment.decision_event_id;
+  end if;
+  select * into v_timezone from public.deal_hunter_opportunity_timezone_revisions
+    where opportunity_id = v_opportunity_id order by revision desc limit 1 for share;
+  if v_crm_text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    v_crm_id := v_crm_text::uuid;
+    select * into v_crm from public.contact_submissions where id = v_crm_id for share;
+  end if;
+  if (public.pursue_cim_current_activation_v1('fl04b-enrollment',v_now) is null
+      and not public.deal_hunter_pursue_contact_rule_basis_v1(p_command))
+    or v_enrollment.id is null or v_enrollment.opportunity_id <> v_opportunity_id
+    or v_enrollment.state not in ('queued','waiting-on-eligibility')
+    or v_enrollment.row_version <> v_enrollment_expected
+    or v_decision.id is null or v_decision.action <> 'pursue'
+    or v_opportunity.opportunity_id is null or v_opportunity.status <> 'active'
+    or v_opportunity.discovery_revision <> v_discovery
+    or v_opportunity.material_revision <> v_material
+    or v_timezone.revision is null or v_timezone.revision <> v_timezone_revision
+    or v_timezone.state not in ('verified','derived')
+    or v_crm.id is null or v_crm.deal_hunter_opportunity_id <> v_opportunity_id
+    or v_crm.archived_at is not null or v_opportunity.primary_submission_id <> v_crm.id
+    or exists (select 1 from public.deal_hunter_cim_requests
+      where opportunity_id = v_opportunity_id and
+        (delivery_state in ('accepted','ambiguous') or
+         request_state in ('provider_pending','provider_accepted')))
+  then
+    return pg_catalog.jsonb_build_object('applied', false, 'existing', false,
+      'actionRequired', true, 'campaign', null, 'initialTouch', null);
+  end if;
+  select * into v_conversation from public.deal_hunter_broker_conversations
+    where id = v_conversation_id for update;
+  if found and (v_conversation.recipient_authority_id <> v_recipient_authority
+    or v_conversation.recipient_address <> v_address
+    or v_conversation.recipient_fingerprint <> v_recipient_fingerprint
+    or v_conversation.state <> 'open')
+  then
+    return pg_catalog.jsonb_build_object('applied', false, 'existing', false,
+      'actionRequired', true, 'campaign', null, 'initialTouch', null);
+  end if;
+  if v_conversation.id is null then
+    insert into public.deal_hunter_broker_conversations
+      (id, recipient_authority_id, recipient_fingerprint, recipient_address,
+       sender_policy_version, reply_policy_version, reply_alias_token_digest,
+       rfc_thread_key, state, batching_policy_version, created_at, updated_at)
+    values (v_conversation_id, v_recipient_authority, v_recipient_fingerprint, v_address,
+      v_sender_policy, v_reply_policy, v_reply_alias_digest, v_thread_key,
+      'open', v_batching_policy, v_now, v_now);
+  end if;
+  insert into public.deal_hunter_cim_campaigns
+    (id, opportunity_id, generation, enrollment_id, decision_event_id, policy_version,
+     template_version, template_digest, permission_version, permission_digest,
+     permission_revision, permission_scope, canonical_revision, crm_submission_id,
+     crm_ownership_revision, recipient_authority_id, recipient_fingerprint,
+     freshness_authority_digest, discovery_revision, material_revision,
+     timezone_revision, conversation_id, state, reason_code, created_at, updated_at)
+  values (v_campaign_id, v_opportunity_id, v_generation, v_enrollment_id, v_decision.id,
+    v_policy, v_template, v_template_digest, v_permission, v_permission_digest,
+    v_permission_revision, v_permission_scope, v_canonical_revision, v_crm.id,
+    v_crm_revision, v_recipient_authority, v_recipient_fingerprint,
+    v_freshness_digest, v_discovery, v_material, v_timezone_revision,
+    v_conversation_id, 'initial-pending', 'awaiting-window', v_now, v_now)
+  returning * into v_campaign;
+  insert into public.deal_hunter_cim_campaign_touches
+    (id, campaign_id, opportunity_id, logical_slot, kind, ordinal,
+     due_at, due_local, timezone_revision, state, created_at, updated_at)
+  values (v_touch_id, v_campaign_id, v_opportunity_id, 'initial', 'initial', 0,
+    v_due, v_due_local, v_timezone_revision, 'scheduled', v_now, v_now)
+  returning * into v_touch;
+  update public.deal_hunter_pursuit_enrollments
+    set state = 'campaign-created', reason_code = null,
+      updated_at = v_now, row_version = row_version + 1
+    where id = v_enrollment_id and row_version = v_enrollment_expected;
+  if not found then
+    raise exception 'Concurrent Pursue CIM enrollment allocation';
+  end if;
+  insert into public.deal_hunter_cim_audit_events
+    (id, event_type, opportunity_id, campaign_id, conversation_id,
+     next_state, actor, source, occurred_at, metadata)
+  values (public.pursue_cim_digest_v1(
+      pg_catalog.to_jsonb('cim-audit:v1'::text),
+      pg_catalog.to_jsonb('campaign-allocated'::text),
+      pg_catalog.to_jsonb(v_campaign_id)),
+    'campaign-allocated', v_opportunity_id, v_campaign_id, v_conversation_id,
+    'initial-pending', v_actor, 'sqlite-transition', v_now, '{}'::jsonb);
+  insert into public.deal_hunter_cim_audit_events
+    (id, event_type, opportunity_id, campaign_id, conversation_id, touch_id,
+     next_state, actor, source, occurred_at, metadata)
+  values (public.pursue_cim_digest_v1(
+      pg_catalog.to_jsonb('cim-audit:v1'::text),
+      pg_catalog.to_jsonb('touch-created'::text), pg_catalog.to_jsonb(v_touch_id)),
+    'touch-created', v_opportunity_id, v_campaign_id, v_conversation_id, v_touch_id,
+    'scheduled', v_actor, 'sqlite-transition', v_now, '{}'::jsonb);
+  insert into public.deal_hunter_cim_audit_events
+    (id, event_type, opportunity_id, prior_state, next_state,
+     actor, source, occurred_at, metadata)
+  values (public.pursue_cim_digest_v1(
+      pg_catalog.to_jsonb('cim-audit:v1'::text),
+      pg_catalog.to_jsonb('enrollment-transition'::text),
+      pg_catalog.to_jsonb(v_enrollment_id || ':' || (v_enrollment_expected + 1)::text)),
+    'enrollment-transition', v_opportunity_id, v_enrollment.state, 'campaign-created',
+    v_actor, 'sqlite-transition', v_now, '{}'::jsonb);
+  return pg_catalog.jsonb_build_object('applied', true, 'existing', false,
+    'actionRequired', false, 'campaign', pg_catalog.to_jsonb(v_campaign),
+    'initialTouch', pg_catalog.to_jsonb(v_touch));
+end;
+$$;
+revoke all on function public.pursue_cim_materialize_campaign_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_materialize_campaign_v1(jsonb) to service_role;
+
+create or replace function public.pursue_cim_materialize_campaign_v2(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_opportunity public.deal_hunter_opportunities%rowtype;
+  v_activation public.deal_hunter_cim_capability_activations%rowtype;
+  v_activation_id text;
+  v_expected bigint;
+  v_campaign_expected bigint;
+  v_global_expected bigint;
+  v_global bigint;
+  v_ownership public.deal_hunter_crm_ownership_revisions%rowtype;
+  v_score public.deal_hunter_opportunity_scores%rowtype;
+  v_crm_match_fingerprint text;
+begin
+  v_expected := public.pursue_cim_required_revision_v1(p_command, 'crmOwnershipRevision');
+  v_campaign_expected := public.pursue_cim_required_revision_v1(p_command, 'campaignAuthorityRevision');
+  v_global_expected := public.pursue_cim_required_revision_v1(p_command, 'globalAuthorityRevision');
+  lock table public.contact_submissions, public.crm_submission_supersessions in share mode;
+  v_crm_match_fingerprint := public.pursue_cim_crm_match_fingerprint_v1();
+  select * into v_opportunity from public.deal_hunter_opportunities
+    where opportunity_id = p_command ->> 'opportunityId' for update;
+  select * into v_ownership from public.deal_hunter_crm_ownership_revisions
+    where opportunity_id = v_opportunity.opportunity_id
+    order by revision desc limit 1;
+  select * into v_score from public.deal_hunter_opportunity_scores
+    where opportunity_id = v_opportunity.opportunity_id for share;
+  select revision into v_global from public.deal_hunter_cim_global_authority
+    where id = 'global' for share;
+  v_activation_id := public.pursue_cim_current_activation_v1('fl04b-enrollment',
+    public.pursue_cim_required_instant_v1(p_command, 'now'));
+  if v_activation_id is not null then
+    select * into v_activation from public.deal_hunter_cim_capability_activations
+      where id = v_activation_id for share;
+  end if;
+  if v_opportunity.opportunity_id is null
+    or v_expected is distinct from v_ownership.revision
+    or v_ownership.submission_id is distinct from (p_command ->> 'crmSubmissionId')
+    or v_score.opportunity_id is null
+    or v_score.operator_priority <> 'high'
+    or v_score.reviewed_at is null
+    or v_score.current_triage_eligible is distinct from true
+    or v_score.should_remove is distinct from false
+    or (case when coalesce(v_score.reviewed_semantic_digest, '') <> ''
+      then v_score.reviewed_semantic_digest is distinct from v_score.semantic_digest
+      else coalesce(v_score.reviewed_fingerprint, '') <> ''
+        and v_score.reviewed_fingerprint is distinct from v_score.score_fingerprint end)
+    or v_crm_match_fingerprint is null
+    or v_crm_match_fingerprint is distinct from (p_command ->> 'crmMatchAuthorityFingerprint')
+    or not (p_command ? 'crmBrokerEmail')
+    or not exists (select 1 from public.contact_submissions as contact
+      where contact.id = v_opportunity.primary_submission_id
+        and contact.status not in ('archived', 'spam')
+        and contact.archived_at is null
+        and contact.deal_hunter_opportunity_id = v_opportunity.opportunity_id
+        and contact.broker_email is not distinct from (p_command ->> 'crmBrokerEmail')
+        and (contact.metadata -> 'dealHunter' ->> 'opportunityId' is null
+          or contact.metadata -> 'dealHunter' ->> 'opportunityId' = v_opportunity.opportunity_id))
+    or exists (select 1 from public.crm_submission_supersessions as relation
+      where relation.superseded_submission_id = v_opportunity.primary_submission_id
+        and relation.status = 'active')
+    or v_campaign_expected <> v_opportunity.campaign_authority_revision
+    or v_global is distinct from v_global_expected
+    or exists (select 1 from public.deal_hunter_source_freshness_state
+      where projection_state in ('pending', 'deferred', 'superseded'))
+    or exists (select 1 from public.deal_hunter_identity_exceptions
+      where status = 'open')
+    or exists (select 1 from public.deal_hunter_cim_requests as request
+      where request.opportunity_id = v_opportunity.opportunity_id
+        or request.deal_key in (select score.deal_key
+          from public.deal_hunter_opportunity_scores as score
+          where score.opportunity_id = v_opportunity.opportunity_id))
+    or exists (select 1 from public.deal_hunter_cim_opportunity_claims
+      where opportunity_id = v_opportunity.opportunity_id)
+    or exists (select 1 from public.email_suppressions
+      where normalized_email = pg_catalog.lower(p_command ->> 'recipientAddress')
+        and lifted_at is null)
+    or exists (select 1 from public.contact_submissions
+      where id = v_opportunity.primary_submission_id and prospectus_url is not null
+        and pg_catalog.btrim(prospectus_url) <> '')
+    or exists (select 1 from public.secure_documents
+      where submission_id = v_opportunity.primary_submission_id)
+    or exists (select 1 from public.secure_upload_requests
+      where submission_id = v_opportunity.primary_submission_id
+        and status in ('completed', 'documents-received'))
+    or exists (select 1 from public.crm_communications
+      where submission_id = v_opportunity.primary_submission_id and direction = 'inbound')
+    or (not public.deal_hunter_pursue_contact_rule_basis_v1(p_command) and (
+      v_activation.id is null
+      or v_activation.id <> (p_command ->> 'permissionVersion')
+      or v_activation.permission_basis_digest is distinct from (p_command ->> 'permissionDigest')
+      or v_activation.permission_revision is distinct from
+        public.pursue_cim_required_revision_v1(p_command, 'permissionRevision')
+      or v_activation.cohort_digest is distinct from (p_command ->> 'permissionScope')
+      or v_activation.policy_hash is distinct from (p_command ->> 'policyHash'))) then
+    return pg_catalog.jsonb_build_object('applied', false, 'existing', false,
+      'actionRequired', true, 'campaign', null, 'initialTouch', null);
+  end if;
+  return public.pursue_cim_materialize_campaign_v1(p_command);
+end;
+$$;
+revoke all on function public.pursue_cim_materialize_campaign_v2(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_materialize_campaign_v2(jsonb)
+  to service_role;
