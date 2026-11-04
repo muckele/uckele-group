@@ -732,3 +732,47 @@ test('Live sending off whose release failed is finished by a retry: the prepared
     'cancelled-before-provider');
   assert.equal(fixture.row('deal_hunter_cim_campaign_touches', touch.id).state, 'scheduled');
 });
+
+test('Live sending off whose release failed, then on again: the prepared follow-up is prepared again and sent exactly once', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, campaigns: [due('a')] });
+  await sendInitial(fixture);
+  const touch = scheduledFollowUp(fixture, 'a');
+  fixture.clock.set(at(touch.due_at, 30_000));
+  const [candidate] = await fixture.storage.listDueCimFollowUpTouches({
+    now: fixture.clock.peek().toISOString() });
+  const prepared = await runCimFollowUpPreparation({ storage: fixture.storage, candidate,
+    clock: fixture.clock, actor: 'crashed-worker', claimTokenDigest: fill('9'),
+    loadAuthority: (input) => loadPursueFollowUpAuthority({ ...input, config: fixture.config,
+      loadMemberAuthority: fixture.loadMemberAuthority }),
+    buildPayload: (input) => buildPursueFollowUpPayload({ ...input, config: fixture.config }) });
+  assert.equal(prepared.prepared, true);
+  // Off: the withdraw succeeds, then the release fails (as if the process died there).
+  await setSendControl(fixture.storage, 'live_sending', false);
+  await assert.rejects(syncPursueGmailCapabilities({
+    storage: crashingOnce(fixture.storage, 'releasePreparedCimTransmissions'),
+    enabled: false, actor: 'owner', now: fixture.clock().toISOString() }), /synthetic process death/);
+  assert.equal(fixture.row('deal_hunter_cim_transmissions', prepared.transmission.id).state, 'prepared');
+  // The owner reloads the card and turns Live sending on (no off retry in between).
+  await setSendControl(fixture.storage, 'live_sending', true);
+  const on = await syncPursueGmailCapabilities({ storage: fixture.storage, enabled: true,
+    actor: 'owner', now: fixture.clock().toISOString() });
+  assert.equal(on.released, 1);
+  assert.equal(fixture.row('deal_hunter_cim_transmissions', prepared.transmission.id).state,
+    'cancelled-before-provider');
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', touch.id).state, 'scheduled');
+  fixture.clock.advance(MINUTE);
+  const summary = await fixture.run();
+  assert.equal(summary.sentFollowUps, 1, JSON.stringify(summary));
+  assert.deepEqual(fixture.database.prepare(`SELECT tr.preparation_generation AS g, tr.state
+    FROM deal_hunter_cim_transmission_touches m JOIN deal_hunter_cim_transmissions tr
+      ON tr.id = m.transmission_id WHERE m.touch_id = ? ORDER BY g`).all(touch.id),
+  [{ g: 1, state: 'cancelled-before-provider' }, { g: 2, state: 'accepted' }]);
+  // An on that finds the chain already whole releases nothing.
+  const again = await syncPursueGmailCapabilities({ storage: fixture.storage, enabled: true,
+    actor: 'owner', now: fixture.clock().toISOString() });
+  assert.equal(again.released, undefined);
+  fixture.clock.advance(15 * MINUTE);
+  assert.equal((await fixture.run()).sentFollowUps, 0);
+  assert.equal(fixture.mailProvider.sent.length, 2);
+  assert.equal(fixture.mailProvider.attempts.length, 2);
+});

@@ -45,7 +45,9 @@ function intact(row, parent, providerProfile, now) {
  * Turning on keeps every link that is already current and correctly chained under the profile
  * and records new links from the first one that is not; turning off withdraws every current
  * link under the profile, child first, then releases every prepared, never-authorized
- * transmission (Ruling N). Returns `{ applied, activations? , withdrawn?, released? }`.
+ * transmission (Ruling N). Turning on also runs that release before it records any link, so
+ * an off whose release failed never strands a prepared follow-up.
+ * Returns `{ applied, activations? , withdrawn?, released? }`.
  */
 export async function syncPursueGmailCapabilities({ storage, enabled, actor, now,
   providerProfile = PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE } = {}) {
@@ -87,12 +89,22 @@ export async function syncPursueGmailCapabilities({ storage, enabled, actor, now
   let parent = null;
   let applied = false;
   let rebuilding = false;
+  let released;
   for (const capability of PURSUE_GMAIL_CAPABILITY_CHAIN) {
     const existing = current.get(capability);
     if (!rebuilding && intact(existing, parent, providerProfile, at)) {
       activations[capability] = existing;
       parent = existing;
       continue;
+    }
+    if (!rebuilding) {
+      // A prepared transmission left by an off whose release failed is bound to the withdrawn
+      // chain and could never be sent under the one recorded now, so the release runs before
+      // every (re)recording. It only touches never-authorized prepared sends and is
+      // idempotent; a recording that fails after it is retried with the chain still broken,
+      // so the release runs again then.
+      ({ released } = await storage.releasePreparedCimTransmissions({
+        reasonCode: 'live_sending_on', actor: actor.trim(), now: at }));
     }
     rebuilding = true;
     const id = `pursue-gmail-${capability}-${digest({ capability, at,
@@ -118,7 +130,8 @@ export async function syncPursueGmailCapabilities({ storage, enabled, actor, now
     activations[capability] = result.activation;
     parent = result.activation;
   }
-  return { applied, activations };
+  return { applied: applied || released > 0, activations,
+    ...(released === undefined ? {} : { released }) };
 }
 
 /**

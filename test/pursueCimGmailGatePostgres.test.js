@@ -895,11 +895,23 @@ test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizat
   const now = iso(realNow);
   assert.equal((await syncPursueGmailCapabilities({ storage, enabled: true, actor: 'owner',
     now })).applied, false);
-  const off = await syncPursueGmailCapabilities({ storage, enabled: false, actor: 'owner', now });
-  assert.deepEqual(off.withdrawn.sort(), ['gmail-fl04a-safety', 'gmail-fl04b-enrollment',
-    'gmail-fl04b-initial', 'gmail-fl04c-followup']);
+  // Off withdraws every link, then its release fails (as if the process died there).
+  const releaseDies = { ...storage, async releasePreparedCimTransmissions() {
+    throw new Error('synthetic process death');
+  } };
+  await assert.rejects(syncPursueGmailCapabilities({ storage: releaseDies, enabled: false,
+    actor: 'owner', now }), /synthetic process death/);
+  assert.deepEqual(await storage.listCurrentCimCapabilityActivations(), []);
+  assert.equal(scalar(`select coalesce(public.pursue_cim_current_activation_v1('fl04c-followup',
+    now()), 'none');`), 'none');
+  assert.equal(scalar(`select state from public.deal_hunter_cim_transmissions
+    where id = '${transmission.id}';`), 'prepared');
+  // On again (no off retry): before recording the chain it releases what the off left behind.
   // Ruling N: the prepared initial is cancelled before the provider and its touch rescheduled.
-  assert.equal(off.released, 1);
+  const on = await syncPursueGmailCapabilities({ storage, enabled: true, actor: 'owner',
+    now: iso(realNow + 1000) });
+  assert.equal(on.applied, true);
+  assert.equal(on.released, 1);
   assert.equal(scalar(`select state from public.deal_hunter_cim_transmissions
     where id = '${transmission.id}';`), 'cancelled-before-provider');
   assert.equal(scalar(`select state || ':' || coalesce(transmission_id, '-')
@@ -908,12 +920,6 @@ test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizat
   assert.equal(scalar(`select (withdrawn_at is not null)::text
     from public.deal_hunter_cim_live_provider_authorizations where id = 'authorization-second';`),
   'true');
-  assert.deepEqual(await storage.listCurrentCimCapabilityActivations(), []);
-  assert.equal(scalar(`select coalesce(public.pursue_cim_current_activation_v1('fl04c-followup',
-    now()), 'none');`), 'none');
-  const on = await syncPursueGmailCapabilities({ storage, enabled: true, actor: 'owner',
-    now: iso(realNow + 1000) });
-  assert.equal(on.applied, true);
   const current = await storage.listCurrentCimCapabilityActivations();
   assert.deepEqual(current.map((row) => [row.capability, row.provider_profile, row.mode]), [
     ['fl04a-safety', GMAIL_PROFILE, 'active'], ['fl04b-enrollment', GMAIL_PROFILE, 'active'],
