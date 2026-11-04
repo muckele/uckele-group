@@ -44,7 +44,7 @@ function createIdentityStorage(t) {
   return storage;
 }
 
-async function seedP4bEligibleFixture(t) {
+async function seedP4bEligibleFixture(t, { timezone = true, dealState = null, dealLocation = null } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p4b-service-'));
   const sqlitePath = path.join(directory, 'service.sqlite');
   const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
@@ -57,15 +57,16 @@ async function seedP4bEligibleFixture(t) {
     VALUES (?, ?, ?, 'P4B Service Co', 'identity-v1', 'San Francisco, CA')`)
     .run(opportunityId, now, now);
   db.prepare(`INSERT INTO deal_hunter_opportunity_scores
-    (opportunity_id, created_at, scored_at, deal_key, name, listing_url,
+    (opportunity_id, created_at, scored_at, deal_key, name, state, listing_url,
      score_fingerprint, engine_version, rules_version, profile_version,
      completeness_policy_version, current_triage_eligible)
-    VALUES (?, ?, ?, 'deal:p4b-service', 'P4B Service Co',
+    VALUES (?, ?, ?, 'deal:p4b-service', 'P4B Service Co', ?,
       'https://broker.example/p4b-service', 'score-p4b', 'test', 'test', 'test', 'test', 1)`)
-    .run(opportunityId, now, now);
+    .run(opportunityId, now, now, dealState);
   for (const [field, value] of [
     ['name', 'P4B Service Co'], ['broker_email', 'broker-p4b@example.test'],
     ['listing_url', 'https://broker.example/p4b-service'],
+    ...(dealLocation ? [['location', dealLocation]] : []),
   ]) await storage.upsertDealHunterOpportunitySourceObservation({
     id: `p4b-${field}`, opportunity_id: opportunityId, source_id: 'sheet-0',
     source_name: 'Synthetic Sheet', source_record_id: 'row-p4b', field, value,
@@ -84,7 +85,7 @@ async function seedP4bEligibleFixture(t) {
     idempotencyKey: 'p4b-service-owner', actor: 'fixture-owner',
     policyVersion: 'owner-decision-v1', now,
     expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 });
-  await storage.appendOpportunityTimezoneRevision({ opportunityId,
+  if (timezone) await storage.appendOpportunityTimezoneRevision({ opportunityId,
     expectedPriorRevision: 0, idempotencyKey: 'p4b-timezone', state: 'verified',
     ianaTimezone: 'America/Los_Angeles', evidenceType: 'operator-verified',
     evidenceId: 'p4b-timezone-evidence', evidenceDigest: 'a'.repeat(64),
@@ -419,6 +420,60 @@ test('P4B absent current permission stays waiting and creates no campaign', asyn
   assert.equal(result.enrollment.state, 'waiting-on-eligibility');
   assert.equal(result.enrollment.reason_code, 'contact_permission_missing');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+async function enrollWithoutTimezoneRevision(t, deal) {
+  const fixture = await seedP4bEligibleFixture(t, { timezone: false, ...deal });
+  const { storage, opportunityId, now, decision } = fixture;
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  return { ...fixture, result };
+}
+
+test('pursue of an AZ deal with no timezone revision enrolls with derived America/Phoenix', async (t) => {
+  const { db, result } = await enrollWithoutTimezoneRevision(t,
+    { dealState: 'AZ', dealLocation: 'Scottsdale, AZ' });
+  assert.equal(result.enrollment.state, 'campaign-created');
+  const rows = db.prepare('SELECT * FROM deal_hunter_opportunity_timezone_revisions').all();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].state, 'derived');
+  assert.equal(rows[0].iana_timezone, 'America/Phoenix');
+  assert.equal(rows[0].evidence_type, 'target-state');
+  assert.equal(rows[0].evidence_id, 'target-state:AZ');
+  assert.equal(rows[0].actor, 'system-timezone-resolver');
+  assert.equal(db.prepare('SELECT timezone_revision FROM deal_hunter_cim_campaigns').get().timezone_revision, 1);
+});
+
+test('pursue of a West Wendover deal reports timezone_ambiguous', async (t) => {
+  const { db, result } = await enrollWithoutTimezoneRevision(t,
+    { dealState: 'NV', dealLocation: 'West Wendover, NV' });
+  assert.equal(result.enrollment.state, 'action-required');
+  assert.equal(result.enrollment.reason_code, 'timezone_ambiguous');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_opportunity_timezone_revisions').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+test('pursue of an out-of-scope deal still reports timezone_missing and a derive failure does not block it', async (t) => {
+  const { db, result } = await enrollWithoutTimezoneRevision(t,
+    { dealState: 'TX', dealLocation: 'Austin, TX' });
+  assert.equal(result.enrollment.reason_code, 'timezone_missing');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_opportunity_timezone_revisions').get().count, 0);
+});
+
+test('a throwing timezone derivation is logged and enrollment proceeds as before', async (t) => {
+  const fixture = await seedP4bEligibleFixture(t, { timezone: false, dealState: 'AZ',
+    dealLocation: 'Scottsdale, AZ' });
+  const { storage, opportunityId, now, decision } = fixture;
+  const failing = new Proxy(storage, { get: (target, name) => name === 'appendOpportunityTimezoneRevision'
+    ? async () => { throw new Error('storage down'); } : target[name]?.bind?.(target) ?? target[name] });
+  const warnings = [];
+  t.mock.method(console, 'warn', (message) => warnings.push(String(message)));
+  const result = await orchestratePursuitEnrollment({ storage: failing, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.reason_code, 'timezone_missing');
+  assert.ok(warnings.some((message) => message.includes('timezone') && message.includes('storage down')));
 });
 
 test('P4B changed timezone blocks allocation', async (t) => {

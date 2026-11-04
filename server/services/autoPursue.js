@@ -171,15 +171,39 @@ async function countTodayCommands(storage, businessDate) {
   return count;
 }
 
+const TODAY_PURSUED_LIMIT = 10;
+
+/** Today's automatic Pursue decisions, newest first, so the owner can stop one from the inbox. */
+async function listTodayPursued(storage, businessDate) {
+  if (typeof storage?.listOwnerDecisionsByPolicy !== 'function') {
+    throw new Error('Owner decision list is unavailable.');
+  }
+  const decisions = await storage.listOwnerDecisionsByPolicy({
+    policyVersion: AUTO_PURSUE_POLICY_VERSION, ...ownerBusinessDateBounds(businessDate), limit: TODAY_PURSUED_LIMIT,
+  });
+  return Promise.all((Array.isArray(decisions) ? decisions : []).slice(0, TODAY_PURSUED_LIMIT).map(async (decision) => {
+    const opportunityId = String(decision.opportunity_id);
+    // The name is display only: a failed lookup shows the id rather than failing the status.
+    let opportunity = null;
+    try {
+      opportunity = await storage.getDealHunterOpportunity(opportunityId);
+    } catch {
+      opportunity = null;
+    }
+    return { opportunityId, name: String(opportunity?.canonical_name || '').trim() || opportunityId };
+  }));
+}
+
 export async function getAutoPursueStatus({ storage = getStorage(), now = new Date() } = {}) {
   const businessDate = ownerBusinessDate(now);
   const { mode, dailyCap } = await readActivation(storage);
-  const [todayCommands, warmup, runs] = await Promise.all([
+  const [todayCommands, todayPursued, warmup, runs] = await Promise.all([
     countTodayCommands(storage, businessDate),
+    listTodayPursued(storage, businessDate),
     getAutoPursueWarmup({ storage }),
     storage.listAutoPursueRuns({ limit: 1 }),
   ]);
-  return { mode, dailyCap, todayCommands, warmup, latestRun: publicRun(runs?.[0] || null), businessDate };
+  return { mode, dailyCap, todayCommands, todayPursued, warmup, latestRun: publicRun(runs?.[0] || null), businessDate };
 }
 
 export async function setAutoPursueMode({
@@ -250,7 +274,11 @@ async function listCandidateRows(storage, asOf) {
         const id = String(row?.opportunity_id || '');
         if (!id || seen.has(id)) return false;
         seen.add(id);
-        return row.criteria_group === 'auto' && row.criteria_profile_version === DEAL_CRITERIA_PROFILE_VERSION;
+        // Auto rows are the candidates. Rows scored under another profile version are kept so the
+        // runner can mark them criteria_out_of_date, and any row still carrying a blocker is kept
+        // so the runner can clear it once the cause is gone.
+        return row.criteria_group === 'auto' || row.criteria_profile_version !== DEAL_CRITERIA_PROFILE_VERSION
+          || Boolean(row.auto_pursue_blocker);
       });
     } catch (error) {
       lastError = error;
@@ -312,16 +340,38 @@ export function autoPursueCriteriaStale(row = {}) {
   return current.failed.length > 0;
 }
 
+/** True when the caller supplied a fingerprint map (possibly empty) from a refresh just run. */
+function fingerprintMapSupplied(currentFingerprints) {
+  return Boolean(currentFingerprints) && typeof currentFingerprints === 'object' && !Array.isArray(currentFingerprints);
+}
+
 /**
- * The section 6.3 blocker for one current auto row, or '' when it may be Pursued.
- * Any read failure is reported as authority_unavailable: never automatic.
+ * True when a refresh just run confirms the stored score still describes the deal as built
+ * from live sources now. The fingerprint cannot be recomputed from stored rows, so a missing
+ * map, a missing entry, or any difference means the facts may have moved: fail closed.
  */
-async function evaluateBlocker({ storage, row, identityExceptions, now }) {
+function fingerprintIsCurrent(currentFingerprints, row) {
+  if (!currentFingerprints || typeof currentFingerprints !== 'object') return false;
+  const id = String(row.opportunity_id);
+  if (!Object.prototype.hasOwnProperty.call(currentFingerprints, id)) return false;
+  const current = currentFingerprints[id];
+  return typeof current === 'string' && current !== '' && current === row.score_fingerprint;
+}
+
+/**
+ * The section 6.3 blocker for one candidate row, or '' when it may be Pursued.
+ * `requireFingerprint` is true in every mode but off. Any read failure is reported as
+ * authority_unavailable: never automatic.
+ */
+async function evaluateBlocker({
+  storage, row, identityExceptions, now, requireFingerprint = false, currentFingerprints = null,
+}) {
   const opportunityId = String(row.opportunity_id);
   if (row.criteria_profile_version !== DEAL_CRITERIA_PROFILE_VERSION || row.criteria_group !== 'auto'
     || !(Number(row.fit_score) >= autoFitFloor)) {
     return { blocker: 'criteria_out_of_date' };
   }
+  if (requireFingerprint && !fingerprintIsCurrent(currentFingerprints, row)) return { blocker: 'criteria_stale' };
   if (autoPursueCriteriaStale(row)) return { blocker: 'criteria_stale' };
   try {
     const projection = await storage.readPursueCimProjection({ opportunityId });
@@ -413,6 +463,7 @@ async function recordAutomaticPursue({ storage, row, recipient, businessDate, da
 
 export async function runAutoPursue({
   storage = getStorage(), now = new Date(), triggeredBy = 'cron', clock = () => new Date(),
+  currentFingerprints = null,
 } = {}) {
   const at = new Date(now);
   const asOf = at.toISOString();
@@ -456,6 +507,13 @@ export async function runAutoPursue({
     items.push({ opportunityId, outcome, reason: why });
   };
   try {
+    // Without a refresh's fingerprints no row can be confirmed current, so an automatic
+    // decision is impossible. Evaluate nothing: per-row criteria_stale blockers here would
+    // stop that day's sheet-sync run (blocked_earlier_today) and move auto rows to review.
+    if (mode !== 'off' && !fingerprintMapSupplied(currentFingerprints)) {
+      reason = 'fingerprints_unavailable';
+      return { ok: true, status: 200, mode, ...base, runKey, reason };
+    }
     let candidates;
     let identityExceptions;
     try {
@@ -470,8 +528,15 @@ export async function runAutoPursue({
 
     const evaluated = [];
     for (const row of candidates) {
-      const { blocker, recipient } = await evaluateBlocker({ storage, row, identityExceptions, now: at });
-      evaluated.push({ row, blocker, recipient });
+      // A current-version row outside the auto group is only here to have a leftover blocker
+      // cleared. It is not a candidate and is not reported.
+      if (row.criteria_profile_version === DEAL_CRITERIA_PROFILE_VERSION && row.criteria_group !== 'auto') {
+        evaluated.push({ row, blocker: '', candidate: false });
+        continue;
+      }
+      const { blocker, recipient } = await evaluateBlocker({
+        storage, row, identityExceptions, now: at, requireFingerprint: mode !== 'off', currentFingerprints });
+      evaluated.push({ row, blocker, recipient, candidate: true });
     }
     const changed = evaluated.filter(({ row, blocker }) => (row.auto_pursue_blocker || '') !== blocker)
       .map(({ row, blocker }) => ({ opportunityId: String(row.opportunity_id), blocker: blocker || null,
@@ -488,6 +553,7 @@ export async function runAutoPursue({
     const earlierBlocked = blockedEarlierToday(priorRuns);
     const eligible = [];
     for (const entry of evaluated) {
+      if (!entry.candidate) continue;
       const opportunityId = String(entry.row.opportunity_id);
       if (entry.blocker) skip(opportunityId, entry.blocker, 'blocked');
       else if (earlierBlocked.has(opportunityId)) skip(opportunityId, 'blocked_earlier_today');

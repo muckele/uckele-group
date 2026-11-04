@@ -50,6 +50,39 @@ function formatStatus(value) {
   return String(value || 'not-recorded').replace(/[-_]/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function pursueOutcomeText(pursue = {}) {
+  if (pursue.skipped) return `skipped: ${pursue.skipped}`;
+  if (pursue.error) return 'error';
+  const commands = pursue.commands === undefined || pursue.commands === null ? null : Number(pursue.commands);
+  const parts = [
+    pursue.mode,
+    Number.isFinite(commands) ? `${commands} ${commands === 1 ? 'decision' : 'decisions'}` : null,
+    pursue.reason,
+    pursue.duplicateInvocation ? 'duplicate invocation' : null,
+    // The HTTP status adds nothing on success; show it only when the run was refused.
+    pursue.status !== undefined && pursue.status !== null && pursue.status !== '' && Number(pursue.status) !== 200
+      ? `HTTP ${pursue.status}` : null,
+  ].filter((part) => part !== undefined && part !== null && part !== '');
+  return parts.length > 0 ? parts.join(' · ') : '';
+}
+
+// Compact secondary line for the daily Sheet sync: per-sheet result, groups, and the automatic Pursue outcome.
+function SheetSyncSummary({ sheetSync }) {
+  if (!sheetSync) return null;
+  const sheets = Array.isArray(sheetSync.sheets) ? sheetSync.sheets : [];
+  const groups = Object.entries(sheetSync.groupCounts || {});
+  const pursueText = pursueOutcomeText(sheetSync.autoPursue || {});
+  return (
+    <div className="mt-1 space-y-0.5 text-xs font-normal text-ink/65" data-testid="sheet-sync-summary">
+      {sheets.length > 0 ? (
+        <p>{sheets.map((sheet) => `${sheet.sourceId}: ${sheet.fetched && !sheet.error ? `fetched ${sheet.rowCount} rows` : `failed: ${sheet.error || 'not fetched'}`}`).join(' · ')}</p>
+      ) : null}
+      {pursueText ? <p>Automatic Pursue: {pursueText}</p> : null}
+      {groups.length > 0 ? <p>{groups.map(([group, count]) => `${group} ${count}`).join(' · ')}</p> : null}
+    </div>
+  );
+}
+
 export default function OperationsCenter({
   data, loading = false, error = '', onSendEmailTest, emailTestSending = false,
   onToggleCimAutomation, cimAutomationUpdating = false, onToggleCimOutreach,
@@ -284,7 +317,7 @@ export default function OperationsCenter({
         <div className="mt-5 overflow-x-auto">
           <table className="min-w-full text-left text-sm">
             <thead className="border-b border-line text-xs uppercase tracking-[0.12em] text-ink/55"><tr><th className="px-3 py-3">Job</th><th className="px-3 py-3">Status</th><th className="px-3 py-3">Updated</th><th className="px-3 py-3">Attempts</th><th className="px-3 py-3">Error</th></tr></thead>
-            <tbody>{jobs.slice(0, 20).map((job) => <tr className="border-b border-line/60" key={job.job_key}><td className="px-3 py-3 font-medium text-ink">{job.job_name}</td><td className="px-3 py-3">{job.status}</td><td className="px-3 py-3">{formatDate(job.updated_at)}</td><td className="px-3 py-3">{job.attempt_count}</td><td className="max-w-sm px-3 py-3 text-red-700">{job.last_error || '—'}</td></tr>)}</tbody>
+            <tbody>{jobs.slice(0, 20).map((job) => <tr className="border-b border-line/60" key={job.job_key}><td className="px-3 py-3 font-medium text-ink">{job.job_name}<SheetSyncSummary sheetSync={job.sheetSync} /></td><td className="px-3 py-3">{job.status}</td><td className="px-3 py-3">{formatDate(job.updated_at)}</td><td className="px-3 py-3">{job.attempt_count}</td><td className="max-w-sm px-3 py-3 text-red-700">{job.last_error || '—'}</td></tr>)}</tbody>
           </table>
           {jobs.length === 0 ? <p className="py-5 text-sm text-ink/60">No scheduler runs have been recorded.</p> : null}
         </div>

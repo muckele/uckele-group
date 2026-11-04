@@ -1,5 +1,8 @@
 import { getConfig } from '../config.js';
-import { containsTrustedIndustryTerm, trustedIndustryTerms, trustedTargetStates } from './cimAutomation.js';
+import { containsTrustedIndustryTerm, trustedIndustryTerms } from './cimAutomation.js';
+import { stateNameCodes, targetStatesIn, trustedTargetStates } from './targetStates.js';
+
+export { stateNameCodes, targetStatesIn };
 
 export const DEAL_CRITERIA_PROFILE_VERSION = 'uckele-criteria-v1';
 
@@ -8,15 +11,6 @@ const MAXIMUM_ANNUAL_PROFIT = 750000;
 const MAXIMUM_PROFIT_MULTIPLE = 4.0;
 const REVIEW_FLOOR = 75;
 const AUTOMATIC_FLOOR_MINIMUM = 90;
-
-const stateNameCodes = Object.freeze({
-  'NEW YORK': 'NY',
-  CALIFORNIA: 'CA',
-  'NEW JERSEY': 'NJ',
-  ARIZONA: 'AZ',
-  NEVADA: 'NV',
-  CONNECTICUT: 'CT',
-});
 
 const OBSERVED_TEXT_LIMIT = 200;
 
@@ -32,7 +26,9 @@ function finiteNumber(value) {
 
 // criteria_result is bounded JSON (spec 5): observed text never exceeds the limit.
 function boundedObserved(text) {
-  return text.length > OBSERVED_TEXT_LIMIT ? text.slice(0, OBSERVED_TEXT_LIMIT) : text;
+  // By code point, so a surrogate pair is never cut in half.
+  const points = Array.from(text);
+  return points.length > OBSERVED_TEXT_LIMIT ? points.slice(0, OBSERVED_TEXT_LIMIT).join('') : text;
 }
 
 export function getDealCriteriaProfile(config = getConfig()) {
@@ -78,13 +74,7 @@ function evaluateGeography(deal, profile) {
   const fields = [deal.location, deal.state].map((value) => String(value || '').trim()).filter(Boolean);
   const targetStates = [...profile.targetStates];
   if (fields.length === 0) return { id: 'geography', outcome: 'unknown', observed: null, targetStates };
-  const pass = fields.some((field) => {
-    let text = field.toUpperCase();
-    for (const [name, code] of Object.entries(stateNameCodes)) {
-      text = text.replace(new RegExp(`(^|[^A-Z])${name}(?=[^A-Z]|$)`, 'g'), `$1${code}`);
-    }
-    return profile.targetStates.some((state) => new RegExp(`(^|[^A-Z])${state}([^A-Z]|$)`).test(text));
-  });
+  const pass = fields.some((field) => targetStatesIn(field, profile.targetStates).length > 0);
   return { id: 'geography', outcome: pass ? 'pass' : 'fail', observed: boundedObserved(fields.join(' | ')), targetStates };
 }
 

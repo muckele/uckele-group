@@ -3894,6 +3894,25 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return count;
     },
 
+    /** Recorded owner decisions under one policy in [since, until), newest first. */
+    async listOwnerDecisionsByPolicy({ policyVersion, since, until, limit = 10 } = {}) {
+      const policy = String(policyVersion || '');
+      if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+        throw new Error('listOwnerDecisionsByPolicy requires a policy version and an instant range.');
+      }
+      const { data, error } = await client
+        .from('deal_hunter_owner_decision_events')
+        .select('opportunity_id,created_at')
+        .eq('policy_version', policy)
+        .gte('created_at', new Date(since).toISOString())
+        .lt('created_at', new Date(until).toISOString())
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(Math.min(Math.max(Math.trunc(Number(limit)) || 10, 1), 100));
+      if (error) throw error;
+      return data || [];
+    },
+
     /**
      * True when any Pursue campaign conversation already targets this recipient address,
      * compared case-insensitively like SQLite's LOWER(recipient_address) = ?. LIKE
@@ -4052,7 +4071,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           .from('deal_hunter_opportunity_scores')
           .select(
             'opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, '
-            + 'profile_version, completeness_policy_version, criteria_profile_version, reviewed_at',
+            + 'profile_version, completeness_policy_version, criteria_profile_version, criteria_group, reviewed_at',
           )
           .in('opportunity_id', batch);
         if (error) throw error;
@@ -4715,6 +4734,20 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       });
       if (error) throw error;
       return { claimed: Boolean(data?.claimed), reason: data?.reason || '', claim: data?.claim || null };
+    },
+
+    async releaseDealHunterCimOpportunityClaim({ opportunityId = '', requestId = '' } = {}) {
+      if (!opportunityId || !requestId) return { released: false };
+      // Only an exact claim that never produced a request row can be released:
+      // a claim backing durable legacy history stays in place.
+      const { data: requestRows, error: requestError } = await client.from('deal_hunter_cim_requests')
+        .select('id').eq('id', requestId).limit(1);
+      if (requestError) throw requestError;
+      if ((requestRows || []).length > 0) return { released: false };
+      const { data, error } = await client.from('deal_hunter_cim_opportunity_claims').delete()
+        .eq('opportunity_id', opportunityId).eq('request_id', requestId).select('opportunity_id');
+      if (error) throw error;
+      return { released: (data || []).length > 0 };
     },
 
     async getDealHunterCimOpportunityClaim(opportunityId) {

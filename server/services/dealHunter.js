@@ -63,6 +63,11 @@ import {
   normalizeDealHunterListingIdentity as normalizeListingIdentity,
   normalizeDealHunterListingUrl as normalizeUrl,
 } from './dealHunterListingIdentity.js';
+import {
+  isPursueOwnershipRefusalCode,
+  pursueOwnershipRefusal,
+  readPursueOwnership,
+} from './pursueOwnership.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -7290,6 +7295,10 @@ export async function executeDealHunterCimFollowUpRequest({
   if (request?.metadata?.manualFollowUp?.mode === 'operator-approved') {
     if (!consumeDealHunterManualFollowUpCapability(approvedContext)
       || !validApprovedManualFollowUpContext(request, approvedContext)) return { status: 'approval-required', request };
+    // One email system per deal, checked only for a trusted approved context
+    // and before any claim, communication, or provider work.
+    const pursueOwnership = await readPursueOwnership({ storage, opportunityId: request.opportunity_id });
+    if (pursueOwnership.owned) return { status: 'skipped', reason: pursueOwnership.reason, request };
     if (request?.submission_id) {
       await assertCrmSubmissionWritable({ storage, submissionId: request.submission_id });
     }
@@ -7510,6 +7519,11 @@ async function processLegacyCimFollowUpRequest(storage, request, nowIso) {
       );
       return { status: 'maxed', request: updatedRequest };
     }
+
+    // One email system per deal: skip, without mutating the legacy request, any
+    // follow-up whose canonical opportunity Pursue owns.
+    const pursueOwnership = await readPursueOwnership({ storage, opportunityId: identity.opportunityId });
+    if (pursueOwnership.owned) return { status: 'skipped', reason: pursueOwnership.reason, request };
 
     let claimedRequest = request;
 
@@ -9231,6 +9245,18 @@ export function cimStage2DailyLimit(mode, policy) {
     : policy.caps.canaryDailyInitials;
 }
 
+// Up to 500 Stage 2 candidates each read the Pursue projection; bound how many run at once.
+export const STAGE2_PROJECTION_READ_CONCURRENCY = 10;
+
+/** Maps `items` in sequential chunks of `size` concurrent calls, preserving order. */
+export async function mapInChunks(items, size, mapper) {
+  const results = [];
+  for (let start = 0; start < items.length; start += size) {
+    results.push(...await Promise.all(items.slice(start, start + size).map(mapper)));
+  }
+  return results;
+}
+
 export async function runCimStage2Automation({
   mode = 'shadow', triggeredBy = 'admin', now = new Date(), storage = getStorage(),
 } = {}) {
@@ -9295,9 +9321,13 @@ export async function runCimStage2Automation({
     const consideredDeals = scoredDeals
       .filter((deal) => deal.cimRequest?.eligible && deal.opportunityId)
       .slice(0, 500);
-    const [suppressions, opportunityClaims] = await Promise.all([
+    const [suppressions, opportunityClaims, pursueOwnerships] = await Promise.all([
       Promise.all(consideredDeals.map((deal) => storage.getActiveEmailSuppression?.(deal.brokerEmail) || null)),
       Promise.all(consideredDeals.map((deal) => storage.getDealHunterCimOpportunityClaim?.(deal.opportunityId) || null)),
+      mapInChunks(consideredDeals, STAGE2_PROJECTION_READ_CONCURRENCY, async (deal) => ({
+        opportunityId: deal.opportunityId,
+        ...await readPursueOwnership({ storage, opportunityId: deal.opportunityId }),
+      })),
     ]);
     const evaluated = evaluateCimAutomationCandidates({
       review,
@@ -9307,6 +9337,7 @@ export async function runCimStage2Automation({
       events,
       suppressions: suppressions.filter(Boolean),
       opportunityClaims: opportunityClaims.filter(Boolean),
+      pursueOwnerships: pursueOwnerships.filter((item) => item.owned),
       now,
     });
     const exceptionByOpportunity = new Map(evaluated.exceptions.map((item) => [item.opportunityId, item]));
@@ -9651,6 +9682,15 @@ async function sendCimRequestForScoredDeal({
       ...identity.aliases.filter((item) => item.alias_type === 'deal-key').map((item) => item.alias_value),
     ]).filter((key) => key !== deal.dealKey),
   };
+
+  // One email system per deal: refuse a Pursue-owned opportunity before any
+  // CRM link or legacy claim exists, so a refusal leaves no legacy residue.
+  const pursueOwnership = await readPursueOwnership({ storage, opportunityId: deal.opportunityId });
+  if (pursueOwnership.owned) {
+    return pursueOwnershipRefusal(pursueOwnership.reason, {
+      deal: publicDeal(attachCimRequestStatus([deal], [])[0]),
+    });
+  }
 
   // Revalidate eligibility and build/link the CRM record from the latest healthy
   // source deal, while keeping the signed approval snapshot as the immutable
@@ -10033,6 +10073,25 @@ async function sendCimRequestForScoredDeal({
         request: owner,
         deal: publicDeal(attachCimRequestStatus([deal], owner ? [owner] : dealRequests)[0]),
       };
+    }
+    // Re-check after the legacy opportunity claim and before any request row or
+    // provider work: a Pursue decision that landed after the pre-check refuses
+    // here, and a later Pursue send sees this claim and refuses on its side.
+    // On refusal the just-taken opportunity claim is released so Pursue can
+    // proceed; the recipient claim and locks are released in `finally`.
+    const postClaimPursueOwnership = await readPursueOwnership({ storage, opportunityId: deal.opportunityId });
+    if (postClaimPursueOwnership.owned) {
+      try {
+        await storage.releaseDealHunterCimOpportunityClaim?.({
+          opportunityId: deal.opportunityId,
+          requestId: pendingRecord.id,
+        });
+      } catch (error) {
+        console.warn(`[deal-hunter] CIM opportunity claim release after Pursue refusal failed: ${normalizeText(error?.message, 300)}`);
+      }
+      return pursueOwnershipRefusal(postClaimPursueOwnership.reason, {
+        deal: publicDeal(attachCimRequestStatus([deal], dealRequests)[0]),
+      });
     }
     const claimResult = storage.claimDealHunterCimRequest
       ? await storage.claimDealHunterCimRequest(pendingRecord, {
@@ -11090,16 +11149,20 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
   const hasSuccessfulOutcome = sent + alreadySent > 0;
   const allFailed = failed > 0 && !hasSuccessfulOutcome;
   const allFailedByMatchGuard = allFailed && results.every((item) => item.code?.startsWith('CRM_MATCH_'));
+  const allFailedByPursueOwnership = allFailed && results.every((item) => isPursueOwnershipRefusalCode(item.code));
 
   return {
     ok: !allFailed,
-    status: allFailed ? (allFailedByMatchGuard ? 409 : 502) : 200,
+    status: allFailed ? (allFailedByMatchGuard || allFailedByPursueOwnership ? 409 : 502) : 200,
     ...(allFailedByMatchGuard && results.length === 1 ? {
       code: results[0].code,
       candidateIds: results[0].candidateIds,
       evidenceCategories: results[0].evidenceCategories,
     } : {}),
-    error: allFailed ? 'No CIM request emails were sent. Review the failed results before retrying.' : '',
+    ...(allFailedByPursueOwnership ? { code: results[0].code } : {}),
+    error: allFailedByPursueOwnership
+      ? results[0].error
+      : allFailed ? 'No CIM request emails were sent. Review the failed results before retrying.' : '',
     review: result?.review || null,
     results,
     sent,
@@ -11243,6 +11306,7 @@ export async function runDealHunterCimFollowUps({
         dealName: request.deal_name,
         recipientEmail: request.recipient_email,
         status: result.status,
+        ...(result.status === 'skipped' && isPursueOwnershipRefusalCode(result.reason) ? { reason: result.reason } : {}),
         followUpCount: result.request?.follow_up_count ?? request.follow_up_count,
         nextFollowUpAt: result.request?.next_follow_up_at || '',
         emailResult: result.emailResult || null,

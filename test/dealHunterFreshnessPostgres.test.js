@@ -912,13 +912,16 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
         values ('${id}', now(), '${id}', 'Old priority', 90, 'high',
           'old-reader-fingerprint', 'test', 'test', 'test', 'test', true, 'high');`);
     }
+    // One shared acceptance a day ago keeps both rows new to UG (the inbox's 0-7 day window)
+    // and tied on discovery, whatever day the suite runs.
+    const exploreAcceptedAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     for (const [suffix, priority] of [['a', 'normal'], ['z', 'urgent']]) {
       const id = `${suffix}-explore-${database}`;
       psql(container, database, `insert into public.deal_hunter_opportunities
         (opportunity_id, created_at, updated_at, canonical_name, identity_version,
           discovery_state, first_accepted_at, discovery_revision)
         values ('${id}', now(), now(), 'Equal discovery', 'test',
-          'known_prospective', '2026-09-23T12:00:00Z', 1);
+          'known_prospective', '${exploreAcceptedAt}', 1);
         insert into public.deal_hunter_opportunity_scores
         (opportunity_id, scored_at, deal_key, name, fit_score, confidence,
           score_fingerprint, engine_version, rules_version, profile_version,
@@ -1139,12 +1142,8 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     const quote = (value) => `'${JSON.stringify(value).replaceAll("'", "''")}'`;
     psql(container, database, `select public.accept_admitted_complete_google_sheet_freshness_v1(
       ${quote(captured.admission)}::jsonb, ${quote(captured.records)});`);
-    const supported = JSON.parse(psql(container, database,
-      "select public.list_deal_hunter_fresh_inbox_v1('new-important');"));
-    const row = supported.areas[0].rows.find((item) => item.opportunity_id === opportunityId);
-    assert.equal(row.discovery_group, 1);
-    assert.equal(row.recently_listed, true);
-    assert.equal(row.publication_precision, 'date');
+    // The 2026-09-22 publication date is fixed, so read the inbox as of the fixture's own
+    // acceptance moment rather than today: "recently listed" lasts only thirty days.
     psql(container, database, `update public.deal_hunter_opportunities
       set first_accepted_at = '2026-09-23T18:00:00.000Z'
       where opportunity_id = '${opportunityId}';`);
@@ -1152,6 +1151,10 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       `select public.list_deal_hunter_fresh_inbox_v1('${area}', 0, 25,
         '', '', '', '', '${asOf}'::timestamptz);`)).areas[0].rows
       .find((item) => item.opportunity_id === opportunityId);
+    const row = boundaryRow('new-important', '2026-09-23T18:00:00.000Z');
+    assert.equal(row.discovery_group, 1);
+    assert.equal(row.recently_listed, true);
+    assert.equal(row.publication_precision, 'date');
     assert.equal(boundaryRow('new-important', '2026-09-30T18:00:00.000Z')?.discovery_group, 1,
       'seven Pacific calendar days remains fresh');
     assert.equal(boundaryRow('new-important', '2026-10-01T18:00:00.000Z'), undefined,
@@ -1188,9 +1191,7 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       values ('peer-observation-${database}', '${opportunityId}', 'synthetic-peer',
         'Synthetic peer', 'external:PEER', 'date_added', '2026-09-20',
         '${at}', '${at}', '${at}', 'peer-core-${database}');`);
-    const conflicted = JSON.parse(psql(container, database,
-      "select public.list_deal_hunter_fresh_inbox_v1('new-important');"));
-    const conflictRow = conflicted.areas[0].rows.find((item) => item.opportunity_id === opportunityId);
+    const conflictRow = boundaryRow('new-important', '2026-09-23T18:00:00.000Z');
     assert.equal(conflictRow.discovery_group, 2);
     assert.equal(conflictRow.recently_listed, false);
     assert.equal(conflictRow.publication_distinct_count, 2);

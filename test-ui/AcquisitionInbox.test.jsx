@@ -3054,4 +3054,149 @@ describe('Criteria-grouped Acquisition Inbox', () => {
     expect(screen.getByRole('button', { name: 'Open Near Air' })).toBeVisible();
     expect(screen.queryByRole('button', { name: /^Request SIM/ })).not.toBeInTheDocument();
   });
+
+  describe('stopping automatic SIM requests', () => {
+    const todayPursued = [
+      { opportunityId: 'pursued-1', name: 'Pursued Air' },
+      { opportunityId: 'pursued-2', name: 'Pursued Heat' },
+    ];
+    const stopReport = { opportunity: { id: 'pursued-1' },
+      actions: { canStop: true, campaignId: 'campaign-1', expectedRowVersion: 4, expectedTerminalRevision: 0 } };
+    function stubStopFetch({ writes = [], statuses = [], report = stopReport, stopResult } = {}) {
+      return stubCriteriaFetchWith(async (url, options) => {
+        if (url.includes('/auto-pursue')) {
+          statuses.push(url);
+          return jsonResponse(autoStatus({ todayPursued }));
+        }
+        if (url.endsWith('/triage/pursued-1/cim-release')) return jsonResponse(report);
+        if (url.endsWith('/triage/pursued-1/cim-release/stop')) {
+          writes.push({ url, method: options.method, body: JSON.parse(options.body) });
+          return stopResult || jsonResponse({ success: true, ok: true, report: { actions: { canStop: false } } });
+        }
+        return null;
+      });
+    }
+    function stubCriteriaFetchWith(handler) {
+      const fallback = stubCriteriaFetch();
+      const fetchMock = vi.fn(async (input, options = {}) => {
+        const handled = await handler(String(input), options);
+        return handled || fallback(input, options);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      return fetchMock;
+    }
+
+    test("Pursuing automatically header lists today's automatic SIM requests with Stop buttons", async () => {
+      stubStopFetch();
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      const list = await within(auto).findByRole('list', { name: 'SIM requested automatically today' });
+      expect(within(list).getByText('Pursued Air')).toBeVisible();
+      expect(within(list).getByText('Pursued Heat')).toBeVisible();
+      expect(within(list).getByRole('button', { name: 'Stop SIM request to Pursued Air' })).toBeEnabled();
+      expect(within(list).getAllByRole('button')).toHaveLength(2);
+      expect(within(list).getAllByText('Stop SIM request')).toHaveLength(2);
+      expect(within(list).getByRole('button', { name: 'Stop SIM request to Pursued Heat' })).toBeEnabled();
+    });
+
+    test('Stop SIM request confirms then POSTs to cim-release/stop', async () => {
+      const writes = [];
+      const statuses = [];
+      stubStopFetch({ writes, statuses });
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(confirm).toHaveBeenCalledWith('Stop the SIM request to Pursued Air? No more emails will be sent.');
+      expect(writes[0]).toEqual({
+        url: '/api/admin/deal-hunter/triage/pursued-1/cim-release/stop',
+        method: 'POST',
+        body: expect.objectContaining({ campaignId: 'campaign-1', expectedRowVersion: 4,
+          expectedTerminalRevision: 0, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/) }),
+      });
+      await waitFor(() => expect(statuses.length).toBeGreaterThan(1));
+      expect(await within(auto).findByText('Stopped')).toBeVisible();
+    });
+
+    test('declining the confirmation sends nothing', async () => {
+      const writes = [];
+      const fetchMock = stubStopFetch({ writes });
+      vi.spyOn(window, 'confirm').mockReturnValue(false);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(window.confirm).toHaveBeenCalledTimes(1);
+      expect(writes).toHaveLength(0);
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/cim-release'))).toBe(false);
+    });
+
+    test('says so when the campaign can no longer be stopped', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' },
+        campaign: { id: 'campaign-1', state: 'completed', generation: 1 }, actions: { canStop: false } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Pursued Air can no longer be stopped');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('says no email is scheduled yet when the release has no campaign', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' }, campaign: null,
+        enrollment: { state: 'waiting' }, actions: { canStop: false } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent(
+        'No email is scheduled yet for Pursued Air; open the deal to review it.');
+      expect(within(auto).getByRole('alert')).not.toHaveTextContent('can no longer be stopped');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('refuses to stop without revision-bound authority', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' },
+        actions: { canStop: true, campaignId: 'campaign-1', expectedRowVersion: 4 } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Unable to stop the Pursue CIM campaign.');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('does not treat a stop response without a report as success', async () => {
+      stubStopFetch({ stopResult: jsonResponse({ success: true, ok: true }) });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Unable to stop the Pursue CIM campaign.');
+      expect(within(auto).queryByText('Stopped')).not.toBeInTheDocument();
+    });
+
+    test('shows the server error when the stop is rejected', async () => {
+      stubStopFetch({ stopResult: jsonResponse({ success: false, error: 'Campaign authority changed before the stop was saved.' },
+        { ok: false, status: 409 }) });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Campaign authority changed before the stop was saved.');
+      expect(within(auto).getByRole('button', { name: 'Stop SIM request to Pursued Air' })).toBeEnabled();
+    });
+
+    test('Stop buttons are hidden for viewers', async () => {
+      stubStopFetch();
+      renderInbox({ initialView: 'inbox', readOnly: true });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => String(url).includes('/auto-pursue'))).toBe(true));
+      expect(await within(auto).findByText('Pursued Air')).toBeVisible();
+      expect(within(auto).queryByRole('button', { name: /^Stop SIM request/ })).not.toBeInTheDocument();
+    });
+  });
 });

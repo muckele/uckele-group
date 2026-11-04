@@ -38,6 +38,7 @@ import {
 import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import { buildDealHunterCimFollowUpEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import { isPursueOwnershipRefusalCode, PURSUE_OWNERSHIP_REFUSAL_MESSAGE } from './pursueOwnership.js';
 
 export const MANUAL_FOLLOW_UP_PREPARATION_TYPE = 'deal-hunter-manual-follow-up-proposal-v1';
 
@@ -865,6 +866,9 @@ export async function approveDealHunterManualFollowUp({
   }
   if (!execution || ['approval-required', 'invalid-approved-context'].includes(execution.status)) {
     return publicFailure('execution_rejected', 'The trusted approved follow-up context was rejected.');
+  }
+  if (execution.status === 'skipped' && isPursueOwnershipRefusalCode(execution.reason)) {
+    return publicFailure(execution.reason, PURSUE_OWNERSHIP_REFUSAL_MESSAGE, 409);
   }
   const request = execution.request || await storage.getDealHunterCimRequestById?.(canonicalRequestId) || authority.request;
   const failure = {

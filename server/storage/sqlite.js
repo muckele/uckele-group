@@ -4500,6 +4500,8 @@ export function createSqliteStorage(config, options = {}) {
         created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
         FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT
       );
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_owner_decision_events_opportunity_created
+        ON deal_hunter_owner_decision_events(opportunity_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS deal_hunter_pursuit_enrollments (
         id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
@@ -10994,6 +10996,21 @@ export function createSqliteStorage(config, options = {}) {
         `).get(policy, new Date(since).toISOString(), new Date(until).toISOString()).count);
       },
 
+      /** Recorded owner decisions under one policy in [since, until), newest first. */
+      async listOwnerDecisionsByPolicy({ policyVersion, since, until, limit = 10 } = {}) {
+        const policy = String(policyVersion || '');
+        if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+          throw new Error('listOwnerDecisionsByPolicy requires a policy version and an instant range.');
+        }
+        return database.prepare(`
+          SELECT opportunity_id, created_at FROM deal_hunter_owner_decision_events
+          WHERE policy_version = ?
+            AND julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?)
+          ORDER BY julianday(created_at) DESC, id DESC LIMIT ?
+        `).all(policy, new Date(since).toISOString(), new Date(until).toISOString(),
+          Math.min(Math.max(Math.trunc(Number(limit)) || 10, 1), 100));
+      },
+
       /** True when any Pursue campaign conversation already targets this recipient address. */
       async hasPursueCimConversationForRecipient(recipientEmail) {
         const address = String(recipientEmail || '').trim().toLowerCase();
@@ -11183,7 +11200,7 @@ export function createSqliteStorage(config, options = {}) {
           const batch = ids.slice(index, index + 500);
           rows.push(...database.prepare(`
             SELECT opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version,
-                   profile_version, completeness_policy_version, criteria_profile_version, reviewed_at
+                   profile_version, completeness_policy_version, criteria_profile_version, criteria_group, reviewed_at
             FROM deal_hunter_opportunity_scores
             WHERE opportunity_id IN (${batch.map(() => '?').join(', ')})
           `).all(...batch));
@@ -14263,6 +14280,21 @@ export function createSqliteStorage(config, options = {}) {
         return { claimed: true, reason: '', claim: { ...claim, metadata: parseJsonColumn(claim.metadata, {}) } };
       });
       return transaction.immediate();
+    },
+
+    async releaseDealHunterCimOpportunityClaim({ opportunityId = '', requestId = '' } = {}) {
+      if (!opportunityId || !requestId) return { released: false };
+      // Only an exact claim that never produced a request row can be released:
+      // a claim backing durable legacy history stays in place.
+      return database.transaction(() => {
+        if (database.prepare('SELECT 1 FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(requestId)) {
+          return { released: false };
+        }
+        const changes = database.prepare(`
+          DELETE FROM deal_hunter_cim_opportunity_claims WHERE opportunity_id = ? AND request_id = ?
+        `).run(opportunityId, requestId).changes;
+        return { released: changes > 0 };
+      }).immediate();
     },
 
     async getDealHunterCimOpportunityClaim(opportunityId) {

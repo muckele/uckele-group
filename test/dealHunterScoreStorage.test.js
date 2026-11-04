@@ -421,6 +421,7 @@ test('fingerprint lookup returns only the columns the refresh gate needs', async
     Object.keys(fingerprints[0]).sort(),
     [
       'completeness_policy_version',
+      'criteria_group',
       'criteria_profile_version',
       'engine_version',
       'opportunity_id',
@@ -473,6 +474,7 @@ test('Supabase fingerprint lookup projects the same complete currentness contrac
   );
   assert.deepEqual(selected.split(/,\s*/).sort(), [
     'completeness_policy_version',
+    'criteria_group',
     'criteria_profile_version',
     'engine_version',
     'opportunity_id',

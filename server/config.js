@@ -419,6 +419,15 @@ export function getConfig() {
         retryIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS, 1000 * 60 * 30),
         markerDir: process.env.DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR || path.join(defaultDataDir, 'deal-hunter-daily-email'),
       },
+      // Weekday Sheet sync, then automatic Pursue. Ships off; the schedule is fixed by the spec.
+      sheetSync: {
+        enabled: process.env.DEAL_HUNTER_SHEET_SYNC_ENABLED === 'true',
+        runAt: '07:30',
+        timezone: 'America/Los_Angeles',
+        retryIntervalMs: 1_800_000,
+        retryUntil: '12:00',
+        checkIntervalMs: 60_000,
+      },
       cimFollowUp: {
         enabled: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED, false),
         checkIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS, 1000 * 60 * 60),

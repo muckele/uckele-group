@@ -22,7 +22,7 @@ const { setCurrentOperatorOpportunityFact } = await import('../server/services/d
 const { ownerBusinessDate } = await import('../server/services/dealHunterFreshInboxPolicy.js');
 const {
   AUTO_PURSUE_CONFIRMATIONS, autoPursueCriteriaStale, autoPursueIdempotencyKey, getAutoPursueStatus, getAutoPursueWarmup,
-  ownerBusinessDateBounds, runAutoPursue, setAutoPursueMode, summarizeAutoPursueWarmup,
+  ownerBusinessDateBounds, runAutoPursue: runAutoPursueRaw, setAutoPursueMode, summarizeAutoPursueWarmup,
 } = await import('../server/services/autoPursue.js');
 
 const owner = 'owner@uckele.test';
@@ -128,6 +128,27 @@ async function scoreRow(storage, opportunityId) {
   return storage.getDealHunterOpportunityScore(opportunityId);
 }
 
+/** The fingerprints a fresh refresh would report when no fact has changed since scoring. */
+async function matchingFingerprints(storage) {
+  const fingerprints = {};
+  for (const id of seededIds.get(storage) || []) {
+    const score = await storage.getDealHunterOpportunityScore(id);
+    if (score) fingerprints[id] = score.score_fingerprint;
+  }
+  return fingerprints;
+}
+
+/**
+ * Runs the runner as the daily job does: with the fingerprints of a refresh that found nothing
+ * changed. A test passes `currentFingerprints` itself (including null) to exercise that check.
+ */
+async function runAutoPursue(options = {}) {
+  const { storage = options.storage } = options;
+  const currentFingerprints = 'currentFingerprints' in options
+    ? options.currentFingerprints : await matchingFingerprints(storage);
+  return runAutoPursueRaw({ ...options, currentFingerprints });
+}
+
 /** Runs `action` with Date (only) mocked to start at `instant`; timers stay real. */
 async function atWallClock(instant, action) {
   mock.timers.enable({ apis: ['Date'], now: instant.getTime() });
@@ -229,6 +250,23 @@ test('canary records at most one pursue per business date across reruns', async 
   assert.equal(status.dailyCap, 1);
   assert.equal(status.todayCommands, 1);
   assert.equal(status.latestRun.commands, 0);
+});
+
+test('status falls back to the opportunity id when a name lookup fails, but a failed decision list fails closed', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-name-fallback');
+  const now = new Date();
+  assert.equal((await runAutoPursue({ storage, now })).commands, 1);
+  const original = storage.getDealHunterOpportunity;
+  storage.getDealHunterOpportunity = async () => { throw new Error('opportunity read failed'); };
+  const status = await getAutoPursueStatus({ storage, now });
+  assert.deepEqual(status.todayPursued, [{ opportunityId: 'opp-name-fallback', name: 'opp-name-fallback' }]);
+  assert.equal(status.todayCommands, 1);
+  storage.getDealHunterOpportunity = original;
+  assert.deepEqual((await getAutoPursueStatus({ storage, now })).todayPursued,
+    [{ opportunityId: 'opp-name-fallback', name: 'Deal opp-name-fallback' }]);
+  storage.listOwnerDecisionsByPolicy = async () => { throw new Error('decision list failed'); };
+  await assert.rejects(getAutoPursueStatus({ storage, now }), /decision list failed/);
 });
 
 test('automatic Pursue uses the automation actor, the policy version, and the single recipient', async () => {
@@ -378,8 +416,9 @@ test('each blocker skips the row', async () => {
   assert.equal(reasonFor(result, 'opp-b-watch'), undefined);
   assert.equal((await scoreRow(storage, 'opp-b-watch')).auto_pursue_blocker ?? null, null);
   assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-b-watch' })).decision.action, 'watch');
-  // Out-of-date criteria never reach the runner (they sit in Your review).
-  assert.equal(reasonFor(result, 'opp-b-stale'), undefined);
+  // A row scored under an older criteria profile is blocked, never Pursued.
+  assert.equal(reasonFor(result, 'opp-b-stale'), 'criteria_out_of_date');
+  assert.equal((await scoreRow(storage, 'opp-b-stale')).auto_pursue_blocker, 'criteria_out_of_date');
   assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-b-stale' })).decision, null);
   assert.equal(result.commands, 1);
   assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-b-clean' })).decision.actor,
@@ -906,6 +945,14 @@ test('Supabase adapter: authoritative count, exclusive claim, activation RPC, an
   assert.deepEqual(calls.at(-1), { table: 'deal_hunter_owner_decision_events', steps: [
     ['select', 'id', { count: 'exact', head: true }], ['eq', 'policy_version', 'auto-pursue-v1'],
     ['gte', 'created_at', '2026-11-02T08:00:00.000Z'], ['lt', 'created_at', '2026-11-03T08:00:00.000Z']] });
+  responses.push({ data: [{ opportunity_id: 'opp-a', created_at: '2026-11-02T20:00:00.000Z' }], error: null });
+  assert.deepEqual(await storage.listOwnerDecisionsByPolicy({ policyVersion: 'auto-pursue-v1',
+    since: '2026-11-02T08:00:00.000Z', until: '2026-11-03T08:00:00.000Z', limit: 10 }),
+  [{ opportunity_id: 'opp-a', created_at: '2026-11-02T20:00:00.000Z' }]);
+  assert.deepEqual(calls.at(-1), { table: 'deal_hunter_owner_decision_events', steps: [
+    ['select', 'opportunity_id,created_at'], ['eq', 'policy_version', 'auto-pursue-v1'],
+    ['gte', 'created_at', '2026-11-02T08:00:00.000Z'], ['lt', 'created_at', '2026-11-03T08:00:00.000Z'],
+    ['order', 'created_at', { ascending: false }], ['order', 'id', { ascending: false }], ['limit', 10]] });
   responses.push({ count: null, error: null });
   await assert.rejects(storage.countOwnerDecisionsByPolicy({ policyVersion: 'auto-pursue-v1',
     since: '2026-11-02T08:00:00.000Z', until: '2026-11-03T08:00:00.000Z' }));
@@ -966,4 +1013,167 @@ test('Supabase adapter: the prior-conversation check is a case-insensitive exact
   responses.push({ data: null, error: { code: '42501', message: 'permission denied' } });
   await assert.rejects(storage.hasPursueCimConversationForRecipient('pat@brokerfirm.test'), { code: '42501' });
   await assert.rejects(storage.hasPursueCimConversationForRecipient('  '));
+});
+
+async function areaIds(storage, area) {
+  const result = await storage.listDealHunterFreshInbox({ area, limit: 100, asOf: new Date().toISOString() });
+  const section = (result?.areas || []).find((item) => item.id === area);
+  return (section?.rows || []).map((row) => String(row.opportunity_id)).sort();
+}
+
+test('shadow and canary runs without a fingerprint map skip as fingerprints_unavailable and evaluate no rows', async () => {
+  for (const mode of ['shadow', 'canary', 'active']) {
+    const storage = await readyStorage(mode, mode === 'active' ? { dailyCap: 3 } : undefined);
+    const ids = [`opp-fp-none-${mode}-a`, `opp-fp-none-${mode}-b`];
+    for (const id of ids) await seedAuto(storage, id);
+    const writes = [];
+    const original = storage.setDealHunterAutoPursueBlockers;
+    storage.setDealHunterAutoPursueBlockers = async (entries) => { writes.push(entries); return original(entries); };
+    const areasBefore = await areaIds(storage, 'auto-pursue');
+    assert.deepEqual(areasBefore, ids);
+    let offsetMs = 0;
+    for (const currentFingerprints of [null, undefined, 'not-a-map']) {
+      offsetMs += 1000;
+      const result = await runAutoPursueRaw({ storage, currentFingerprints, now: new Date(Date.now() + offsetMs) });
+      assert.equal(result.ok, true, mode);
+      assert.equal(result.status, 200, mode);
+      assert.equal(result.reason, 'fingerprints_unavailable', mode);
+      assert.equal(result.commands, 0, mode);
+      assert.deepEqual(result.skipped, [], mode);
+      assert.deepEqual(result.wouldPursue, [], mode);
+    }
+    assert.equal(writes.length, 0, `${mode}: no blocker writes`);
+    for (const id of ids) assert.equal((await scoreRow(storage, id)).auto_pursue_blocker ?? null, null, id);
+    assert.deepEqual(await areaIds(storage, 'auto-pursue'), ids, `${mode}: inbox areas unchanged`);
+    assert.deepEqual(await areaIds(storage, 'your-review'), [], `${mode}: nothing moved to review`);
+    assert.equal(await autoDecisions(storage), 0);
+    const runs = await storage.listAutoPursueRuns({ limit: 10 });
+    assert.equal(runs.length, 3, mode);
+    for (const run of runs) {
+      assert.equal(run.status, 'completed', mode);
+      assert.ok(run.completed_at, mode);
+      assert.equal(run.reason, 'fingerprints_unavailable', mode);
+      assert.deepEqual(run.items, [], mode);
+    }
+  }
+});
+
+test('a cron run without fingerprints does not stop a same-day sheet-sync run from Pursuing in canary', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-fp-cron-first');
+  const cron = await runAutoPursueRaw({ storage, triggeredBy: 'cron', currentFingerprints: null });
+  assert.equal(cron.reason, 'fingerprints_unavailable');
+  const sync = await runAutoPursueRaw({ storage, triggeredBy: 'sheet-sync',
+    currentFingerprints: { 'opp-fp-cron-first': 'fp-opp-fp-cron-first' }, now: new Date(Date.now() + 1000) });
+  assert.equal(sync.commands, 1);
+  assert.equal(reasonFor(sync, 'opp-fp-cron-first'), undefined, 'no blocked_earlier_today');
+  assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-fp-cron-first' })).decision.actor,
+    'automation-auto-pursue');
+});
+
+test('canary run with matching fingerprint Pursues the row', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-fp-match');
+  const result = await runAutoPursueRaw({ storage, currentFingerprints: { 'opp-fp-match': 'fp-opp-fp-match' } });
+  assert.equal(result.commands, 1);
+  assert.equal(reasonFor(result, 'opp-fp-match'), undefined);
+  assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-fp-match' })).decision.actor,
+    'automation-auto-pursue');
+});
+
+test('canary run with mismatched fingerprint blocks with criteria_stale and records no decision', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-fp-mismatch');
+  await seedAuto(storage, 'opp-fp-missing');
+  const result = await runAutoPursueRaw({ storage, currentFingerprints: {
+    'opp-fp-mismatch': 'fp-changed-since-scoring', 'unrelated-opportunity': 'fp-x' } });
+  assert.equal(result.commands, 0);
+  assert.equal(reasonFor(result, 'opp-fp-mismatch'), 'criteria_stale');
+  assert.equal(reasonFor(result, 'opp-fp-missing'), 'criteria_stale', 'a missing entry fails closed');
+  assert.equal((await scoreRow(storage, 'opp-fp-mismatch')).auto_pursue_blocker, 'criteria_stale');
+  assert.equal((await storage.readPursueCimProjection({ opportunityId: 'opp-fp-mismatch' })).decision, null);
+  assert.equal(await autoDecisions(storage), 0);
+});
+
+test('a prototype property name is never a matching fingerprint', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'constructor');
+  const result = await runAutoPursueRaw({ storage, currentFingerprints: {} });
+  assert.equal(reasonFor(result, 'constructor'), 'criteria_stale');
+  assert.equal(await autoDecisions(storage), 0);
+});
+
+test('shadow run with mismatched fingerprint records criteria_stale blocker', async () => {
+  const storage = await readyStorage('shadow');
+  await seedAuto(storage, 'opp-fp-shadow-bad');
+  await seedAuto(storage, 'opp-fp-shadow-good');
+  const result = await runAutoPursueRaw({ storage, currentFingerprints: {
+    'opp-fp-shadow-bad': 'fp-different', 'opp-fp-shadow-good': 'fp-opp-fp-shadow-good' } });
+  assert.equal(result.commands, 0);
+  assert.equal(reasonFor(result, 'opp-fp-shadow-bad'), 'criteria_stale');
+  assert.equal((await scoreRow(storage, 'opp-fp-shadow-bad')).auto_pursue_blocker, 'criteria_stale');
+  assert.deepEqual(result.wouldPursue, ['opp-fp-shadow-good']);
+  assert.equal((await scoreRow(storage, 'opp-fp-shadow-good')).auto_pursue_blocker ?? null, null);
+});
+
+test('off mode ignores currentFingerprints', async () => {
+  const storage = await readyStorage('off');
+  await seedAuto(storage, 'opp-fp-off');
+  const result = await runAutoPursueRaw({ storage });
+  assert.deepEqual(result.wouldPursue, ['opp-fp-off']);
+  assert.equal((await scoreRow(storage, 'opp-fp-off')).auto_pursue_blocker ?? null, null);
+});
+
+test('row stored under an older criteria profile version shows criteria_out_of_date and clears after rescore at current version', async () => {
+  const storage = await readyStorage('off');
+  await seedAuto(storage, 'opp-old-version', { criteriaProfileVersion: 'uckele-criteria-v0' });
+  const first = await runAutoPursue({ storage });
+  assert.equal(reasonFor(first, 'opp-old-version'), 'criteria_out_of_date');
+  assert.equal((await scoreRow(storage, 'opp-old-version')).auto_pursue_blocker, 'criteria_out_of_date');
+  assert.deepEqual(first.wouldPursue, []);
+
+  // The refresh rescores the row at the current version; the next run clears the blocker.
+  await seedAuto(storage, 'opp-old-version');
+  const second = await runAutoPursue({ storage, now: new Date(Date.now() + 1000) });
+  assert.equal((await scoreRow(storage, 'opp-old-version')).auto_pursue_blocker ?? null, null);
+  // Blocked earlier in the business date, so not retried until the next one.
+  assert.equal(reasonFor(second, 'opp-old-version'), 'blocked_earlier_today');
+  const nextDay = new Date(Date.now() + 36 * 3_600_000);
+  const third = await atWallClock(nextDay, () => runAutoPursue({ storage, now: nextDay }));
+  assert.deepEqual(third.wouldPursue, ['opp-old-version']);
+});
+
+test('an out-of-date blocker also clears when the rescore regroups the row away from auto', async () => {
+  const storage = await readyStorage('off');
+  await seedAuto(storage, 'opp-old-regroup', { criteriaProfileVersion: 'uckele-criteria-v0' });
+  await runAutoPursue({ storage });
+  assert.equal((await scoreRow(storage, 'opp-old-regroup')).auto_pursue_blocker, 'criteria_out_of_date');
+  await seedAuto(storage, 'opp-old-regroup', { criteriaGroup: 'review' });
+  const result = await runAutoPursue({ storage, now: new Date(Date.now() + 1000) });
+  assert.deepEqual(result.wouldPursue, []);
+  assert.equal((await scoreRow(storage, 'opp-old-regroup')).auto_pursue_blocker ?? null, null);
+});
+
+test('an out-of-date row is never Pursued in canary even with a matching fingerprint', async () => {
+  const storage = await readyStorage('canary');
+  await seedAuto(storage, 'opp-old-canary', { criteriaProfileVersion: 'uckele-criteria-v0' });
+  const result = await runAutoPursue({ storage });
+  assert.equal(result.commands, 0);
+  assert.equal(reasonFor(result, 'opp-old-canary'), 'criteria_out_of_date');
+});
+
+test('blocker is not rewritten when unchanged', async () => {
+  const storage = await readyStorage('shadow');
+  await seedAuto(storage, 'opp-rewrite-stale');
+  await seedAuto(storage, 'opp-rewrite-old', { criteriaProfileVersion: 'uckele-criteria-v0' });
+  const writes = [];
+  const original = storage.setDealHunterAutoPursueBlockers;
+  storage.setDealHunterAutoPursueBlockers = async (entries) => { writes.push(entries); return original(entries); };
+  const options = { storage, currentFingerprints: {} };
+  await runAutoPursueRaw({ ...options, now: new Date(Date.now()) });
+  await runAutoPursueRaw({ ...options, now: new Date(Date.now() + 1000) });
+  assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].map((entry) => [entry.opportunityId, entry.blocker]).sort(), [
+    ['opp-rewrite-old', 'criteria_out_of_date'], ['opp-rewrite-stale', 'criteria_stale'],
+  ]);
 });

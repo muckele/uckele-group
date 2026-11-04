@@ -830,6 +830,31 @@ test('refresh stores the criteria group and result', async (t) => {
   assert.deepEqual(result.mustHaves.map((entry) => entry.id), ['profit', 'multiple', 'geography', 'industry', 'gates']);
 });
 
+test('refreshOpportunityScores returns currentFingerprints for scored and unchanged candidates', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'opp-refresh-1');
+  await seedOpportunity(storage, 'opp-refresh-2');
+  const deals = [scoredDeal(), scoredDeal({ opportunityId: 'opp-refresh-2', dealKey: 'deal-refresh-2',
+    name: 'Second Fire Safety Co', listingUrl: 'https://listings.example.invalid/opp-refresh-2' })];
+
+  const first = await refreshOpportunityScores({ deals, storage });
+  assert.deepEqual(Object.keys(first.currentFingerprints).sort(), ['opp-refresh-1', 'opp-refresh-2']);
+  for (const id of ['opp-refresh-1', 'opp-refresh-2']) {
+    assert.equal(first.currentFingerprints[id], (await storage.getDealHunterOpportunityScore(id)).score_fingerprint, id);
+  }
+
+  // Unchanged candidates are skipped without a write but still report their fingerprint.
+  const second = await refreshOpportunityScores({ deals, storage });
+  assert.equal(second.counts.skipped, 2);
+  assert.deepEqual(second.currentFingerprints, first.currentFingerprints);
+
+  // A changed fact yields a different current fingerprint than the one stored before the rewrite.
+  const changed = await refreshOpportunityScores({
+    deals: [scoredDeal({ annualProfit: 900000 }), deals[1]], storage });
+  assert.notEqual(changed.currentFingerprints['opp-refresh-1'], first.currentFingerprints['opp-refresh-1']);
+  assert.equal(changed.currentFingerprints['opp-refresh-2'], first.currentFingerprints['opp-refresh-2']);
+});
+
 test('a stale criteria profile version forces a rewrite', async (t) => {
   const storage = withStorage(t);
   await seedOpportunity(storage, 'opp-refresh-1');
@@ -1112,6 +1137,7 @@ test('required-source outage defers implicit refresh and preview without erasing
   assert.equal(refreshed.status, 503);
   assert.equal(refreshed.scoringDeferred, true);
   assert.deepEqual(refreshed.counts, { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 });
+  assert.deepEqual(refreshed.currentFingerprints, {}, 'a deferred refresh supplies no fingerprints');
   assert.equal(previewed.ok, false);
   assert.equal(previewed.status, 503);
   assert.equal(previewed.scoringDeferred, true);

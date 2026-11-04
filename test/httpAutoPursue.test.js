@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import RawDatabase from 'better-sqlite3';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-http-auto-pursue-'));
 process.env.ADMIN_SESSION_SECRET = 'http-auto-pursue-secret';
@@ -190,5 +191,39 @@ test('mode change cannot be spoofed with a body actor and command modes need war
     const status = await (await fetch(`${origin}${statusPath}`, { headers: { Cookie: adminCookie } })).json();
     assert.equal(status.mode, 'canary');
     assert.equal(status.warmup.ready, true);
+  });
+});
+
+function seedAutomaticDecision({ opportunityId, name, createdAt, policyVersion = 'auto-pursue-v1' }) {
+  const raw = new RawDatabase(process.env.SQLITE_PATH);
+  try {
+    raw.prepare(`INSERT INTO deal_hunter_opportunities (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+      VALUES (?, ?, ?, ?, 'test')`).run(opportunityId, createdAt, createdAt, name ?? '');
+    raw.prepare(`INSERT INTO deal_hunter_owner_decision_events (id, idempotency_key, request_digest, opportunity_id, action, actor,
+      expected_discovery_revision, expected_material_revision, observed_discovery_revision, observed_material_revision,
+      policy_version, created_at) VALUES (?, ?, ?, ?, 'pursue', 'automation-auto-pursue', 0, 0, 0, 0, ?, ?)`)
+      .run(`decision-${opportunityId}`, `key-${opportunityId}`, 'a'.repeat(64), opportunityId, policyVersion, createdAt);
+  } finally {
+    raw.close();
+  }
+}
+
+test("GET /api/admin/deal-hunter/auto-pursue includes todayPursued for today's automatic decisions only", async () => {
+  const now = Date.now();
+  seedAutomaticDecision({ opportunityId: 'today-older', name: 'Older Air', createdAt: new Date(now - 2_000).toISOString() });
+  seedAutomaticDecision({ opportunityId: 'today-newer', name: 'Newer Air', createdAt: new Date(now - 1_000).toISOString() });
+  seedAutomaticDecision({ opportunityId: 'today-unnamed', name: null, createdAt: new Date(now - 3_000).toISOString() });
+  seedAutomaticDecision({ opportunityId: 'yesterday-auto', name: 'Yesterday Air', createdAt: new Date(now - 36 * 3_600_000).toISOString() });
+  seedAutomaticDecision({ opportunityId: 'today-manual', name: 'Manual Air', createdAt: new Date(now - 500).toISOString(),
+    policyVersion: 'owner-decision-v1' });
+  await withServer(async (origin) => {
+    const viewerCookie = await viewerLogin(origin);
+    const status = await (await fetch(`${origin}${statusPath}`, { headers: { Cookie: viewerCookie } })).json();
+    assert.deepEqual(status.todayPursued, [
+      { opportunityId: 'today-newer', name: 'Newer Air' },
+      { opportunityId: 'today-older', name: 'Older Air' },
+      { opportunityId: 'today-unnamed', name: 'today-unnamed' },
+    ]);
+    assert.equal(status.todayCommands, 3, 'the list agrees with the daily-cap count');
   });
 });

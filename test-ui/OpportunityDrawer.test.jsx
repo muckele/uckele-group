@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import OpportunityDrawer from '../src/components/admin/OpportunityDrawer.jsx';
 
@@ -406,6 +406,100 @@ describe('Opportunity drawer', () => {
     }));
     expect(within(card).queryByRole('button', { name: /retry|send again|regenerate|authorize|resume/i }))
       .not.toBeInTheDocument();
+  });
+
+  describe('timezone picker', () => {
+    const timezoneNames = ['America/New_York', 'America/Chicago', 'America/Denver',
+      'America/Phoenix', 'America/Los_Angeles'];
+    const releaseWith = (timezoneAuthority) => cimReleaseFixture({ timezoneAuthority });
+    const pickerGroup = () => screen.queryByRole('group', { name: 'Set timezone' });
+
+    test('timezone picker shows only when timezone authority is missing or ambiguous', () => {
+      for (const [timezoneAuthority, visible] of [
+        [null, true],
+        [{ state: 'missing', ianaTimezone: '', revision: 2, selectedRevision: null, current: false }, true],
+        [{ state: 'ambiguous', ianaTimezone: '', revision: 2, selectedRevision: null, current: false }, true],
+        [{ state: 'verified', ianaTimezone: 'America/Denver', revision: 3, selectedRevision: 3, current: true }, false],
+        [{ state: 'derived', ianaTimezone: 'America/Phoenix', revision: 1, selectedRevision: 1, current: true }, false],
+      ]) {
+        render(<OpportunityDrawer cimRelease={releaseWith(timezoneAuthority)} detail={detailFixture()}
+          onClose={vi.fn()} />);
+        if (visible) {
+          expect(pickerGroup()).toBeVisible();
+          expect(screen.getByText('No sendable timezone is on record, so the first email cannot be scheduled. '
+            + 'After you set one, click Request SIM again to schedule the email.')).toBeVisible();
+          expect(within(pickerGroup()).getAllByRole('button').map((button) => button.textContent))
+            .toEqual(timezoneNames);
+        } else {
+          expect(pickerGroup()).not.toBeInTheDocument();
+        }
+        cleanup();
+      }
+    });
+
+    test('picker confirms then POSTs operator-verified body and reloads the release', async () => {
+      const fetchMock = vi.fn(async () => ({ ok: true, status: 200,
+        json: async () => ({ success: true, ok: true, status: 200 }) }));
+      vi.stubGlobal('fetch', fetchMock);
+      const onTimezoneSet = vi.fn();
+      render(<OpportunityDrawer cimRelease={releaseWith({ state: 'ambiguous', ianaTimezone: '',
+        revision: 4, selectedRevision: null, current: false })} detail={detailFixture()}
+      onCimTimezoneSet={onTimezoneSet} onClose={vi.fn()} />);
+
+      fireEvent.click(within(pickerGroup()).getByRole('button', { name: 'America/Phoenix' }));
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(screen.getByText("Use America/Phoenix for this deal's send times?")).toBeVisible();
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm timezone' }));
+
+      await waitFor(() => expect(onTimezoneSet).toHaveBeenCalledTimes(1));
+      expect(screen.getByText('Timezone saved. Click Request SIM again to schedule the email.'))
+        .toHaveAttribute('role', 'status');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('/api/admin/deal-hunter/triage/opp-1/timezone');
+      expect(init.method).toBe('POST');
+      expect(init.credentials).toBe('same-origin');
+      const body = JSON.parse(init.body);
+      expect(body).toEqual({ ianaTimezone: 'America/Phoenix', evidenceType: 'operator-verified',
+        evidenceId: 'owner-drawer', expectedPriorRevision: 4, idempotencyKey: expect.any(String) });
+      expect(body.idempotencyKey).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+      vi.unstubAllGlobals();
+    });
+
+    test('picker with no timezone row sends expectedPriorRevision 0 and cancel sends nothing', () => {
+      const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ success: true }) }));
+      vi.stubGlobal('fetch', fetchMock);
+      render(<OpportunityDrawer cimRelease={releaseWith(null)} detail={detailFixture()}
+        onClose={vi.fn()} />);
+      fireEvent.click(within(pickerGroup()).getByRole('button', { name: 'America/Denver' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByText(/for this deal's send times\?/)).not.toBeInTheDocument();
+      expect(fetchMock).not.toHaveBeenCalled();
+      vi.unstubAllGlobals();
+    });
+
+    test('409 shows Timezone changed elsewhere — reload and try again.', async () => {
+      const fetchMock = vi.fn(async () => ({ ok: false, status: 409,
+        json: async () => ({ success: false, ok: false, status: 409,
+          reasonCode: 'stale_timezone_revision', currentRevision: 5 }) }));
+      vi.stubGlobal('fetch', fetchMock);
+      const onTimezoneSet = vi.fn();
+      render(<OpportunityDrawer cimRelease={releaseWith(null)} detail={detailFixture()}
+        onCimTimezoneSet={onTimezoneSet} onClose={vi.fn()} />);
+      fireEvent.click(within(pickerGroup()).getByRole('button', { name: 'America/Chicago' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm timezone' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Timezone changed elsewhere — reload and try again.');
+      expect(onTimezoneSet).not.toHaveBeenCalled();
+      vi.unstubAllGlobals();
+    });
+
+    test('picker hidden in read-only mode', () => {
+      render(<OpportunityDrawer cimRelease={releaseWith(null)} cimReleaseReadOnly
+        detail={detailFixture()} onClose={vi.fn()} readOnly />);
+      expect(pickerGroup()).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'America/Phoenix' })).not.toBeInTheDocument();
+    });
   });
 
   test('shows a durable provider outcome ahead of the earlier release state', () => {

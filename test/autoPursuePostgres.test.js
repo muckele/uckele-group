@@ -55,6 +55,7 @@ test('PostgreSQL automatic Pursue activation, runs, and blocker writer on fresh 
     create role service_role nologin bypassrls; -- as in Supabase
     create database pursue_fresh;
     create database pursue_upgrade;
+    create database pursue_guard_refuses;
   `);
   const currentSchema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
   const previousSchema = execFileSync('git', ['show', `${schemaBeforeBestFirst}:supabase/schema.sql`],
@@ -65,6 +66,25 @@ test('PostgreSQL automatic Pursue activation, runs, and blocker writer on fresh 
   psql(container, 'pursue_upgrade', previousSchema);
   psql(container, 'pursue_upgrade', migration);
   psql(container, 'pursue_upgrade', migration); // forward-only and re-runnable
+  const guardMigration = fs.readFileSync(path.join(root,
+    'supabase/migrations/20261102130000_mvp_send_readiness_guards.sql'), 'utf8');
+  psql(container, 'pursue_upgrade', guardMigration);
+  psql(container, 'pursue_upgrade', guardMigration); // re-runnable too
+
+  // The guard migration refuses to run over a row that already violates the policy guard.
+  psql(container, 'pursue_guard_refuses', previousSchema);
+  psql(container, 'pursue_guard_refuses', migration);
+  psql(container, 'pursue_guard_refuses', `insert into public.deal_hunter_opportunities
+      (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+      values ('guard-bad', now(), now(), 'Guard bad', 'test');
+    insert into public.deal_hunter_owner_decision_events
+      (id, idempotency_key, request_digest, opportunity_id, action, actor, expected_discovery_revision,
+        expected_material_revision, observed_discovery_revision, observed_material_revision,
+        policy_version, created_at)
+      values ('guard-bad', 'guard-bad', repeat('a', 64), 'guard-bad', 'pursue', 'owner', 0, 0, 0, 0,
+        'auto-pursue-v1', now());`);
+  psqlFails(container, 'pursue_guard_refuses', guardMigration,
+    /owner_decision_events has rows violating policy guard/);
 
   for (const database of ['pursue_fresh', 'pursue_upgrade']) {
     const activation = (id, mode, cap, confirmation) => `select public.create_deal_hunter_auto_pursue_activation_v1(
@@ -137,6 +157,29 @@ test('PostgreSQL automatic Pursue activation, runs, and blocker writer on fresh 
       /Invalid automatic Pursue blocker entries/);
     psqlFails(container, database, `set role anon;
       select public.set_deal_hunter_auto_pursue_blockers_v1('[]'::jsonb);`, /permission denied/);
+
+    // Decision-event guards: only the two known policies, and an automatic event must be an
+    // automatic Pursue by the automation actor.
+    psql(container, database, `insert into public.deal_hunter_opportunities
+      (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+      values ('guard-opp', now(), now(), 'Guard opp', 'test');`);
+    const insertEvent = (id, policy, actor, action) => `insert into public.deal_hunter_owner_decision_events
+      (id, idempotency_key, request_digest, opportunity_id, action, actor, expected_discovery_revision,
+        expected_material_revision, observed_discovery_revision, observed_material_revision,
+        policy_version, created_at)
+      values ('${id}', '${id}', repeat('a', 64), 'guard-opp', '${action}', '${actor}', 0, 0, 0, 0,
+        '${policy}', now());`;
+    // rejects auto-pursue-v1 decision event with a non-automation actor
+    psqlFails(container, database, insertEvent('guard-actor', 'auto-pursue-v1', 'owner', 'pursue'),
+      /auto_pursue_actor_check/);
+    psqlFails(container, database, insertEvent('guard-action', 'auto-pursue-v1', 'automation-auto-pursue', 'watch'),
+      /auto_pursue_actor_check/);
+    psqlFails(container, database, insertEvent('guard-policy', 'owner-v1', 'owner', 'pursue'),
+      /policy_version_allowed_check/);
+    // (A valid automatic event is covered by the locked writer below; adding one here would use the cap.)
+    psql(container, database, insertEvent('guard-ok-owner', 'owner-decision-v1', 'owner', 'watch'));
+    assert.equal(psql(container, database, `select count(*) from pg_indexes
+      where indexname = 'idx_deal_hunter_owner_decision_events_opportunity_created';`), '1');
 
     // Locked automatic writer: owner decisions win, the cap and business day hold, replays pass.
     for (const id of ['lock-watch', 'lock-a', 'lock-b', 'lock-date']) {

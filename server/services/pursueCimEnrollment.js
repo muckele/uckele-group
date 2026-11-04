@@ -7,6 +7,7 @@ import {
 } from './dealHunterBrokerMaterials.js';
 import { ensureDealHunterSubmissionForCim } from './dealHunter.js';
 import { validateIanaTimezone } from './opportunityTimezone.js';
+import { appendDerivedOpportunityTimezoneRevision } from './opportunityTimezoneRevision.js';
 
 const digest = (value) => sha256(stableCanonicalJson(value));
 const framedDigest = (...parts) => sha256(JSON.stringify(parts.map((part) => {
@@ -91,6 +92,18 @@ function dealForCrm(authority, recipient) {
       .map((item) => item.alias_value) || [] };
 }
 
+// A derivation failure is never an enrollment failure: the timezone check below reports what is stored.
+async function deriveTimezoneFromState({ storage, opportunityId, authority, now }) {
+  try {
+    const location = authority.sourceRows?.find((row) => row.field === 'location')?.value;
+    return await appendDerivedOpportunityTimezoneRevision({ storage, opportunityId,
+      state: authority.score?.state, location, now });
+  } catch (error) {
+    console.warn(`[pursue-cim] timezone derivation failed for ${opportunityId}: ${error?.message || error}`);
+    return { written: false, reason: 'derivation_failed' };
+  }
+}
+
 function crmReason(error) {
   if (error?.code === 'CRM_MATCH_AMBIGUOUS') return 'crm_ambiguous';
   if (error?.code === 'CRM_MATCH_RECORD_INACTIVE') return 'crm_archived';
@@ -133,12 +146,15 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
         } else {
           const recipient = choice.selected;
           if (await storage.getActiveEmailSuppression(recipient.email)) reason = 'recipient_suppressed';
+          const derivation = await deriveTimezoneFromState({ storage, opportunityId,
+            authority, now: at.toISOString() });
           const envelope = await storage.readPursuitEnrollmentAuthority({ opportunityId,
             now: at.toISOString() });
           const timezone = envelope.timezone;
           if (!reason && (!timezone || !['verified', 'derived'].includes(timezone.state)
             || !validateIanaTimezone(timezone.iana_timezone))) {
-            reason = timezone?.state === 'ambiguous' ? 'timezone_ambiguous' : 'timezone_missing';
+            reason = timezone?.state === 'ambiguous' || derivation.reason === 'timezone_ambiguous'
+              ? 'timezone_ambiguous' : 'timezone_missing';
           }
           const activation = envelope.activation;
           if (!reason && !activation) {

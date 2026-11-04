@@ -110,7 +110,7 @@ test('PostgreSQL inbox places 75+ rows into criteria areas on fresh and upgraded
         expected_discovery_revision, expected_material_revision,
         observed_discovery_revision, observed_material_revision, policy_version, created_at)
       values ('${id}-${database}', '${id}-${database}', repeat('a', 64), '${criteriaId(name)}', '${action}',
-        'fixture-owner', 0, 0, 0, 0, '${policy}', '${at}');`);
+        '${policy === 'auto-pursue-v1' ? 'automation-auto-pursue' : 'fixture-owner'}', 0, 0, 0, 0, '${policy}', '${at}');`);
     decide('watch', 'watched', 'watch', 'owner-decision-v1', '2026-10-01T10:00:00Z');
     decide('pursue', 'pursued', 'pursue', 'owner-decision-v1', '2026-10-01T10:00:00Z');
     decide('auto', 'auto-pursued', 'pursue', 'auto-pursue-v1', '2026-10-01T10:00:00Z');
