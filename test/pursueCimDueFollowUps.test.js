@@ -28,6 +28,7 @@ import {
   SENDER_SETTINGS,
   createGmailGateFixture,
   fixtureMemberAuthority,
+  gmailConfig,
   fixtureRecipientFingerprint,
   seedActivationChain,
   seedCampaign,
@@ -89,7 +90,7 @@ async function acceptedInitialCampaign(t, suffix) {
   database.prepare(`UPDATE deal_hunter_cim_campaign_touches SET due_at = ?, due_local = ?
     WHERE id = ?`).run('2026-09-29T15:00:00.000Z', '2026-09-29T08:00:00', followUpTouchId);
   const hooks = {
-    loadAuthority: (input) => loadPursueFollowUpAuthority({ ...input,
+    loadAuthority: (input) => loadPursueFollowUpAuthority({ ...input, config: fixture.config,
       loadMemberAuthority: async ({ opportunityId }) => fixtureMemberAuthority(opportunityId) }),
     buildPayload: (input) => buildPursueFollowUpPayload({ ...input, config: fixture.config }),
   };
@@ -143,6 +144,15 @@ async function sendFollowUp(fixture, transmission, attempt) {
     authorizationId, writerPath: 'pursue-cim-follow-up', providerProfile: GMAIL_PROFILE,
     actor: 'pursue-cim-sender', now: new Date(gateNow), configOverride: fixture.config,
     mailProvider: fixture.mailProvider });
+}
+
+/** Moves the campaign's expiry, keeping its stamped expiry derivation bound to it. */
+function setCampaignExpiry(database, campaignId, expiresAt) {
+  const derivation = JSON.parse(row(database, 'deal_hunter_cim_campaigns', campaignId)
+    .expiry_derivation);
+  database.prepare(`UPDATE deal_hunter_cim_campaigns SET local_expiry_at = ?,
+    expiry_derivation = ? WHERE id = ?`).run(expiresAt,
+    JSON.stringify({ ...derivation, expiresAt }), campaignId);
 }
 
 /** One follow-up a day and one per recipient: a slot that still counted would block. */
@@ -249,8 +259,7 @@ test('payload marks the last follow-up before expiry as Final', async (t) => {
   assert.equal(regular.bodyHtmlSanitized, variantA.html);
 
   // The next slot (two business days on) would land after expiry: this one is Final.
-  database.prepare('UPDATE deal_hunter_cim_campaigns SET local_expiry_at = ? WHERE id = ?')
-    .run(new Date(Date.now() + DAY).toISOString(), ids.campaignId);
+  setCampaignExpiry(database, ids.campaignId, new Date(Date.now() + DAY).toISOString());
   const final = await build();
   const finalCopy = renderPursueCimEmail({ kind: 'follow-up', followUpNumber: 1, isFinal: true,
     deal, sender: SENDER_SETTINGS, initialSubject: fixture.initialSubject });
@@ -284,16 +293,80 @@ test('payload threads to the initial Message-ID', async (t) => {
     `cim_in_reply_to=${initialMessageId}`,
   ]);
 
-  // Without an accepted initial there is nothing to reply to, so no payload is built.
+  // Without an accepted initial there is nothing to reply to: the authority is unavailable,
+  // and the builder still refuses defensively.
   const orphan = await createGmailGateFixture(t, 'orphan', { kind: 'follow-up' });
-  const orphanCandidate = { touch_id: orphan.ids.touchId };
-  const orphanAuthority = await loadPursueFollowUpAuthority({ candidate: orphanCandidate,
-    storage: orphan.storage, now,
-    loadMemberAuthority: async ({ opportunityId }) => fixtureMemberAuthority(opportunityId) });
-  assert.equal(orphanAuthority.initial, null);
-  await assert.rejects(buildPursueFollowUpPayload({ candidate: orphanCandidate,
-    authority: orphanAuthority, storage: orphan.storage, now, config: orphan.config }),
-  /pursue_follow_up_initial_unavailable/);
+  assert.equal(await loadPursueFollowUpAuthority({ candidate: { touch_id: orphan.ids.touchId },
+    storage: orphan.storage, now, config: orphan.config,
+    loadMemberAuthority: async ({ opportunityId }) => fixtureMemberAuthority(opportunityId) }),
+  null);
+  await assert.rejects(buildPursueFollowUpPayload({ candidate, authority: { ...authority,
+    initial: null }, storage, now, config: fixture.config }), /pursue_follow_up_initial_unavailable/);
+});
+
+test('anything the payload would reject stops the follow-up before it is claimed', async (t) => {
+  const unclaimed = async (fixture, candidate, { storage = fixture.storage,
+    config = fixture.config } = {}) => {
+    const before = row(fixture.database, 'deal_hunter_cim_campaign_touches', candidate.touch_id);
+    const result = await runCimFollowUpPreparation({ storage, candidate, clock: () => new Date(),
+      claimTokenDigest: fill('9'),
+      loadAuthority: (input) => loadPursueFollowUpAuthority({ ...input, config,
+        loadMemberAuthority: async ({ opportunityId }) => fixtureMemberAuthority(opportunityId) }),
+      buildPayload: (input) => buildPursueFollowUpPayload({ ...input, config }) });
+    assert.deepEqual({ prepared: result.prepared, blockedReason: result.blockedReason,
+      claim: result.claim }, { prepared: false, blockedReason: 'authority_unavailable',
+      claim: undefined });
+    const after = row(fixture.database, 'deal_hunter_cim_campaign_touches', candidate.touch_id);
+    assert.deepEqual({ state: after.state, claim: after.claim_token_digest,
+      owner: after.claim_owner, rowVersion: after.row_version, transmission: after.transmission_id },
+    { state: 'scheduled', claim: null, owner: null, rowVersion: before.row_version,
+      transmission: null });
+  };
+
+  // No accepted initial to reply to.
+  const { storage, database, seed } = await listingStore(t);
+  const orphan = seed('no-initial');
+  const [orphanCandidate] = (await storage.listDueCimFollowUpTouches({ now: wallNow() }))
+    .filter((item) => item.touch_id === orphan.touchId);
+  await unclaimed({ storage, database, config: gmailConfig() }, orphanCandidate);
+
+  // The initial's Message-ID would be unsafe in a header (its sender has no usable domain).
+  const unsafe = await acceptedInitialCampaign(t, 'unsafe-message-id');
+  const unsafeStorage = Object.create(unsafe.storage, { readCimFollowUpAuthority: { value:
+    async (command) => {
+      const durable = await unsafe.storage.readCimFollowUpAuthority(command);
+      return { ...durable, initial: { ...durable.initial, fromAddress: 'owner@localhost' } };
+    } } });
+  await unclaimed(unsafe, await dueCandidate(unsafe), { storage: unsafeStorage });
+
+  // The provider profile is not Gmail, or Gmail has no sender address.
+  const resend = await acceptedInitialCampaign(t, 'not-gmail');
+  await unclaimed(resend, await dueCandidate(resend), { config: gmailConfig({ provider: 'resend' }) });
+  const noSender = gmailConfig();
+  noSender.dealHunter.cimProvider.gmailSenderAddress = '';
+  await unclaimed(resend, await dueCandidate(resend), { config: noSender });
+
+  // The campaign cadence cannot say whether this is the Final follow-up.
+  const cadence = await acceptedInitialCampaign(t, 'cadence');
+  const derivation = JSON.parse(row(cadence.database, 'deal_hunter_cim_campaigns',
+    cadence.ids.campaignId).expiry_derivation);
+  for (const broken of [
+    { ...derivation, cadencePolicyVersion: 'deal-hunter-cim-cadence-v9' },
+    { ...derivation, policyVersion: 'another-policy' },
+    { ...derivation, sendTime: undefined },
+    { ...derivation, expiresAt: new Date(Date.now() + DAY).toISOString() },
+    { ...derivation, sourceAcceptedAt: new Date(Date.now() - DAY).toISOString() },
+    {},
+  ]) {
+    cadence.database.prepare(`UPDATE deal_hunter_cim_campaigns SET expiry_derivation = ?
+      WHERE id = ?`).run(JSON.stringify(broken), cadence.ids.campaignId);
+    await unclaimed(cadence, await dueCandidate(cadence));
+  }
+  // Restored, the same touch is claimed and prepared.
+  cadence.database.prepare(`UPDATE deal_hunter_cim_campaigns SET expiry_derivation = ?
+    WHERE id = ?`).run(JSON.stringify(derivation), cadence.ids.campaignId);
+  const prepared = await prepareFollowUp(cadence, await dueCandidate(cadence), '1');
+  assert.equal(prepared.prepared, true, JSON.stringify(prepared));
 });
 
 test('follow-up authority reads the durable touch, campaign, chain and stop signals', async (t) => {

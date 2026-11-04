@@ -14,6 +14,7 @@ import {
   isFinalPursueFollowUp,
   loadPursueFollowUpAuthority,
 } from '../server/services/pursueCimFollowUpHooks.js';
+import { runCimFollowUpPreparation } from '../server/services/pursueCimFollowUpPreparation.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
@@ -443,32 +444,54 @@ test('PostgreSQL lists due follow-ups and prepares a released follow-up again un
   await assert.rejects(storage.listDueCimFollowUpTouches({ now: wallNow(), limit: 101 }),
     /due selection/);
 
-  // The production authority loader reads the same durable authority as SQLite.
-  const authority = await loadPursueFollowUpAuthority({ candidate, storage, now: wallNow(),
-    loadMemberAuthority: memberAuthority });
-  assert.deepEqual({ touch: authority.touch.id, campaign: authority.campaign.id,
-    conversation: authority.conversation.id, opportunity: authority.opportunity.opportunity_id,
-    submission: authority.crmSubmission.id, owner: authority.crmOwnership.submission_id,
-    activation: authority.activation.id, timezone: authority.timezone.iana_timezone,
-    recipient: authority.recipient, initial: authority.initial, terminal: authority.terminal },
+  // The durable follow-up authority read returns the same shape as SQLite.
+  const durable = await storage.readCimFollowUpAuthority({ touchId: due.touchId, now: wallNow() });
+  assert.deepEqual({ touch: durable.touch.id, campaign: durable.campaign.id,
+    conversation: durable.conversation.id, opportunity: durable.opportunity.opportunity_id,
+    submission: durable.crmSubmission, owner: durable.crmOwnership.submission_id,
+    activation: durable.activation.id, timezone: durable.timezone.iana_timezone,
+    initial: durable.initial, signals: durable.signals },
   { touch: due.touchId, campaign: due.campaignId, conversation: due.conversationId,
-    opportunity: due.opportunityId, submission: due.submissionId, owner: due.submissionId,
-    activation: 'gmail-fl04c-followup', timezone: 'America/Los_Angeles',
-    recipient: { address: BROKER, fingerprint: fingerprintFor('due'), firstName: 'Jordan',
-      displayName: 'Jordan Lee' },
+    opportunity: due.opportunityId,
+    submission: { id: due.submissionId, deal_hunter_opportunity_id: due.opportunityId,
+      archived_at: null },
+    owner: due.submissionId, activation: 'gmail-fl04c-followup', timezone: 'America/Los_Angeles',
     initial: null,
-    terminal: { replyReceived: false, materialsReceived: false, advancedDiligence: false,
-      suppressed: false, unsafeDelivery: false, providerPending: false, providerAmbiguous: false } });
-  // The cadence reads the PostgreSQL rows as they come back (jsonb derivation, +00:00 instants).
-  assert.equal(isFinalPursueFollowUp({ authority, now: wallNow() }), false);
-  assert.equal(isFinalPursueFollowUp({ authority: { ...authority, campaign: { ...authority.campaign,
-    local_expiry_at: new Date(Date.now() + 86_400_000).toISOString() } }, now: wallNow() }), true);
-  await assert.rejects(buildPursueFollowUpPayload({ candidate, authority, storage, now: wallNow(),
-    config: { isProduction: false, dealHunter: { cimProvider: { enabled: true,
-      profile: GMAIL_PROFILE, mode: 'production-gmail', provider: 'gmail',
-      gmailSenderAddress: SENDER } } } }), /pursue_follow_up_initial_unavailable/);
-  assert.equal(await loadPursueFollowUpAuthority({ candidate: { touch_id: 'missing' }, storage,
-    now: wallNow(), loadMemberAuthority: memberAuthority }), null);
+    signals: { replyReceived: false, suppressed: false, unsafeDelivery: false,
+      providerPending: false, providerAmbiguous: false } });
+  assert.equal(await storage.readCimFollowUpAuthority({ touchId: 'missing', now: wallNow() }), null);
+  // The cadence check reads the PostgreSQL rows as they come back (jsonb derivation, +00:00
+  // instants), validated against the campaign's acceptance and expiry.
+  assert.equal(isFinalPursueFollowUp({ authority: durable, now: wallNow() }), false);
+  const soon = new Date(Date.now() + 86_400_000).toISOString();
+  assert.equal(isFinalPursueFollowUp({ authority: { ...durable, campaign: { ...durable.campaign,
+    local_expiry_at: soon, expiry_derivation: { ...durable.campaign.expiry_derivation,
+      expiresAt: soon } } }, now: wallNow() }), true);
+  assert.throws(() => isFinalPursueFollowUp({ authority: { ...durable, campaign: {
+    ...durable.campaign, local_expiry_at: soon } }, now: wallNow() }),
+  /pursue_follow_up_cadence_unavailable/);
+
+  // With no accepted initial to reply to, the production hooks stop before the claim: the
+  // touch stays scheduled and unclaimed.
+  const gmailConfig = { isProduction: false, dealHunter: { cimProvider: { enabled: true,
+    profile: GMAIL_PROFILE, mode: 'production-gmail', provider: 'gmail',
+    gmailSenderAddress: SENDER } } };
+  const loadAuthority = (input) => loadPursueFollowUpAuthority({ ...input, config: gmailConfig,
+    loadMemberAuthority: memberAuthority });
+  assert.equal(await loadAuthority({ candidate, storage, now: wallNow() }), null);
+  const touchRow = () => scalar(`select state || ':' || row_version || ':'
+    || coalesce(claim_token_digest, '-') from public.deal_hunter_cim_campaign_touches
+    where id = '${due.touchId}';`);
+  const beforeRun = touchRow();
+  const stopped = await runCimFollowUpPreparation({ storage, candidate, clock: () => new Date(),
+    claimTokenDigest: fill('9'), loadAuthority,
+    buildPayload: (input) => buildPursueFollowUpPayload({ ...input, config: gmailConfig }) });
+  assert.deepEqual({ prepared: stopped.prepared, blockedReason: stopped.blockedReason },
+    { prepared: false, blockedReason: 'authority_unavailable' });
+  assert.equal(touchRow(), beforeRun);
+  assert.equal(beforeRun, 'scheduled:1:-');
+  await assert.rejects(buildPursueFollowUpPayload({ candidate, authority: durable, storage,
+    now: wallNow(), config: gmailConfig }), /pursue_follow_up_initial_unavailable/);
 
   // A follow-up Gmail never accepted is released, listed under generation 2, prepared again
   // although only one follow-up per day and per recipient is allowed, renewed after its lease

@@ -8,7 +8,10 @@ import {
   validateCimProviderProfileBinding,
 } from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
-import { calculateNextCimSlot } from './cimCampaignPolicy.js';
+import {
+  calculateNextCimSlot,
+  SUPPORTED_CIM_CADENCE_POLICY_VERSIONS,
+} from './cimCampaignPolicy.js';
 import { cimRfcMessageId } from './cimMailProvider.js';
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import { normalizeResendTags } from './delivery.js';
@@ -51,20 +54,67 @@ function recipientFingerprint(opportunityId, option) {
     contactAuthorityRevision: option.contactAuthorityRevision }));
 }
 
+function gmailSenderAddress(config) {
+  return cimProviderUsesGmail(config)
+    ? String(getCimProviderDeliveryConfig(config).delivery?.gmailSenderAddress || '').trim() : '';
+}
+
+// The initial's RFC Message-ID the follow-up replies to, or null when there is none.
+function initialMessageId(initial) {
+  return initial?.transmissionId && initial.subject
+    ? cimRfcMessageId(initial.transmissionId, initial.fromAddress) : null;
+}
+
+/**
+ * The campaign's stamped cadence, validated the way `deriveAcceptedCimCadence` validates it
+ * before scheduling the next touch: same policy, a supported cadence version, a send time, and
+ * a derivation bound to the campaign's initial acceptance and expiry. Throws
+ * `pursue_follow_up_cadence_unavailable` otherwise.
+ */
+function followUpCadence({ touch, campaign, timezone }) {
+  const unavailable = () => new Error('pursue_follow_up_cadence_unavailable');
+  const derivation = jsonObject(campaign?.expiry_derivation);
+  const kind = nextCimTouchKind(touch?.kind);
+  const same = (left, right) => {
+    const a = Date.parse(left ?? '');
+    return Number.isFinite(a) && a === Date.parse(right ?? '');
+  };
+  if (!kind || !timezone?.iana_timezone || !campaign?.local_expiry_at
+    || !campaign.initial_accepted_at
+    || derivation.policyVersion !== campaign.policy_version
+    || !SUPPORTED_CIM_CADENCE_POLICY_VERSIONS.includes(derivation.cadencePolicyVersion)
+    || typeof derivation.sendTime !== 'string'
+    || !same(derivation.sourceAcceptedAt, campaign.initial_accepted_at)
+    || !same(derivation.expiresAt, campaign.local_expiry_at)) throw unavailable();
+  return { kind, derivation };
+}
+
 /**
  * Reads the authority `runCimFollowUpPreparation` checks before and after its claim. Durable
  * records come from `storage.readCimFollowUpAuthority`; the recipient and the materials state
  * come from the broker-materials authority (`loadMemberAuthority`, the same reader the final
- * gate uses). Returns null when the touch does not exist or that authority is unavailable.
+ * gate uses). Returns null (the runner stops with authority_unavailable, before claiming) when
+ * the touch does not exist, that authority is unavailable, or anything `buildPayload` would
+ * reject is already known: no Gmail sender, no accepted initial or no safe Message-ID to reply
+ * to, or a campaign cadence that cannot say whether this follow-up is the Final one.
  */
 export async function loadPursueFollowUpAuthority({ candidate, storage, now,
-  loadMemberAuthority = loadBrokerMaterialsAuthority } = {}) {
+  loadMemberAuthority = loadBrokerMaterialsAuthority, config: configOverride } = {}) {
   if (typeof storage?.readCimFollowUpAuthority !== 'function') {
     throw new Error('CIM follow-up authority storage unavailable');
   }
   const at = isoInstant(now);
+  const config = configOverride || getConfig();
+  if (!gmailSenderAddress(config)) return null;
   const durable = await storage.readCimFollowUpAuthority({ touchId: candidate?.touch_id, now: at });
-  if (!durable?.touch) return null;
+  if (!durable?.touch || !initialMessageId(durable.initial)) return null;
+  const ordinal = Number(durable.touch.ordinal);
+  if (!Number.isSafeInteger(ordinal) || ordinal < 1) return null;
+  try {
+    isFinalPursueFollowUp({ authority: durable, now: at });
+  } catch {
+    return null;
+  }
   const opportunityId = durable.touch.opportunity_id;
   let broker;
   try {
@@ -113,16 +163,17 @@ export async function loadPursueFollowUpAuthority({ candidate, storage, now,
  * acceptance now under the campaign's stamped cadence, would land at or after its expiry.
  */
 export function isFinalPursueFollowUp({ authority, now }) {
-  const { touch, campaign, timezone } = authority ?? {};
-  const derivation = jsonObject(campaign?.expiry_derivation);
-  const kind = nextCimTouchKind(touch?.kind);
-  if (!kind || !campaign?.local_expiry_at || !timezone?.iana_timezone) {
+  const { campaign, timezone } = authority ?? {};
+  const { kind, derivation } = followUpCadence(authority ?? {});
+  let following;
+  try {
+    following = calculateNextCimSlot({ policyVersion: campaign.policy_version,
+      cadencePolicyVersion: derivation.cadencePolicyVersion, timezone: timezone.iana_timezone,
+      kind, priorAcceptedAt: isoInstant(now), priorOutcome: 'accepted',
+      expiryAt: isoInstant(campaign.local_expiry_at), sendTime: derivation.sendTime });
+  } catch {
     throw new Error('pursue_follow_up_cadence_unavailable');
   }
-  const following = calculateNextCimSlot({ policyVersion: campaign.policy_version,
-    cadencePolicyVersion: derivation.cadencePolicyVersion, timezone: timezone.iana_timezone, kind,
-    priorAcceptedAt: isoInstant(now), priorOutcome: 'accepted',
-    expiryAt: isoInstant(campaign.local_expiry_at), sendTime: derivation.sendTime || '08:00' });
   return following === null;
 }
 
@@ -133,15 +184,13 @@ export function isFinalPursueFollowUp({ authority, now }) {
  * that the Gmail dispatch reads. Throws a coded error when there is nothing to reply to.
  */
 export async function buildPursueFollowUpPayload({ authority, now, config: configOverride } = {}) {
+  // Defensive: loadPursueFollowUpAuthority already returns null for each of these, so the
+  // runner stops before claiming the touch.
   const config = configOverride || getConfig();
   if (!cimProviderUsesGmail(config)) throw new Error('pursue_follow_up_requires_gmail');
-  const fromAddress = String(getCimProviderDeliveryConfig(config).delivery?.gmailSenderAddress
-    || '').trim();
+  const fromAddress = gmailSenderAddress(config);
   const { touch, conversation, opportunity, initial, recipient } = authority ?? {};
-  if (!initial?.transmissionId || !initial.subject) {
-    throw new Error('pursue_follow_up_initial_unavailable');
-  }
-  const inReplyTo = cimRfcMessageId(initial.transmissionId, initial.fromAddress);
+  const inReplyTo = initialMessageId(initial);
   if (!inReplyTo) throw new Error('pursue_follow_up_initial_unavailable');
   const toAddress = conversation?.recipient_address ?? '';
   const followUpNumber = Number(touch?.ordinal);
