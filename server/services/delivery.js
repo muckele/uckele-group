@@ -537,8 +537,66 @@ async function recordTrackedEmailDelivery(message, result) {
   }
 }
 
+// Pursue CIM through the owner's Gmail mailbox (spec 2026-11-03 §4.3, §5.6, §5.7). Runs only
+// after the CIM boundary entered the provider seam. The provider never throws for a provider
+// outcome; anything thrown is treated as an ambiguous outcome to reconcile through findSent.
+async function sendViaGmailCim(message, { mailProvider, onProviderAttempt, fromName = '' } = {}) {
+  // The seam was entered: from here every path is a provider outcome the touch is finalized,
+  // released or reconciled under, never a silent provider-pending.
+  onProviderAttempt?.();
+  const followUp = message.kind === 'cim-follow-up';
+  if (followUp && (!message.gmailThreadId || !message.inReplyTo)) {
+    return { status: 'failed', provider: 'gmail', providerMessageId: '',
+      errorCategory: 'gmail_thread_missing', definitiveFailure: true,
+      error: 'A follow-up needs the conversation Gmail thread and the initial Message-ID.' };
+  }
+  // The owner's name (DEAL_HUNTER_SENDER_NAME) is the From display name; the address is the
+  // stored one. The header writer strips or encodes anything unsafe in the name.
+  const displayName = String(fromName ?? '').trim();
+  let sent;
+  try {
+    sent = await mailProvider.send({
+      transmissionId: message.transmissionId,
+      to: normalizeRecipients(message.to)[0],
+      from: displayName ? { name: displayName, address: message.from } : message.from,
+      subject: message.subject,
+      text: message.text,
+      html: message.html,
+      ...(followUp ? { threadId: message.gmailThreadId, inReplyTo: message.inReplyTo,
+        references: message.references?.length ? message.references : [message.inReplyTo] } : {}),
+    });
+  } catch {
+    sent = { outcome: 'ambiguous', code: 'gmail_send_threw' };
+  }
+  const code = typeof sent?.code === 'string' && sent.code ? sent.code.slice(0, 160)
+    : 'gmail_outcome_unknown';
+  const base = { provider: 'gmail', rfcMessageId: sent?.rfcMessageId ?? null };
+  switch (sent?.outcome) {
+    case 'accepted':
+      return { ...base, status: 'sent', error: '', errorCategory: '',
+        providerMessageId: sent.messageId, providerThreadId: sent.threadId };
+    case 'definitive-failure':
+      return { ...base, status: 'failed', error: `Gmail rejected the message (${code}).`,
+        errorCategory: code, definitiveFailure: true, providerMessageId: '' };
+    case 'quota':
+      // Gmail refused before acceptance: nothing was sent, and the touch goes back to scheduled.
+      return { ...base, status: 'failed', error: `Gmail quota reached (${code}).`,
+        errorCategory: 'provider_quota', providerUnsent: true, definitiveFailure: false,
+        providerMessageId: '' };
+    case 'not-attempted':
+      // Nothing reached Gmail and the message is not at fault (Ruling E).
+      return { ...base, status: 'failed', error: `Gmail was not reached (${code}).`,
+        errorCategory: code, providerUnsent: true, definitiveFailure: false,
+        providerMessageId: '' };
+    default:
+      return { ...base, status: 'ambiguous', error: `Gmail outcome is ambiguous (${code}).`,
+        errorCategory: code, providerOutcomeAmbiguous: true, providerMessageId: '' };
+  }
+}
+
 async function sendMessage(message, {
   configOverride, fetcher, cimProviderAuthorization, storage, now, testHooks = {},
+  cimMailProvider,
 } = {}) {
   const config = configOverride || getConfig();
   let deliveryConfig = config;
@@ -600,7 +658,9 @@ async function sendMessage(message, {
         providerMessageId: '',
       };
     }
-    if (deliveryConfig.delivery.provider !== 'resend') {
+    const gmailEligible = deliveryConfig.delivery.provider === 'gmail'
+      && typeof cimMailProvider?.send === 'function';
+    if (deliveryConfig.delivery.provider !== 'resend' && !gmailEligible) {
       return {
         status: 'failed',
         error: 'The selected provider profile is not eligible for CIM outreach.',
@@ -657,6 +717,15 @@ async function sendMessage(message, {
 
   try {
     switch (deliveryConfig.delivery.provider) {
+      case 'gmail':
+        // Gmail exists only for protected CIM work that entered the seam with a mail provider;
+        // anything else keeps the previous fallthrough to the console provider.
+        result = cimClassification.protected && typeof cimMailProvider?.send === 'function'
+          ? await sendViaGmailCim(message, { mailProvider: cimMailProvider,
+            fromName: config?.dealHunter?.sender?.name,
+            onProviderAttempt: () => { providerAttempted = true; } })
+          : await sendViaConsole(message);
+        break;
       case 'resend':
         result = await sendViaResend(message, { config: deliveryConfig, fetcher,
           onProviderAttempt: () => { providerAttempted = true; } });

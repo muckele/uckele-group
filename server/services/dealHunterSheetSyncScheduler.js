@@ -24,6 +24,7 @@ function sheetSyncMetadata(result, { ok, error }) {
     groupCounts: result?.groupCounts && typeof result.groupCounts === 'object' ? result.groupCounts : {},
     requiredSourcesHealthy: result?.requiredSourcesHealthy === true,
     autoPursue: result?.autoPursue ?? null,
+    waitingEnrollments: result?.waitingEnrollments ?? null,
     durationMs: Number.isFinite(Number(result?.durationMs)) ? Number(result.durationMs) : null,
     error: error || null,
   }));

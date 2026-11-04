@@ -345,6 +345,15 @@ const relationshipInventoryEntries = [
     scannerPath: 'excluded.autoPursueRunIdentity',
     reason: excludedRelationshipReason,
   }),
+  // A Pursue send control key names one global switch (live sending, contact rule,
+  // wording approval); it carries no canonical opportunity identity.
+  ...relationshipEntries({
+    table: 'deal_hunter_pursue_send_controls',
+    columns: ['control_key'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
+    scannerPath: 'excluded.pursueSendControlKey',
+    reason: excludedRelationshipReason,
+  }),
   ...relationshipEntries({
     table: 'deal_hunter_opportunity_timezone_revisions',
     columns: ['evidence_id', 'opportunity_id'],
@@ -361,7 +370,14 @@ const relationshipInventoryEntries = [
   }),
   ...relationshipEntries({
     table: 'deal_hunter_broker_conversations',
-    columns: ['recipient_authority_id', 'rfc_thread_key'],
+    columns: ['gmail_thread_id', 'recipient_authority_id', 'rfc_thread_key'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_gmail_reply_messages',
+    columns: ['conversation_id', 'gmail_message_id', 'gmail_thread_id'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
     scannerPath: 'dependentState.records.pursueCimAuthorities',
     reason: inertPursueCimAuthorityBlockingReason,

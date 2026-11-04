@@ -37,6 +37,16 @@ import { restoreCrmLifecycleInTransaction } from './crmRestoreSqlite.js';
 import { upgradeOperatorFinancialFacts } from './operatorFinancialFactsSqlite.js';
 import { restoreCurrentUnlinkedInTransaction } from './currentUnlinkedRestoreSqlite.js';
 import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRestore.js';
+import {
+  SEND_CONTROL_AUDIT_EVENT, SEND_CONTROL_AUDIT_SOURCE, normalizeGmailConnectionRow,
+  normalizeOpenGmailConversationRow, normalizeSendControlRow, normalizeSendControlRows,
+  sendControlConflictError, validateCimCommunicationMessageId,
+  validateConversationGmailThread, validateGmailCheckpointUpdate,
+  validateGmailTokenCheck, validateRevokeGmailConnection, validateSaveGmailConnection,
+  validateSetPursueSendControl, normalizeGmailReplyMessageRow, normalizeGmailSentIdentityRow,
+  validateGmailReplyMessage, validateGmailReplyMessageLookup, validateGmailSentIdentityLookup,
+  validateGmailPendingReplyLookup,
+} from './gmailSendStorageContract.js';
 
 function cimSafetyDigest(...parts) {
   const framed = parts.map((part) => {
@@ -1053,6 +1063,81 @@ function crmSubmissionReversalReceiptMatches(relation, receipt) {
     && manifest.supersededSubmissionId === relation.supersededSubmissionId
     && manifest.opportunityId === relation.opportunityId
   );
+}
+
+// A follow-up's reservation is consumed when its transmission goes provider-pending. The
+// recipient window never shrinks (the lifecycle trigger forbids it), so it is the later of the
+// reserved window and one day from consumption. Recreated at startup so existing databases
+// pick up the latest definition.
+const cimCapacityConsumeTriggerSql = `
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_consume
+      BEFORE UPDATE OF state ON deal_hunter_cim_transmissions
+      WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'provider-pending'
+        AND EXISTS (
+          SELECT 1 FROM deal_hunter_cim_transmission_touches m
+          JOIN deal_hunter_cim_campaign_touches t ON t.id=m.touch_id
+          WHERE m.transmission_id=NEW.id AND m.cancelled_at IS NULL AND t.kind <> 'initial'
+        )
+      BEGIN
+        SELECT CASE WHEN (
+          SELECT COUNT(*) FROM deal_hunter_cim_capacity_reservations r
+          JOIN deal_hunter_cim_campaign_touches t ON t.id=r.touch_id
+          JOIN deal_hunter_cim_campaigns c ON c.id=r.campaign_id
+          JOIN deal_hunter_broker_conversations v ON v.id=r.conversation_id
+          JOIN deal_hunter_cim_capability_activations a ON a.id=r.activation_id
+          JOIN deal_hunter_cim_capability_activations initial
+            ON initial.id=a.prerequisite_activation_id
+          JOIN deal_hunter_cim_capability_activations enrollment
+            ON enrollment.id=initial.prerequisite_activation_id
+          JOIN deal_hunter_cim_capability_activations safety
+            ON safety.id=enrollment.prerequisite_activation_id
+          WHERE r.transmission_id=NEW.id AND r.state='reserved'
+            AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND t.transmission_id=NEW.id AND t.state='claimed'
+            AND t.claim_token_digest=r.claim_token_digest
+            AND t.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND c.id=t.campaign_id AND c.state='active-follow-up'
+            AND c.local_expiry_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND c.recipient_fingerprint=r.recipient_fingerprint
+            AND v.id=NEW.conversation_id AND v.state='open'
+            AND v.recipient_fingerprint=r.recipient_fingerprint
+            AND v.recipient_address=json_extract(NEW.to_addresses,'$[0]')
+            AND a.capability='fl04c-followup' AND a.status='current' AND a.mode='active'
+            AND (a.expires_at IS NULL OR a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND a.prerequisite_evidence_id IS NOT NULL
+            AND a.prerequisite_evidence_hash IS NOT NULL
+            AND initial.capability='fl04b-initial' AND initial.status='current'
+            AND initial.mode NOT IN ('off','shadow')
+            AND (initial.expires_at IS NULL
+              OR initial.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND initial.prerequisite_evidence_id IS NOT NULL
+            AND initial.prerequisite_evidence_hash IS NOT NULL
+            AND enrollment.capability='fl04b-enrollment' AND enrollment.status='current'
+            AND enrollment.mode NOT IN ('off','shadow')
+            AND (enrollment.expires_at IS NULL
+              OR enrollment.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND enrollment.prerequisite_evidence_id IS NOT NULL
+            AND enrollment.prerequisite_evidence_hash IS NOT NULL
+            AND safety.capability='fl04a-safety' AND safety.status='current'
+            AND safety.mode NOT IN ('off','shadow')
+            AND (safety.expires_at IS NULL
+              OR safety.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ) <> 1 THEN RAISE(ABORT, 'follow-up capacity authority unavailable') END;
+        UPDATE deal_hunter_cim_capacity_reservations SET state = 'consumed',
+          consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+          recipient_window_expires_at = MAX(recipient_window_expires_at,
+            strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day')),
+          row_version = row_version + 1
+        WHERE transmission_id = NEW.id AND state = 'reserved'
+          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now');
+      END;
+`;
+
+function migrateCimCapacityConsumeTrigger(database) {
+  database.transaction(() => {
+    database.exec('DROP TRIGGER IF EXISTS trg_deal_hunter_cim_capacity_consume');
+    database.exec(cimCapacityConsumeTriggerSql);
+  }).immediate();
 }
 
 function migrateCrmSubmissionReversalTrigger(database) {
@@ -4954,66 +5039,7 @@ export function createSqliteStorage(config, options = {}) {
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_no_delete
       BEFORE DELETE ON deal_hunter_cim_capacity_reservations
       BEGIN SELECT RAISE(ABORT, 'capacity reservation evidence is retained'); END;
-      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_consume
-      BEFORE UPDATE OF state ON deal_hunter_cim_transmissions
-      WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'provider-pending'
-        AND EXISTS (
-          SELECT 1 FROM deal_hunter_cim_transmission_touches m
-          JOIN deal_hunter_cim_campaign_touches t ON t.id=m.touch_id
-          WHERE m.transmission_id=NEW.id AND m.cancelled_at IS NULL AND t.kind <> 'initial'
-        )
-      BEGIN
-        SELECT CASE WHEN (
-          SELECT COUNT(*) FROM deal_hunter_cim_capacity_reservations r
-          JOIN deal_hunter_cim_campaign_touches t ON t.id=r.touch_id
-          JOIN deal_hunter_cim_campaigns c ON c.id=r.campaign_id
-          JOIN deal_hunter_broker_conversations v ON v.id=r.conversation_id
-          JOIN deal_hunter_cim_capability_activations a ON a.id=r.activation_id
-          JOIN deal_hunter_cim_capability_activations initial
-            ON initial.id=a.prerequisite_activation_id
-          JOIN deal_hunter_cim_capability_activations enrollment
-            ON enrollment.id=initial.prerequisite_activation_id
-          JOIN deal_hunter_cim_capability_activations safety
-            ON safety.id=enrollment.prerequisite_activation_id
-          WHERE r.transmission_id=NEW.id AND r.state='reserved'
-            AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            AND t.transmission_id=NEW.id AND t.state='claimed'
-            AND t.claim_token_digest=r.claim_token_digest
-            AND t.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            AND c.id=t.campaign_id AND c.state='active-follow-up'
-            AND c.local_expiry_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            AND c.recipient_fingerprint=r.recipient_fingerprint
-            AND v.id=NEW.conversation_id AND v.state='open'
-            AND v.recipient_fingerprint=r.recipient_fingerprint
-            AND v.recipient_address=json_extract(NEW.to_addresses,'$[0]')
-            AND a.capability='fl04c-followup' AND a.status='current' AND a.mode='active'
-            AND (a.expires_at IS NULL OR a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            AND a.prerequisite_evidence_id IS NOT NULL
-            AND a.prerequisite_evidence_hash IS NOT NULL
-            AND initial.capability='fl04b-initial' AND initial.status='current'
-            AND initial.mode NOT IN ('off','shadow')
-            AND (initial.expires_at IS NULL
-              OR initial.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            AND initial.prerequisite_evidence_id IS NOT NULL
-            AND initial.prerequisite_evidence_hash IS NOT NULL
-            AND enrollment.capability='fl04b-enrollment' AND enrollment.status='current'
-            AND enrollment.mode NOT IN ('off','shadow')
-            AND (enrollment.expires_at IS NULL
-              OR enrollment.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            AND enrollment.prerequisite_evidence_id IS NOT NULL
-            AND enrollment.prerequisite_evidence_hash IS NOT NULL
-            AND safety.capability='fl04a-safety' AND safety.status='current'
-            AND safety.mode NOT IN ('off','shadow')
-            AND (safety.expires_at IS NULL
-              OR safety.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        ) <> 1 THEN RAISE(ABORT, 'follow-up capacity authority unavailable') END;
-        UPDATE deal_hunter_cim_capacity_reservations SET state = 'consumed',
-          consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-          recipient_window_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day'),
-          row_version = row_version + 1
-        WHERE transmission_id = NEW.id AND state = 'reserved'
-          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now');
-      END;
+${cimCapacityConsumeTriggerSql}
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_release
       AFTER UPDATE OF state ON deal_hunter_cim_transmissions
       WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'cancelled-before-provider'
@@ -5542,6 +5568,66 @@ export function createSqliteStorage(config, options = {}) {
       CREATE INDEX IF NOT EXISTS idx_auto_pursue_runs_business_date
         ON deal_hunter_auto_pursue_runs(business_date, created_at);
 
+      -- The owner's Gmail connection: one active (non-revoked) row. The refresh token
+      -- is stored only as AES-256-GCM ciphertext.
+      CREATE TABLE IF NOT EXISTS deal_hunter_gmail_connections (
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 120),
+        email_address TEXT NOT NULL
+          CHECK(email_address = trim(email_address) AND length(email_address) BETWEEN 3 AND 320),
+        refresh_token_ciphertext TEXT NOT NULL
+          CHECK(refresh_token_ciphertext LIKE 'v1.%' AND length(refresh_token_ciphertext) <= 8192),
+        granted_scopes TEXT NOT NULL DEFAULT '[]' CHECK(json_type(granted_scopes) = 'array'),
+        connected_at TEXT NOT NULL CHECK(julianday(connected_at) IS NOT NULL),
+        connected_by TEXT NOT NULL CHECK(connected_by = trim(connected_by) AND length(connected_by) BETWEEN 1 AND 200),
+        revoked_at TEXT CHECK(revoked_at IS NULL OR julianday(revoked_at) IS NOT NULL),
+        revoked_by TEXT CHECK(revoked_by IS NULL OR (revoked_by = trim(revoked_by) AND length(revoked_by) BETWEEN 1 AND 200)),
+        history_checkpoint TEXT
+          CHECK(history_checkpoint IS NULL OR (length(history_checkpoint) BETWEEN 1 AND 30
+            AND history_checkpoint NOT GLOB '*[^0-9]*')),
+        last_token_ok_at TEXT CHECK(last_token_ok_at IS NULL OR julianday(last_token_ok_at) IS NOT NULL),
+        last_error_code TEXT CHECK(last_error_code IS NULL OR (length(last_error_code) BETWEEN 1 AND 80
+          AND last_error_code NOT GLOB '*[^a-z0-9_]*')),
+        CHECK((revoked_at IS NULL) = (revoked_by IS NULL))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_gmail_connections_active
+        ON deal_hunter_gmail_connections((1)) WHERE revoked_at IS NULL;
+
+      -- Durable, revisioned Pursue send controls; every change appends a CIM audit event.
+      CREATE TABLE IF NOT EXISTS deal_hunter_pursue_send_controls (
+        control_key TEXT NOT NULL PRIMARY KEY
+          CHECK(control_key IN ('live_sending', 'contact_rule', 'wording_approval')),
+        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+        value_digest TEXT CHECK(value_digest IS NULL OR (length(value_digest) = 64
+          AND value_digest NOT GLOB '*[^0-9a-f]*')),
+        policy_version TEXT CHECK(policy_version IS NULL
+          OR (policy_version = trim(policy_version) AND length(policy_version) BETWEEN 1 AND 120)),
+        changed_at TEXT NOT NULL CHECK(julianday(changed_at) IS NOT NULL),
+        changed_by TEXT NOT NULL CHECK(changed_by = trim(changed_by) AND length(changed_by) BETWEEN 1 AND 200),
+        revision INTEGER NOT NULL CHECK(revision >= 1),
+        CHECK(control_key <> 'wording_approval' OR enabled = 0 OR value_digest IS NOT NULL)
+      );
+
+      -- The reply poller's processed-message log: one row per Gmail message it applied. Only
+      -- the classification, the Gmail ids, a From-address fingerprint and timestamps; never a
+      -- body, subject or snippet.
+      CREATE TABLE IF NOT EXISTS deal_hunter_gmail_reply_messages (
+        gmail_message_id TEXT NOT NULL PRIMARY KEY CHECK(length(gmail_message_id) BETWEEN 1 AND 240
+          AND gmail_message_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        gmail_thread_id TEXT NOT NULL CHECK(length(gmail_thread_id) BETWEEN 1 AND 240
+          AND gmail_thread_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        conversation_id TEXT NOT NULL
+          CHECK(conversation_id = trim(conversation_id) AND length(conversation_id) BETWEEN 1 AND 240),
+        classification TEXT NOT NULL
+          CHECK(classification IN ('ours', 'owner', 'bounce', 'auto-reply', 'stop', 'reply')),
+        from_fingerprint TEXT CHECK(from_fingerprint IS NULL OR (length(from_fingerprint) = 64
+          AND from_fingerprint NOT GLOB '*[^0-9a-f]*')),
+        message_at TEXT CHECK(message_at IS NULL OR julianday(message_at) IS NOT NULL),
+        processed_at TEXT NOT NULL CHECK(julianday(processed_at) IS NOT NULL),
+        applied INTEGER NOT NULL DEFAULT 1 CHECK(applied IN (0, 1))
+      );
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_gmail_reply_messages_conversation
+        ON deal_hunter_gmail_reply_messages(conversation_id, processed_at);
+
     CREATE TABLE IF NOT EXISTS scheduled_job_runs (
       job_key TEXT PRIMARY KEY,
       job_name TEXT NOT NULL,
@@ -5723,6 +5809,7 @@ export function createSqliteStorage(config, options = {}) {
 	  `);
 
   migrateCrmSubmissionReversalTrigger(database);
+  migrateCimCapacityConsumeTrigger(database);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
   ensureColumn(database, 'contact_submissions', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
@@ -5842,6 +5929,16 @@ export function createSqliteStorage(config, options = {}) {
   // deliberately absent from the machine score write and every operator-owned writer.
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_blocker', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_checked_at', 'TEXT');
+  // Whether a Gmail reply's effect has been applied (pending rows are applied again).
+  ensureColumn(database, 'deal_hunter_gmail_reply_messages', 'applied',
+    'INTEGER NOT NULL DEFAULT 1 CHECK(applied IN (0, 1))');
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_deal_hunter_gmail_reply_messages_pending
+    ON deal_hunter_gmail_reply_messages(processed_at, gmail_message_id) WHERE applied = 0`);
+  // The Gmail thread a Pursue conversation's accepted sends live in; the reply poller reads it.
+  ensureColumn(database, 'deal_hunter_broker_conversations', 'gmail_thread_id',
+    "TEXT CHECK(gmail_thread_id IS NULL OR (length(gmail_thread_id) BETWEEN 1 AND 240 AND gmail_thread_id NOT GLOB '*[^A-Za-z0-9_-]*'))");
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_deal_hunter_broker_conversations_gmail_thread
+    ON deal_hunter_broker_conversations(gmail_thread_id) WHERE gmail_thread_id IS NOT NULL`);
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunities', 'first_accepted_at', 'TEXT');
@@ -11021,6 +11118,261 @@ export function createSqliteStorage(config, options = {}) {
         `).get(address));
       },
 
+      async getGmailConnection() {
+        return normalizeGmailConnectionRow(database.prepare(`
+          SELECT * FROM deal_hunter_gmail_connections WHERE revoked_at IS NULL LIMIT 1
+        `).get());
+      },
+
+      /**
+       * Stores a new active connection, revoking any prior active row in the same transaction.
+       * Reconnecting the previous connection's mailbox (same address, any case) keeps that
+       * connection's reply checkpoint instead of Google's current historyId, so a reply that
+       * arrived while it was disconnected is still read (Ruling U).
+       */
+      async saveGmailConnection(command = {}) {
+        const connection = validateSaveGmailConnection(command);
+        const id = randomUUID();
+        return database.transaction(() => {
+          const previous = database.prepare(`
+            SELECT email_address, history_checkpoint FROM deal_hunter_gmail_connections
+            ORDER BY (revoked_at IS NULL) DESC, connected_at DESC, revoked_at DESC, id DESC LIMIT 1
+          `).get();
+          const historyCheckpoint = previous && String(previous.email_address).trim().toLowerCase()
+            === connection.emailAddress.trim().toLowerCase()
+            ? previous.history_checkpoint ?? null : connection.historyCheckpoint;
+          database.prepare(`
+            UPDATE deal_hunter_gmail_connections SET revoked_at = ?, revoked_by = ?
+            WHERE revoked_at IS NULL
+          `).run(connection.now, connection.connectedBy);
+          database.prepare(`
+            INSERT INTO deal_hunter_gmail_connections (
+              id, email_address, refresh_token_ciphertext, granted_scopes, connected_at,
+              connected_by, history_checkpoint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(id, connection.emailAddress, connection.refreshTokenCiphertext,
+            JSON.stringify(connection.grantedScopes), connection.now, connection.connectedBy,
+            historyCheckpoint);
+          return normalizeGmailConnectionRow(database.prepare(`
+            SELECT * FROM deal_hunter_gmail_connections WHERE id = ?
+          `).get(id));
+        }).immediate();
+      },
+
+      async revokeGmailConnection(command = {}) {
+        const { revokedBy, now } = validateRevokeGmailConnection(command);
+        return database.transaction(() => {
+          const active = database.prepare(`
+            SELECT id FROM deal_hunter_gmail_connections WHERE revoked_at IS NULL LIMIT 1
+          `).get();
+          if (!active) return null;
+          database.prepare(`
+            UPDATE deal_hunter_gmail_connections SET revoked_at = ?, revoked_by = ? WHERE id = ?
+          `).run(now, revokedBy, active.id);
+          return normalizeGmailConnectionRow(database.prepare(`
+            SELECT * FROM deal_hunter_gmail_connections WHERE id = ?
+          `).get(active.id));
+        }).immediate();
+      },
+
+      /** A successful check clears the error; a failed one keeps the last good instant. */
+      async recordGmailTokenCheck(command = {}) {
+        const { ok, errorCode, now } = validateGmailTokenCheck(command);
+        return database.transaction(() => {
+          const changed = ok
+            ? database.prepare(`UPDATE deal_hunter_gmail_connections
+                SET last_token_ok_at = ?, last_error_code = NULL WHERE revoked_at IS NULL`).run(now).changes
+            : database.prepare(`UPDATE deal_hunter_gmail_connections
+                SET last_error_code = ? WHERE revoked_at IS NULL`).run(errorCode).changes;
+          if (changed === 0) return null;
+          return normalizeGmailConnectionRow(database.prepare(`
+            SELECT * FROM deal_hunter_gmail_connections WHERE revoked_at IS NULL LIMIT 1
+          `).get());
+        }).immediate();
+      },
+
+      /** Compare-and-set of the active connection's reply checkpoint. */
+      async updateGmailHistoryCheckpoint(command = {}) {
+        const { expected, next } = validateGmailCheckpointUpdate(command);
+        return database.prepare(`
+          UPDATE deal_hunter_gmail_connections SET history_checkpoint = ?
+          WHERE revoked_at IS NULL AND history_checkpoint IS ?
+        `).run(next, expected).changes === 1;
+      },
+
+      async getPursueSendControls() {
+        return normalizeSendControlRows(database.prepare(`
+          SELECT * FROM deal_hunter_pursue_send_controls
+        `).all());
+      },
+
+      /** Revisioned write of one send control plus its audit event; a stale revision conflicts. */
+      async setPursueSendControl(command = {}) {
+        const control = validateSetPursueSendControl(command);
+        return database.transaction(() => {
+          const current = database.prepare(`
+            SELECT * FROM deal_hunter_pursue_send_controls WHERE control_key = ?
+          `).get(control.controlKey);
+          const currentRevision = current ? Number(current.revision) : 0;
+          if (currentRevision !== control.expectedRevision) throw sendControlConflictError();
+          const revision = currentRevision + 1;
+          database.prepare(`
+            INSERT INTO deal_hunter_pursue_send_controls (
+              control_key, enabled, value_digest, policy_version, changed_at, changed_by, revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(control_key) DO UPDATE SET enabled = excluded.enabled,
+              value_digest = excluded.value_digest, policy_version = excluded.policy_version,
+              changed_at = excluded.changed_at, changed_by = excluded.changed_by,
+              revision = excluded.revision
+          `).run(control.controlKey, control.enabled ? 1 : 0, control.valueDigest,
+            control.policyVersion, control.now, control.actor, revision);
+          database.prepare(`
+            INSERT INTO deal_hunter_cim_audit_events (
+              id, event_type, prior_state, next_state, reason_code, authority_digest,
+              actor, source, occurred_at, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(`send-control:${control.controlKey}:${revision}`, SEND_CONTROL_AUDIT_EVENT,
+            current?.enabled ? 'on' : 'off', control.enabled ? 'on' : 'off', control.controlKey,
+            control.valueDigest, control.actor, SEND_CONTROL_AUDIT_SOURCE, control.now,
+            JSON.stringify({ controlKey: control.controlKey, revision,
+              policyVersion: control.policyVersion, valueDigest: control.valueDigest,
+              reason: control.reason }));
+          return normalizeSendControlRow(database.prepare(`
+            SELECT * FROM deal_hunter_pursue_send_controls WHERE control_key = ?
+          `).get(control.controlKey));
+        }).immediate();
+      },
+
+      /**
+       * Records the Gmail thread of a conversation once. The same thread again is a replay;
+       * a different one is a conflict. The terminal writers' row_version is left alone.
+       */
+      async setCimConversationGmailThread(command = {}) {
+        const { conversationId, gmailThreadId, now } = validateConversationGmailThread(command);
+        return database.transaction(() => {
+          const conversation = database.prepare(`
+            SELECT gmail_thread_id FROM deal_hunter_broker_conversations WHERE id = ?
+          `).get(conversationId);
+          if (!conversation) throw new Error('Unknown Pursue CIM conversation');
+          if (conversation.gmail_thread_id === gmailThreadId) {
+            return { applied: false, replay: true, conflict: false };
+          }
+          if (conversation.gmail_thread_id !== null) return { applied: false, replay: false, conflict: true };
+          database.prepare(`
+            UPDATE deal_hunter_broker_conversations SET gmail_thread_id = ?, updated_at = ?
+            WHERE id = ? AND gmail_thread_id IS NULL
+          `).run(gmailThreadId, now, conversationId);
+          return { applied: true, replay: false, conflict: false };
+        }).immediate();
+      },
+
+      /**
+       * Stores the Message-ID Gmail actually gave an accepted Gmail transmission's sent message
+       * as its communication's message id (follow-up threading, reply recognition, findSent).
+       * Never overwrites a different stored id.
+       */
+      async setCimCommunicationMessageId(command = {}) {
+        const { transmissionId, messageId } = validateCimCommunicationMessageId(command);
+        return database.transaction(() => {
+          const row = database.prepare(`
+            SELECT tr.state, tr.provider, c.id AS communication_id, c.message_id
+            FROM deal_hunter_cim_transmissions tr
+            JOIN crm_communications c ON c.id = tr.communication_id
+            WHERE tr.id = ?
+          `).get(transmissionId);
+          if (!row) throw new Error('Unknown Pursue CIM transmission');
+          if (row.state !== 'accepted' || row.provider !== 'gmail') {
+            return { applied: false, replay: false, conflict: true };
+          }
+          if (row.message_id === messageId) return { applied: false, replay: true, conflict: false };
+          if (row.message_id) return { applied: false, replay: false, conflict: true };
+          database.prepare(`
+            UPDATE crm_communications SET message_id = ? WHERE id = ? AND message_id IS NULL
+          `).run(messageId, row.communication_id);
+          return { applied: true, replay: false, conflict: false };
+        }).immediate();
+      },
+
+      /**
+       * Non-terminal conversations with a Gmail thread, each with its most recent
+       * non-terminal campaign (or its most recent campaign when all are terminal).
+       */
+      async listOpenGmailConversations() {
+        return database.prepare(`
+          SELECT v.id AS conversation_id, v.gmail_thread_id, v.recipient_fingerprint,
+            (SELECT c.id FROM deal_hunter_cim_campaigns c WHERE c.conversation_id = v.id
+              ORDER BY c.state IN ('responded', 'materials-received', 'stopped', 'expired'),
+                c.created_at DESC, c.id DESC LIMIT 1) AS campaign_id
+          FROM deal_hunter_broker_conversations v
+          WHERE v.gmail_thread_id IS NOT NULL
+            AND v.state IN ('open', 'reply-review-required', 'provider-ambiguous')
+          ORDER BY v.id
+        `).all().map(normalizeOpenGmailConversationRow);
+      },
+
+      /**
+       * Every transmission of the given conversations, in any state, with its sender address,
+       * Gmail id and stored RFC Message-ID: what lets the reply poller recognize our own sends.
+       */
+      async listGmailConversationSentIdentities(command = {}) {
+        const { conversationIds } = validateGmailSentIdentityLookup(command);
+        if (conversationIds.length === 0) return [];
+        return database.prepare(`
+          SELECT tr.conversation_id, tr.id AS transmission_id, tr.from_address, tr.provider,
+            tr.provider_message_id, communication.message_id AS rfc_message_id
+          FROM deal_hunter_cim_transmissions tr
+          LEFT JOIN crm_communications communication ON communication.id = tr.communication_id
+          WHERE tr.conversation_id IN (${conversationIds.map(() => '?').join(', ')})
+          ORDER BY tr.conversation_id, tr.id
+        `).all(...conversationIds).map(normalizeGmailSentIdentityRow);
+      },
+
+      /** The processed-message rows among the given Gmail message ids. */
+      async listGmailReplyMessages(command = {}) {
+        const { gmailMessageIds } = validateGmailReplyMessageLookup(command);
+        if (gmailMessageIds.length === 0) return [];
+        return database.prepare(`
+          SELECT * FROM deal_hunter_gmail_reply_messages
+          WHERE gmail_message_id IN (${gmailMessageIds.map(() => '?').join(', ')})
+          ORDER BY gmail_message_id
+        `).all(...gmailMessageIds).map(normalizeGmailReplyMessageRow);
+      },
+
+      /**
+       * Records a Gmail message once (the first classification wins). A pending row
+       * (applied = false) is settled by recording it again with applied = true; nothing ever
+       * moves a settled row back to pending. `applied` is true when a row was written.
+       */
+      async recordGmailReplyMessage(command = {}) {
+        const row = validateGmailReplyMessage(command);
+        const changes = database.prepare(`
+          INSERT INTO deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
+            conversation_id, classification, from_fingerprint, message_at, processed_at, applied)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(gmail_message_id) DO UPDATE SET applied = 1
+            WHERE deal_hunter_gmail_reply_messages.applied = 0 AND excluded.applied = 1
+        `).run(row.gmailMessageId, row.gmailThreadId, row.conversationId, row.classification,
+          row.fromFingerprint, row.messageAt, row.now, row.applied ? 1 : 0).changes;
+        return { applied: changes === 1, replay: changes === 0 };
+      },
+
+      /** Recorded Gmail messages whose effect is not applied yet, oldest first. */
+      async listPendingGmailReplyMessages(command = {}) {
+        const { limit } = validateGmailPendingReplyLookup(command);
+        return database.prepare(`
+          SELECT * FROM deal_hunter_gmail_reply_messages WHERE applied = 0
+          ORDER BY processed_at, gmail_message_id LIMIT ?
+        `).all(limit).map(normalizeGmailReplyMessageRow);
+      },
+
+      /** Every conversation with a Gmail reply whose effect is still pending, distinct, uncapped. */
+      async listGmailPendingReplyConversationIds() {
+        return database.prepare(`
+          SELECT DISTINCT conversation_id FROM deal_hunter_gmail_reply_messages WHERE applied = 0
+          ORDER BY conversation_id
+        `).all().map((row) => row.conversation_id);
+      },
+
       async getCurrentAutoPursueActivation() {
         return database.prepare(`
           SELECT * FROM deal_hunter_auto_pursue_activations WHERE status = 'current' LIMIT 1
@@ -15306,10 +15658,17 @@ export function createSqliteStorage(config, options = {}) {
       return normalizeScheduledJobRow(run);
     },
 
-    async listScheduledJobs({ limit = 100 } = {}) {
+    async listScheduledJobs({ limit = 100, jobName = '' } = {}) {
+      const bounded = Math.max(1, Math.min(Number(limit) || 100, 500));
+      if (jobName) {
+        return database
+          .prepare('SELECT * FROM scheduled_job_runs WHERE job_name = ? ORDER BY updated_at DESC LIMIT ?')
+          .all(String(jobName), bounded)
+          .map(normalizeScheduledJobRow);
+      }
       return database
         .prepare('SELECT * FROM scheduled_job_runs ORDER BY updated_at DESC LIMIT ?')
-        .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
+        .all(bounded)
         .map(normalizeScheduledJobRow);
     },
 

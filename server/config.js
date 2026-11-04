@@ -47,6 +47,8 @@ function numberListFromEnv(value, fallback = []) {
 export const CONTROLLED_CIM_MAILBOX_PROFILE = 'controlled-mailbox-v1';
 export const CONTROLLED_CIM_LIMITED_SMOKE_PROFILE = 'controlled-mailbox-limited-smoke-v1';
 export const PRODUCTION_CIM_PROVIDER_PROFILE = 'production-resend-v1';
+// Pursue CIM email sent from the owner's own Gmail mailbox (spec 2026-11-03 §4.3).
+export const PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE = 'production-gmail-v1';
 export const P10B_LIMITED_SMOKE_RECIPIENT = 'mathew@uckelegroup.com';
 export const P10B_LIMITED_SMOKE_SENDING_DOMAIN = 'p10b.uckelegroup.com';
 
@@ -65,6 +67,26 @@ export function resolveCimProviderProfile(environment = process.env) {
   const enabled = environment.DEAL_HUNTER_CIM_PROVIDER_ENABLED === 'true';
   const profile = String(environment.DEAL_HUNTER_CIM_PROVIDER_PROFILE || '').trim();
   if (profile === CONTROLLED_CIM_MAILBOX_PROFILE) {
+    // The owner's controlled test can go through Gmail instead of Resend (spec §10 step 5).
+    const gmail = String(environment.DEAL_HUNTER_CIM_MAILBOX_PROVIDER || '').trim() === 'gmail';
+    if (gmail) {
+      return {
+        enabled,
+        profile,
+        mode: 'controlled-mailbox',
+        provider: 'gmail',
+        gmailSenderAddress: String(environment.DEAL_HUNTER_GMAIL_SENDER_ADDRESS || '').trim(),
+        resendApiKey: '',
+        resendFromEmail: '',
+        resendReplyTo: '',
+        resendInboundDomain: '',
+        emailWebhookSecret: '',
+        reconciliationApiKey: '',
+        allowedRecipients: listFromEnv(
+          environment.DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS,
+        ),
+      };
+    }
     return {
       enabled,
       profile,
@@ -118,20 +140,45 @@ export function resolveCimProviderProfile(environment = process.env) {
       allowedRecipients: [],
     };
   }
+  if (profile === PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE) {
+    return {
+      enabled,
+      profile,
+      mode: 'production-gmail',
+      provider: 'gmail',
+      gmailSenderAddress: String(environment.DEAL_HUNTER_GMAIL_SENDER_ADDRESS || '').trim(),
+      resendApiKey: '',
+      resendFromEmail: '',
+      resendReplyTo: '',
+      resendInboundDomain: '',
+      emailWebhookSecret: '',
+      reconciliationApiKey: '',
+      allowedRecipients: [],
+    };
+  }
   return { enabled, profile, mode: 'unknown', provider: '', resendApiKey: '',
     resendFromEmail: '', resendReplyTo: '', resendInboundDomain: '',
     emailWebhookSecret: '', reconciliationApiKey: '', allowedRecipients: [] };
 }
 
+/** True when the selected CIM provider profile sends through the owner's Gmail mailbox. */
+export function cimProviderUsesGmail(config) {
+  const profile = config?.dealHunter?.cimProvider;
+  return profile?.provider === 'gmail'
+    && ['production-gmail', 'controlled-mailbox'].includes(profile?.mode);
+}
+
 export function getCimProviderDeliveryConfig(config) {
   const profile = config?.dealHunter?.cimProvider;
-  if (!['controlled-mailbox', 'controlled-mailbox-limited-smoke', 'production']
-    .includes(profile?.mode)) return config;
+  if (!['controlled-mailbox', 'controlled-mailbox-limited-smoke', 'production',
+    'production-gmail'].includes(profile?.mode)) return config;
   return {
     ...config,
     delivery: {
       ...(config?.delivery || {}),
       provider: profile.provider,
+      ...(profile.provider === 'gmail'
+        ? { gmailSenderAddress: profile.gmailSenderAddress || '' } : {}),
       resendApiKey: profile.resendApiKey,
       resendFromEmail: profile.resendFromEmail,
       resendReplyTo: profile.resendReplyTo,
@@ -157,6 +204,10 @@ export function getCimWebhookAuthority(config) {
 
 export function getCimProviderReconciliationConfig(config) {
   const profile = config?.dealHunter?.cimProvider;
+  if (cimProviderUsesGmail(config)) {
+    // Gmail reconciliation reads the owner's mailbox (findSent); there is no API key.
+    return { providerProfile: profile.profile, provider: 'gmail', apiKey: '' };
+  }
   if (profile?.mode === 'controlled-mailbox') {
     return { providerProfile: profile.profile, provider: profile.provider,
       apiKey: profile.reconciliationApiKey };
@@ -166,12 +217,61 @@ export function getCimProviderReconciliationConfig(config) {
       ? profile.reconciliationApiKey : config?.delivery?.resendApiKey || '' };
 }
 
+// The controlled-mailbox test through Gmail: one allowed recipient, sent from the configured
+// Gmail sender, with replies going back to that same mailbox.
+function validateGmailControlledMailboxBinding(profile, binding) {
+  const blockers = [];
+  if (profile.profile !== CONTROLLED_CIM_MAILBOX_PROFILE
+    || binding.providerProfile !== profile.profile) blockers.push('profile_mismatch');
+  const sender = emailAddress(profile.gmailSenderAddress);
+  if (!sender) blockers.push('outbound_credentials_missing');
+  const configuredRecipients = Array.isArray(profile.allowedRecipients)
+    ? profile.allowedRecipients : [];
+  const allowedRecipients = Array.from(new Set(configuredRecipients
+    .map(emailAddress).filter(Boolean)));
+  if (allowedRecipients.length !== 1 || configuredRecipients.length !== 1) {
+    blockers.push('mailbox_recipient_allowlist_invalid');
+  }
+  const rawToAddresses = Array.isArray(binding.toAddresses) ? binding.toAddresses : [];
+  const rawCcAddresses = Array.isArray(binding.ccAddresses) ? binding.ccAddresses : [];
+  const rawBccAddresses = Array.isArray(binding.bccAddresses) ? binding.bccAddresses : [];
+  const toAddresses = rawToAddresses.map(emailAddress).filter(Boolean);
+  if (allowedRecipients.length !== 1 || toAddresses.length !== 1
+    || rawToAddresses.length !== 1 || toAddresses[0] !== allowedRecipients[0]
+    || rawCcAddresses.length > 0 || rawBccAddresses.length > 0) {
+    blockers.push('mailbox_recipient_mismatch');
+  }
+  if (!sender || emailAddress(binding.fromAddress) !== sender) {
+    blockers.push('mailbox_sender_mismatch');
+  }
+  if (binding.replyToAddress && emailAddress(binding.replyToAddress) !== sender) {
+    blockers.push('mailbox_reply_domain_mismatch');
+  }
+  const uniqueBlockers = Array.from(new Set(blockers));
+  return { ok: uniqueBlockers.length === 0, blockers: uniqueBlockers };
+}
+
 export function validateCimProviderProfileBinding(config, binding = {}) {
   const profile = config?.dealHunter?.cimProvider;
   const selectedControlled = profile?.mode === 'controlled-mailbox';
   const requestedControlled = binding.providerProfile === CONTROLLED_CIM_MAILBOX_PROFILE;
   const selectedLimited = profile?.mode === 'controlled-mailbox-limited-smoke';
   const requestedLimited = binding.providerProfile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE;
+  const selectedGmail = profile?.mode === 'production-gmail';
+  const requestedGmail = binding.providerProfile === PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE;
+  if (selectedGmail || requestedGmail) {
+    // Production Gmail sends only from the configured owner mailbox, with replies to it.
+    const sender = emailAddress(profile?.gmailSenderAddress);
+    const blockers = [];
+    if (!selectedGmail || !requestedGmail || profile.provider !== 'gmail'
+      || profile.profile !== PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE) blockers.push('profile_mismatch');
+    if (!sender) blockers.push('outbound_credentials_missing');
+    if (!sender || emailAddress(binding.fromAddress) !== sender) blockers.push('mailbox_sender_mismatch');
+    if (binding.replyToAddress && emailAddress(binding.replyToAddress) !== sender) {
+      blockers.push('mailbox_reply_domain_mismatch');
+    }
+    return { ok: blockers.length === 0, blockers };
+  }
   if (!selectedControlled && !requestedControlled && !selectedLimited && !requestedLimited) {
     return { ok: true, blockers: [] };
   }
@@ -217,6 +317,9 @@ export function validateCimProviderProfileBinding(config, binding = {}) {
     if (profile?.reconciliationApiKey) blockers.push('limited_smoke_reconciliation_forbidden');
     const uniqueBlockers = Array.from(new Set(blockers));
     return { ok: uniqueBlockers.length === 0, blockers: uniqueBlockers };
+  }
+  if (selectedControlled && profile.provider === 'gmail') {
+    return validateGmailControlledMailboxBinding(profile, binding);
   }
   if (!selectedControlled || profile.profile !== CONTROLLED_CIM_MAILBOX_PROFILE
     || binding.providerProfile !== profile.profile || profile.provider !== 'resend') {
@@ -400,6 +503,22 @@ export function getConfig() {
       cimProvider: {
         ...cimProvider,
       },
+      // The owner's Gmail mailbox for Pursue sending. All empty until the owner sets them;
+      // tokenKey is a 32-byte base64 AES-256-GCM key for the stored refresh token.
+      gmail: {
+        clientId: process.env.GOOGLE_OAUTH_CLIENT_ID || '',
+        clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET || '',
+        senderAddress: (process.env.DEAL_HUNTER_GMAIL_SENDER_ADDRESS || '').trim(),
+        tokenKey: process.env.DEAL_HUNTER_GMAIL_TOKEN_KEY || '',
+      },
+      // The signature and footer on Pursue CIM emails. Sending is refused by readiness
+      // (signature_incomplete) while any field is blank, so these are not startup requirements.
+      sender: {
+        name: (process.env.DEAL_HUNTER_SENDER_NAME || '').trim(),
+        title: (process.env.DEAL_HUNTER_SENDER_TITLE || '').trim(),
+        phone: (process.env.DEAL_HUNTER_SENDER_PHONE || '').trim(),
+        postalAddress: (process.env.DEAL_HUNTER_CIM_AUTOMATION_PHYSICAL_POSTAL_ADDRESS || process.env.EMAIL_BRAND_MAILING_ADDRESS || '').trim(),
+      },
       sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
       // Airtable is retired from Deal Hunter. Keep the public configuration
       // field pinned off so an obsolete deployment variable cannot silently
@@ -427,6 +546,16 @@ export function getConfig() {
         retryIntervalMs: 1_800_000,
         retryUntil: '12:00',
         checkIntervalMs: 60_000,
+      },
+      // The 15-minute Pursue sender (spec 2026-11-03 §5.1). Ships off.
+      pursueSender: {
+        enabled: process.env.DEAL_HUNTER_PURSUE_SENDER_ENABLED === 'true',
+        intervalMinutes: 15,
+      },
+      // The 5-minute Gmail reply poller (spec 2026-11-03 §6). Ships off.
+      replyPoller: {
+        enabled: process.env.DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED === 'true',
+        intervalMinutes: 5,
       },
       cimFollowUp: {
         enabled: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED, false),

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 import { deriveAcceptedCimCadence } from '../server/services/pursueCimCadence.js';
 import { calculateCampaignExpiry } from '../server/services/cimCampaignPolicy.js';
+import { CONTACT_POLICY_VERSION, contactPolicyDigest } from '../server/services/pursueCimContactPolicy.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -57,6 +58,10 @@ const fl04cCapacityMigrationPath = path.join(root,
   'supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql');
 const cadenceV3MigrationPath = path.join(root,
   'supabase/migrations/20261102140000_pursue_cim_cadence_v3.sql');
+// The Gmail send runner migration adds pursue_cim_list_due_followup_touches_v1 and
+// pursue_cim_read_followup_authority_v1, so the P1C upgrade database replays it last.
+const gmailSendRunnersMigrationPath = path.join(root,
+  'supabase/migrations/20261103120000_gmail_send_runners.sql');
 // Migrations between the FL04C capacity and cadence v3 files. The best-first deal list one
 // adds pursue_cim_record_auto_pursue_decision_v1, so the P1C upgrade database replays them
 // in order to match the fresh schema's function inventory.
@@ -119,12 +124,14 @@ const expectedP1cFunctions = [
   'pursue_cim_finalize_with_cadence_v1',
   'pursue_cim_issue_live_authorization_v1',
   'pursue_cim_json_stringify_v1',
+  'pursue_cim_list_due_followup_touches_v1',
   'pursue_cim_list_due_initial_touches_v1',
   'pursue_cim_materialize_campaign_v1',
   'pursue_cim_prepare_reserved_followup_v1',
   'pursue_cim_prepare_transmission_v1',
   'pursue_cim_read_cadence_context_v1',
   'pursue_cim_read_final_gate_context_v1',
+  'pursue_cim_read_followup_authority_v1',
   'pursue_cim_read_import_outreach_counters_v1',
   'pursue_cim_read_operations_snapshot_v1',
   'pursue_cim_read_projection_v1',
@@ -1133,6 +1140,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     psql(container, 'pursue_cim_upgrade', fs.readFileSync(migrationFile, 'utf8'));
   }
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(cadenceV3MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(gmailSendRunnersMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -2230,6 +2238,57 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       assert.equal(JSON.parse(output.at(-2)).actionRequired, true, `${database}: ${label}`);
       assert.deepEqual(JSON.parse(output.at(-1)), { conversations: 0, campaigns: 0,
         touches: 0, enrollment: 'queued' }, `${database}: ${label}`);
+    }
+    if (database === 'pursue_cim_fresh') {
+      // The standing contact rule allocates without the fl04b-enrollment activation while it is
+      // on under the same policy version, whatever its revision; off pauses, on again resumes.
+      // Fresh schema only: the P1C upgrade stops before that migration.
+      const ruleDigest = contactPolicyDigest();
+      const ruleCommand = JSON.stringify({ ...postgresCampaignCommands[0],
+        permissionVersion: CONTACT_POLICY_VERSION, permissionDigest: ruleDigest,
+        permissionRevision: 1, policyHash: ruleDigest }).replaceAll("'", "''");
+      const withdrawActivation = `select public.pursue_cim_withdraw_capability_activation_v1(
+        '{"id":"activation-enrollment","actor":"fixture","reason":"contact rule","now":"${now}"}'::jsonb);`;
+      const setRule = (enabled, expectedRevision, policyVersion = CONTACT_POLICY_VERSION) => `select
+        public.deal_hunter_pursue_set_send_control_v1('${JSON.stringify({ controlKey: 'contact_rule',
+    enabled, valueDigest: null, policyVersion, expectedRevision, actor: 'fixture', reason: 'synthetic',
+    now })}'::jsonb);`;
+      for (const [label, mutation, allocated] of [
+        ['rule-on', `${withdrawActivation} ${setRule(true, 0)}`, true],
+        ['rule-never-set', withdrawActivation, false],
+        ['rule-off', `${withdrawActivation} ${setRule(true, 0)} ${setRule(false, 1)}`, false],
+        ['rule-off-then-on', `${withdrawActivation} ${setRule(true, 0)} ${setRule(false, 1)}
+          ${setRule(true, 2)}`, true],
+        ['rule-no-policy-version', `${withdrawActivation} ${setRule(true, 0, null)}`, false],
+        ['rule-other-policy-version', `${withdrawActivation}
+          ${setRule(true, 0, 'listing-broker-inquiry-v2')}`, false],
+      ]) {
+        const output = psql(container, database, `begin; ${mutation}
+          select public.pursue_cim_materialize_campaign_v2('${ruleCommand}'::jsonb);
+          select jsonb_build_object(
+            'campaigns', (select count(*) from public.deal_hunter_cim_campaigns
+              where opportunity_id='opp-decision'),
+            'permission', (select jsonb_build_object('version', permission_version,
+              'digest', permission_digest, 'revision', permission_revision)
+              from public.deal_hunter_cim_campaigns where opportunity_id='opp-decision'));
+          rollback;`).split('\n').filter((line) => line.startsWith('{'));
+        assert.equal(JSON.parse(output.at(-2)).applied, allocated, `${database}: ${label}`);
+        assert.deepEqual(JSON.parse(output.at(-1)), allocated
+          ? { campaigns: 1, permission: { version: CONTACT_POLICY_VERSION, digest: ruleDigest, revision: 1 } }
+          : { campaigns: 0, permission: null }, `${database}: ${label}`);
+      }
+      // Replay of the allocated campaign: off pauses it, on again resumes it, and another
+      // policy version refuses it.
+      const step = (name) => `select jsonb_build_object('step', '${name}', 'result',
+        public.pursue_cim_materialize_campaign_v2('${ruleCommand}'::jsonb));`;
+      const replay = psql(container, database, `begin; ${withdrawActivation} ${setRule(true, 0)}
+        ${step('allocate')} ${setRule(false, 1)} ${step('off')} ${setRule(true, 2)} ${step('on-again')}
+        ${setRule(true, 3, 'listing-broker-inquiry-v2')} ${step('other-version')}
+        rollback;`).split('\n').filter((line) => line.includes('"step"'))
+        .map((line) => JSON.parse(line))
+        .map(({ step: name, result }) => [name, result.applied, result.existing, result.actionRequired]);
+      assert.deepEqual(replay, [['allocate', true, false, false], ['off', false, false, true],
+        ['on-again', false, true, false], ['other-version', false, false, true]], database);
     }
     const raceDatabase = `p4b_race_${database.endsWith('fresh') ? 'f' : 'u'}`;
     run(dockerCommand, ['exec', container, 'createdb', '-U', 'postgres',

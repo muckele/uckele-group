@@ -25,6 +25,12 @@ export const genericMailboxNames = new Set([
   'admin', 'broker', 'contact', 'deals', 'enquiries', 'hello', 'info', 'inquiries',
   'listings', 'mail', 'office', 'sales', 'support', 'team',
 ]);
+/** True for a shared inbox: the whole mailbox, or its first segment, is a generic name. */
+export function isGenericMailbox(address) {
+  const mailbox = String(address || '').toLowerCase().split('@')[0] || '';
+  const firstSegment = mailbox.split(/[^a-z0-9]+/).filter(Boolean)[0] || '';
+  return genericMailboxNames.has(mailbox) || genericMailboxNames.has(firstSegment);
+}
 const suppressionTypes = new Set(['bounced', 'complained', 'failed', 'suppressed', 'unsubscribed']);
 const adverseDeliveryStates = new Set(['bounced', 'complained', 'failed', 'suppressed']);
 const acceptedInitialStates = new Set([

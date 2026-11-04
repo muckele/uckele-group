@@ -9,7 +9,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { genericMailboxNames } from './cimAutomation.js';
+import { isGenericMailbox } from './cimAutomation.js';
 import { DEAL_CRITERIA_PROFILE_VERSION, evaluateDealCriteria } from './dealCriteriaProfile.js';
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import { ownerBusinessDate } from './dealHunterFreshInboxPolicy.js';
@@ -294,12 +294,6 @@ function openIdentityExceptionFor(exceptions, opportunityId) {
     const candidates = item?.candidate_opportunity_ids;
     return !Array.isArray(candidates) || candidates.length === 0 || candidates.includes(opportunityId);
   });
-}
-
-function isGenericMailbox(address) {
-  const mailbox = String(address || '').toLowerCase().split('@')[0] || '';
-  const firstSegment = mailbox.split(/[^a-z0-9]+/).filter(Boolean)[0] || '';
-  return genericMailboxNames.has(mailbox) || genericMailboxNames.has(firstSegment);
 }
 
 /** Milliseconds, null when absent, or NaN when present but unparseable. */
