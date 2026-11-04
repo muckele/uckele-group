@@ -206,7 +206,10 @@ export function validateCimProviderRelease(command = {}) {
 }
 
 // The reply poller's processed-message log (spec §6): only the classification, the Gmail ids,
-// a fingerprint of the From address and timestamps. Never a body, subject or snippet.
+// a fingerprint of the From address, timestamps and whether its effect has been applied. It is
+// written before the effect (applied = false) and settled after it, so a crash in between leaves
+// a pending row that the next poll (or the sender, before any send) applies again. Never a body,
+// subject or snippet.
 export const GMAIL_REPLY_CLASSIFICATIONS = Object.freeze(['ours', 'owner', 'bounce', 'auto-reply',
   'stop', 'reply']);
 const gmailIdPattern = /^[A-Za-z0-9_-]{1,240}$/;
@@ -232,6 +235,7 @@ export function validateGmailReplyMessage(command = {}) {
     || !digestPattern.test(fromFingerprint))) throw invalid('fromFingerprint');
   const messageAt = command.messageAt === null || command.messageAt === undefined
     ? null : instant(command.messageAt, 'messageAt');
+  if (typeof command.applied !== 'boolean') throw invalid('applied');
   return {
     gmailMessageId: gmailId(command.gmailMessageId, 'gmailMessageId'),
     gmailThreadId: gmailId(command.gmailThreadId, 'gmailThreadId'),
@@ -239,8 +243,15 @@ export function validateGmailReplyMessage(command = {}) {
     classification: command.classification,
     fromFingerprint,
     messageAt,
+    applied: command.applied,
     now: instant(command.now),
   };
+}
+
+export function validateGmailPendingReplyLookup(command = {}) {
+  const limit = command.limit ?? 100;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw invalid('limit');
+  return { limit };
 }
 
 export function validateGmailReplyMessageLookup(command = {}) {
@@ -262,6 +273,7 @@ export function normalizeGmailReplyMessageRow(row) {
     fromFingerprint: row.from_fingerprint ?? null,
     messageAt: optionalInstant(row.message_at),
     processedAt: optionalInstant(row.processed_at),
+    applied: row.applied === true || row.applied === 1,
   };
 }
 

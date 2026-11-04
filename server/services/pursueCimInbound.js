@@ -317,6 +317,8 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now, profi
     };
   }
   if (!terminal.fromStates.includes(resolution.conversation.state)) {
+    // Not applicable in this state (provider-ambiguous): nothing is written. `deferred` tells a
+    // caller that keeps the evidence (the Gmail reply poller) to apply it again later.
     return {
       handled: true,
       exact: true,
@@ -324,6 +326,8 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now, profi
       reviewRequired: true,
       terminalized: false,
       alreadyTerminal: false,
+      deferred: true,
+      conversationState: resolution.conversation.state,
       conversationId: resolution.conversation.id,
       transmissionId: text(resolution.transmission?.id),
       campaignIds: unique(resolution.campaignIds || [], 50).sort(),

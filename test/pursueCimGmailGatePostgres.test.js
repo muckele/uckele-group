@@ -937,7 +937,7 @@ test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-
     opportunityId: `opp-gmail-${suffix}`, emailHash: sha256(BROKER),
     provenanceFingerprint: fill('9'), contactAuthorityRevision: fill('b') }));
   const seeded = {};
-  for (const suffix of ['reply', 'owner', 'bounce', 'auto', 'stop']) {
+  for (const suffix of ['reply', 'owner', 'bounce', 'auto', 'stop', 'held']) {
     seeded[suffix] = seedCampaign(container, database, `poll-${suffix}`,
       recipientFingerprint(`poll-${suffix}`), { followUp: true, basis: 'rule' });
   }
@@ -1002,7 +1002,8 @@ test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-
 
   const first = await poll();
   assert.deepEqual(first, { processed: 5, responded: 1, ownerReplied: 1, bounced: 1,
-    autoReplies: 1, stopped: 0, failed: 0, checkpointExpired: false, checkpointAdvanced: true });
+    autoReplies: 1, stopped: 0, pending: 0, failed: 0, checkpointExpired: false,
+    checkpointAdvanced: true });
   const campaign = (ids) => scalar(`select state || ':' || coalesce(reason_code, '-')
     from public.deal_hunter_cim_campaigns where id = '${ids.campaignId}';`);
   const touch = (ids) => scalar(`select state || ':' || coalesce(terminal_reason, '-')
@@ -1034,9 +1035,34 @@ test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-
   assert.equal(scalar('select count(*) from public.deal_hunter_cim_terminal_events;'), terminalEvents);
   assert.deepEqual(await storage.recordGmailReplyMessage({ gmailMessageId: 'fake-msg-2',
     gmailThreadId: 'gmail-thread-poll-reply', conversationId: seeded.reply.conversationId,
-    classification: 'reply', fromFingerprint: null, messageAt: null, now: GATE_NOW }),
-  { applied: false, replay: true });
+    classification: 'reply', fromFingerprint: null, messageAt: null, applied: false,
+    now: GATE_NOW }), { applied: false, replay: true });
+  assert.equal(scalar(`select string_agg(applied::text, ',') from (select distinct applied
+    from public.deal_hunter_gmail_reply_messages) a;`), 'true');
 
+  // A reply on a provider-ambiguous conversation is recorded pending, not counted, and applied
+  // by the next poll once the conversation is open again.
+  scalar(`update public.deal_hunter_broker_conversations set state = 'provider-ambiguous',
+    terminal_revision = terminal_revision + 1, row_version = row_version + 1
+    where id = '${seeded.held.conversationId}';`);
+  inject('held', {}, 'Still available.');
+  const held = await poll();
+  assert.equal(held.processed, 1, JSON.stringify(held));
+  assert.equal(held.responded, 0);
+  assert.equal(held.pending, 1);
+  const [pending] = await storage.listPendingGmailReplyMessages({ limit: 10 });
+  assert.deepEqual([pending.conversationId, pending.classification, pending.applied],
+    [seeded.held.conversationId, 'reply', false]);
+  assert.equal((await poll()).pending, 1);
+  assert.equal(campaign(seeded.held), 'active-follow-up:-');
+  scalar(`update public.deal_hunter_broker_conversations set state = 'open',
+    terminal_revision = terminal_revision + 1, row_version = row_version + 1
+    where id = '${seeded.held.conversationId}';`);
+  const reopened = await poll();
+  assert.equal(reopened.responded, 1, JSON.stringify(reopened));
+  assert.equal(reopened.pending, 0);
+  assert.equal(campaign(seeded.held), 'responded:reply_received');
+  assert.deepEqual(await storage.listPendingGmailReplyMessages({ limit: 10 }), []);
   // A stop word responds and suppresses the recipient through the existing suppression write.
   inject('stop', {}, 'Please remove me from your list.');
   const stop = await poll();
@@ -1047,6 +1073,15 @@ test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-
   assert.equal(suppression.source, 'gmail-reply');
   assert.equal(scalar(`select count(*) from public.deal_hunter_gmail_reply_messages t
     where to_jsonb(t)::text like '%${marker}%' or to_jsonb(t)::text like '%brokerage.test%';`), '0');
+
+  // A Gmail draft is never recorded.
+  const draft = mailbox.injectReply('gmail-thread-poll-auto', { labelIds: ['DRAFT'],
+    internalDate: now().toISOString(), bodyPrefix: 'draft',
+    headers: { from: SENDER, messageId: '<CAdraft@mail.gmail.com>' } });
+  const drafted = await poll();
+  assert.equal(drafted.processed, 0, JSON.stringify(drafted));
+  assert.equal(drafted.ownerReplied, 0);
+  assert.deepEqual(await storage.listGmailReplyMessages({ gmailMessageIds: [draft.id] }), []);
   assert.equal(scalar(`select count(*) from public.deal_hunter_cim_terminal_events t
     where to_jsonb(t)::text like '%${marker}%';`), '0');
 });

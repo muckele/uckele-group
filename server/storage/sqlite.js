@@ -44,6 +44,7 @@ import {
   validateGmailTokenCheck, validateRevokeGmailConnection, validateSaveGmailConnection,
   validateSetPursueSendControl, normalizeGmailReplyMessageRow, normalizeGmailSentIdentityRow,
   validateGmailReplyMessage, validateGmailReplyMessageLookup, validateGmailSentIdentityLookup,
+  validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
 
 function cimSafetyDigest(...parts) {
@@ -5620,7 +5621,8 @@ ${cimCapacityConsumeTriggerSql}
         from_fingerprint TEXT CHECK(from_fingerprint IS NULL OR (length(from_fingerprint) = 64
           AND from_fingerprint NOT GLOB '*[^0-9a-f]*')),
         message_at TEXT CHECK(message_at IS NULL OR julianday(message_at) IS NOT NULL),
-        processed_at TEXT NOT NULL CHECK(julianday(processed_at) IS NOT NULL)
+        processed_at TEXT NOT NULL CHECK(julianday(processed_at) IS NOT NULL),
+        applied INTEGER NOT NULL DEFAULT 1 CHECK(applied IN (0, 1))
       );
       CREATE INDEX IF NOT EXISTS idx_deal_hunter_gmail_reply_messages_conversation
         ON deal_hunter_gmail_reply_messages(conversation_id, processed_at);
@@ -5926,6 +5928,11 @@ ${cimCapacityConsumeTriggerSql}
   // deliberately absent from the machine score write and every operator-owned writer.
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_blocker', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_checked_at', 'TEXT');
+  // Whether a Gmail reply's effect has been applied (pending rows are applied again).
+  ensureColumn(database, 'deal_hunter_gmail_reply_messages', 'applied',
+    'INTEGER NOT NULL DEFAULT 1 CHECK(applied IN (0, 1))');
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_deal_hunter_gmail_reply_messages_pending
+    ON deal_hunter_gmail_reply_messages(processed_at, gmail_message_id) WHERE applied = 0`);
   // The Gmail thread a Pursue conversation's accepted sends live in; the reply poller reads it.
   ensureColumn(database, 'deal_hunter_broker_conversations', 'gmail_thread_id',
     "TEXT CHECK(gmail_thread_id IS NULL OR (length(gmail_thread_id) BETWEEN 1 AND 240 AND gmail_thread_id NOT GLOB '*[^A-Za-z0-9_-]*'))");
@@ -11291,17 +11298,31 @@ ${cimCapacityConsumeTriggerSql}
         `).all(...gmailMessageIds).map(normalizeGmailReplyMessageRow);
       },
 
-      /** Marks a Gmail message processed once; the same message again is a replay. */
+      /**
+       * Records a Gmail message once (the first classification wins). A pending row
+       * (applied = false) is settled by recording it again with applied = true; nothing ever
+       * moves a settled row back to pending. `applied` is true when a row was written.
+       */
       async recordGmailReplyMessage(command = {}) {
         const row = validateGmailReplyMessage(command);
         const changes = database.prepare(`
           INSERT INTO deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
-            conversation_id, classification, from_fingerprint, message_at, processed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(gmail_message_id) DO NOTHING
+            conversation_id, classification, from_fingerprint, message_at, processed_at, applied)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(gmail_message_id) DO UPDATE SET applied = 1
+            WHERE deal_hunter_gmail_reply_messages.applied = 0 AND excluded.applied = 1
         `).run(row.gmailMessageId, row.gmailThreadId, row.conversationId, row.classification,
-          row.fromFingerprint, row.messageAt, row.now).changes;
+          row.fromFingerprint, row.messageAt, row.now, row.applied ? 1 : 0).changes;
         return { applied: changes === 1, replay: changes === 0 };
+      },
+
+      /** Recorded Gmail messages whose effect is not applied yet, oldest first. */
+      async listPendingGmailReplyMessages(command = {}) {
+        const { limit } = validateGmailPendingReplyLookup(command);
+        return database.prepare(`
+          SELECT * FROM deal_hunter_gmail_reply_messages WHERE applied = 0
+          ORDER BY processed_at, gmail_message_id LIMIT ?
+        `).all(limit).map(normalizeGmailReplyMessageRow);
       },
 
       async getCurrentAutoPursueActivation() {

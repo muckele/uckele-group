@@ -1,19 +1,27 @@
 // The Gmail reply poller (spec 2026-11-03 §6). One poll:
 //   1. needs an active Gmail connection (otherwise it skips with gmail_not_connected);
-//   2. lists the open Pursue conversations that have a Gmail thread, and every transmission of
-//      them, so our own sends are recognized by their Message-ID (or stored Gmail id);
-//   3. reads the thread changes since the stored history checkpoint. An expired or missing
-//      checkpoint comes back as every message of those threads, so messages are deduplicated by
-//      Gmail id and skipped when already processed;
-//   4. classifies each new message (pursueCimReplyClassifier.js) and applies it through the
-//      verified inbound path with evidence method gmail-thread: a reply or stop word responds
-//      (a stop word also suppresses the recipient through the existing suppression write), an
-//      owner message stops the campaign with owner_replied, a bounce sends it to action-required
-//      with recipient_bounced, and an auto-reply is only logged;
-//   5. records each applied message once (classification, Gmail ids, From fingerprint, time);
-//   6. only when every message was applied, advances the checkpoint by compare-and-set.
-// A crash anywhere means the next poll re-reads from the old checkpoint; terminal events are
-// idempotent per Gmail message id (their id derives from it), so nothing is applied twice.
+//   2. first applies every recorded reply whose effect is still pending (see below);
+//   3. reads the thread changes of the open Pursue conversations since the stored history
+//      checkpoint. An expired or missing checkpoint comes back as every message of those threads,
+//      so messages are deduplicated by Gmail id and skipped when already recorded. Drafts are
+//      skipped without a record (once sent, a draft arrives as a new message id);
+//   4. only then lists every transmission of those conversations, so our own sends are recognized
+//      by their Message-ID (or stored Gmail id) even when the sender sent one while the history
+//      was being read (transmission rows exist from preparation, before any send);
+//   5. classifies each new message (pursueCimReplyClassifier.js), records it, and applies it
+//      through the verified inbound path with evidence method gmail-thread: a reply or stop word
+//      responds (a stop word also suppresses the recipient through the existing suppression
+//      write), an owner message stops the campaign with owner_replied, a bounce sends it to
+//      action-required with recipient_bounced, and an auto-reply is only logged;
+//   6. only when every new message was recorded, advances the checkpoint by compare-and-set.
+//
+// The record is an intent log. A message with an effect is recorded pending (applied = false)
+// before the effect and settled after it. A crash in between, an effect that fails, or a reply
+// on a provider-ambiguous conversation (where it cannot apply yet) leaves the row pending, and
+// pending rows are applied again at the start of every poll and by the sender before any send
+// (applyPendingPursueCimReplies), so a broker who answered is never sent another follow-up.
+// Terminal events are idempotent per Gmail message id (their id derives from it) and suppression
+// is skipped when one is active, so applying again never duplicates anything.
 // Message bodies are read for classification only and never stored or logged.
 import { randomUUID } from 'node:crypto';
 
@@ -26,6 +34,7 @@ import { classifyPursueCimReply, replyFromAddress } from './pursueCimReplyClassi
 
 export const PURSUE_CIM_REPLY_POLLER_ACTOR = 'pursue-cim-reply-poller';
 const LOOKUP_CHUNK = 500;
+const PENDING_LIMIT = 200;
 const GMAIL_ID = /^[A-Za-z0-9_-]{1,240}$/;
 
 const INBOUND_OUTCOME = Object.freeze({ reply: 'reply', stop: 'reply', owner: 'owner_replied',
@@ -67,36 +76,39 @@ async function knownIdentities(storage, conversationIds, connectedAddress) {
   return { messageIds, providerMessageIds };
 }
 
-async function processedIds(storage, gmailMessageIds) {
-  const processed = new Set();
+async function recordedIds(storage, gmailMessageIds) {
+  const recorded = new Set();
   for (const ids of chunks(gmailMessageIds, LOOKUP_CHUNK)) {
     for (const row of await storage.listGmailReplyMessages({ gmailMessageIds: ids })) {
-      processed.add(row.gmailMessageId);
+      recorded.add(row.gmailMessageId);
     }
   }
-  return processed;
+  return recorded;
 }
 
-/** The inbound event a classified thread message becomes; headers only, never the body. */
-function inboundEvent(message, observedAt) {
+/**
+ * The inbound event a recorded message becomes: its Gmail ids and, for a message read in this
+ * poll, its In-Reply-To and References headers. Never the body.
+ */
+function inboundEvent(record, observedAt) {
   return {
-    id: `gmail-message:${message.id}`,
+    id: `gmail-message:${record.gmailMessageId}`,
     event_type: 'replied',
     provider: 'gmail',
-    provider_event_id: `gmail-message:${message.id}`,
+    provider_event_id: `gmail-message:${record.gmailMessageId}`,
     created_at: observedAt,
     metadata: {
       rawType: 'email.received',
-      gmailThreadId: message.threadId,
-      inReplyTo: message.headers?.inReplyTo ?? '',
-      references: message.headers?.references ?? '',
+      gmailThreadId: record.gmailThreadId,
+      inReplyTo: record.inReplyTo ?? '',
+      references: record.references ?? '',
     },
   };
 }
 
 /** A stop word suppresses the conversation's recipient for every future listing. */
-async function suppressRecipient(storage, { conversationId, message, at }) {
-  const conversation = await storage.getPursueCimBrokerConversation(conversationId);
+async function suppressRecipient(storage, { record, at }) {
+  const conversation = await storage.getPursueCimBrokerConversation(record.conversationId);
   const address = String(conversation?.recipient_address || '').trim().toLowerCase();
   if (!address) throw new Error('Pursue CIM stop reply has no recipient to suppress');
   // An active suppression is left as it is (its first evidence stays the evidence).
@@ -106,60 +118,93 @@ async function suppressRecipient(storage, { conversationId, message, at }) {
     normalized_email: address,
     reason: 'explicit-opt-out',
     source: 'gmail-reply',
-    source_event_id: `gmail-message:${message.id}`,
+    source_event_id: `gmail-message:${record.gmailMessageId}`,
     source_communication_id: null,
     created_at: at,
     created_by: PURSUE_CIM_REPLY_POLLER_ACTOR,
-    metadata: { gmailMessageId: message.id, gmailThreadId: message.threadId, conversationId },
-  });
-}
-
-async function applyMessage({ storage, message, conversation, classification, now }) {
-  const at = instantOf(now);
-  const outcome = INBOUND_OUTCOME[classification];
-  if (outcome) {
-    await applyVerifiedPursueCimInbound(inboundEvent(message, messageInstant(message) ?? at), {
-      storage, now: at, outcome, actor: PURSUE_CIM_REPLY_POLLER_ACTOR });
-  }
-  if (classification === 'stop') {
-    await suppressRecipient(storage, { conversationId: conversation.conversationId, message, at });
-  }
-  const from = replyFromAddress(message.headers?.from);
-  await storage.recordGmailReplyMessage({
-    gmailMessageId: message.id,
-    gmailThreadId: message.threadId,
-    conversationId: conversation.conversationId,
-    classification,
-    fromFingerprint: from ? sha256(from) : null,
-    messageAt: messageInstant(message),
-    now: instantOf(now),
+    metadata: { gmailMessageId: record.gmailMessageId, gmailThreadId: record.gmailThreadId,
+      conversationId: record.conversationId },
   });
 }
 
 /**
+ * Applies a recorded reply, stop, owner or bounce message and settles its record. Returns true
+ * when settled, false when it stays pending (its conversation is provider-ambiguous).
+ */
+async function applyRecorded({ storage, record, now }) {
+  const at = instantOf(now);
+  const result = await applyVerifiedPursueCimInbound(inboundEvent(record, record.messageAt ?? at), {
+    storage, now: at, outcome: INBOUND_OUTCOME[record.classification],
+    actor: PURSUE_CIM_REPLY_POLLER_ACTOR });
+  // An opt-out is honored even while the conversation cannot take the terminal yet.
+  if (record.classification === 'stop') await suppressRecipient(storage, { record, at });
+  if (result?.deferred) return false;
+  await storage.recordGmailReplyMessage({ gmailMessageId: record.gmailMessageId,
+    gmailThreadId: record.gmailThreadId, conversationId: record.conversationId,
+    classification: record.classification, fromFingerprint: record.fromFingerprint ?? null,
+    messageAt: record.messageAt ?? null, applied: true, now: instantOf(now) });
+  return true;
+}
+
+/**
+ * Applies every recorded Gmail reply whose effect is still pending. The poller runs it first in
+ * every poll and the sender runs it after reconciliation and before any send, so a reply held
+ * while its conversation was provider-ambiguous is applied before a follow-up can go out once
+ * the conversation is reopened. Returns the settled counts and the conversations that still
+ * have a pending reply (the sender sends nothing to them in that run).
+ */
+export async function applyPendingPursueCimReplies({ storage, now } = {}) {
+  const outcome = { settled: 0, pending: 0, counts: {}, pendingConversationIds: new Set() };
+  if (typeof storage?.listPendingGmailReplyMessages !== 'function') return outcome;
+  for (const record of await storage.listPendingGmailReplyMessages({ limit: PENDING_LIMIT })) {
+    if (!INBOUND_OUTCOME[record.classification]) continue;
+    let settled = false;
+    try {
+      settled = await applyRecorded({ storage, record, now });
+    } catch {
+      settled = false;
+    }
+    if (settled) {
+      outcome.settled += 1;
+      const counter = COUNTER[record.classification];
+      outcome.counts[counter] = (outcome.counts[counter] || 0) + 1;
+    } else {
+      outcome.pending += 1;
+      outcome.pendingConversationIds.add(record.conversationId);
+    }
+  }
+  return outcome;
+}
+
+/**
  * One reply poll. `now` is an instant or a clock function. Returns counts only:
- * `{ processed, responded, ownerReplied, bounced, autoReplies, stopped, failed,
+ * `{ processed, responded, ownerReplied, bounced, autoReplies, stopped, pending, failed,
  *    checkpointExpired, checkpointAdvanced }`, plus `stoppedFor: 'gmail_not_connected'` when
- * there is no active connection. Throws only when the poll as a whole could not run (for
- * example Gmail's history read or the checkpoint save failed); one message that cannot be
- * applied is counted in `failed` and holds the checkpoint so the next poll retries it.
+ * there is no active connection. `responded`, `stopped`, `ownerReplied` and `bounced` count
+ * effects applied in this poll (new or previously pending); `pending` counts recorded replies
+ * still waiting to apply; `failed` counts new messages that could not be recorded, which holds
+ * the checkpoint. Throws only when the poll as a whole could not run.
  */
 export async function runPursueCimReplyPoll({ storage, mailProvider, now, config } = {}) {
   if (!storage) throw new Error('Pursue reply poller storage is unavailable');
   const summary = { processed: 0, responded: 0, ownerReplied: 0, bounced: 0, autoReplies: 0,
-    stopped: 0, failed: 0, checkpointExpired: false, checkpointAdvanced: false };
+    stopped: 0, pending: 0, failed: 0, checkpointExpired: false, checkpointAdvanced: false };
+  const count = (classification) => {
+    if (COUNTER[classification]) summary[COUNTER[classification]] += 1;
+  };
 
   const connection = await storage.getGmailConnection();
   if (!connection) return { ...summary, stoppedFor: 'gmail_not_connected' };
   const provider = mailProvider || createGmailCimProvider({ storage, config: config || getConfig() });
 
+  const earlier = await applyPendingPursueCimReplies({ storage, now });
+  for (const [counter, value] of Object.entries(earlier.counts)) summary[counter] += value;
+  summary.pending = earlier.pending;
+
   const conversations = (await storage.listOpenGmailConversations())
     .filter((conversation) => GMAIL_ID.test(conversation.gmailThreadId || ''));
   const byThread = new Map(conversations.map((conversation) => [conversation.gmailThreadId,
     conversation]));
-  const known = await knownIdentities(storage,
-    conversations.map(({ conversationId }) => conversationId), connection.email_address);
-
   const checkpoint = connection.history_checkpoint ?? null;
   const changes = await provider.listThreadChanges({ checkpoint, threadIds: [...byThread.keys()],
     withBodyPrefix: true });
@@ -169,29 +214,52 @@ export async function runPursueCimReplyPoll({ storage, mailProvider, now, config
   for (const message of Array.isArray(changes?.messages) ? changes.messages : []) {
     if (typeof message?.id !== 'string' || !GMAIL_ID.test(message.id)) continue;
     if (!byThread.has(message.threadId) || unique.has(message.id)) continue;
+    if (Array.isArray(message.labelIds) && message.labelIds.includes('DRAFT')) continue;
     unique.set(message.id, message);
   }
   const messages = [...unique.values()].sort((left, right) => {
     const byTime = (Date.parse(left.internalDate ?? '') || 0) - (Date.parse(right.internalDate ?? '') || 0);
     return byTime || left.id.localeCompare(right.id);
   });
-  const processed = await processedIds(storage, messages.map(({ id }) => id));
+  const recorded = await recordedIds(storage, messages.map(({ id }) => id));
+  // After the history read: every send that can appear in it was prepared before it.
+  const known = messages.some(({ id }) => !recorded.has(id))
+    ? await knownIdentities(storage, conversations.map(({ conversationId }) => conversationId),
+      connection.email_address)
+    : { messageIds: new Set(), providerMessageIds: new Set() };
 
   for (const message of messages) {
-    if (processed.has(message.id)) continue;
+    if (recorded.has(message.id)) continue;
     const classification = classifyPursueCimReply({ message,
       connectedAddress: connection.email_address, knownMessageIds: known.messageIds,
       knownProviderMessageIds: known.providerMessageIds });
+    const from = replyFromAddress(message.headers?.from);
+    const record = { gmailMessageId: message.id, gmailThreadId: message.threadId,
+      conversationId: byThread.get(message.threadId).conversationId, classification,
+      fromFingerprint: from ? sha256(from) : null, messageAt: messageInstant(message) };
+    const effectful = Boolean(INBOUND_OUTCOME[classification]);
     try {
-      await applyMessage({ storage, message, conversation: byThread.get(message.threadId),
-        classification, now });
-      processed.add(message.id);
-      summary.processed += 1;
-      if (COUNTER[classification]) summary[COUNTER[classification]] += 1;
+      await storage.recordGmailReplyMessage({ ...record, applied: !effectful, now: instantOf(now) });
     } catch {
-      // Held for the next poll: the checkpoint does not advance past an unapplied message.
+      // Not recorded: the checkpoint does not advance past it, so the next poll reads it again.
       summary.failed += 1;
+      continue;
     }
+    recorded.add(message.id);
+    summary.processed += 1;
+    if (!effectful) {
+      count(classification);
+      continue;
+    }
+    let settled = false;
+    try {
+      settled = await applyRecorded({ storage, now, record: { ...record,
+        inReplyTo: message.headers?.inReplyTo ?? '', references: message.headers?.references ?? '' } });
+    } catch {
+      settled = false;
+    }
+    if (settled) count(classification);
+    else summary.pending += 1;
   }
 
   const next = changes?.nextCheckpoint === undefined || changes?.nextCheckpoint === null

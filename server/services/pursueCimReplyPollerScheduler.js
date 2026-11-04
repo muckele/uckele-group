@@ -15,7 +15,7 @@ const claimStaleMs = 30 * 60 * 1000;
 const checkIntervalMs = 60_000;
 const CODE = /^[a-z][a-z0-9_]{0,79}$/;
 const COUNTS = ['processed', 'responded', 'ownerReplied', 'bounced', 'autoReplies', 'stopped',
-  'failed'];
+  'pending', 'failed'];
 
 function count(value) {
   return Math.max(0, Math.trunc(Number(value) || 0));
@@ -108,7 +108,8 @@ export function startPursueCimReplyPollerScheduler({
         logger.log(`[pursue-cim-reply-poller] slot=${slot} processed=${metadata.processed}`
           + ` responded=${metadata.responded} stopped=${metadata.stopped}`
           + ` ownerReplied=${metadata.ownerReplied} bounced=${metadata.bounced}`
-          + ` autoReplies=${metadata.autoReplies} failed=${metadata.failed}`);
+          + ` autoReplies=${metadata.autoReplies} pending=${metadata.pending}`
+          + ` failed=${metadata.failed}`);
       }
     } catch (cause) {
       logger.error(`[pursue-cim-reply-poller] run not recorded slot=${slot} code=${errorCode(cause)}`);

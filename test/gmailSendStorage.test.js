@@ -332,14 +332,22 @@ test('gmail reply messages are recorded once with classification, ids and a fing
   seedConversation(database, 'a');
   const row = { gmailMessageId: '18c2f0a1b2c3d4e5', gmailThreadId: 'gmail-thread-a',
     conversationId: 'conversation-a', classification: 'reply', fromFingerprint: hex('broker'),
-    messageAt: at, now: later };
+    messageAt: at, applied: false, now: later };
+  // Recorded pending before its effect, then settled; a settled row never returns to pending.
   assert.deepEqual(await storage.recordGmailReplyMessage(row), { applied: true, replay: false });
-  assert.deepEqual(await storage.recordGmailReplyMessage({ ...row, classification: 'stop' }),
+  assert.deepEqual(await storage.recordGmailReplyMessage(row), { applied: false, replay: true });
+  assert.deepEqual((await storage.listPendingGmailReplyMessages({ limit: 10 }))
+    .map(({ gmailMessageId, applied }) => [gmailMessageId, applied]), [['18c2f0a1b2c3d4e5', false]]);
+  assert.deepEqual(await storage.recordGmailReplyMessage({ ...row, applied: true,
+    classification: 'stop' }), { applied: true, replay: false });
+  assert.deepEqual(await storage.recordGmailReplyMessage({ ...row, applied: true }),
     { applied: false, replay: true });
+  assert.deepEqual(await storage.recordGmailReplyMessage(row), { applied: false, replay: true });
+  assert.deepEqual(await storage.listPendingGmailReplyMessages(), []);
   assert.deepEqual(await storage.listGmailReplyMessages({
     gmailMessageIds: ['18c2f0a1b2c3d4e5', 'unknown'] }), [{ gmailMessageId: '18c2f0a1b2c3d4e5',
     gmailThreadId: 'gmail-thread-a', conversationId: 'conversation-a', classification: 'reply',
-    fromFingerprint: hex('broker'), messageAt: at, processedAt: later }]);
+    fromFingerprint: hex('broker'), messageAt: at, processedAt: later, applied: true }]);
   assert.deepEqual(await storage.listGmailReplyMessages({ gmailMessageIds: [] }), []);
   await assert.rejects(storage.recordGmailReplyMessage({ ...row, gmailMessageId: 'x',
     classification: 'body' }), /Invalid classification/);
@@ -349,6 +357,9 @@ test('gmail reply messages are recorded once with classification, ids and a fing
     /Invalid gmailMessageId/);
   await assert.rejects(storage.listGmailReplyMessages({ gmailMessageIds: ['a', 'a'] }),
     /Invalid gmailMessageIds/);
+  await assert.rejects(storage.recordGmailReplyMessage({ ...row, gmailMessageId: 'z',
+    applied: 'yes' }), /Invalid applied/);
+  await assert.rejects(storage.listPendingGmailReplyMessages({ limit: 0 }), /Invalid limit/);
   assert.deepEqual(await storage.listGmailConversationSentIdentities({
     conversationIds: ['conversation-a'] }), []);
   await assert.rejects(storage.listGmailConversationSentIdentities({ conversationIds: 'x' }),

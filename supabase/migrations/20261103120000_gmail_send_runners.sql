@@ -3188,16 +3188,25 @@ create table if not exists public.deal_hunter_gmail_reply_messages (
     check (classification in ('ours', 'owner', 'bounce', 'auto-reply', 'stop', 'reply')),
   from_fingerprint text check (from_fingerprint is null or from_fingerprint ~ '^[0-9a-f]{64}$'),
   message_at timestamptz,
-  processed_at timestamptz not null
+  processed_at timestamptz not null,
+  applied boolean not null default true
 );
+-- Written before its effect (applied = false) and settled after it, so a crash in between
+-- leaves a pending row that the next poll, or the sender before any send, applies again.
+alter table public.deal_hunter_gmail_reply_messages
+  add column if not exists applied boolean not null default true;
 create index if not exists idx_deal_hunter_gmail_reply_messages_conversation
   on public.deal_hunter_gmail_reply_messages (conversation_id, processed_at);
+create index if not exists idx_deal_hunter_gmail_reply_messages_pending
+  on public.deal_hunter_gmail_reply_messages (processed_at, gmail_message_id) where not applied;
 alter table public.deal_hunter_gmail_reply_messages enable row level security;
 revoke all on table public.deal_hunter_gmail_reply_messages
   from public, anon, authenticated, service_role;
 grant select on table public.deal_hunter_gmail_reply_messages to service_role;
 
--- Marks a Gmail message processed once; the same message again is a replay.
+-- Records a Gmail message once (the first classification wins). A pending row is settled by
+-- recording it again with applied = true; a settled row never returns to pending. 'applied' in
+-- the result is true when a row was written.
 create or replace function public.deal_hunter_gmail_record_reply_message_v1(p_command jsonb)
 returns jsonb
 language plpgsql
@@ -3220,17 +3229,19 @@ begin
     or coalesce(v_classification, '') not in ('ours', 'owner', 'bounce', 'auto-reply', 'stop', 'reply')
     or coalesce(pg_catalog.jsonb_typeof(p_command -> 'fromFingerprint'), 'null') not in ('string', 'null')
     or (v_fingerprint is not null and v_fingerprint !~ '^[0-9a-f]{64}$')
-    or coalesce(pg_catalog.jsonb_typeof(p_command -> 'messageAt'), 'null') not in ('string', 'null') then
+    or coalesce(pg_catalog.jsonb_typeof(p_command -> 'messageAt'), 'null') not in ('string', 'null')
+    or pg_catalog.jsonb_typeof(p_command -> 'applied') is distinct from 'boolean' then
     raise exception 'Invalid Gmail reply message';
   end if;
   if p_command ->> 'messageAt' is not null then
     v_message_at := public.pursue_cim_required_instant_v1(p_command, 'messageAt');
   end if;
-  insert into public.deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
-    conversation_id, classification, from_fingerprint, message_at, processed_at)
+  insert into public.deal_hunter_gmail_reply_messages as t (gmail_message_id, gmail_thread_id,
+    conversation_id, classification, from_fingerprint, message_at, processed_at, applied)
   values (v_message_id, v_thread_id, v_conversation_id, v_classification, v_fingerprint,
-    v_message_at, v_now)
-  on conflict (gmail_message_id) do nothing;
+    v_message_at, v_now, (p_command ->> 'applied')::boolean)
+  on conflict (gmail_message_id) do update set applied = true
+    where not t.applied and excluded.applied;
   return pg_catalog.jsonb_build_object('applied', found, 'replay', not found);
 end;
 $$;

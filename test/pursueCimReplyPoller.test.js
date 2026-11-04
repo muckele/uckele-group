@@ -12,8 +12,12 @@ import {
   startPursueCimReplyPollerScheduler,
 } from '../server/services/pursueCimReplyPollerScheduler.js';
 import { runPursueCimReplyPoll } from '../server/services/pursueCimReplyPoller.js';
+import {
+  createCimGmailReconciliationLookup,
+  reconcileCimProviderTransmission,
+} from '../server/services/pursueCimProvider.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
-import { createSenderFixture } from './fixtures/pursueCimSenderFixture.js';
+import { MINUTE, createSenderFixture } from './fixtures/pursueCimSenderFixture.js';
 import { BROKER, SENDER } from './fixtures/pursueCimGmailGateFixture.js';
 
 // Monday 2030-10-28 08:05 PDT, and Wednesday 08:05 PDT when follow-up-1 is due.
@@ -93,7 +97,8 @@ test('reply stops the campaign and cancels scheduled follow-ups', async (t) => {
   const reply = world.inject({ from: `Assistant <${COLLEAGUE}>` });
   const summary = await world.poll();
   assert.deepEqual(summary, { processed: 2, responded: 1, ownerReplied: 0, bounced: 0,
-    autoReplies: 0, stopped: 0, failed: 0, checkpointExpired: false, checkpointAdvanced: true });
+    autoReplies: 0, stopped: 0, pending: 0, failed: 0, checkpointExpired: false,
+    checkpointAdvanced: true });
   assert.equal(world.conversation().state, 'responded');
   const campaign = world.campaign();
   assert.equal(campaign.state, 'responded');
@@ -107,8 +112,8 @@ test('reply stops the campaign and cancels scheduled follow-ups', async (t) => {
   assert.equal(event.evidence_type, 'gmail-inbound-gmail-thread');
   assert.equal(event.actor, 'pursue-cim-reply-poller');
   // Our own initial email is recorded as ours and ignored.
-  assert.deepEqual(world.replyRows().map((row) => [row.gmail_message_id, row.classification]),
-    [[world.mailProvider.sent[0].messageId, 'ours'], [reply.id, 'reply']]);
+  assert.deepEqual(world.replyRows().map((row) => [row.gmail_message_id, row.classification,
+    row.applied]), [[world.mailProvider.sent[0].messageId, 'ours', 1], [reply.id, 'reply', 1]]);
   assert.equal(await world.checkpoint(), '2');
   // Nothing more to do on the next run; the responded conversation is no longer polled.
   const again = await world.poll();
@@ -227,19 +232,15 @@ test('expired checkpoint falls back to per-thread reads and processes no message
   assert.equal(await world.checkpoint(), '3');
 });
 
-test('crash before checkpoint save reprocesses without duplicate terminal events', async (t) => {
-  const world = await sentWorld(t);
-  world.inject({ from: 'MAILER-DAEMON@googlemail.com' }, 'Delivery failed.');
-  const before = world.terminalEvents();
-
-  // The process dies after the bounce's terminal event and before its processed marker.
-  let died = false;
-  const dying = new Proxy(world.storage, { get(target, name) {
+/** A store whose recordGmailReplyMessage throws once for the matching command. */
+function dyingAtRecord(storage, matches) {
+  const state = { died: false };
+  const proxy = new Proxy(storage, { get(target, name) {
     const value = target[name];
     if (name === 'recordGmailReplyMessage') {
       return async (command) => {
-        if (command.classification === 'bounce' && !died) {
-          died = true;
+        if (!state.died && matches(command)) {
+          state.died = true;
           throw new Error('synthetic process death');
         }
         return value.call(target, command);
@@ -247,46 +248,226 @@ test('crash before checkpoint save reprocesses without duplicate terminal events
     }
     return typeof value === 'function' ? value.bind(target) : value;
   } });
-  const crashed = await world.poll({ storage: dying });
-  assert.equal(died, true);
-  assert.equal(crashed.failed, 1, JSON.stringify(crashed));
-  assert.equal(crashed.checkpointAdvanced, false);
+  return { proxy, state };
+}
+
+test('crash before checkpoint save reprocesses without duplicate terminal events', async (t) => {
+  const world = await sentWorld(t);
+  world.inject({ from: 'MAILER-DAEMON@googlemail.com' }, 'Delivery failed.');
+  const before = world.terminalEvents();
+
+  // The process dies before the bounce is recorded: nothing applied, checkpoint held.
+  const unrecorded = dyingAtRecord(world.storage,
+    (command) => command.classification === 'bounce' && command.applied === false);
+  const lost = await world.poll({ storage: unrecorded.proxy });
+  assert.equal(unrecorded.state.died, true);
+  assert.equal(lost.failed, 1, JSON.stringify(lost));
+  assert.equal(lost.checkpointAdvanced, false);
+  assert.equal(world.campaign().state, 'active-follow-up');
+  assert.equal(world.terminalEvents(), before);
+  assert.equal(await world.checkpoint(), '0', 'the checkpoint never moves past an unrecorded message');
+
+  // The bounce's terminal event is written, then the process dies before its record is settled
+  // and again at the checkpoint save.
+  world.clock.advance(60_000);
+  const unsettled = dyingAtRecord(crashingOnce(world.storage, 'updateGmailHistoryCheckpoint'),
+    (command) => command.classification === 'bounce' && command.applied === true);
+  await assert.rejects(() => world.poll({ storage: unsettled.proxy }), /synthetic process death/);
+  assert.equal(unsettled.state.died, true);
+  assert.equal(await world.checkpoint(), '0');
   assert.equal(world.campaign().state, 'action-required');
   assert.equal(world.terminalEvents(), before + 2);
-  assert.equal(await world.checkpoint(), '0', 'the checkpoint never moves past an unapplied batch');
-
-  // The process dies at the checkpoint save, after every message was applied.
-  world.clock.advance(60_000);
-  await assert.rejects(() => world.poll({ storage: crashingOnce(world.storage,
-    'updateGmailHistoryCheckpoint') }), /synthetic process death/);
-  assert.equal(await world.checkpoint(), '0');
-  assert.equal(world.terminalEvents(), before + 2);
+  assert.equal(world.replyRows().find((row) => row.classification === 'bounce').applied, 0);
 
   world.clock.advance(60_000);
   const recovered = await world.poll();
   assert.equal(recovered.processed, 0, JSON.stringify(recovered));
   assert.equal(recovered.failed, 0);
+  assert.equal(recovered.pending, 0);
+  assert.equal(recovered.bounced, 1, 'the pending bounce settles once');
   assert.equal(recovered.checkpointAdvanced, true);
   assert.equal(world.terminalEvents(), before + 2);
   assert.equal(world.campaign().state, 'action-required');
   assert.equal(world.campaign().terminal_revision, 1);
-  assert.deepEqual(world.replyRows().map((row) => row.classification).sort(), ['bounce', 'ours']);
+  assert.deepEqual(world.replyRows().map((row) => [row.classification, row.applied]).sort(),
+    [['bounce', 1], ['ours', 1]]);
   assert.equal(await world.checkpoint(), '2');
 });
 
-test('a reply that cannot be applied holds the checkpoint and is retried', async (t) => {
+test('a reply that cannot be applied stays pending and is applied by the next poll', async (t) => {
   const world = await sentWorld(t);
   world.inject();
   const failing = crashingOnce(world.storage, 'appendCimTerminalEvent');
   const failed = await world.poll({ storage: failing });
-  assert.equal(failed.failed, 1, JSON.stringify(failed));
-  assert.equal(failed.checkpointAdvanced, false);
-  assert.equal(await world.checkpoint(), '0');
+  assert.equal(failed.pending, 1, JSON.stringify(failed));
+  assert.equal(failed.responded, 0, 'an unapplied reply is not counted as responded');
+  assert.equal(failed.failed, 0);
+  // The reply is recorded, so the checkpoint may move on: the record is what gets retried.
+  assert.equal(await world.checkpoint(), '2');
   assert.equal(world.campaign().state, 'active-follow-up');
   const retried = await world.poll();
   assert.equal(retried.responded, 1, JSON.stringify(retried));
+  assert.equal(retried.pending, 0);
+  assert.equal(retried.processed, 0);
   assert.equal(world.campaign().state, 'responded');
-  assert.equal(await world.checkpoint(), '2');
+});
+
+test('a stop word is never lost: suppression and terminal survive a crash at either step', async (t) => {
+  // The process dies at the suppression write, after the terminal event.
+  const world = await sentWorld(t);
+  world.inject({}, 'Stop.');
+  const suppressionDies = crashingOnce(world.storage, 'upsertEmailSuppression');
+  const first = await world.poll({ storage: suppressionDies });
+  assert.equal(first.pending, 1, JSON.stringify(first));
+  assert.equal(first.stopped, 0);
+  assert.equal(world.conversation().state, 'responded');
+  assert.equal(await world.storage.getActiveEmailSuppression(BROKER), null);
+  // The conversation is terminal and no longer polled, but its pending record is applied again.
+  const second = await world.poll();
+  assert.equal(second.stopped, 1, JSON.stringify(second));
+  assert.equal(second.processed, 0);
+  assert.equal((await world.storage.getActiveEmailSuppression(BROKER)).reason, 'explicit-opt-out');
+  assert.equal(world.replyRows().find((row) => row.classification === 'stop').applied, 1);
+  assert.equal(world.campaign().reason_code, 'reply_received');
+
+  // The process dies after every effect, before the record is settled.
+  const other = await sentWorld(t);
+  other.inject({}, 'Please unsubscribe me.');
+  const settleDies = dyingAtRecord(other.storage,
+    (command) => command.classification === 'stop' && command.applied === true);
+  const crashed = await other.poll({ storage: settleDies.proxy });
+  assert.equal(settleDies.state.died, true);
+  assert.equal(crashed.pending, 1, JSON.stringify(crashed));
+  assert.ok(await other.storage.getActiveEmailSuppression(BROKER));
+  assert.equal(other.campaign().state, 'responded');
+  const terminalEvents = other.terminalEvents();
+  const settled = await other.poll();
+  assert.equal(settled.stopped, 1, JSON.stringify(settled));
+  assert.equal(other.terminalEvents(), terminalEvents);
+  assert.equal(other.replyRows().find((row) => row.classification === 'stop').applied, 1);
+});
+
+/** World with follow-up-1 sent ambiguous and not found: the conversation is provider-ambiguous. */
+async function ambiguousWorld(t) {
+  const world = await sentWorld(t);
+  world.clock.set(WEDNESDAY_0805);
+  world.mailProvider.failNext('ambiguous');
+  const sender = await world.run();
+  assert.equal(sender.ambiguous, 1, JSON.stringify(sender));
+  assert.equal(world.conversation().state, 'provider-ambiguous');
+  assert.equal(world.campaign().state, 'provider-ambiguous');
+  return world;
+}
+
+/** The owner finds follow-up-1 in Gmail after all: reconciled accepted, the conversation reopens. */
+async function reconcileFollowUp(world) {
+  const transmission = world.database.prepare(`SELECT tr.* FROM deal_hunter_cim_transmissions tr
+    WHERE tr.conversation_id = ? AND tr.state = 'ambiguous'`).get(world.ids.conversationId);
+  const at = world.clock.peek();
+  const reconciled = await reconcileCimProviderTransmission({ storage: world.storage,
+    transmission, readProviderEvidence: createCimGmailReconciliationLookup({
+      mailProvider: { async findSent() {
+        return { found: true, messageId: 'gmail-late-1', threadId: world.thread() };
+      } }, clock: () => at }),
+    providerProfile: 'production-gmail-v1', actor: 'owner', now: at, configOverride: world.config });
+  assert.equal(reconciled.outcome, 'accepted', JSON.stringify(reconciled));
+  assert.equal(world.conversation().state, 'open');
+  assert.equal(world.campaign().state, 'active-follow-up');
+}
+
+test('a reply held while provider-ambiguous is applied once the conversation reopens', async (t) => {
+  const world = await ambiguousWorld(t);
+  world.clock.advance(60 * MINUTE);
+  world.inject({}, 'Yes, still available. NDA attached.');
+  const held = await world.poll();
+  assert.equal(held.processed, 2, JSON.stringify(held)); // our initial email and the reply
+  assert.equal(held.responded, 0, 'an unapplied reply is not counted as responded');
+  assert.equal(held.pending, 1);
+  assert.equal(world.replyRows().find((row) => row.classification === 'reply').applied, 0);
+  // Still provider-ambiguous: the next poll keeps it pending and writes nothing.
+  const terminalEvents = world.terminalEvents();
+  assert.equal((await world.poll()).pending, 1);
+  assert.equal(world.terminalEvents(), terminalEvents);
+
+  await reconcileFollowUp(world);
+  const applied = await world.poll();
+  assert.equal(applied.responded, 1, JSON.stringify(applied));
+  assert.equal(applied.pending, 0);
+  assert.equal(world.campaign().state, 'responded');
+  assert.equal(world.conversation().state, 'responded');
+  assert.ok(world.touches(world.ids.campaignId).filter((touch) => touch.state === 'scheduled')
+    .length === 0, 'no follow-up remains scheduled');
+});
+
+test('the sender applies a held reply before sending the next follow-up, even if the poller never ran', async (t) => {
+  const world = await ambiguousWorld(t);
+  world.clock.advance(60 * MINUTE);
+  world.inject({}, 'Yes, still available. NDA attached.');
+  assert.equal((await world.poll()).pending, 1);
+  await reconcileFollowUp(world);
+  const next = world.touches(world.ids.campaignId).find((touch) => touch.state === 'scheduled');
+  assert.ok(next, 'the reopened campaign scheduled its next follow-up');
+  const attempts = world.mailProvider.attempts.length;
+
+  // The next follow-up falls due; only the sender runs.
+  world.clock.set(new Date(Date.parse(next.due_at) + 5 * MINUTE).toISOString());
+  const sender = await world.run();
+  assert.equal(sender.sentFollowUps, 0, JSON.stringify(sender));
+  assert.equal(world.mailProvider.attempts.length, attempts, 'nothing was sent to a broker who answered');
+  assert.equal(world.campaign().state, 'responded');
+  assert.equal(world.row('deal_hunter_cim_campaign_touches', next.id).state,
+    'cancelled-before-provider');
+  assert.equal(world.replyRows().find((row) => row.classification === 'reply').applied, 1);
+});
+
+test('the sender sends nothing to a conversation whose held reply cannot be applied', async (t) => {
+  const world = await ambiguousWorld(t);
+  world.clock.advance(60 * MINUTE);
+  world.inject();
+  assert.equal((await world.poll()).pending, 1);
+  await reconcileFollowUp(world);
+  const next = world.touches(world.ids.campaignId).find((touch) => touch.state === 'scheduled');
+  world.clock.set(new Date(Date.parse(next.due_at) + 5 * MINUTE).toISOString());
+  const attempts = world.mailProvider.attempts.length;
+  const sender = await world.run({ storage: crashingOnce(world.storage, 'appendCimTerminalEvent') });
+  assert.equal(sender.skipped.gmail_reply_pending, 1, JSON.stringify(sender));
+  assert.equal(world.mailProvider.attempts.length, attempts);
+  assert.equal(world.row('deal_hunter_cim_campaign_touches', next.id).state, 'scheduled');
+});
+
+test('our follow-up sent while the history is read is ours, not an owner reply', async (t) => {
+  const world = await sentWorld(t);
+  const fake = world.mailProvider;
+  // The sender's slot fires between the poller's open-conversation read and its history read.
+  const racing = { async listThreadChanges(input) {
+    world.clock.set(WEDNESDAY_0805);
+    const sent = await world.run();
+    assert.equal(sent.sentFollowUps, 1, JSON.stringify(sent));
+    return fake.listThreadChanges(input);
+  } };
+  const summary = await world.poll({ mailProvider: racing });
+  assert.equal(summary.ownerReplied, 0, JSON.stringify(summary));
+  assert.equal(summary.processed, 2);
+  assert.equal(world.campaign().state, 'active-follow-up');
+  assert.deepEqual(world.replyRows().map((row) => row.classification), ['ours', 'ours']);
+  assert.ok(world.replyRows().some((row) => row.gmail_message_id === fake.sent[1].messageId));
+});
+
+test('an unsent Gmail draft in the thread is skipped and not recorded', async (t) => {
+  const world = await sentWorld(t);
+  const draft = world.inject({ from: SENDER, messageId: '<CAdraft@mail.gmail.com>' },
+    'Jordan, following up on', { labelIds: ['DRAFT'] });
+  const summary = await world.poll();
+  assert.equal(summary.ownerReplied, 0, JSON.stringify(summary));
+  assert.equal(summary.processed, 1);
+  assert.equal(world.campaign().state, 'active-follow-up');
+  assert.equal(world.replyRows().some((row) => row.gmail_message_id === draft.id), false);
+  assert.equal(summary.checkpointAdvanced, true);
+  // Sent later, it arrives as a new message and stops the campaign as the owner's reply.
+  world.inject({ from: SENDER, messageId: '<CAsent@mail.gmail.com>' }, 'Jordan, following up on',
+    { labelIds: ['SENT'] });
+  assert.equal((await world.poll()).ownerReplied, 1);
+  assert.equal(world.campaign().reason_code, 'owner_replied');
 });
 
 test('no message body is persisted', async (t) => {
@@ -305,7 +486,7 @@ test('no message body is persisted', async (t) => {
   }
   const columns = world.database.prepare('PRAGMA table_info(deal_hunter_gmail_reply_messages)')
     .all().map(({ name }) => name).sort();
-  assert.deepEqual(columns, ['classification', 'conversation_id', 'from_fingerprint',
+  assert.deepEqual(columns, ['applied', 'classification', 'conversation_id', 'from_fingerprint',
     'gmail_message_id', 'gmail_thread_id', 'message_at', 'processed_at']);
   const reply = world.replyRows().find((row) => row.classification === 'reply');
   assert.match(reply.from_fingerprint, /^[0-9a-f]{64}$/);
@@ -358,7 +539,8 @@ test('the reply poller runs once per 5-minute slot and records counts only', asy
   const scheduler = h.start({ run: async () => {
     runs += 1;
     return { processed: 3, responded: 1, ownerReplied: 0, bounced: 1, autoReplies: 1, stopped: 0,
-      failed: 0, checkpointExpired: true, checkpointAdvanced: true, body: 'never stored' };
+      pending: 2, failed: 0, checkpointExpired: true, checkpointAdvanced: true,
+      body: 'never stored' };
   } });
   await Promise.all([scheduler.tick(), scheduler.tick()]);
   await h.start({ run: async () => { runs += 1; return {}; } }).tick();
@@ -372,6 +554,7 @@ test('the reply poller runs once per 5-minute slot and records counts only', asy
   assert.equal(row.status, 'completed');
   assert.equal(row.metadata.processed, 3);
   assert.equal(row.metadata.bounced, 1);
+  assert.equal(row.metadata.pending, 2);
   assert.equal(row.metadata.checkpointExpired, true);
   assert.equal(JSON.stringify(row).includes('never stored'), false);
 });

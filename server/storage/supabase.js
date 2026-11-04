@@ -6,7 +6,7 @@ import {
   validateGmailCheckpointUpdate, validateGmailTokenCheck, validateRevokeGmailConnection,
   validateSaveGmailConnection, validateSetPursueSendControl, normalizeGmailReplyMessageRow,
   normalizeGmailSentIdentityRow, validateGmailReplyMessage, validateGmailReplyMessageLookup,
-  validateGmailSentIdentityLookup,
+  validateGmailSentIdentityLookup, validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -4273,7 +4273,17 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeGmailReplyMessageRow);
     },
 
-    /** Marks a Gmail message processed once; the same message again is a replay. */
+    /** Recorded Gmail messages whose effect is not applied yet, oldest first. */
+    async listPendingGmailReplyMessages(command = {}) {
+      const { limit } = validateGmailPendingReplyLookup(command);
+      const { data, error } = await client.from('deal_hunter_gmail_reply_messages').select('*')
+        .eq('applied', false).order('processed_at', { ascending: true })
+        .order('gmail_message_id', { ascending: true }).limit(limit);
+      if (error) throw error;
+      return (data || []).map(normalizeGmailReplyMessageRow);
+    },
+
+    /** Records a Gmail message once; a pending row is settled by recording it applied. */
     async recordGmailReplyMessage(command = {}) {
       const { data, error } = await client.rpc('deal_hunter_gmail_record_reply_message_v1', {
         p_command: validateGmailReplyMessage(command),

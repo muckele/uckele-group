@@ -3,6 +3,8 @@
 //   2. the day-28 expiry sweep;
 //   3. sends whose provider seam was entered but never recorded an outcome are reconciled
 //      through Gmail's own Sent mail (findSent), never sent again (Review Focus 3);
+//   3b. Gmail replies recorded by the reply poller but not yet applied are applied, so a
+//      conversation reopened by step 3 stops before its next follow-up;
 //   4. initial emails inside their campaign's weekday 08:00-17:00 local window;
 //   5. due follow-ups.
 // Sends go one at a time: prepare, issue the one-time authorization (only while Live sending
@@ -26,6 +28,7 @@ import {
   reconcileCimProviderTransmission,
 } from './pursueCimProvider.js';
 import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
+import { applyPendingPursueCimReplies } from './pursueCimReplyPoller.js';
 
 export const PURSUE_CIM_SENDER_ACTOR = 'pursue-cim-sender';
 export const PURSUE_CIM_SENDER_QUOTA_JOB_NAME = 'pursue-cim-sender-quota';
@@ -334,6 +337,19 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
     skip(errorCode(error, 'release_failed'));
   }
 
+  // 3b. Gmail replies the reply poller recorded but could not apply yet (for example while
+  // their conversation was provider-ambiguous, which step 3 may just have reopened) are applied
+  // before anything is sent. A conversation whose reply still cannot be applied gets nothing
+  // this run; if the pending replies cannot be read at all, nothing is sent.
+  let replyHeldConversationIds;
+  try {
+    replyHeldConversationIds = (await applyPendingPursueCimReplies({ storage, now: instant }))
+      .pendingConversationIds;
+  } catch (error) {
+    skip(errorCode(error, 'gmail_reply_pending_failed'));
+    return summary;
+  }
+
   if (await quotaMarked(storage, instant())) {
     skip('provider_quota_wait');
     return summary;
@@ -344,6 +360,10 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   // to the next. A touch left claimed by it is recovered once its claim lapses (Ruling L).
   const each = async (rows, handle, fallback) => {
     for (const row of rows) {
+      if (row?.conversation_id && replyHeldConversationIds.has(row.conversation_id)) {
+        skip('gmail_reply_pending');
+        continue;
+      }
       let outcome;
       try {
         outcome = await handle(row);
