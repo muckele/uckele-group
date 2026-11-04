@@ -7,7 +7,7 @@ import { PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE, cimProviderUsesGmail } from '../
 import { createGmailCimProvider } from './gmailCimProvider.js';
 import { CONTACT_POLICY_VERSION, contactPolicyDigest } from './pursueCimContactPolicy.js';
 import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
-import { PURSUE_CIM_REPLY_POLLER_JOB_NAME } from './pursueCimReplyPollerScheduler.js';
+import { PURSUE_CIM_REPLY_POLLER_JOB_NAME, readPursueReplyPollerHold } from './pursueCimReplyPoller.js';
 import { PURSUE_CIM_SENDER_JOB_NAME } from './pursueCimSenderScheduler.js';
 import {
   pursueCimWordingDigest,
@@ -90,6 +90,16 @@ function projectRun(row, countNames) {
   };
 }
 
+/** The durable CIM outreach pause, read as the final gate reads it: no setting is paused. */
+async function centralPauseOn(storage) {
+  try {
+    const settings = await storage.getDealHunterCimSafetySettings?.();
+    return !settings || Boolean(settings.outreach_paused);
+  } catch {
+    return true;
+  }
+}
+
 async function latestRun(storage, jobName, countNames) {
   if (typeof storage?.listScheduledJobs !== 'function') return null;
   const [row] = await storage.listScheduledJobs({ limit: 1, jobName });
@@ -119,10 +129,16 @@ export async function getEmailSendingStatus({ storage, config, now = new Date(),
   const inSync = await capabilitiesInSync({ storage, enabled: liveSending.enabled, providerProfile,
     now: new Date(now).toISOString() });
   // The card's readiness adds what the sender would also stop on: Gmail sending not configured
-  // on the server, or a Live sending control whose capability chain was not applied.
+  // on the server, or a Live sending control whose capability chain was not applied. "Ready to
+  // send." also needs the sender switched on, reply checking switched on and run recently (or
+  // follow-ups are held), and no central CIM outreach pause (Ruling U).
   const reasons = [...readiness.reasons];
   if (!gmailSendingConfigured(config)) reasons.push('provider_not_gmail');
   if (!inSync) reasons.push('live_sending_not_applied');
+  if (config?.dealHunter?.pursueSender?.enabled !== true) reasons.push('sender_off');
+  const replyHold = await readPursueReplyPollerHold({ storage, config, now });
+  if (replyHold) reasons.push(replyHold);
+  if (await centralPauseOn(storage)) reasons.push('central_pause');
   const [senderRun, replyPoller] = await Promise.all([
     latestRun(storage, PURSUE_CIM_SENDER_JOB_NAME, SENDER_COUNTS),
     latestRun(storage, PURSUE_CIM_REPLY_POLLER_JOB_NAME, POLLER_COUNTS),

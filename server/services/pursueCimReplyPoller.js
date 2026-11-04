@@ -33,6 +33,10 @@ import { applyVerifiedPursueCimInbound } from './pursueCimInbound.js';
 import { classifyPursueCimReply, replyFromAddress } from './pursueCimReplyClassifier.js';
 
 export const PURSUE_CIM_REPLY_POLLER_ACTOR = 'pursue-cim-reply-poller';
+export const PURSUE_CIM_REPLY_POLLER_JOB_NAME = 'pursue-cim-reply-poller';
+// Follow-ups wait while reply checking has no completed run this recent (Ruling U).
+export const PURSUE_REPLY_POLLER_FRESH_MS = 30 * 60 * 1000;
+const RECENT_RUNS = 25;
 const LOOKUP_CHUNK = 500;
 const PENDING_LIMIT = 200;
 const GMAIL_ID = /^[A-Za-z0-9_-]{1,240}$/;
@@ -144,6 +148,30 @@ async function applyRecorded({ storage, record, now }) {
     classification: record.classification, fromFingerprint: record.fromFingerprint ?? null,
     messageAt: record.messageAt ?? null, applied: true, now: instantOf(now) });
   return true;
+}
+
+/**
+ * Why follow-ups must wait for reply checking, or null when they need not: `reply_poller_off`
+ * when DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED is not true, `reply_poller_stale` when the
+ * reply poller's Job history has no completed run (one that finished without a run-level
+ * error) in the last 30 minutes, or when that history cannot be read. Without a working reply
+ * poller a broker's answer would never stop the campaign, so a follow-up is not sent.
+ */
+export async function readPursueReplyPollerHold({ storage, config, now } = {}) {
+  if (config?.dealHunter?.replyPoller?.enabled !== true) return 'reply_poller_off';
+  const at = Date.parse(instantOf(now));
+  try {
+    const runs = await storage.listScheduledJobs({ jobName: PURSUE_CIM_REPLY_POLLER_JOB_NAME,
+      limit: RECENT_RUNS });
+    const fresh = (Array.isArray(runs) ? runs : []).some((run) => {
+      const completedAt = Date.parse(run?.completed_at ?? '');
+      return run?.job_name === PURSUE_CIM_REPLY_POLLER_JOB_NAME && run.status === 'completed'
+        && Number.isFinite(completedAt) && at - completedAt <= PURSUE_REPLY_POLLER_FRESH_MS;
+    });
+    return fresh ? null : 'reply_poller_stale';
+  } catch {
+    return 'reply_poller_stale';
+  }
 }
 
 /**

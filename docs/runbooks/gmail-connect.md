@@ -260,7 +260,10 @@ and contact your engineer. Don't go on to step 6.
 - **To stop all Pursue sending right away:** click **Turn off Live sending** and confirm. It
   takes effect before the next send. Emails that were about to go out go back on schedule and
   wait. The **Pause all CIM outreach** switch in Operations also stops everything.
-- **To stop checking replies too:** set `DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=false`.
+- **To stop checking replies too:** turn off Live sending first, then set
+  `DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=false`. Without reply checks a broker's reply could
+  not stop a campaign, so follow-ups are held while reply checking is off or hasn't run in the
+  last 30 minutes; first emails would still go out if Live sending stayed on.
 - **To disconnect Gmail:** click **Disconnect** and confirm. Sending and reply checks stop until
   you connect again. You can also remove the app's access at
   <https://myaccount.google.com/permissions>; the card then says to reconnect.
@@ -285,3 +288,7 @@ What each readiness sentence means:
 | Your name, title, phone, or mailing address is missing from settings. | Set the signature settings from Part B, then approve the wording again. |
 | The server isn't set to send through Gmail yet (see the Gmail setup runbook). | Set `DEAL_HUNTER_CIM_PROVIDER_ENABLED=true` and the sending setup (`DEAL_HUNTER_CIM_PROVIDER_PROFILE`) from step 5 or step 6. |
 | Live sending needs to be re-applied — use Try again. | Click **Try again** under Live sending. |
+| The sender is switched off in server settings. | Set `DEAL_HUNTER_PURSUE_SENDER_ENABLED=true` (step 5 or step 6). |
+| Reply checking is switched off in server settings, so follow-ups are held. | Set `DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=true`. Until then no follow-up is sent. |
+| Reply checking hasn't run recently, so follow-ups are held. | Check **Last runs**: reply checks should run every 5 minutes. If the latest one failed, or Gmail needs reconnecting, fix that; follow-ups resume after the next successful check. If it keeps failing, contact your engineer. |
+| All CIM outreach is paused. | Someone turned on **Pause all CIM outreach** in Operations. Turn it off there when you want sending to resume. |

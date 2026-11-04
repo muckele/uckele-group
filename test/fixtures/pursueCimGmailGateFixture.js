@@ -43,6 +43,7 @@ export function gmailConfig({ provider = 'gmail', sender = SENDER_SETTINGS } = {
       gmail: { clientId: 'client', clientSecret: 'secret', senderAddress: SENDER, tokenKey: '' },
       sender,
       cimAutomation: { sendWindowStart: '08:00' },
+      replyPoller: { enabled: true, intervalMinutes: 5 },
     },
   };
 }

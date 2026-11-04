@@ -5,6 +5,7 @@
 // The controlled clock runs ahead of the wall clock (2030), because the follow-up capacity
 // trigger compares claim and reservation expiry with SQLite's own clock; everything else reads
 // the controlled clock, including follow-up preparation through `pursueCimExecutionClock`.
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -41,6 +42,24 @@ export function controlledClock(startIso, stepMs = 1000) {
   return clock;
 }
 
+/**
+ * One reply-poller Job history row at `at`, as the reply poller scheduler leaves it: completed
+ * (a run without a run-level error) or failed.
+ */
+export async function recordReplyPollerRun(storage, at, { status = 'completed' } = {}) {
+  const nowIso = new Date(at).toISOString();
+  const jobKey = `pursue-cim-reply-poller:${nowIso}`;
+  const claimToken = randomUUID();
+  const claim = await storage.claimScheduledJob({ jobKey, jobName: 'pursue-cim-reply-poller',
+    triggeredBy: 'scheduler', claimToken, nowIso,
+    staleBefore: new Date(Date.parse(nowIso) - 30 * MINUTE).toISOString(),
+    metadata: { slot: nowIso, trigger: 'scheduler' } });
+  if (!(claim.applied ?? claim.claimed)) return;
+  await storage.transitionScheduledJob({ jobKey, claimToken, expectedStatuses: ['pending'], status,
+    nowIso, ...(status === 'failed' ? { lastError: 'pursue_reply_poller_failed' } : { completedAt: nowIso }),
+    metadataPatch: { ok: status === 'completed', error: status === 'failed' ? 'pursue_reply_poller_failed' : null } });
+}
+
 function temporaryPath(t, prefix) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), `ug-${prefix}-`));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -53,9 +72,11 @@ function temporaryPath(t, prefix) {
  * @param {Array<{suffix: string, dueAt: string, dueLocal: string}>} options.campaigns
  * @param {object} [options.config]  sender config (default: production-gmail-v1)
  * @param {string} [options.providerProfile]  the profile Live sending records its chain under
+ * @param {boolean} [options.replyPollerRuns]  record a completed reply-poller run before each
+ *   `run()` (default true), as the 5-minute reply poller scheduler does in production
  */
 export async function createSenderFixture(t, { start, campaigns, config: configOverride,
-  providerProfile } = {}) {
+  providerProfile, replyPollerRuns = true } = {}) {
   const clock = controlledClock(start);
   const sqlitePath = temporaryPath(t, 'pursue-sender');
   const storage = createSqliteStorage({ storage: { sqlitePath },
@@ -100,8 +121,11 @@ export async function createSenderFixture(t, { start, campaigns, config: configO
       ORDER BY source_id`).all(),
     sourceHealth: { healthy: true, issues: [], requiredSources: ['sheet-0'] },
     identityExceptions: [] });
-  const run = (overrides = {}) => runPursueCimSender({ storage, mailProvider, clock, config,
-    loadMemberAuthority, loadInitialAuthority, readCurrentAuthority, ...overrides });
+  const run = async (overrides = {}) => {
+    if (replyPollerRuns) await recordReplyPollerRun(storage, clock.peek());
+    return runPursueCimSender({ storage, mailProvider, clock, config,
+      loadMemberAuthority, loadInitialAuthority, readCurrentAuthority, ...overrides });
+  };
   const row = (table, id) => database.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id);
   const touches = (campaignId) => database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
     WHERE campaign_id = ? ORDER BY ordinal, id`).all(campaignId);

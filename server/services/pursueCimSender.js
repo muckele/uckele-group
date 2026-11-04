@@ -6,7 +6,8 @@
 //   3b. Gmail replies recorded by the reply poller but not yet applied are applied, so a
 //      conversation reopened by step 3 stops before its next follow-up;
 //   4. initial emails inside their campaign's weekday 08:00-17:00 local window;
-//   5. due follow-ups.
+//   5. due follow-ups, only while reply checking is on and has completed a run in the last
+//      30 minutes (otherwise each is held with reply_poller_off or reply_poller_stale).
 // Sends go one at a time: prepare, issue the one-time authorization (only while Live sending
 // is on), the final gate, then Gmail, then finalize or reconcile. A touch whose claim lapsed is
 // picked up again (Ruling L); nothing that may have reached Gmail is ever prepared or sent again.
@@ -28,7 +29,7 @@ import {
   reconcileCimProviderTransmission,
 } from './pursueCimProvider.js';
 import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
-import { applyPendingPursueCimReplies } from './pursueCimReplyPoller.js';
+import { applyPendingPursueCimReplies, readPursueReplyPollerHold } from './pursueCimReplyPoller.js';
 
 export const PURSUE_CIM_SENDER_ACTOR = 'pursue-cim-sender';
 export const PURSUE_CIM_SENDER_QUOTA_JOB_NAME = 'pursue-cim-sender-quota';
@@ -356,6 +357,10 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   }
 
   const chain = await currentChain();
+  // Follow-ups (never initial emails) wait while reply checking is off or not running, so a
+  // broker's reply always stops the campaign before the next follow-up (Ruling U).
+  const followUpHold = await readPursueReplyPollerHold({ storage, config: resolvedConfig,
+    now: instant() });
   // Each touch is isolated: anything one touch throws is recorded by code and the run goes on
   // to the next. A touch left claimed by it is recovered once its claim lapses (Ruling L).
   const each = async (rows, handle, fallback) => {
@@ -516,6 +521,10 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
 
   async function recoverLapsedPreparation(row) {
     const followUp = row.kind !== 'initial';
+    if (followUp && followUpHold) {
+      skip(followUpHold);
+      return null;
+    }
     const activation = followUp ? chain.followUp : chain.initial;
     if (!activation) return stop('not_ready', 'capability_inactive');
     if (!(await inWindow(row.touch_id, followUp ? String(row.due_local ?? '') : undefined))) {
@@ -567,6 +576,10 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   }
 
   async function sendDueFollowUp(candidate) {
+    if (followUpHold) {
+      skip(followUpHold);
+      return null;
+    }
     if (!chain.followUp || chain.followUp.id !== candidate.activation_id) {
       return stop('not_ready', 'capability_inactive');
     }

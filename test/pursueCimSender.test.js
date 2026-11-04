@@ -11,8 +11,8 @@ import { startPursueCimSenderScheduler } from '../server/services/pursueCimSende
 import { syncPursueGmailCapabilities } from '../server/services/pursueGmailCapabilities.js';
 import { orchestratePursuitEnrollment } from '../server/services/pursueCimEnrollment.js';
 import { runDealHunterSheetSync } from '../server/services/dealHunterSheetSync.js';
-import { MINUTE, createSenderFixture } from './fixtures/pursueCimSenderFixture.js';
-import { setSendControl } from './fixtures/pursueCimGmailGateFixture.js';
+import { MINUTE, createSenderFixture, recordReplyPollerRun } from './fixtures/pursueCimSenderFixture.js';
+import { gmailConfig, setSendControl } from './fixtures/pursueCimGmailGateFixture.js';
 import { seedP4bEligibleFixture } from './fixtures/pursueCimEnrollmentFixture.js';
 
 // Monday 2030-10-28 08:00 PDT, and the instants around it.
@@ -775,4 +775,41 @@ test('Live sending off whose release failed, then on again: the prepared follow-
   assert.equal((await fixture.run()).sentFollowUps, 0);
   assert.equal(fixture.mailProvider.sent.length, 2);
   assert.equal(fixture.mailProvider.attempts.length, 2);
+});
+
+test('follow-ups, not initial emails, are held while reply checking is off or has not run in 30 minutes', async (t) => {
+  const base = gmailConfig();
+  const pollerOff = { ...base, dealHunter: { ...base.dealHunter, replyPoller: { enabled: false } } };
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, config: pollerOff,
+    replyPollerRuns: false, campaigns: [due('a')] });
+  // Reply checking is switched off: the initial still goes out.
+  await sendInitial(fixture);
+  const touch = scheduledFollowUp(fixture, 'a');
+  fixture.clock.set(at(touch.due_at, 30_000));
+  const off = await fixture.run();
+  assert.deepEqual([off.sentFollowUps, off.skipped.reply_poller_off, off.stoppedFor],
+    [0, 1, undefined], JSON.stringify(off));
+
+  // Switched on, but no completed run yet, only one 31 minutes old, or only a failed one: stale.
+  const run = () => fixture.run({ config: base });
+  const stale = async () => {
+    const summary = await run();
+    assert.deepEqual([summary.sentFollowUps, summary.skipped.reply_poller_stale], [0, 1],
+      JSON.stringify(summary));
+  };
+  await stale();
+  await recordReplyPollerRun(fixture.storage, fixture.clock.peek().getTime() - 31 * MINUTE);
+  await stale();
+  await recordReplyPollerRun(fixture.storage, fixture.clock.peek().getTime() - 2 * MINUTE,
+    { status: 'failed' });
+  await stale();
+  assert.equal(fixture.mailProvider.attempts.length, 1);
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', touch.id).state, 'scheduled');
+  assert.equal(fixture.count('deal_hunter_cim_transmissions'), 1, 'a held follow-up is not prepared');
+
+  // A completed run in the last 30 minutes: the follow-up goes out, once.
+  await recordReplyPollerRun(fixture.storage, fixture.clock.peek().getTime() - 29 * MINUTE);
+  const sent = await run();
+  assert.equal(sent.sentFollowUps, 1, JSON.stringify(sent));
+  assert.equal(fixture.mailProvider.sent.length, 2);
 });

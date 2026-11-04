@@ -8,6 +8,8 @@
 // - Every control is changed through the Operations card's service (changeEmailSendingControl),
 //   which also records and withdraws the Gmail capability chain.
 // - The scheduled sender and the reply poller are driven tick by tick under a controlled clock.
+//   Every sender tick is preceded by a reply poller scheduler tick (its 5-minute slot), as in
+//   production, so follow-ups see a recently completed reply check (Ruling U).
 //
 // The controlled clock is the process clock too: `Date` reads it, so the owner command and the
 // enrollment it runs see the same instants as the sender, and each read of the sender's clock
@@ -27,6 +29,7 @@ import { recordAcquisitionOwnerCommand } from '../../server/services/dealHunterT
 import { createFakeCimProvider } from '../../server/services/fakeCimProvider.js';
 import { buildGmailConnectUrl, completeGmailConnect, disconnectGmail } from '../../server/services/gmailConnection.js';
 import { runPursueCimReplyPoll } from '../../server/services/pursueCimReplyPoller.js';
+import { startPursueCimReplyPollerScheduler } from '../../server/services/pursueCimReplyPollerScheduler.js';
 import { readPursueCimProviderReadiness } from '../../server/services/pursueCimReadiness.js';
 import { runPursueCimSender } from '../../server/services/pursueCimSender.js';
 import { renderPursueCimEmail } from '../../server/services/pursueCimTemplates.js';
@@ -124,7 +127,12 @@ async function createWorld(t, createBackend, { start }) {
     },
     readiness: () => readPursueCimProviderReadiness({ storage, providerProfile: 'production-gmail-v1',
       now: clock.peek(), mailProvider, config }),
-    send: () => runPursueCimSender({ storage, mailProvider, clock, config }),
+    async send() {
+      await startPursueCimReplyPollerScheduler({ storage, config, now: () => clock.peek(),
+        setTimer: () => null, clearTimer: () => {}, logger: { log() {}, error() {} },
+        run: (input) => runPursueCimReplyPoll({ ...input, mailProvider }) }).tick();
+      return runPursueCimSender({ storage, mailProvider, clock, config });
+    },
     poll: () => runPursueCimReplyPoll({ storage, mailProvider, now: clock, config }),
     run: backend.run,
     one,

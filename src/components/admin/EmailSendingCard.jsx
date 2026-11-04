@@ -17,6 +17,10 @@ export const READINESS_SENTENCES = Object.freeze({
   signature_incomplete: 'Your name, title, phone, or mailing address is missing from settings.',
   provider_not_gmail: "The server isn't set to send through Gmail yet (see the Gmail setup runbook).",
   live_sending_not_applied: 'Live sending needs to be re-applied — use Try again.',
+  sender_off: 'The sender is switched off in server settings.',
+  reply_poller_off: 'Reply checking is switched off in server settings, so follow-ups are held.',
+  reply_poller_stale: "Reply checking hasn't run recently, so follow-ups are held.",
+  central_pause: 'All CIM outreach is paused.',
 });
 
 // The `gmail` query value the connect callback redirects back with.

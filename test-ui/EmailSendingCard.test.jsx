@@ -133,6 +133,22 @@ describe('Email sending card', () => {
     expect(screen.queryByText(/gmail_not_connected/)).not.toBeInTheDocument();
   });
 
+  test('says why sending is held when the sender, reply checking or outreach is off', async () => {
+    stubFetch(status({ readiness: { ready: false, reasons: [
+      'sender_off', 'reply_poller_off', 'reply_poller_stale', 'central_pause',
+    ] } }));
+    render(<EmailSendingCard />);
+
+    const list = await screen.findByRole('list', { name: 'Why sending is paused' });
+    expect(within(list).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      'The sender is switched off in server settings.',
+      'Reply checking is switched off in server settings, so follow-ups are held.',
+      "Reply checking hasn't run recently, so follow-ups are held.",
+      'All CIM outreach is paused.',
+    ]);
+    expect(screen.queryByText('Ready to send.')).not.toBeInTheDocument();
+  });
+
   test('says ready when no reason remains', async () => {
     stubFetch(status({ readiness: { ready: true, reasons: [] } }));
     render(<EmailSendingCard />);

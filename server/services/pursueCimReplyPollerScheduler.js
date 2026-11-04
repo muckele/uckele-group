@@ -8,9 +8,9 @@ import { randomUUID } from 'node:crypto';
 
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { runPursueCimReplyPoll } from './pursueCimReplyPoller.js';
+import { PURSUE_CIM_REPLY_POLLER_JOB_NAME, runPursueCimReplyPoll } from './pursueCimReplyPoller.js';
 
-export const PURSUE_CIM_REPLY_POLLER_JOB_NAME = 'pursue-cim-reply-poller';
+export { PURSUE_CIM_REPLY_POLLER_JOB_NAME };
 const claimStaleMs = 30 * 60 * 1000;
 const checkIntervalMs = 60_000;
 const CODE = /^[a-z][a-z0-9_]{0,79}$/;

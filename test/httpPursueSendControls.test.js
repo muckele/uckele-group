@@ -142,9 +142,11 @@ test('viewer gets status without preview and cannot change controls', async () =
     assert.equal(emailSending.wording.approvedDigest, null);
     assert.equal(Object.hasOwn(emailSending.wording, 'preview'), false);
     assert.equal(emailSending.readiness.ready, false);
-    // This server has no Gmail CIM provider profile configured, so the card says so too.
+    // This server has no Gmail CIM provider profile configured, so the card says so too, and
+    // neither the sender nor reply checking is switched on, and outreach has never been unpaused.
     assert.deepEqual(emailSending.readiness.reasons,
-      ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off', 'provider_not_gmail']);
+      ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off', 'provider_not_gmail',
+        'sender_off', 'reply_poller_off', 'central_pause']);
     assert.equal(emailSending.liveSending.capabilitiesInSync, true);
     assert.equal(emailSending.liveSending.providerProfile, 'production-gmail-v1');
     assert.equal(emailSending.liveSending.enabled, false);
