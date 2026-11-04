@@ -8,7 +8,8 @@
  * - definitive-failure: rejected for good (a non-quota 4xx, or an invalid message caught locally).
  * - ambiguous: timeout, 5xx or lost response; reconcile with findSent before anything else.
  * - quota: rejected before acceptance by a rate or daily limit; nothing was sent.
- * - not-attempted: nothing reached the provider (no connection, revoked or failed token refresh).
+ * - not-attempted: nothing was sent and the message is not at fault (no connection, revoked or
+ *   failed token refresh, or the provider rejected our access: Gmail 401 or 403 access reasons).
  */
 
 /**
@@ -19,7 +20,7 @@
  * @property {string|null} rfcMessageId our `<{transmissionId}@{sender domain}>`, null if invalid input
  * @property {string} code `accepted`, `gmail_<status>`, `gmail_403_<quota reason>`, `gmail_timeout`,
  *   `gmail_network_error`, `gmail_response_invalid`, `invalid_message`, or a token code
- *   (`gmail_not_connected`, `gmail_token_invalid`, `gmail_token_refresh_failed`).
+ *   (`gmail_not_connected`, `gmail_token_invalid`, `gmail_token_refresh_failed`, `gmail_access_denied`).
  */
 
 /**

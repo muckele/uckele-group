@@ -212,6 +212,14 @@ test('each status maps to the documented outcome', async (t) => {
     [() => json(403, { error: { code: 403, errors: [{ reason: 'forbidden' }] } }),
       'definitive-failure', 'gmail_403'],
     [() => json(429, { error: { code: 429, message: 'Too many requests' } }), 'quota', 'gmail_429'],
+    [() => json(401, { error: { code: 401, message: 'Invalid Credentials', errors: [{ reason: 'authError' }] } }),
+      'not-attempted', 'gmail_token_invalid'],
+    [() => json(403, { error: { code: 403, errors: [{ reason: 'insufficientPermissions' }] } }),
+      'not-attempted', 'gmail_access_denied'],
+    [() => json(403, { error: { code: 403, errors: [{ reason: 'authError' }] } }),
+      'not-attempted', 'gmail_access_denied'],
+    [() => json(403, { error: { code: 403, errors: [{ reason: 'domainPolicy' }] } }),
+      'definitive-failure', 'gmail_403'],
     [() => json(500, { error: { code: 500, message: 'Backend Error' } }), 'ambiguous', 'gmail_500'],
     [() => json(503, { error: { code: 503 } }), 'ambiguous', 'gmail_503'],
     [() => new Response('<html>bad gateway</html>', { status: 502 }), 'ambiguous', 'gmail_502'],
@@ -231,11 +239,11 @@ test('each status maps to the documented outcome', async (t) => {
       assert.equal(result.threadId, null);
     }
     assertNoSecrets(result);
-    assert.doesNotMatch(JSON.stringify(result), /Backend Error|bad gateway|Invalid To header/);
+    assert.doesNotMatch(JSON.stringify(result), /Backend Error|bad gateway|Invalid To header|Invalid Credentials/);
   }
 });
 
-test('quota reasons map to quota, other 403 to definitive-failure', async (t) => {
+test('quota reasons map to quota, access reasons to not-attempted, other 403 to definitive-failure', async (t) => {
   const storage = openStorage(t);
   const config = makeConfig();
   await connect(storage, config);
@@ -243,7 +251,8 @@ test('quota reasons map to quota, other 403 to definitive-failure', async (t) =>
     ['rateLimitExceeded', 'quota', 'gmail_403_rateLimitExceeded'],
     ['userRateLimitExceeded', 'quota', 'gmail_403_userRateLimitExceeded'],
     ['dailyLimitExceeded', 'quota', 'gmail_403_dailyLimitExceeded'],
-    ['insufficientPermissions', 'definitive-failure', 'gmail_403'],
+    ['insufficientPermissions', 'not-attempted', 'gmail_access_denied'],
+    ['authError', 'not-attempted', 'gmail_access_denied'],
     ['domainPolicy', 'definitive-failure', 'gmail_403'],
     [null, 'definitive-failure', 'gmail_403'],
   ];

@@ -14,6 +14,8 @@ export const GMAIL_REQUEST_TIMEOUT_MS = 30_000;
 const API = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const TOKEN_CHECK_REUSE_MS = 15 * 60 * 1000;
 const QUOTA_REASONS = new Set(['rateLimitExceeded', 'userRateLimitExceeded', 'dailyLimitExceeded']);
+// A 403 for these reasons rejects our access, not the message: nothing was sent.
+const ACCESS_DENIED_REASONS = new Set(['insufficientPermissions', 'authError']);
 const TOKEN_CODES = new Set(['gmail_not_connected', 'gmail_token_invalid', 'gmail_token_refresh_failed']);
 const GMAIL_ID = /^[A-Za-z0-9_-]{1,240}$/;
 const MAX_HISTORY_PAGES = 100;
@@ -51,12 +53,15 @@ async function gmailRequest(fetcher, accessToken, url, { method = 'GET', body } 
   return { status: response.status, ok: response.ok, body: parsed, transport: null };
 }
 
-function quotaReason(body) {
+function errorReasons(body) {
   const errors = Array.isArray(body?.error?.errors) ? body.error.errors : [];
-  return errors.map((entry) => entry?.reason).find((reason) => QUOTA_REASONS.has(reason)) ?? null;
+  return errors.map((entry) => entry?.reason).filter((reason) => typeof reason === 'string');
 }
 
-/** Maps a messages.send response to the §5.7 outcome table. */
+/**
+ * Maps a messages.send response to the §5.7 outcome table. Auth rejections (401, or 403 for an
+ * access reason) are not-attempted: the message was never sent and is not at fault (Ruling G).
+ */
 function sendOutcome(response) {
   if (response.transport) return { outcome: 'ambiguous', code: response.transport };
   const { status, body } = response;
@@ -70,10 +75,15 @@ function sendOutcome(response) {
     return { outcome: 'ambiguous', code: 'gmail_response_invalid' };
   }
   if (status === 429) return { outcome: 'quota', code: 'gmail_429' };
+  if (status === 401) return { outcome: 'not-attempted', code: 'gmail_token_invalid' };
   if (status === 403) {
-    const reason = quotaReason(body);
-    return reason ? { outcome: 'quota', code: `gmail_403_${reason}` }
-      : { outcome: 'definitive-failure', code: 'gmail_403' };
+    const reasons = errorReasons(body);
+    const quota = reasons.find((reason) => QUOTA_REASONS.has(reason));
+    if (quota) return { outcome: 'quota', code: `gmail_403_${quota}` };
+    if (reasons.some((reason) => ACCESS_DENIED_REASONS.has(reason))) {
+      return { outcome: 'not-attempted', code: 'gmail_access_denied' };
+    }
+    return { outcome: 'definitive-failure', code: 'gmail_403' };
   }
   if (status >= 400 && status < 500) return { outcome: 'definitive-failure', code: `gmail_${status}` };
   return { outcome: 'ambiguous', code: `gmail_${status}` };
