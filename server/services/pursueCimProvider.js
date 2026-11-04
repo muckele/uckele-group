@@ -1,9 +1,18 @@
 import { getCimProviderReconciliationConfig, getConfig } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { createCimProviderBoundaryAuthorization } from './cimProviderBoundary.js';
+import { cimRfcMessageId } from './cimMailProvider.js';
+import { RFC_MESSAGE_ID } from './rfc5322.js';
 import { deriveAcceptedCimCadence } from './pursueCimCadence.js';
 import { sendPreparedMessage } from './delivery.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { CIM_PROVIDER_RELEASE_CODES } from '../storage/gmailSendStorageContract.js';
+
+// Reconciliation proof may come from the provider a transmission was sent through.
+const reconciliationProviders = new Set(['resend', 'gmail']);
+// A follow-up's In-Reply-To: the follow-up payload carries the initial's RFC Message-ID as
+// this tag, so threading is part of the digest-bound durable payload.
+export const PURSUE_CIM_IN_REPLY_TO_TAG = 'cim_in_reply_to';
 
 const reconciliationEvidenceTypes = new Set([
   'persisted-provider-result',
@@ -46,6 +55,23 @@ export function normalizeCimProviderOutcome(result = {}) {
     return { category: 'accepted', provider, providerMessageId: coherentIdentity,
       providerResultCode: 'accepted' };
   }
+  if (reportedProvider === 'gmail') {
+    if (result.status === 'sent' && coherentIdentity) {
+      return { category: 'accepted', provider, providerMessageId: coherentIdentity,
+        providerResultCode: 'accepted' };
+    }
+    // Quota, or nothing reached Gmail: never accepted, so the touch is released (Ruling D).
+    if (result.status === 'failed' && result.providerUnsent === true && rawIds.length === 0
+      && CIM_PROVIDER_RELEASE_CODES.includes(result.errorCategory)) {
+      return { category: 'unsent', provider, providerMessageId: null,
+        providerResultCode: result.errorCategory };
+    }
+    if (result.status === 'failed' && result.definitiveFailure === true
+      && result.providerUnsent !== true && rawIds.length === 0) {
+      return { category: 'definitive-failure', provider, providerMessageId: null,
+        providerResultCode: boundedResultCode(result.errorCategory, 'gmail-nonacceptance') };
+    }
+  }
   if (reportedProvider === 'resend' && result.status === 'failed' && result.definitiveFailure === true
     && result.errorCategory === 'provider-nonacceptance' && rawIds.length === 0) {
     return { category: 'definitive-failure', provider, providerMessageId: null,
@@ -87,6 +113,31 @@ async function acceptedCadence(storage, transmissionId, observedAt, configOverri
 // same-process P6A result, reconstructs the provider message from durable
 // records, and delegates the actual enforcement and adapter call to the
 // private delivery.sendMessage boundary.
+function taggedValue(tags, name) {
+  const prefix = `${name}=`;
+  const match = (Array.isArray(tags) ? tags : [])
+    .find((tag) => typeof tag === 'string' && tag.startsWith(prefix));
+  return match ? match.slice(prefix.length) : '';
+}
+
+// A Gmail follow-up goes into the conversation's Gmail thread, replying to the initial's
+// Message-ID. Both come from durable records; the send refuses a follow-up missing either.
+function gmailThreading(durable, communication) {
+  if (communication.kind !== 'cim-follow-up') return {};
+  const inReplyTo = taggedValue(communication.tags, PURSUE_CIM_IN_REPLY_TO_TAG);
+  return {
+    gmailThreadId: typeof durable?.conversation?.gmail_thread_id === 'string'
+      ? durable.conversation.gmail_thread_id : '',
+    inReplyTo,
+    references: inReplyTo ? [inReplyTo] : [],
+  };
+}
+
+/**
+ * `mailProvider` (optional) is the CIM mail provider. It is used only when the selected profile
+ * sends through Gmail (production-gmail-v1, or controlled-mailbox-v1 with provider gmail); the
+ * Resend paths ignore it and are unchanged.
+ */
 export async function sendAuthorizedCimTransmission({
   storage,
   finalGateResult,
@@ -97,6 +148,7 @@ export async function sendAuthorizedCimTransmission({
   now = new Date(),
   configOverride,
   fetcher,
+  mailProvider,
   testHooks = {},
 } = {}) {
   if (typeof storage?.readCimFinalGateContext !== 'function') return denied();
@@ -134,6 +186,7 @@ export async function sendAuthorizedCimTransmission({
     text: communication.body_text,
     html: communication.body_html_sanitized,
     tags: communication.tags,
+    ...(mailProvider ? gmailThreading(durable, communication) : {}),
   });
   return sendPreparedMessage(message, {
     storage,
@@ -142,7 +195,55 @@ export async function sendAuthorizedCimTransmission({
     configOverride,
     fetcher,
     testHooks,
+    ...(mailProvider ? { cimMailProvider: mailProvider } : {}),
   });
+}
+
+// On acceptance through Gmail, the conversation remembers its Gmail thread for follow-ups and
+// reply detection. A different thread already stored is never overwritten: the conflict is
+// reported by code only, and the accepted touch stays finalized because the email went out.
+async function storeGmailThread(storage, { conversationId, gmailThreadId, now }) {
+  if (!conversationId || typeof gmailThreadId !== 'string' || !gmailThreadId
+    || typeof storage?.setCimConversationGmailThread !== 'function') return null;
+  try {
+    const result = await storage.setCimConversationGmailThread({ conversationId, gmailThreadId,
+      now: now instanceof Date ? now.toISOString() : new Date(now).toISOString() });
+    if (result?.conflict) {
+      console.warn('[pursue-cim] gmail_thread_conflict: the conversation keeps its stored Gmail thread');
+    }
+    return { applied: result?.applied === true, replay: result?.replay === true,
+      conflict: result?.conflict === true };
+  } catch {
+    console.warn('[pursue-cim] gmail_thread_store_failed');
+    return { applied: false, replay: false, conflict: false, failed: true };
+  }
+}
+
+/**
+ * Gmail may give a sent message its own Message-ID instead of ours. After an accepted Gmail
+ * send the real one is read back and stored as the communication's message id, which
+ * follow-ups reply to, the reply poller recognizes as ours, and findSent searches first. A
+ * failed read keeps ours: nothing changes. Never throws.
+ */
+async function storeSentMessageId(storage, { mailProvider, transmissionId, providerMessageId, now }) {
+  if (typeof mailProvider?.readMessageId !== 'function'
+    || typeof storage?.setCimCommunicationMessageId !== 'function'
+    || typeof providerMessageId !== 'string' || !providerMessageId) return null;
+  let messageId;
+  try {
+    messageId = await mailProvider.readMessageId({ messageId: providerMessageId });
+  } catch {
+    return { stored: false, code: 'gmail_message_id_unread' };
+  }
+  try {
+    const result = await storage.setCimCommunicationMessageId({ transmissionId, messageId,
+      now: now instanceof Date ? now.toISOString() : new Date(now).toISOString() });
+    if (result?.conflict) console.warn('[pursue-cim] gmail_message_id_conflict: the stored Message-ID is kept');
+    return { stored: result?.applied === true || result?.replay === true };
+  } catch {
+    console.warn('[pursue-cim] gmail_message_id_store_failed');
+    return { stored: false, code: 'gmail_message_id_store_failed' };
+  }
 }
 
 export async function finalizeAuthorizedCimTransmission({
@@ -155,11 +256,13 @@ export async function finalizeAuthorizedCimTransmission({
   now = new Date(),
   configOverride,
   fetcher,
+  mailProvider,
   sendAuthorized = sendAuthorizedCimTransmission,
   testHooks = {},
 } = {}) {
   const providerResult = await sendAuthorized({ storage, finalGateResult, authorizationId,
-    writerPath, providerProfile, actor, now, configOverride, fetcher, testHooks });
+    writerPath, providerProfile, actor, now, configOverride, fetcher, testHooks,
+    ...(mailProvider ? { mailProvider } : {}) });
   await testHooks.afterProviderResult?.({ providerResult, finalGateResult });
   const outcome = normalizeCimProviderOutcome(providerResult);
   if (outcome.category === 'pending') {
@@ -198,9 +301,33 @@ export async function finalizeAuthorizedCimTransmission({
   const expectedRowVersion = Number.isSafeInteger(providerResult.providerFinalizationRowVersion)
     ? providerResult.providerFinalizationRowVersion
     : Number.isSafeInteger(transmission?.row_version) ? transmission.row_version + 1 : null;
+  if (outcome.category === 'unsent') {
+    if (!transmission?.id || !Number.isSafeInteger(expectedRowVersion)
+      || typeof storage?.releaseCimProviderPendingUnsent !== 'function') {
+      throw new Error('The unsent provider result cannot be bound to a durable release.');
+    }
+    const durableResult = await storage.releaseCimProviderPendingUnsent({
+      transmissionId: transmission.id,
+      payloadDigest: transmission.payload_digest,
+      expectedRowVersion,
+      provider: outcome.provider,
+      providerResultCode: outcome.providerResultCode,
+      actor,
+      now: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
+    });
+    return { providerResult, outcome, durableResult };
+  }
   if (!transmission?.id || !Number.isSafeInteger(expectedRowVersion)
     || typeof storage?.finalizeCimTransmission !== 'function') {
     throw new Error('The provider result cannot be bound to durable CIM finalization.');
+  }
+  if (outcome.category === 'ambiguous' && outcome.provider === 'gmail'
+    && typeof mailProvider?.findSent === 'function') {
+    // Spec §5.7: an unsure Gmail send is searched for by its own Message-ID before anything
+    // else. Found means accepted; not found (or a failed search) is recorded as ambiguous.
+    const reconciled = await reconcileUnsureGmailSend({ storage, transmission, authorizationId,
+      writerPath, providerProfile, actor, now, configOverride, mailProvider });
+    if (reconciled) return { providerResult, ...reconciled };
   }
   const observedAt = new Date(providerResult.providerOutcomeObservedAt).toISOString();
   const command = {
@@ -220,7 +347,44 @@ export async function finalizeAuthorizedCimTransmission({
   await testHooks.beforeFinalization?.({ command, providerResult, outcome });
   const durableResult = await storage.finalizeCimTransmission(command);
   await testHooks.afterFinalization?.({ command, providerResult, outcome, durableResult });
-  return { providerResult, outcome, durableResult };
+  const gmailAccepted = outcome.category === 'accepted' && outcome.provider === 'gmail'
+    && (durableResult?.applied || durableResult?.existing);
+  const gmailThread = gmailAccepted
+    ? await storeGmailThread(storage, { conversationId: transmission.conversation_id,
+      gmailThreadId: providerResult.providerThreadId, now })
+    : undefined;
+  const gmailMessageId = gmailAccepted
+    ? await storeSentMessageId(storage, { mailProvider, transmissionId: transmission.id,
+      providerMessageId: outcome.providerMessageId, now })
+    : undefined;
+  return { providerResult, outcome, durableResult, ...(gmailThread ? { gmailThread } : {}),
+    ...(gmailMessageId ? { gmailMessageId } : {}) };
+}
+
+async function reconcileUnsureGmailSend({ storage, transmission, authorizationId, writerPath,
+  providerProfile, actor, now, configOverride, mailProvider }) {
+  try {
+    const durable = await storage.readCimFinalGateContext({ transmissionId: transmission.id,
+      authorizationId, writerPath, providerProfile,
+      now: now instanceof Date ? now.toISOString() : new Date(now).toISOString() });
+    const current = durable?.transmission;
+    if (current?.state !== 'provider-pending') return null;
+    const reconciled = await reconcileCimProviderTransmission({ storage, transmission: current,
+      readProviderEvidence: createCimGmailReconciliationLookup({ mailProvider, storage,
+        clock: () => new Date(now) }),
+      providerProfile, actor, now, configOverride });
+    if (!reconciled.resolved || reconciled.outcome !== 'accepted') return null;
+    return {
+      outcome: { category: 'accepted', provider: 'gmail',
+        providerMessageId: reconciled.durableResult?.transmission?.provider_message_id ?? null,
+        providerResultCode: 'reconciled-accepted' },
+      durableResult: reconciled.durableResult,
+      reconciled: true,
+      ...(reconciled.gmailThread ? { gmailThread: reconciled.gmailThread } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function requiredEvidenceText(value, name, maximum) {
@@ -280,7 +444,9 @@ function normalizeProviderProof(proof, expectedBinding, providerProfile = '') {
   if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return null;
   const evidence = normalizeReconciliationEvidence({ type: proof.type, id: proof.id,
     digest: '0'.repeat(64), observedAt: proof.observedAt });
-  if (proof.provider !== 'resend') throw new Error('Reconciliation proof must come from Resend');
+  if (!reconciliationProviders.has(proof.provider)) {
+    throw new Error('Reconciliation proof must come from Resend or Gmail');
+  }
   if (providerProfile && proof.providerProfile !== providerProfile) {
     throw new Error('Reconciliation proof does not match the provider profile');
   }
@@ -291,9 +457,9 @@ function normalizeProviderProof(proof, expectedBinding, providerProfile = '') {
   if (!suppliedBinding || stableCanonicalJson(suppliedBinding) !== stableCanonicalJson(expectedBinding)) {
     throw new Error('Reconciliation proof does not match the immutable transmission');
   }
-  const candidates = normalizeProviderCandidates(proof.candidates ?? []);
+  const candidates = normalizeProviderCandidates(proof.candidates ?? [], proof.provider);
   const canonical = { version: 'cim-provider-reconciliation-evidence-v1',
-    type: evidence.type, id: evidence.id, provider: 'resend', outcome: proof.outcome,
+    type: evidence.type, id: evidence.id, provider: proof.provider, outcome: proof.outcome,
     ...(providerProfile ? { providerProfile } : {}),
     observedAt: evidence.observedAt, binding: expectedBinding, candidates };
   return { ...canonical, digest: sha256(stableCanonicalJson(canonical)) };
@@ -371,26 +537,81 @@ export function createCimResendReconciliationLookup({ listSentEmails, clock = ()
   };
 }
 
-function normalizeProviderCandidates(candidates) {
+function normalizeProviderCandidates(candidates, provider = 'resend') {
   if (!Array.isArray(candidates) || candidates.length > 20) {
     throw new Error('Provider reconciliation candidates must be a bounded array');
   }
   return candidates.map((candidate, index) => {
-    if (candidate?.provider !== 'resend') {
-      throw new Error('Provider reconciliation candidates must come from Resend');
+    if (candidate?.provider !== provider) {
+      throw new Error('Provider reconciliation candidates must come from the proof provider');
     }
     const providerMessageId = boundedProviderMessageId(candidate.providerMessageId);
     if (!providerMessageId) throw new Error('Invalid reconciliation provider identity');
     const evidenceId = requiredEvidenceText(candidate.evidenceId ?? `candidate-${index + 1}`,
       'candidate.evidenceId', 240);
     return {
-      provider: 'resend',
+      provider,
       providerMessageId,
       evidenceId,
-      evidenceDigest: sha256(stableCanonicalJson({ provider: 'resend', providerMessageId,
+      evidenceDigest: sha256(stableCanonicalJson({ provider, providerMessageId,
         evidenceId })),
     };
   });
+}
+
+/** The stored real Message-ID of a transmission's sent message, or null. */
+async function storedMessageId(storage, transmission) {
+  if (typeof storage?.listGmailConversationSentIdentities !== 'function'
+    || typeof transmission?.conversation_id !== 'string' || !transmission.conversation_id) return null;
+  const identities = await storage.listGmailConversationSentIdentities({
+    conversationIds: [transmission.conversation_id] });
+  const value = identities.find((identity) => identity.transmissionId === transmission.id)?.rfcMessageId;
+  return typeof value === 'string' && RFC_MESSAGE_ID.test(value) ? value : null;
+}
+
+/**
+ * The Gmail reconciliation reader for reconcileCimProviderTransmission (spec §5.7): searches
+ * the owner's mailbox through `mailProvider.findSent` for the Message-ID Gmail gave the message
+ * when it is stored (given `storage`), then for our own `<{transmissionId}@{sender domain}>`.
+ * Found is acceptance; not found is unresolved, never rejection. A failed search throws, so
+ * nothing is inferred from it.
+ */
+export function createCimGmailReconciliationLookup({ mailProvider, clock = () => new Date(),
+  storage = null } = {}) {
+  if (typeof mailProvider?.findSent !== 'function') {
+    throw new Error('A Gmail mail provider with findSent is required');
+  }
+  return async ({ transmission, binding, providerProfile = '' } = {}) => {
+    const expected = immutableTransmissionBinding(transmission, providerProfile);
+    if (stableCanonicalJson(binding) !== stableCanonicalJson(expected)) {
+      throw new Error('Gmail lookup does not match the immutable transmission');
+    }
+    const ours = cimRfcMessageId(transmission.id, expected.fromAddress);
+    if (!ours) throw new Error('Gmail lookup has no valid Message-ID');
+    const observedAt = new Date(clock()).toISOString();
+    // The Message-ID Gmail actually gave the message, when it was read back and stored, is
+    // searched first; our own is the fallback.
+    const stored = await storedMessageId(storage, transmission);
+    let rfcMessageId = ours;
+    let found = { found: false };
+    for (const candidate of stored && stored !== ours ? [stored, ours] : [ours]) {
+      rfcMessageId = candidate;
+      found = await mailProvider.findSent({ rfcMessageId: candidate });
+      if (found?.found === true) break;
+    }
+    const candidates = found?.found === true && boundedProviderMessageId(found.messageId)
+      ? [{ provider: 'gmail', providerMessageId: found.messageId,
+        evidenceId: `gmail-message:${found.messageId}`,
+        threadId: typeof found.threadId === 'string' ? found.threadId : null }]
+      : [];
+    return { type: 'provider-read',
+      id: `gmail-rfc822msgid:${sha256(stableCanonicalJson({ observedAt, rfcMessageId,
+        candidates: candidates.map(({ providerMessageId }) => providerMessageId) }))}`,
+      provider: 'gmail', ...(providerProfile ? { providerProfile } : {}),
+      outcome: candidates.length === 1 ? 'accepted' : 'unresolved',
+      observedAt, binding: expected, candidates,
+      gmailThreadId: candidates[0]?.threadId ?? null };
+  };
 }
 
 // Reconciliation is deliberately read-only at the provider boundary. It can
@@ -414,10 +635,11 @@ export async function reconcileCimProviderTransmission({
     throw new Error('Exact durable CIM transmission context is required for reconciliation');
   }
   const binding = immutableTransmissionBinding(transmission, providerProfile);
-  const exactEvidence = normalizeProviderProof(await readProviderEvidence({
+  const proof = await readProviderEvidence({
     transmission: Object.freeze({ ...transmission }), binding: Object.freeze({ ...binding }),
     providerProfile,
-  }), binding, providerProfile);
+  });
+  const exactEvidence = normalizeProviderProof(proof, binding, providerProfile);
   if (!exactEvidence) {
     return { resolved: false, reconciliationOnly: true, providerCalls: 0,
       outcome: transmission.state, durableResult: null };
@@ -446,7 +668,7 @@ export async function reconcileCimProviderTransmission({
     payloadDigest: transmission.payload_digest,
     expectedRowVersion: transmission.row_version,
     outcome,
-    provider: 'resend',
+    provider: exactEvidence.provider,
     providerMessageId,
     providerResultCode,
     evidenceType: exactEvidence.type,
@@ -460,7 +682,12 @@ export async function reconcileCimProviderTransmission({
       ? await acceptedCadence(storage, transmission.id, exactEvidence.observedAt,
         configOverride) : null,
   });
+  const gmailThread = outcome === 'accepted' && exactEvidence.provider === 'gmail'
+    && (durableResult?.applied || durableResult?.unchanged)
+    ? await storeGmailThread(storage, { conversationId: transmission.conversation_id,
+      gmailThreadId: proof?.gmailThreadId, now })
+    : undefined;
   return { resolved: outcome !== 'ambiguous' && !durableResult.conflict,
     reconciliationOnly: outcome === 'ambiguous', providerCalls: 0,
-    outcome, durableResult };
+    outcome, durableResult, ...(gmailThread ? { gmailThread } : {}) };
 }

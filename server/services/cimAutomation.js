@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import { PURSUE_OWNERSHIP_REFUSAL_MESSAGE } from './pursueOwnership.js';
+import { trustedTargetStates } from './targetStates.js';
 import {
   getCimIdentityOperationsStatus,
   logicalCimTouchesForRecipient,
@@ -19,21 +21,27 @@ const passReasons = new Set([
   'industry', 'geography', 'valuation', 'profit', 'owner-dependence', 'duplicate',
   'recipient', 'financing', 'quality', 'timing', 'other',
 ]);
-const genericMailboxNames = new Set([
+export const genericMailboxNames = new Set([
   'admin', 'broker', 'contact', 'deals', 'enquiries', 'hello', 'info', 'inquiries',
   'listings', 'mail', 'office', 'sales', 'support', 'team',
 ]);
+/** True for a shared inbox: the whole mailbox, or its first segment, is a generic name. */
+export function isGenericMailbox(address) {
+  const mailbox = String(address || '').toLowerCase().split('@')[0] || '';
+  const firstSegment = mailbox.split(/[^a-z0-9]+/).filter(Boolean)[0] || '';
+  return genericMailboxNames.has(mailbox) || genericMailboxNames.has(firstSegment);
+}
 const suppressionTypes = new Set(['bounced', 'complained', 'failed', 'suppressed', 'unsubscribed']);
 const adverseDeliveryStates = new Set(['bounced', 'complained', 'failed', 'suppressed']);
 const acceptedInitialStates = new Set([
   'accepted', 'delivered', 'delayed', 'bounced', 'complained', 'failed', 'suppressed', 'replied', 'development-only',
 ]);
-const trustedIndustryTerms = [
+export const trustedIndustryTerms = [
   'hvac', 'plumbing', 'electrical', 'landscape', 'maintenance', 'repair', 'restoration',
   'field service', 'commercial service', 'environmental', 'waste', 'pet', 'veterinary',
   'healthcare service', 'professional service', 'property management',
 ];
-const trustedTargetStates = ['NY', 'CA', 'NJ', 'AZ', 'NV', 'CT'];
+export { trustedTargetStates };
 const automationModes = new Set(['off', 'shadow', 'canary', 'active']);
 
 function normalizeText(value = '', maxLength = 1000) {
@@ -840,7 +848,7 @@ function exactSourceContact(deal, email) {
   ));
 }
 
-function containsTrustedIndustryTerm(value = '', term = '') {
+export function containsTrustedIndustryTerm(value = '', term = '') {
   const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
   return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(value);
 }
@@ -878,7 +886,7 @@ export function assessCimStage2StaticCandidate(deal = {}, { policy = getCimStage
 
 export function evaluateCimAutomationCandidates({
   review = {}, scoredDeals = [], status = {}, requests = [], events = [], suppressions = [],
-  recipientClaims = [], opportunityClaims = [], now = new Date(),
+  recipientClaims = [], opportunityClaims = [], pursueOwnerships = [], now = new Date(),
 } = {}) {
   const policy = status.policy?.policyHash ? status.policy : getCimStage2Policy();
   const latestDecision = status.metrics?.latestHumanByDeal instanceof Map ? status.metrics.latestHumanByDeal : new Map();
@@ -899,6 +907,9 @@ export function evaluateCimAutomationCandidates({
   const suppressionSet = new Set(suppressions.map((item) => normalizeEmail(item.normalized_email || item.email)).filter(Boolean));
   const recipientClaimSet = new Set(recipientClaims.map((item) => normalizeEmail(item.recipient_email)).filter(Boolean));
   const opportunityClaimSet = new Set(opportunityClaims.map((item) => normalizeText(item.opportunity_id, 160)).filter(Boolean));
+  const pursueOwnershipByOpportunity = new Map(pursueOwnerships
+    .filter((item) => item?.owned && item.reason)
+    .map((item) => [normalizeText(item.opportunityId, 160), item.reason]));
   const exceptions = [];
   const eligible = [];
   const nowMs = now.getTime();
@@ -926,6 +937,9 @@ export function evaluateCimAutomationCandidates({
     if (touches30Days >= policy.caps.recipient30Days) reasons.push(reason('recipient_30_day_cap', 'The rolling 30-day logical-touch cap is reached.'));
     if (recipientClaimSet.has(email)) reasons.push(reason('recipient_claim_pending', 'Another recipient transmission claim is pending.'));
     if (opportunityClaimSet.has(opportunityId)) reasons.push(reason('opportunity_claim_pending', 'Another canonical opportunity claim is pending.'));
+    if (pursueOwnershipByOpportunity.has(opportunityId)) {
+      reasons.push(reason(pursueOwnershipByOpportunity.get(opportunityId), PURSUE_OWNERSHIP_REFUSAL_MESSAGE));
+    }
     if (suppressionSet.has(email) || adverse) reasons.push(reason('recipient_suppressed', 'The recipient has a suppression or adverse delivery state.'));
     if (replied) reasons.push(reason('reply_state_ambiguous', 'The opportunity has a reply and requires human review.'));
     if ((latestOpportunityDecision.get(opportunityId) || latestDecision.get(deal.dealKey))?.decision === 'rejected') {

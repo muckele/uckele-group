@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { appOrigin } from './app-origin.js';
 
 const ownerCommandUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -922,7 +923,7 @@ async function fulfillPhase1Json(route, body, status = 200) {
   await route.fulfill({ contentType: 'application/json', status, body: JSON.stringify(body) });
 }
 
-const phase1AppOrigin = 'http://127.0.0.1:4173';
+const phase1AppOrigin = appOrigin;
 
 function phase1RequestRecord(request) {
   const url = new URL(request.url());
@@ -1568,6 +1569,28 @@ async function installPhase1OperationsFixture(page) {
     await fulfillPhase1Json(route, { success: true, rows: [], total: 0, page: 1, pageSize: 25 });
   });
 
+  // The Email sending card on the Operations view reads its status once.
+  await page.route('**/api/admin/deal-hunter/email-sending', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() !== 'GET' || url.search) {
+      await rejectPhase1Request(route, state, 'Unexpected Email sending request.');
+      return;
+    }
+    const off = { enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0 };
+    await fulfillPhase1Json(route, {
+      success: true,
+      emailSending: {
+        gmail: { connected: false, emailAddress: null, lastTokenOkAt: null, lastErrorCode: null },
+        wording: { approvedDigest: null, currentDigest: 'a'.repeat(64), approvedAt: null, approvedBy: null, revision: 0, signatureComplete: true, preview: [] },
+        contactRule: off,
+        liveSending: off,
+        readiness: { ready: false, reasons: ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off'] },
+        lastRuns: { sender: null, replyPoller: null },
+      },
+    });
+  });
+
   return state;
 }
 
@@ -2001,6 +2024,65 @@ test('an authenticated administrator can reach the Operations Center', async ({ 
   await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible();
 });
 
+test('Email sending card shows readiness and gates Live sending behind confirmation', async ({ page }) => {
+  await mockAuthenticatedAdmin(page);
+  const control = (overrides = {}) => ({ enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0, ...overrides });
+  let liveSending = control({ revision: 2, providerProfile: 'production-gmail-v1', capabilitiesInSync: true });
+  const controlPosts = [];
+  await page.route('**/api/admin/deal-hunter/email-sending', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      status: 200,
+      body: JSON.stringify({
+        success: true,
+        emailSending: {
+          gmail: { connected: true, emailAddress: 'owner@uckele.test', lastTokenOkAt: '2026-11-03T17:00:00.000Z', lastErrorCode: null },
+          wording: {
+            approvedDigest: 'a'.repeat(64), currentDigest: 'a'.repeat(64), approvedAt: '2026-11-03T16:00:00.000Z',
+            approvedBy: 'phase16-admin', revision: 1, signatureComplete: true,
+            preview: [{ variant: 'initial', subject: 'Inquiry about Sample Business', text: 'Hi Jordan,\n\nInitial body' }],
+          },
+          contactRule: control({ enabled: true, policyVersion: 'listing-broker-inquiry-v1', revision: 1 }),
+          liveSending,
+          readiness: liveSending.enabled ? { ready: true, reasons: [] } : { ready: false, reasons: ['live_sending_off'] },
+          lastRuns: { sender: null, replyPoller: null },
+        },
+      }),
+    });
+  });
+  await page.route('**/api/admin/deal-hunter/email-sending/controls', async (route) => {
+    const body = route.request().postDataJSON();
+    controlPosts.push(body);
+    liveSending = control({ enabled: body.enabled, changedAt: '2026-11-03T18:00:00.000Z', changedBy: 'phase16-admin',
+      revision: body.expectedRevision + 1, providerProfile: 'production-gmail-v1', capabilitiesInSync: true });
+    await route.fulfill({ contentType: 'application/json', status: 200, body: JSON.stringify({ success: true, control: liveSending }) });
+  });
+
+  await page.goto('/admin/operations');
+  const card = page.getByRole('region', { name: 'Email sending' });
+  await expect(card.getByText('owner@uckele.test')).toBeVisible();
+  await expect(card.getByText('Live sending is off.')).toBeVisible();
+  await expect(card.getByText('Sending setup: production')).toBeVisible();
+
+  const turnOn = card.getByRole('button', { name: 'Turn on Live sending' });
+  await turnOn.click();
+  const dialog = page.getByRole('dialog', { name: 'Turn on Live sending?' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(turnOn).toBeFocused();
+  expect(controlPosts).toHaveLength(0);
+
+  await turnOn.click();
+  await dialog.getByLabel('Reason (optional)').fill('Controlled test passed');
+  await dialog.getByRole('button', { name: 'Turn on Live sending' }).click();
+  await expect(dialog).toBeHidden();
+  expect(controlPosts).toEqual([{ controlKey: 'live_sending', enabled: true, expectedRevision: 2, reason: 'Controlled test passed' }]);
+  await expect(card.getByText('Ready to send.')).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Turn off Live sending' })).toBeVisible();
+});
+
 test('the follow-up queue renders a full server page and its mobile dialog is keyboard-safe', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await mockAuthenticatedAdmin(page);
@@ -2040,7 +2122,7 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
   const inboxViews = page.getByRole('navigation', { name: 'Deal Hunter views' });
   await inboxViews.getByRole('link', { name: 'Operations' }).click();
 
-  await expect(page).toHaveURL('http://127.0.0.1:4173/admin/deal-hunter?view=operations');
+  await expect(page).toHaveURL(`${phase1AppOrigin}/admin/deal-hunter?view=operations`);
   const operationsViews = page.getByRole('navigation', { name: 'Deal Hunter views' });
   await expect(operationsViews.getByRole('link', { name: 'Operations' })).toHaveAttribute('aria-current', 'page');
   await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toHaveCount(0);
@@ -2057,6 +2139,7 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
     'GET /api/admin/communications/unassigned?page=1&pageSize=25',
     'GET /api/admin/acquisition-command-center',
+    'GET /api/admin/deal-hunter/email-sending',
   ].sort();
   await expect.poll(() => state.apiRequests.length).toBe(expectedOperationsApiRequests.length);
   expect(state.apiRequests.map(phase1RequestSignature).sort()).toEqual(expectedOperationsApiRequests);
@@ -2082,7 +2165,7 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
   await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toBeVisible();
   await page.getByRole('navigation', { name: 'Deal Hunter views' }).getByRole('link', { name: 'Operations' }).click();
 
-  await expect(page).toHaveURL('http://127.0.0.1:4173/admin/deal-hunter?view=operations');
+  await expect(page).toHaveURL(`${phase1AppOrigin}/admin/deal-hunter?view=operations`);
   await expect(page.getByRole('heading', { level: 2, name: 'Daily source review' })).toBeVisible();
   const sheetSource = page.getByText('SMB Deal Hunter Google Sheet', { exact: true }).locator('..').locator('..');
   await expect(sheetSource).toContainText('1 rows');
@@ -2237,6 +2320,7 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
     'GET /api/admin/communications/unassigned?page=1&pageSize=25',
     'GET /api/admin/acquisition-command-center',
+    'GET /api/admin/deal-hunter/email-sending',
     'POST /api/admin/deal-hunter/deal-os-import',
     'GET /api/admin/acquisition-command-center',
     'POST /api/admin/deal-hunter/crm-reconciliation/preview',
@@ -2470,7 +2554,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(evergreenOriginalListing).toHaveAttribute('href', 'https://broker.example/evergreen');
   await expect(evergreenOriginalListing).toHaveAttribute('target', '_blank');
   await expect(evergreenOriginalListing).toHaveAttribute('rel', /noopener/);
-  await expect(queue.getByRole('button', { name: 'Pursue Evergreen Safety Services' }).locator('..'))
+  await expect(queue.getByRole('button', { name: 'Request SIM Evergreen Safety Services' }).locator('..'))
     .toHaveCSS('justify-content', 'flex-start');
   await page.screenshot({ path: testInfo.outputPath('phase1-opportunity-links-desktop.png'), fullPage: false });
   await evergreenTrigger.click();
@@ -2563,7 +2647,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(refreshedSources.getByText(/Observed Aug 30, 2026/).first()).toBeVisible();
   expect(state.requests.some((request) => /refresh|review|backfill|import/i.test(request.path))).toBe(false);
 
-  await dialog.getByRole('button', { name: 'Pursue Evergreen Safety Services' }).click();
+  await dialog.getByRole('button', { name: 'Request SIM Evergreen Safety Services' }).click();
   await expect.poll(() => state.actionPayloads.filter((payload) => payload.path === '/api/admin/deal-hunter/triage/opp-evergreen/action').length).toBe(1);
   await expectPhase1DetailValue(dialog, 'Operator state', 'High');
   await expectPhase1DetailValue(dialog, 'Fit', 92);
@@ -2615,7 +2699,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(dialog.getByText('Passed: Valuation').first()).toBeVisible();
   await expect(dialog.getByRole('heading', { name: 'Disposition history' })).toBeVisible();
   await expect(dialog.getByText(/Passed: Valuation · Asking price exceeds the current acquisition valuation. · phase1-admin/)).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: 'Request SIM Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Watch Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Pass Cascade Field Compliance' })).toHaveCount(0);
   await dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
@@ -2664,14 +2748,14 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const mobileSummitListing = queue.getByRole('link', { name: 'Open original listing for Summit Fire Systems' });
   await expect(mobileSummitDetails).toHaveText('Open opportunity');
   await expect(mobileSummitListing).toHaveAttribute('href', 'https://broker.example/summit');
-  const mobileSummitActions = queue.getByRole('button', { name: 'Pursue Summit Fire Systems' }).locator('..');
+  const mobileSummitActions = queue.getByRole('button', { name: 'Request SIM Summit Fire Systems' }).locator('..');
   await expect(mobileSummitActions).toHaveCSS('justify-content', 'center');
   const mobileControls = [
     page.getByRole('searchbox', { name: 'Search opportunities' }),
     page.getByRole('combobox', { name: 'Confidence', exact: true }),
     page.getByRole('combobox', { name: 'Operator priority', exact: true }),
     page.getByRole('combobox', { name: 'Sort opportunities', exact: true }),
-    page.getByRole('button', { name: 'Pursue Summit Fire Systems' }),
+    page.getByRole('button', { name: 'Request SIM Summit Fire Systems' }),
     page.getByRole('button', { name: 'Watch Summit Fire Systems' }),
     page.getByRole('button', { name: 'Pass Summit Fire Systems' }),
     mobileSummitDetails,
@@ -2690,7 +2774,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   expect(mobileDialogBox.height).toBeGreaterThanOrEqual(811);
   for (const control of [
     dialog.getByRole('button', { name: 'Close opportunity detail' }),
-    dialog.getByRole('button', { name: 'Pursue Summit Fire Systems' }),
+    dialog.getByRole('button', { name: 'Request SIM Summit Fire Systems' }),
     dialog.getByRole('button', { name: 'Watch Summit Fire Systems' }),
     dialog.getByRole('button', { name: 'Pass Summit Fire Systems' }),
     dialog.getByLabel('Verified fact field'),
@@ -2846,7 +2930,7 @@ test('Request Broker Materials desktop review sends the exact approved proposal 
   score.financials.annualProfit = null;
   const { dialog, card } = await openBrokerOpportunity(page);
 
-  await dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' }).click();
+  await dialog.getByRole('button', { name: 'Request SIM Cascade Field Compliance' }).click();
   await expect(card.getByRole('button', { name: 'Request Broker Materials' })).toBeVisible();
   await card.getByRole('button', { name: 'Request Broker Materials' }).click();
 
@@ -3025,7 +3109,7 @@ test('Request Broker Materials viewer can inspect preview and status but cannot 
   const state = await installPhase1Fixture(page, { role: 'viewer' });
   markBrokerOpportunityPursued(state);
   const { dialog, card } = await openBrokerOpportunity(page);
-  await expect(dialog.getByRole('button', { name: /Pursue|Watch|Pass/ })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: /Request SIM|Pursue|Watch|Pass/ })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Save verified fact' })).toHaveCount(0);
   await card.getByRole('button', { name: 'Preview Broker Materials' }).click();
   await expect(card.getByLabel('Greeting')).toHaveAttribute('readonly');

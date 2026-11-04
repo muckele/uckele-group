@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import {
   CONTROLLED_CIM_LIMITED_SMOKE_PROFILE,
   CONTROLLED_CIM_MAILBOX_PROFILE,
+  cimProviderUsesGmail,
   getConfig,
   validateCimProviderProfileBinding,
 } from '../config.js';
@@ -12,6 +13,11 @@ import { readCimCurrentAuthority as readCurrentCimAuthority } from './cimCampaig
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { CIM_CAMPAIGN_POLICY_VERSION } from './cimCampaignPolicy.js';
+import { isContactRuleCampaign } from './pursueCimContactPolicy.js';
+import {
+  PURSUE_CIM_READINESS_REASONS,
+  readPursueCimProviderReadiness,
+} from './pursueCimReadiness.js';
 import {
   P10B_CONTROLLED_MAILBOX_HTML,
   P10B_CONTROLLED_MAILBOX_SUBJECT,
@@ -27,6 +33,15 @@ import {
 const READINESS_VERSION = 'cim-provider-readiness-v1';
 const SOURCE_AUTHORITY_VERSION = 'cim-source-health-authority-v1';
 const INITIAL_PAYLOAD_VERSION = 'deal-hunter-cim-manual-stage1-v1';
+export const PURSUE_INITIAL_PAYLOAD_VERSION = 'deal-hunter-cim-pursue-initial-v2';
+export const PURSUE_FOLLOW_UP_PAYLOAD_VERSION = 'deal-hunter-cim-pursue-follow-up-v1';
+// Payload versions the final gate accepts for each capability. The manual Stage 1 initial is
+// unchanged; the Pursue Gmail templates add one initial and one follow-up version.
+const SUPPORTED_PAYLOAD_VERSIONS = Object.freeze({
+  'fl04b-initial': Object.freeze([INITIAL_PAYLOAD_VERSION, PURSUE_INITIAL_PAYLOAD_VERSION]),
+  'fl04c-followup': Object.freeze([PURSUE_FOLLOW_UP_PAYLOAD_VERSION]),
+});
+const KNOWN_PAYLOAD_VERSIONS = Object.freeze(Object.values(SUPPORTED_PAYLOAD_VERSIONS).flat());
 const INITIAL_BATCHING_POLICY_VERSION = 'batching-off-v1';
 
 function text(value, maximum = 240) {
@@ -98,11 +113,46 @@ function sourceAuthorityEvidence(authority, globalAuthorityRevision) {
   return { ...evidence, authorityDigest: digest(evidence) };
 }
 
+// Gmail readiness (spec 2026-11-03 §4.4): the blockers are the readiness reasons, plus the
+// evidence version and expiry. Replies arrive by the reply poller, not a signed webhook, and
+// ambiguity is reconciled through findSent, so the Resend-only checks do not apply.
+function normalizeGmailProviderReadiness(readiness, { providerProfile, now, generatedAt,
+  expiresAt }) {
+  const reasons = sortedUnique((Array.isArray(readiness.reasons) ? readiness.reasons : [])
+    .map((reason) => text(reason, 80)));
+  const ordered = PURSUE_CIM_READINESS_REASONS.filter((reason) => reasons.includes(reason));
+  const normalized = {
+    version: READINESS_VERSION,
+    provider: 'gmail',
+    providerProfile: text(readiness.providerProfile ?? providerProfile, 120),
+    reasons: [...ordered, ...reasons.filter((reason) => !ordered.includes(reason))],
+    signatureComplete: readiness.signatureComplete === true,
+    evidenceRevision: text(readiness.evidenceRevision, 240),
+    generatedAt,
+    expiresAt,
+  };
+  const blockers = [...normalized.reasons];
+  if (readiness.ready !== true && blockers.length === 0) blockers.push('provider_unavailable');
+  if (!normalized.signatureComplete && !blockers.includes('signature_incomplete')) {
+    blockers.push('signature_incomplete');
+  }
+  if (!normalized.evidenceRevision) blockers.push('readiness_evidence_unversioned');
+  if (!(Boolean(normalized.expiresAt) && Date.parse(normalized.expiresAt) > Date.parse(now))) {
+    blockers.push('readiness_evidence_expired');
+  }
+  const authority = { ...normalized, blockers, ready: blockers.length === 0 };
+  return { ...authority, authorityDigest: digest(authority) };
+}
+
 export function normalizeCimProviderReadiness(readiness = {}, {
   providerProfile, now = new Date().toISOString(),
 } = {}) {
   const generatedAt = instant(readiness.generatedAt) || instant(now);
   const expiresAt = instant(readiness.expiresAt) || generatedAt;
+  if (readiness.provider === 'gmail') {
+    return normalizeGmailProviderReadiness(readiness, { providerProfile, now, generatedAt,
+      expiresAt });
+  }
   const normalized = {
     version: READINESS_VERSION,
     provider: text(readiness.provider, 80),
@@ -137,7 +187,10 @@ export function normalizeCimProviderReadiness(readiness = {}, {
   return { ...authority, authorityDigest: digest(authority) };
 }
 
-async function defaultProviderReadiness({ storage, providerProfile, now }) {
+async function defaultProviderReadiness({ storage, providerProfile, now, config }) {
+  if (cimProviderUsesGmail(config)) {
+    return readPursueCimProviderReadiness({ storage, providerProfile, now, config });
+  }
   const email = await getEmailReadiness({ storage });
   return normalizeCimProviderReadiness({ ...email,
     providerProfile,
@@ -281,7 +334,10 @@ export async function authorizePreparedCimTransmission({
     : { version: P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
       subject: P10B_CONTROLLED_MAILBOX_SUBJECT, text: P10B_CONTROLLED_MAILBOX_TEXT,
       html: P10B_CONTROLLED_MAILBOX_HTML, replyTo: null };
-  const supportedInitialPayload = controlledMailboxProfile
+  // The controlled mailbox pins the P10B synthetic template, except when it sends through
+  // Gmail: then the owner's controlled test uses the Pursue templates (spec §10 step 5).
+  const pinnedControlledTemplate = controlledMailboxProfile && !cimProviderUsesGmail(config);
+  const supportedInitialPayload = pinnedControlledTemplate
     ? context.transmission.payload_version === controlledTemplate.version
       && context.communication?.subject === controlledTemplate.subject
       && context.communication?.body_text_digest === sha256(controlledTemplate.text)
@@ -289,16 +345,31 @@ export async function authorizePreparedCimTransmission({
       && (controlledTemplate.replyTo === null
         || (context.communication?.reply_to_address || '') === controlledTemplate.replyTo)
       && context.members.every(isP10bControlledMailboxSyntheticMember)
-    : context.transmission.payload_version === INITIAL_PAYLOAD_VERSION;
+    : KNOWN_PAYLOAD_VERSIONS.includes(context.transmission.payload_version);
+  // A known payload version under the other capability is a wiring mismatch, not an unknown
+  // campaign policy: refuse it without touching the campaign.
+  if (!pinnedControlledTemplate && supportedInitialPayload
+    && !(SUPPORTED_PAYLOAD_VERSIONS[context.authorization?.capability] ?? [])
+      .includes(context.transmission.payload_version)) {
+    return failure('capability_inactive');
+  }
+  const followUpAuthorization = context.authorization?.capability === 'fl04c-followup';
   const unknownTransmissionPolicy = !supportedInitialPayload
     || context.conversation?.sender_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
     || context.conversation?.reply_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
     || context.conversation?.batching_policy_version !== INITIAL_BATCHING_POLICY_VERSION;
+  // A rule-based campaign's authority is the contact rule (Ruling H), not an activation.
+  // A follow-up authorization's activation is fl04c-followup, whose prerequisite is the
+  // fl04b-initial activation rather than the enrollment activation the campaign names, so
+  // storage checks a follow-up's activation basis against the chain without a terminal event.
+  const unknownPermission = (campaign) => !isContactRuleCampaign(campaign)
+    && (followUpAuthorization ? !text(campaign?.permission_version, 120)
+      : campaign?.permission_version !== context.activation?.prerequisite_activation_id);
   const unknownPolicyCampaigns = [...new Map(context.members
     .filter((member) => unknownTransmissionPolicy
       || member?.campaign?.policy_version !== CIM_CAMPAIGN_POLICY_VERSION
       || member?.campaign?.template_version !== CIM_CAMPAIGN_POLICY_VERSION
-      || member?.campaign?.permission_version !== context.activation?.prerequisite_activation_id)
+      || unknownPermission(member?.campaign))
     .map((member) => [member.campaign?.id, member.campaign])).values()]
     .filter((campaign) => campaign?.id);
   if (unknownPolicyCampaigns.length > 0) {
@@ -350,7 +421,7 @@ export async function authorizePreparedCimTransmission({
     return failure('unknown_policy_version');
   }
   const readinessInput = await readProviderReadiness({ storage, providerProfile, now: gateInstant,
-    context });
+    context, config });
   const readiness = readinessInput?.authorityDigest && typeof readinessInput.ready === 'boolean'
     ? readinessInput
     : normalizeCimProviderReadiness(readinessInput, { providerProfile, now: gateInstant });
@@ -426,7 +497,9 @@ export async function authorizePreparedCimTransmission({
   if (!outcome?.authorized) {
     const blockedReason = outcome?.blockedReason || 'lifecycle_conflict';
     return { ...failure(blockedReason, blockedReason === 'already_provider_pending'),
-      transmission: outcome?.transmission ?? null };
+      transmission: outcome?.transmission ?? null,
+      ...(blockedReason === 'provider_readiness_unavailable'
+        ? { readinessBlockers: [...(readiness.blockers ?? [])] } : {}) };
   }
   if (outcome.boundaryNonceDigest !== boundaryNonceDigest
     || outcome.transmission?.state !== 'provider-pending'

@@ -130,3 +130,74 @@ test('P6D scenarios 34-36: expiry suppresses the next slot and unknown/stale aut
   terminal.members[0].campaign.terminal_revision = 1;
   assert.equal(deriveAcceptedCimCadence(terminal, acceptedAt), null);
 });
+
+function stampedDerivation(cadencePolicyVersion, expiresAt = '2026-11-30T17:00:00.000Z') {
+  return JSON.stringify({ policyVersion: 'deal-hunter-cim-autopilot-v1', cadencePolicyVersion,
+    sourceAcceptedAt: '2026-11-02T17:00:00.000Z', sendTime: '08:00', expiresAt });
+}
+
+function stampedContext(cadencePolicyVersion, touch) {
+  const value = context({ ...touch, campaign: {
+    initial_accepted_at: '2026-11-02T17:00:00.000Z',
+    local_expiry_at: '2026-11-30T17:00:00.000Z',
+    expiry_derivation: stampedDerivation(cadencePolicyVersion) } });
+  value.members[0].timezone.iana_timezone = 'America/Los_Angeles';
+  return value;
+}
+
+test('new acceptance stamps deal-hunter-cim-cadence-v3', () => {
+  const projection = deriveAcceptedCimCadence(context(), acceptedAt);
+  assert.equal(projection.expiryDerivation.cadencePolicyVersion, 'deal-hunter-cim-cadence-v3');
+  assert.equal(projection.nextTouch.cadencePolicyVersion, 'deal-hunter-cim-cadence-v3');
+  // Monday 2026-11-02 09:00 Los Angeles: follow-up-1 is due Wednesday 08:00.
+  const monday = context();
+  monday.members[0].timezone.iana_timezone = 'America/Los_Angeles';
+  const fresh = deriveAcceptedCimCadence(monday, '2026-11-02T17:00:00.000Z');
+  assert.equal(fresh.expiryDerivation.cadencePolicyVersion, 'deal-hunter-cim-cadence-v3');
+  assert.equal(fresh.localExpiryAt, '2026-11-30T17:00:00.000Z');
+  assert.equal(fresh.nextTouch.dueLocal, '2026-11-04T08:00:00');
+  assert.equal(fresh.nextTouch.dueAt, '2026-11-04T16:00:00.000Z');
+});
+
+test('derivation dispatches on the campaign expiry_derivation cadence version', () => {
+  // follow-up-1 accepted Thursday 2026-11-05 10:00 Los Angeles.
+  const thursday = '2026-11-05T18:00:00.000Z';
+  const v3 = deriveAcceptedCimCadence(stampedContext('deal-hunter-cim-cadence-v3',
+    { kind: 'follow-up-1', ordinal: 1 }), thursday);
+  assert.equal(v3.nextTouch.kind, 'follow-up-2');
+  assert.equal(v3.nextTouch.dueLocal, '2026-11-09T08:00:00');
+  assert.equal(v3.nextTouch.dueAt, '2026-11-09T16:00:00.000Z');
+  assert.equal(v3.nextTouch.cadencePolicyVersion, 'deal-hunter-cim-cadence-v3');
+  assert.equal(v3.expiryDerivation.cadencePolicyVersion, 'deal-hunter-cim-cadence-v3');
+  const v2 = deriveAcceptedCimCadence(stampedContext('deal-hunter-cim-cadence-v2',
+    { kind: 'follow-up-1', ordinal: 1 }), thursday);
+  assert.equal(v2.nextTouch.dueLocal, '2026-11-07T08:00:00');
+  assert.equal(v2.nextTouch.dueAt, '2026-11-07T16:00:00.000Z');
+  assert.equal(v2.nextTouch.cadencePolicyVersion, 'deal-hunter-cim-cadence-v2');
+
+  // The repeating slot key follows the stamped version, and so does the touch id.
+  const friday = '2026-11-06T17:00:00.000Z';
+  const v3Repeat = deriveAcceptedCimCadence(stampedContext('deal-hunter-cim-cadence-v3',
+    { kind: 'weekday-follow-up', logicalSlot: 'business:2026-11-06', ordinal: 4 }), friday);
+  assert.equal(v3Repeat.nextTouch.logicalSlot, 'business:2026-11-10');
+  assert.equal(v3Repeat.nextTouch.dueLocal, '2026-11-10T08:00:00');
+  assert.equal(v3Repeat.nextTouch.ordinal, 5);
+  const v2Repeat = deriveAcceptedCimCadence(stampedContext('deal-hunter-cim-cadence-v2',
+    { kind: 'weekday-follow-up', logicalSlot: 'calendar:2026-11-06', ordinal: 4 }), friday);
+  assert.equal(v2Repeat.nextTouch.logicalSlot, 'calendar:2026-11-08');
+  assert.equal(v2Repeat.nextTouch.dueLocal, '2026-11-08T08:00:00');
+  assert.notEqual(v3Repeat.nextTouch.id, v2Repeat.nextTouch.id);
+
+  // A repeating touch whose slot key belongs to the other version fails closed.
+  assert.throws(() => deriveAcceptedCimCadence(stampedContext('deal-hunter-cim-cadence-v3',
+    { kind: 'weekday-follow-up', logicalSlot: 'calendar:2026-11-06', ordinal: 4 }), friday),
+  /Invalid current CIM cadence touch/);
+  assert.throws(() => deriveAcceptedCimCadence(stampedContext('deal-hunter-cim-cadence-v2',
+    { kind: 'weekday-follow-up', logicalSlot: 'business:2026-11-06', ordinal: 4 }), friday),
+  /Invalid current CIM cadence touch/);
+  // An unknown or missing stamped version never defaults.
+  for (const version of ['deal-hunter-cim-cadence-v1', 'deal-hunter-cim-cadence-v4', undefined]) {
+    assert.throws(() => deriveAcceptedCimCadence(stampedContext(version,
+      { kind: 'follow-up-1', ordinal: 1 }), thursday), /expiry authority/i);
+  }
+});

@@ -8,6 +8,7 @@
 // no path in this module can touch an operator decision.
 
 import { recordCrmActivity } from './activity.js';
+import { DEAL_CRITERIA_PROFILE_VERSION, evaluateDealCriteria } from './dealCriteriaProfile.js';
 import { collectScoredOpportunities, isBuilderProducedScoredSet } from './dealHunter.js';
 import { getStorage } from '../storage/index.js';
 import {
@@ -122,10 +123,26 @@ function storedScoreIsCurrent(stored, result, storedContradictions = null) {
     && stored.engine_version === result.engineVersion
     && stored.rules_version === result.rulesVersion
     && stored.profile_version === result.profileVersion
-    && stored.completeness_policy_version === result.completenessPolicyVersion;
+    && stored.completeness_policy_version === result.completenessPolicyVersion
+    // A new owner-criteria profile regroups every stored score, so rows
+    // written under an older profile (or before criteria were stored) rewrite.
+    && stored.criteria_profile_version === DEAL_CRITERIA_PROFILE_VERSION;
 }
 
 function machineScoreRow(deal, result) {
+  // Only the fields the must-haves read are passed, so scoring inputs are not
+  // re-enumerated (and a malformed peer field is not re-read) here.
+  const criteria = evaluateDealCriteria({
+    name: deal.name,
+    industry: deal.industry,
+    location: deal.location,
+    state: deal.state,
+    annualProfit: deal.annualProfit,
+    profitMultiple: deal.profitMultiple,
+    askingPrice: deal.askingPrice,
+    fitScore: result.fitScore,
+    gates: result.gates,
+  });
   return {
     opportunity_id: deal.opportunityId,
     scored_at: new Date().toISOString(),
@@ -153,6 +170,13 @@ function machineScoreRow(deal, result) {
     applied_caps: result.appliedCaps,
     missing_evidence: result.missingEvidence,
     confidence_reasons: result.confidenceReasons,
+    criteria_profile_version: criteria.profileVersion,
+    criteria_group: criteria.group,
+    criteria_result: {
+      mustHaves: criteria.mustHaves,
+      failed: criteria.failed,
+      unknown: criteria.unknown,
+    },
     summary: {
       recommendation: result.recommendation,
       strengths: result.strengths.slice(0, 6),
@@ -261,6 +285,7 @@ export async function refreshOpportunityScores({
         error: deferredScoringError(collected.review),
         review: collected.review,
         counts: { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 },
+        currentFingerprints: {},
         errors: [],
         rulesVersion: DEAL_SCORING_RULES_VERSION,
         engineVersion: DEAL_SCORING_ENGINE_VERSION,
@@ -312,9 +337,14 @@ export async function refreshOpportunityScores({
   const counts = { considered: scoped.length, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 };
   const errors = [];
   const evaluated = [];
+  // The fingerprint of each considered deal as built from live sources now. It cannot be
+  // recomputed from stored rows, so automatic Pursue compares its stored fingerprint to this.
+  const currentFingerprints = {};
   for (const deal of scoped) {
     try {
-      evaluated.push({ deal, result: scoreOpportunity(deal) });
+      const result = scoreOpportunity(deal);
+      evaluated.push({ deal, result });
+      currentFingerprints[deal.opportunityId] = result.fingerprint;
     } catch (error) {
       counts.failed += 1;
       errors.push({ opportunityId: deal.opportunityId, error: normalizeText(error.message, 500) });
@@ -405,6 +435,7 @@ export async function refreshOpportunityScores({
       providerCalls: authoritativeReview.providerCalls,
     } : {}),
     counts,
+    currentFingerprints,
     errors: errors.slice(0, 100),
     eligibilityReconciliation,
     rulesVersion: DEAL_SCORING_RULES_VERSION,

@@ -1,5 +1,6 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { readCimCurrentAuthority } from './cimCampaignSafety.js';
+import { isGenericMailbox } from './cimAutomation.js';
 import { calculateNextCimSlot, CIM_CAMPAIGN_POLICY_VERSION } from './cimCampaignPolicy.js';
 import {
   loadBrokerMaterialsAuthority,
@@ -7,6 +8,10 @@ import {
 } from './dealHunterBrokerMaterials.js';
 import { ensureDealHunterSubmissionForCim } from './dealHunter.js';
 import { validateIanaTimezone } from './opportunityTimezone.js';
+import { appendDerivedOpportunityTimezoneRevision } from './opportunityTimezoneRevision.js';
+import { CONTACT_POLICY_VERSION, contactPolicyDigest } from './pursueCimContactPolicy.js';
+
+export { CONTACT_POLICY_VERSION, contactPolicyDigest };
 
 const digest = (value) => sha256(stableCanonicalJson(value));
 const framedDigest = (...parts) => sha256(JSON.stringify(parts.map((part) => {
@@ -26,6 +31,40 @@ export function pursuitPermissionBasisDigest(authority, recipient) {
 export function pursuitPermissionCohortDigest(authority, recipient) {
   return digest({ type: 'p8-00-one-recipient-cohort-v1', opportunityId: authority.opportunityId,
     recipientIdentityHash: sha256(recipient.email) });
+}
+
+const contactRuleSources = new Set(['structured_source', 'crm', 'operator_verified']);
+const contactRuleRefusal = (reason) => ({ permitted: false, reason });
+
+/**
+ * The standing listing-broker contact rule (spec §7): while the owner has it on, one listing
+ * broker may be contacted once about one listing without a per-recipient activation.
+ * `suppression` is the recipient's active suppression row, read by the caller.
+ */
+export function contactRulePermits({ authority, recipient, controls, suppression = null } = {}) {
+  const rule = controls?.contactRule;
+  if (rule?.enabled !== true || rule.policyVersion !== CONTACT_POLICY_VERSION
+    || !Number.isSafeInteger(Number(rule.revision)) || Number(rule.revision) < 1) {
+    return contactRuleRefusal('contact_rule_off');
+  }
+  const contactOptions = Array.isArray(authority?.recipientOptions) ? authority.recipientOptions : [];
+  if (contactOptions.length !== 1 || !recipient?.email
+    || contactOptions[0].email !== recipient.email
+    || contactOptions[0].provenanceFingerprint !== recipient.provenanceFingerprint) {
+    return contactRuleRefusal('contact_option_not_single');
+  }
+  const sources = Array.isArray(recipient.provenances) && recipient.provenances.length
+    ? recipient.provenances.map((item) => item?.provenance) : [recipient.provenance];
+  if (!sources.every((source) => contactRuleSources.has(source))) {
+    return contactRuleRefusal('contact_source_not_allowed');
+  }
+  if (isGenericMailbox(recipient.email)) return contactRuleRefusal('generic_mailbox');
+  if (suppression || authority.suppression) return contactRuleRefusal('recipient_suppressed');
+  if ((Array.isArray(authority.requests) && authority.requests.length > 0)
+    || authority.existingRequest || authority.opportunityClaim) {
+    return contactRuleRefusal('prior_outreach');
+  }
+  return { permitted: true, reason: '' };
 }
 
 function freshnessDigest(snapshot) {
@@ -91,12 +130,44 @@ function dealForCrm(authority, recipient) {
       .map((item) => item.alias_value) || [] };
 }
 
+// A derivation failure is never an enrollment failure: the timezone check below reports what is stored.
+async function deriveTimezoneFromState({ storage, opportunityId, authority, now }) {
+  try {
+    const location = authority.sourceRows?.find((row) => row.field === 'location')?.value;
+    return await appendDerivedOpportunityTimezoneRevision({ storage, opportunityId,
+      state: authority.score?.state, location, now });
+  } catch (error) {
+    console.warn(`[pursue-cim] timezone derivation failed for ${opportunityId}: ${error?.message || error}`);
+    return { written: false, reason: 'derivation_failed' };
+  }
+}
+
 function crmReason(error) {
   if (error?.code === 'CRM_MATCH_AMBIGUOUS') return 'crm_ambiguous';
   if (error?.code === 'CRM_MATCH_RECORD_INACTIVE') return 'crm_archived';
   if (error?.code === 'CRM_SUBMISSION_SUPERSEDED'
     || error?.evidenceCategories?.includes('supersession-conflict')) return 'crm_superseded';
   return 'crm_missing';
+}
+
+/**
+ * The campaign permission fields when the standing rule is on and permits this recipient,
+ * else null. Unreadable controls count as off, so the activation path is left as it was.
+ */
+async function contactRuleBasis({ storage, authority, recipient, suppression }) {
+  let controls;
+  try {
+    if (typeof storage.getPursueSendControls !== 'function') return null;
+    controls = await storage.getPursueSendControls();
+  } catch (error) {
+    console.warn(`[pursue-cim] contact rule unreadable, using the activation path: ${error?.message || error}`);
+    return null;
+  }
+  if (!contactRulePermits({ authority, recipient, controls, suppression }).permitted) return null;
+  const policyDigest = contactPolicyDigest();
+  return { controls, permission: { permissionVersion: CONTACT_POLICY_VERSION,
+    permissionDigest: policyDigest, permissionRevision: Number(controls.contactRule.revision),
+    permissionScope: pursuitPermissionCohortDigest(authority, recipient), policyHash: policyDigest } };
 }
 
 export async function orchestratePursuitEnrollment({ storage, opportunityId, enrollment,
@@ -132,25 +203,35 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
           if (reason === 'current_authority_unavailable') nextState = 'waiting-on-eligibility';
         } else {
           const recipient = choice.selected;
-          if (await storage.getActiveEmailSuppression(recipient.email)) reason = 'recipient_suppressed';
+          const suppression = await storage.getActiveEmailSuppression(recipient.email);
+          if (suppression) reason = 'recipient_suppressed';
+          const derivation = await deriveTimezoneFromState({ storage, opportunityId,
+            authority, now: at.toISOString() });
           const envelope = await storage.readPursuitEnrollmentAuthority({ opportunityId,
             now: at.toISOString() });
           const timezone = envelope.timezone;
           if (!reason && (!timezone || !['verified', 'derived'].includes(timezone.state)
             || !validateIanaTimezone(timezone.iana_timezone))) {
-            reason = timezone?.state === 'ambiguous' ? 'timezone_ambiguous' : 'timezone_missing';
+            reason = timezone?.state === 'ambiguous' || derivation.reason === 'timezone_ambiguous'
+              ? 'timezone_ambiguous' : 'timezone_missing';
           }
           const activation = envelope.activation;
-          if (!reason && !activation) {
+          // The standing rule enrolls without an activation; when it refuses, the
+          // per-recipient activation path below runs unchanged.
+          const ruleBasis = reason ? null
+            : await contactRuleBasis({ storage, authority, recipient, suppression });
+          if (!reason && !ruleBasis && !activation) {
             reason = 'contact_permission_missing'; nextState = 'waiting-on-eligibility';
           }
-          if (!reason && activation.permission_basis_digest !== pursuitPermissionBasisDigest(authority, recipient)) {
+          if (!reason && !ruleBasis
+            && activation.permission_basis_digest !== pursuitPermissionBasisDigest(authority, recipient)) {
             reason = 'contact_permission_changed';
           }
-          if (!reason && activation.cohort_digest !== pursuitPermissionCohortDigest(authority, recipient)) {
+          if (!reason && !ruleBasis
+            && activation.cohort_digest !== pursuitPermissionCohortDigest(authority, recipient)) {
             reason = 'contact_permission_outside_cohort';
           }
-          if (!reason && (!Number.isSafeInteger(Number(activation.permission_revision))
+          if (!reason && !ruleBasis && (!Number.isSafeInteger(Number(activation.permission_revision))
             || Number(activation.permission_revision) < 1)) reason = 'contact_permission_missing';
           if (!reason) {
             let crm;
@@ -166,7 +247,9 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
               const internallyLinkedCrm = !authority.submission?.id
                 && freshAuthority.submission?.id === crm.id;
               if (!freshRecipient || (recipientContactRef && !internallyLinkedCrm
-                && !resolveBrokerMaterialsRecipientContactRef(freshAuthority, recipientContactRef, at))) {
+                && !resolveBrokerMaterialsRecipientContactRef(freshAuthority, recipientContactRef, at))
+                || (ruleBasis && !contactRulePermits({ authority: freshAuthority,
+                  recipient: freshRecipient, controls: ruleBasis.controls, suppression }).permitted)) {
                 reason = 'recipient_changed';
               } else {
                 const fresh = await readCimCurrentAuthority({ storage, opportunityId,
@@ -199,10 +282,12 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                     templateVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     templateDigest: digest({ opportunityId, recipientFingerprint,
                       policyVersion: CIM_CAMPAIGN_POLICY_VERSION }),
-                    permissionVersion: activation.id,
-                    permissionDigest: activation.permission_basis_digest,
-                    permissionRevision: Number(activation.permission_revision),
-                    permissionScope: activation.cohort_digest, policyHash: activation.policy_hash,
+                    ...(ruleBasis ? ruleBasis.permission : {
+                      permissionVersion: activation.id,
+                      permissionDigest: activation.permission_basis_digest,
+                      permissionRevision: Number(activation.permission_revision),
+                      permissionScope: activation.cohort_digest, policyHash: activation.policy_hash,
+                    }),
                     canonicalRevision: Number(fresh.opportunity.discovery_revision),
                     crmSubmissionId: crm.id,
                     crmOwnershipRevision: Number(ownership.revision),

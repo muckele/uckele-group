@@ -93,6 +93,7 @@ import {
   validateCimReviewDecisions,
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
+import { getAutoPursueStatus, runAutoPursue, setAutoPursueMode } from './services/autoPursue.js';
 import {
   createManualSubmission,
   enforceContactBodyRateLimit,
@@ -149,6 +150,16 @@ import {
   liftAdminEmailSuppression,
 } from './services/followUpWorkspace.js';
 import { registerAdminOnboardingRoutes } from './routes/adminOnboarding.js';
+import {
+  buildGmailConnectUrl,
+  completeGmailConnect,
+  disconnectGmail,
+} from './services/gmailConnection.js';
+import {
+  changeEmailSendingControl,
+  getEmailSendingStatus,
+  parseEmailSendingControlRequest,
+} from './services/pursueEmailSending.js';
 import {
   createCimRecipientOverride,
   resolveCimIdentityException,
@@ -547,6 +558,7 @@ function projectSourceAuthorityReconciliation(value) {
 export function createApp({
   dailyDealHunterRunner = runClaimedDailyDealHunterEmail,
   sourceAuthorityRevalidator = revalidateRequiredSourceAuthority,
+  gmailFetcher = (...args) => globalThis.fetch(...args),
 } = {}) {
   const config = getConfig();
   const app = express();
@@ -712,7 +724,7 @@ export function createApp({
     },
   );
   app.use(
-    ['/api/admin/deal-hunter/send', '/api/deal-hunter/daily-email'],
+    ['/api/admin/deal-hunter/send', '/api/deal-hunter/daily-email', '/api/deal-hunter/auto-pursue/run'],
     (request, response, next) => {
       if (request.method !== 'POST') {
         next();
@@ -2447,6 +2459,176 @@ export function createApp({
   );
 
   app.get(
+    '/api/admin/deal-hunter/auto-pursue',
+    asyncRoute(async (request, response) => {
+      // Read-only viewers may inspect the capability, like adjacent Deal Hunter reads.
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      try {
+        response.json({ success: true, ...await getAutoPursueStatus() });
+      } catch {
+        response.status(503).json({ success: false, error: 'Automatic Pursue status is unavailable.' });
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/auto-pursue/mode',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      if (session.role !== 'admin') {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await setAutoPursueMode({
+        mode: request.body?.mode,
+        dailyCap: request.body?.dailyCap,
+        reason: request.body?.reason,
+        confirmation: request.body?.confirmation,
+        actor: session.username,
+      });
+      response.status(result.status || (result.ok ? 200 : 409)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  // Gmail connect flow (spec §4.2). Admin role only. The callback always redirects back to
+  // Operations with a code; token material never reaches a response, a URL or a log line.
+  const gmailOperationsRedirect = (code) => `/admin/deal-hunter?view=operations&gmail=${code}`;
+  const gmailCallbackErrorCodes = new Set(['gmail_state_invalid', 'gmail_address_mismatch', 'gmail_scope_missing']);
+
+  app.get(
+    '/api/admin/deal-hunter/gmail/connect',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      try {
+        const { url } = buildGmailConnectUrl({ config, actor: session.username || 'admin', now: new Date() });
+        response.redirect(302, url);
+      } catch (error) {
+        console.warn(`[request:${request.id || 'unknown'}] gmail connect unavailable`, { code: 'gmail_connect_failed',
+          cause: String(error?.code || error?.name || 'Error').slice(0, 100) });
+        response.redirect(302, gmailOperationsRedirect('gmail_connect_failed'));
+      }
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/gmail/callback',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      try {
+        await completeGmailConnect({
+          storage: getStorage(),
+          config,
+          code: typeof request.query?.code === 'string' ? request.query.code : '',
+          state: typeof request.query?.state === 'string' ? request.query.state : '',
+          actor: session.username || 'admin',
+          now: new Date(),
+          fetcher: gmailFetcher,
+        });
+        response.redirect(302, gmailOperationsRedirect('connected'));
+      } catch (error) {
+        const code = gmailCallbackErrorCodes.has(error?.code) ? error.code : 'gmail_connect_failed';
+        if (code === 'gmail_connect_failed') {
+          console.warn(`[request:${request.id || 'unknown'}] gmail connect failed`, {
+            code, cause: String(error?.code || error?.name || 'Error').slice(0, 100) });
+        }
+        response.redirect(302, gmailOperationsRedirect(code));
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/gmail/disconnect',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const { revokedAt } = await disconnectGmail({
+        storage: getStorage(),
+        config,
+        actor: session.username || 'admin',
+        now: new Date(),
+        fetcher: gmailFetcher,
+      });
+      response.json({ success: true, revokedAt });
+    }),
+  );
+
+  // Operations "Email sending" card (spec §9). Viewers read status without the wording preview;
+  // only the admin role changes a control. Token material is never part of either response.
+  app.get(
+    '/api/admin/deal-hunter/email-sending',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const emailSending = await getEmailSendingStatus({
+        storage: getStorage(),
+        config,
+        now: new Date(),
+        fetcher: gmailFetcher,
+        includePreview: session.role === 'admin',
+      });
+      response.json({ success: true, emailSending });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/email-sending/controls',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      if (session.role !== 'admin') {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const command = parseEmailSendingControlRequest(request.body);
+      if (!command.ok) {
+        response.status(command.status).json({ success: false, code: command.code, error: command.error });
+        return;
+      }
+      const result = await changeEmailSendingControl({
+        storage: getStorage(),
+        config,
+        command,
+        actor: session.username || 'admin',
+        now: new Date(),
+      });
+      if (!result.ok) {
+        if (result.code === 'live_sending_sync_failed') {
+          console.error(`[request:${request.id || 'unknown'}] live sending capability sync failed`,
+            { code: result.code });
+        }
+        response.status(result.status).json({ success: false, code: result.code, error: result.error,
+          ...(result.control ? { control: result.control } : {}) });
+        return;
+      }
+      response.json({ success: true, control: result.control });
+    }),
+  );
+
+  app.get(
     '/api/admin/deal-hunter/cim-stage2/runs/:id/decisions',
     asyncRoute(async (request, response) => {
       if (!await requireAdmin(request)) {
@@ -2639,6 +2821,33 @@ export function createApp({
         providerCalls: Number(result.providerCalls || 0),
         duplicateInvocation: Boolean(result.duplicateInvocation),
         run: result.run || null,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/deal-hunter/auto-pursue/run',
+    asyncRoute(async (request, response) => {
+      if (!requireDealHunterCron(request, config)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      // Mode, cap, and clock are server-owned; the cron caller supplies nothing.
+      if (!hasStrictEmptyBody(request)) {
+        response.status(400).json({ success: false, error: 'Automatic Pursue accepts an empty request body only.' });
+        return;
+      }
+      const result = await runAutoPursue({ triggeredBy: 'external-auto-pursue-cron' });
+      response.status(result.status || (result.ok ? 200 : 500)).json({
+        success: Boolean(result.ok),
+        status: result.status,
+        mode: result.mode,
+        businessDate: result.businessDate,
+        commands: Number(result.commands || 0),
+        skipped: Array.isArray(result.skipped) ? result.skipped : [],
+        wouldPursue: Array.isArray(result.wouldPursue) ? result.wouldPursue : [],
+        duplicateInvocation: Boolean(result.duplicateInvocation),
+        reason: result.reason || null,
       });
     }),
   );

@@ -1,4 +1,14 @@
 import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRestore.js';
+import {
+  normalizeGmailConnectionRow, normalizeOpenGmailConversationRow, normalizeSendControlRow,
+  normalizeSendControlRows, sendControlConflictError, validateCimProviderRelease,
+  validateCimCommunicationMessageId,
+  validateConversationGmailThread,
+  validateGmailCheckpointUpdate, validateGmailTokenCheck, validateRevokeGmailConnection,
+  validateSaveGmailConnection, validateSetPursueSendControl, normalizeGmailReplyMessageRow,
+  normalizeGmailSentIdentityRow, validateGmailReplyMessage, validateGmailReplyMessageLookup,
+  validateGmailSentIdentityLookup, validateGmailPendingReplyLookup,
+} from './gmailSendStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
@@ -113,6 +123,31 @@ const pursueCimNumericColumns = new Set([
 const pursueCimJsonTextColumns = new Set([
   'to_addresses', 'cc_addresses', 'bcc_addresses', 'expiry_derivation',
 ]);
+
+function pursueCimNumericRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  const result = { ...row };
+  for (const [key, value] of Object.entries(row)) {
+    if (pursueCimNumericColumns.has(key) && typeof value === 'string' && /^-?\d+$/.test(value)) {
+      result[key] = Number(value);
+    }
+  }
+  return result;
+}
+
+function pursueCimSelectionLimit(limit, maximum, name) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > maximum) {
+    throw new Error(`Invalid ${name} limit`);
+  }
+  return limit;
+}
+
+function pursueCimSelectionInstant(value, name) {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`Invalid ${name} instant`);
+  }
+  return new Date(value).toISOString();
+}
 
 function normalizePursueCimRpcResult(data, booleanFields, rowFields = [], {
   requiredRows = {}, extraFields = [], requireOutcome = false,
@@ -1343,6 +1378,190 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return data;
     },
 
+    async listDueCimFollowUpTouches({ now, limit = 25 } = {}) {
+      if (typeof now !== 'string' || !Number.isFinite(Date.parse(now))
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid Pursue CIM due selection');
+      }
+      const { data, error } = await client.rpc('pursue_cim_list_due_followup_touches_v1', {
+        p_now: now, p_limit: limit,
+      });
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed Pursue CIM due selection');
+      return data;
+    },
+
+    async listCurrentCimCapabilityActivations() {
+      const { data, error } = await client.from('deal_hunter_cim_capability_activations')
+        .select('*').eq('status', 'current').order('capability').order('id');
+      if (error) throw error;
+      return (data ?? []).map(pursueCimNumericRow);
+    },
+
+    async listExpiredCimCampaigns({ now, limit = 100 } = {}) {
+      const at = pursueCimSelectionInstant(now, 'expired campaign');
+      pursueCimSelectionLimit(limit, 500, 'expired campaign');
+      const { data, error } = await client.from('deal_hunter_cim_campaigns')
+        .select('id, opportunity_id, conversation_id, state, terminal_revision, row_version, local_expiry_at')
+        .in('state', ['initial-pending', 'active-follow-up'])
+        .not('local_expiry_at', 'is', null).lte('local_expiry_at', at)
+        .order('local_expiry_at').order('id').limit(limit);
+      if (error) throw error;
+      return (data ?? []).map(pursueCimNumericRow);
+    },
+
+    async listCimProviderPendingTransmissions({ enteredBefore, limit = 50 } = {}) {
+      const before = pursueCimSelectionInstant(enteredBefore, 'provider-pending');
+      pursueCimSelectionLimit(limit, 100, 'provider-pending');
+      const { data, error } = await client.from('deal_hunter_cim_transmissions')
+        .select('*').eq('state', 'provider-pending')
+        .not('provider_seam_entered_at', 'is', null).lte('provider_seam_entered_at', before)
+        .is('provider_message_id', null)
+        .order('provider_seam_entered_at').order('id').limit(limit);
+      if (error) throw error;
+      return (data ?? []).map(pursueCimNumericRow);
+    },
+
+    // Mirrors the SQLite join with bounded reads; every condition is re-checked atomically by
+    // the renewal transition, so a row that changes in between is refused there.
+    async listLapsedCimPreparedTouches({ now, limit = 25 } = {}) {
+      const at = pursueCimSelectionInstant(now, 'lapsed touch');
+      pursueCimSelectionLimit(limit, 100, 'lapsed touch');
+      const { data: touches, error } = await client.from('deal_hunter_cim_campaign_touches')
+        .select('*').eq('state', 'claimed').not('transmission_id', 'is', null)
+        .not('claim_expires_at', 'is', null).lte('claim_expires_at', at)
+        .order('claim_expires_at').order('id').limit(500);
+      if (error) throw error;
+      if (!touches?.length) return [];
+      const byId = async (table, ids) => {
+        const unique = [...new Set(ids)];
+        const { data, error: readError } = await client.from(table).select('*').in('id', unique);
+        if (readError) throw readError;
+        return new Map((data ?? []).map((row) => [row.id, pursueCimNumericRow(row)]));
+      };
+      const transmissions = await byId('deal_hunter_cim_transmissions',
+        touches.map((touch) => touch.transmission_id));
+      const campaigns = await byId('deal_hunter_cim_campaigns',
+        touches.map((touch) => touch.campaign_id));
+      const conversations = await byId('deal_hunter_broker_conversations',
+        [...campaigns.values()].map((campaign) => campaign.conversation_id));
+      const { data: memberships, error: membershipError } = await client
+        .from('deal_hunter_cim_transmission_touches').select('touch_id, transmission_id')
+        .in('touch_id', touches.map((touch) => touch.id)).is('cancelled_at', null);
+      if (membershipError) throw membershipError;
+      const live = new Set((memberships ?? []).map((row) => `${row.touch_id}|${row.transmission_id}`));
+      const atMs = Date.parse(at);
+      return touches.map(pursueCimNumericRow).filter((touch) => {
+        const transmission = transmissions.get(touch.transmission_id);
+        const campaign = campaigns.get(touch.campaign_id);
+        const conversation = campaign && conversations.get(campaign.conversation_id);
+        return transmission && campaign && conversation
+          && live.has(`${touch.id}|${touch.transmission_id}`)
+          && transmission.state === 'prepared' && transmission.invocation_authority_count === 0
+          && !transmission.provider_seam_entered_at
+          && ['initial-pending', 'active-follow-up'].includes(campaign.state)
+          && conversation.state === 'open'
+          && (!campaign.local_expiry_at || Date.parse(campaign.local_expiry_at) > atMs)
+          && touch.opportunity_id === campaign.opportunity_id
+          && touch.timezone_revision === campaign.timezone_revision;
+      }).slice(0, limit).map((touch) => {
+        const campaign = campaigns.get(touch.campaign_id);
+        return { touch_id: touch.id, kind: touch.kind, campaign_id: touch.campaign_id,
+          opportunity_id: touch.opportunity_id, row_version: touch.row_version,
+          claim_expires_at: touch.claim_expires_at, due_local: touch.due_local,
+          transmission_id: touch.transmission_id,
+          preparation_generation: transmissions.get(touch.transmission_id).preparation_generation,
+          conversation_id: campaign.conversation_id,
+          recipient_fingerprint: campaign.recipient_fingerprint, campaign_state: campaign.state };
+      });
+    },
+
+    async listCimUnenteredProviderPendingTransmissions({ authorizedBefore, limit = 50 } = {}) {
+      const before = pursueCimSelectionInstant(authorizedBefore, 'provider-pending');
+      pursueCimSelectionLimit(limit, 100, 'provider-pending');
+      const { data: transmissions, error } = await client.from('deal_hunter_cim_transmissions')
+        .select('*').eq('state', 'provider-pending').is('provider_seam_entered_at', null)
+        .is('provider_message_id', null).order('id').limit(500);
+      if (error) throw error;
+      if (!transmissions?.length) return [];
+      const { data: authorizations, error: authorizationError } = await client
+        .from('deal_hunter_cim_live_provider_authorizations')
+        .select('transmission_id, provider_profile, consumed_at')
+        .in('transmission_id', transmissions.map((row) => row.id))
+        .not('consumed_at', 'is', null);
+      if (authorizationError) throw authorizationError;
+      const consumed = new Map((authorizations ?? []).map((row) => [row.transmission_id, row]));
+      const beforeMs = Date.parse(before);
+      return transmissions.map(pursueCimNumericRow).filter((row) => {
+        const authorization = consumed.get(row.id);
+        return row.invocation_authority_count === 1 && authorization
+          && Date.parse(authorization.consumed_at) <= beforeMs;
+      }).map((row) => ({ ...row,
+        authorization_provider_profile: consumed.get(row.id).provider_profile,
+        authorization_consumed_at: consumed.get(row.id).consumed_at }))
+        .sort((left, right) => Date.parse(left.authorization_consumed_at)
+          - Date.parse(right.authorization_consumed_at) || left.id.localeCompare(right.id))
+        .slice(0, limit);
+    },
+
+    async releasePreparedCimTransmissions(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_release_prepared_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || !Number.isSafeInteger(Number(data.released))
+        || !Array.isArray(data.transmissionIds)) {
+        throw new Error('Malformed Pursue CIM prepared release result');
+      }
+      return { released: Number(data.released), transmissionIds: [...data.transmissionIds] };
+    },
+
+    async renewLapsedCimInitialClaim(command) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_renew_initial_claim_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (![null, 'renewal_authority_changed'].includes(data?.blockedReason ?? null)) {
+        throw new Error('Malformed Pursue CIM initial renewal result');
+      }
+      return normalizePursueCimRpcResult(data, ['renewed', 'existing', 'terminal'],
+        ['transmission', 'touch'], { requiredRows: { transmission: ['renewed', 'existing'],
+          touch: ['renewed', 'existing'] }, extraFields: ['blockedReason'] });
+    },
+
+    async listWaitingPursuitEnrollments({ limit = 100 } = {}) {
+      pursueCimSelectionLimit(limit, 500, 'waiting enrollment');
+      const { data: enrollments, error } = await client.from('deal_hunter_pursuit_enrollments')
+        .select('*').eq('state', 'waiting-on-eligibility')
+        .order('updated_at').order('id').limit(limit);
+      if (error) throw error;
+      if (!enrollments?.length) return [];
+      const { data: decisions, error: decisionError } = await client
+        .from('deal_hunter_owner_decision_events').select('*')
+        .in('id', [...new Set(enrollments.map((row) => row.decision_event_id))]);
+      if (decisionError) throw decisionError;
+      const byId = new Map((decisions ?? []).map((row) => [row.id, pursueCimNumericRow(row)]));
+      return enrollments.map((row) => ({ enrollment: pursueCimNumericRow(row),
+        decision: byId.get(row.decision_event_id) ?? null }));
+    },
+
+    async readCimFollowUpAuthority({ touchId, now } = {}) {
+      if (typeof touchId !== 'string' || !touchId.trim() || touchId.length > 240
+        || typeof now !== 'string' || !Number.isFinite(Date.parse(now))) {
+        throw new Error('Invalid Pursue CIM follow-up authority read');
+      }
+      const { data, error } = await client.rpc('pursue_cim_read_followup_authority_v1', {
+        p_command: { touchId, now },
+      });
+      if (error) throw error;
+      if (data === null) return null;
+      if (!data || typeof data !== 'object' || Array.isArray(data) || !data.touch
+        || !data.signals || typeof data.signals !== 'object') {
+        throw new Error('Malformed Pursue CIM follow-up authority');
+      }
+      return data;
+    },
+
     async readPursueCimProjection(command) {
       const { data, error } = await client.rpc('pursue_cim_read_projection_v1', {
         p_command: command,
@@ -1537,6 +1756,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
     },
 
+    /** Automatic Pursue through the owner-decision writer under the same lock (see the RPC). */
+    async recordAutoPursueDecision(command, guard = {}) {
+      const { data, error } = await client.rpc('pursue_cim_record_auto_pursue_decision_v1', {
+        p_command: command,
+        p_guard: { since: guard.since, until: guard.until, dailyCap: guard.dailyCap },
+      });
+      if (error) {
+        if (/FL01_STALE_REVIEW/.test(error.message || '')) {
+          const stale = new Error('Freshness changed since this opportunity was shown. Reload before acting.');
+          stale.code = 'DEAL_HUNTER_FRESHNESS_STALE'; stale.status = 409; throw stale;
+        }
+        throw error;
+      }
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['decision', 'enrollment'],
+        { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
+    },
+
     async materializePursuitCampaign(command) {
       const { data, error } = await client.rpc('pursue_cim_materialize_campaign_v2', {
         p_command: command,
@@ -1660,6 +1897,23 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizePursueCimRpcResult(data,
         ['applied', 'existing', 'conflict'], ['transmission', 'nextTouch'],
         { requiredRows: { transmission: ['applied', 'existing'] } });
+    },
+
+    /** Ruling D: a quota-refused or never-attempted Gmail send returns its touches to scheduled. */
+    async releaseCimProviderPendingUnsent(command) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_release_unsent_v1', {
+        p_command: validateCimProviderRelease(command),
+      });
+      if (error) throw error;
+      const result = normalizePursueCimRpcResult(data, ['applied', 'replay', 'conflict'],
+        ['transmission'], { requiredRows: { transmission: ['applied', 'replay'] },
+          extraFields: ['touches'] });
+      if (!Array.isArray(result.touches)
+        || result.touches.some((touch) => !touch || typeof touch.id !== 'string')) {
+        throw new Error('Malformed Pursue CIM provider release result');
+      }
+      return { ...result, touches: result.touches.map((touch) => ({ ...touch,
+        row_version: Number(touch.row_version) })) };
     },
 
     async reconcileCimTransmission(command) {
@@ -3824,6 +4078,336 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityScoreRow(data);
     },
 
+    /** Warm-up evidence, one row per owner decision; idempotent on decision_event_id. */
+    async insertAutoPursueDecisionEvidence(row = {}) {
+      const { error } = await client
+        .from('deal_hunter_auto_pursue_decision_evidence')
+        .upsert({
+          decision_event_id: String(row.decision_event_id || ''),
+          opportunity_id: String(row.opportunity_id || ''),
+          action: String(row.action || ''),
+          policy_version: String(row.policy_version || ''),
+          criteria_group: row.criteria_group ?? null,
+          criteria_profile_version: row.criteria_profile_version ?? null,
+          recipient_unchanged: Boolean(row.recipient_unchanged),
+          created_at: String(row.created_at || new Date().toISOString()),
+        }, { onConflict: 'decision_event_id', ignoreDuplicates: true });
+      if (error) throw error;
+    },
+
+    async listAutoPursueDecisionEvidence({ policyVersion } = {}) {
+      const rows = [];
+      for (let from = 0; ; from += 1000) {
+        const { data, error } = await client
+          .from('deal_hunter_auto_pursue_decision_evidence')
+          .select('*')
+          .eq('policy_version', String(policyVersion || ''))
+          .order('created_at', { ascending: true })
+          .order('decision_event_id', { ascending: true })
+          .range(from, from + 999);
+        if (error) throw error;
+        rows.push(...(data || []));
+        if (!data || data.length < 1000) break;
+      }
+      // Match the SQLite storage shape so callers compare recipient_unchanged the same way.
+      return rows.map((row) => ({ ...row, recipient_unchanged: row.recipient_unchanged ? 1 : 0 }));
+    },
+
+    /** Authoritative count of recorded owner decisions under one policy in [since, until). */
+    async countOwnerDecisionsByPolicy({ policyVersion, since, until } = {}) {
+      const policy = String(policyVersion || '');
+      if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+        throw new Error('countOwnerDecisionsByPolicy requires a policy version and an instant range.');
+      }
+      const { count, error } = await client
+        .from('deal_hunter_owner_decision_events')
+        .select('id', { count: 'exact', head: true })
+        .eq('policy_version', policy)
+        .gte('created_at', new Date(since).toISOString())
+        .lt('created_at', new Date(until).toISOString());
+      if (error) throw error;
+      if (!Number.isSafeInteger(count) || count < 0) throw new Error('Owner decision count is unavailable.');
+      return count;
+    },
+
+    /** Recorded owner decisions under one policy in [since, until), newest first. */
+    async listOwnerDecisionsByPolicy({ policyVersion, since, until, limit = 10 } = {}) {
+      const policy = String(policyVersion || '');
+      if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+        throw new Error('listOwnerDecisionsByPolicy requires a policy version and an instant range.');
+      }
+      const { data, error } = await client
+        .from('deal_hunter_owner_decision_events')
+        .select('opportunity_id,created_at')
+        .eq('policy_version', policy)
+        .gte('created_at', new Date(since).toISOString())
+        .lt('created_at', new Date(until).toISOString())
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(Math.min(Math.max(Math.trunc(Number(limit)) || 10, 1), 100));
+      if (error) throw error;
+      return data || [];
+    },
+
+    /**
+     * True when any Pursue campaign conversation already targets this recipient address,
+     * compared case-insensitively like SQLite's LOWER(recipient_address) = ?. LIKE
+     * metacharacters are escaped so the ILIKE is an exact match; PostgREST also reads
+     * '*' as a wildcard, which can only over-match and so fails toward prior_outreach.
+     */
+    async hasPursueCimConversationForRecipient(recipientEmail) {
+      const address = String(recipientEmail || '').trim().toLowerCase();
+      if (!address) throw new Error('A recipient address is required.');
+      const pattern = address.replace(/[\\%_]/g, (character) => `\\${character}`);
+      const { data, error } = await client.from('deal_hunter_broker_conversations')
+        .select('id').ilike('recipient_address', pattern).limit(1);
+      if (error) throw error;
+      return Array.isArray(data) && data.length > 0;
+    },
+
+    async getGmailConnection() {
+      const { data, error } = await client.from('deal_hunter_gmail_connections')
+        .select('*').is('revoked_at', null).maybeSingle();
+      if (error) throw error;
+      return normalizeGmailConnectionRow(data);
+    },
+
+    /** Stores a new active connection; the RPC revokes any prior active row in one transaction. */
+    async saveGmailConnection(command = {}) {
+      const connection = validateSaveGmailConnection(command);
+      const { data, error } = await client.rpc('deal_hunter_gmail_save_connection_v1', {
+        p_command: { id: randomUUID(), ...connection },
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || typeof data.id !== 'string') {
+        throw new Error('Malformed Gmail connection result');
+      }
+      return normalizeGmailConnectionRow(data);
+    },
+
+    async revokeGmailConnection(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_revoke_connection_v1', {
+        p_command: validateRevokeGmailConnection(command),
+      });
+      if (error) throw error;
+      return normalizeGmailConnectionRow(data);
+    },
+
+    /** A successful check clears the error; a failed one keeps the last good instant. */
+    async recordGmailTokenCheck(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_record_token_check_v1', {
+        p_command: validateGmailTokenCheck(command),
+      });
+      if (error) throw error;
+      return normalizeGmailConnectionRow(data);
+    },
+
+    /** Compare-and-set of the active connection's reply checkpoint. */
+    async updateGmailHistoryCheckpoint(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_update_checkpoint_v1', {
+        p_command: validateGmailCheckpointUpdate(command),
+      });
+      if (error) throw error;
+      if (typeof data !== 'boolean') throw new Error('Malformed Gmail checkpoint result');
+      return data;
+    },
+
+    async getPursueSendControls() {
+      const { data, error } = await client.from('deal_hunter_pursue_send_controls').select('*');
+      if (error) throw error;
+      return normalizeSendControlRows(data || []);
+    },
+
+    /** Revisioned write of one send control plus its audit event; a stale revision conflicts. */
+    async setPursueSendControl(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_set_send_control_v1', {
+        p_command: validateSetPursueSendControl(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || typeof data.applied !== 'boolean'
+        || typeof data.conflict !== 'boolean') {
+        throw new Error('Malformed Pursue send control result');
+      }
+      if (data.conflict) throw sendControlConflictError();
+      return normalizeSendControlRow(data.control);
+    },
+
+    /** Records a conversation's Gmail thread once; same thread is a replay, another a conflict. */
+    async setCimConversationGmailThread(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_set_conversation_thread_v1', {
+        p_command: validateConversationGmailThread(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object'
+        || ['applied', 'replay', 'conflict'].some((key) => typeof data[key] !== 'boolean')) {
+        throw new Error('Malformed Pursue CIM conversation thread result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict };
+    },
+
+    async listOpenGmailConversations() {
+      const { data, error } = await client.rpc('deal_hunter_gmail_list_open_conversations_v1');
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed open Gmail conversation list');
+      return data.map(normalizeOpenGmailConversationRow);
+    },
+
+    /** Every transmission of the given conversations: what makes a thread message "ours". */
+    async listGmailConversationSentIdentities(command = {}) {
+      const { conversationIds } = validateGmailSentIdentityLookup(command);
+      if (conversationIds.length === 0) return [];
+      const { data, error } = await client.rpc('deal_hunter_gmail_list_sent_identities_v1', {
+        p_command: { conversationIds },
+      });
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed Gmail sent identity list');
+      return data.map(normalizeGmailSentIdentityRow);
+    },
+
+    /** The processed-message rows among the given Gmail message ids. */
+    async listGmailReplyMessages(command = {}) {
+      const { gmailMessageIds } = validateGmailReplyMessageLookup(command);
+      if (gmailMessageIds.length === 0) return [];
+      const { data, error } = await client.from('deal_hunter_gmail_reply_messages').select('*')
+        .in('gmail_message_id', gmailMessageIds).order('gmail_message_id', { ascending: true });
+      if (error) throw error;
+      return (data || []).map(normalizeGmailReplyMessageRow);
+    },
+
+    /** Recorded Gmail messages whose effect is not applied yet, oldest first. */
+    async listPendingGmailReplyMessages(command = {}) {
+      const { limit } = validateGmailPendingReplyLookup(command);
+      const { data, error } = await client.from('deal_hunter_gmail_reply_messages').select('*')
+        .eq('applied', false).order('processed_at', { ascending: true })
+        .order('gmail_message_id', { ascending: true }).limit(limit);
+      if (error) throw error;
+      return (data || []).map(normalizeGmailReplyMessageRow);
+    },
+
+    /**
+     * Stores the Message-ID Gmail actually gave an accepted Gmail transmission's sent message
+     * as its communication's message id. Never overwrites a different stored id.
+     */
+    async setCimCommunicationMessageId(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_set_communication_message_id_v1', {
+        p_command: validateCimCommunicationMessageId(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean'
+        || typeof data.conflict !== 'boolean') {
+        throw new Error('Malformed Gmail communication Message-ID result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict };
+    },
+
+    /** Every conversation with a Gmail reply whose effect is still pending, distinct, uncapped. */
+    async listGmailPendingReplyConversationIds() {
+      const { data, error } = await client.rpc('deal_hunter_gmail_list_pending_reply_conversations_v1');
+      if (error) throw error;
+      if (!Array.isArray(data) || data.some((id) => typeof id !== 'string' || !id)) {
+        throw new Error('Malformed Gmail pending reply conversations result');
+      }
+      return data;
+    },
+
+    /** Records a Gmail message once; a pending row is settled by recording it applied. */
+    async recordGmailReplyMessage(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_record_reply_message_v1', {
+        p_command: validateGmailReplyMessage(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean') {
+        throw new Error('Malformed Gmail reply message result');
+      }
+      return { applied: data.applied, replay: data.replay };
+    },
+
+    async getCurrentAutoPursueActivation() {
+      const { data, error } = await client.from('deal_hunter_auto_pursue_activations')
+        .select('*').eq('status', 'current').maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
+    /** Records a new current activation; the RPC supersedes the prior one in one transaction. */
+    async createAutoPursueActivation(activation = {}) {
+      const { data, error } = await client.rpc('create_deal_hunter_auto_pursue_activation_v1', {
+        p_activation: {
+          id: String(activation.id || randomUUID()),
+          mode: String(activation.mode || ''),
+          daily_cap: Number(activation.daily_cap),
+          actor: String(activation.actor || ''),
+          reason: String(activation.reason || ''),
+          confirmation: String(activation.confirmation || ''),
+          created_at: String(activation.created_at || new Date().toISOString()),
+        },
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || data.status !== 'current') {
+        throw new Error('Malformed automatic Pursue activation result');
+      }
+      return data;
+    },
+
+    /** Exclusive claim of a run key; a second claim of the same key returns claimed false. */
+    async claimAutoPursueRun(run = {}) {
+      const runKey = String(run.run_key || '');
+      const { data, error } = await client.from('deal_hunter_auto_pursue_runs').insert({
+        id: String(run.id || randomUUID()), run_key: runKey,
+        business_date: String(run.business_date || ''), mode: String(run.mode || ''),
+        status: 'running', triggered_by: String(run.triggered_by || ''), commands: 0, items: [],
+        created_at: String(run.created_at || new Date().toISOString()),
+      }).select('*').single();
+      if (!error) return { claimed: true, run: data };
+      if (!isUniqueViolation(error)) throw error;
+      const existing = await client.from('deal_hunter_auto_pursue_runs').select('*')
+        .eq('run_key', runKey).maybeSingle();
+      if (existing.error) throw existing.error;
+      return { claimed: false, run: existing.data ?? null };
+    },
+
+    async completeAutoPursueRun({ id, status = 'completed', commands = 0, items = [], reason = null,
+      completedAt } = {}) {
+      const { data, error } = await client.from('deal_hunter_auto_pursue_runs').update({
+        status: String(status), commands: Math.max(0, Math.trunc(Number(commands)) || 0),
+        items: Array.isArray(items) ? items : [],
+        reason: reason === null || reason === undefined ? null : String(reason),
+        completed_at: String(completedAt || new Date().toISOString()),
+      }).eq('id', String(id || '')).is('completed_at', null).select('*').maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
+    /** Runs newest first; one business date when given. */
+    async listAutoPursueRuns({ businessDate, limit = 100 } = {}) {
+      let query = client.from('deal_hunter_auto_pursue_runs').select('*');
+      if (businessDate) query = query.eq('business_date', String(businessDate));
+      const { data, error } = await query
+        .order('created_at', { ascending: false })
+        .order('completed_at', { ascending: false, nullsFirst: true })
+        .order('id', { ascending: false })
+        .limit(Math.max(1, Math.min(Math.trunc(Number(limit)) || 100, 1000)));
+      if (error) throw error;
+      return (data || []).map((row) => ({ ...row, commands: Number(row.commands || 0),
+        items: Array.isArray(row.items) ? row.items : [] }));
+    },
+
+    /** The only writer of the runner-owned blocker columns; returns the number of rows changed. */
+    async setDealHunterAutoPursueBlockers(entries = []) {
+      if (!Array.isArray(entries)) throw new Error('Blocker entries must be an array.');
+      const { data, error } = await client.rpc('set_deal_hunter_auto_pursue_blockers_v1', {
+        p_entries: entries.map((entry) => ({
+          opportunity_id: String(entry.opportunityId || ''),
+          blocker: entry.blocker ? String(entry.blocker) : null,
+          checked_at: String(entry.checkedAt || new Date().toISOString()),
+        })),
+      });
+      if (error) throw error;
+      const changed = typeof data === 'string' ? Number(data) : data;
+      if (!Number.isSafeInteger(changed) || changed < 0) throw new Error('Malformed blocker write result');
+      return changed;
+    },
+
     async getCurrentDealHunterOpportunityScore(opportunityId) {
       const { data, error } = await client
         .from('deal_hunter_opportunity_scores')
@@ -3880,7 +4464,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           .from('deal_hunter_opportunity_scores')
           .select(
             'opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, '
-            + 'profile_version, completeness_policy_version, reviewed_at',
+            + 'profile_version, completeness_policy_version, criteria_profile_version, criteria_group, reviewed_at',
           )
           .in('opportunity_id', batch);
         if (error) throw error;
@@ -4543,6 +5127,20 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       });
       if (error) throw error;
       return { claimed: Boolean(data?.claimed), reason: data?.reason || '', claim: data?.claim || null };
+    },
+
+    async releaseDealHunterCimOpportunityClaim({ opportunityId = '', requestId = '' } = {}) {
+      if (!opportunityId || !requestId) return { released: false };
+      // Only an exact claim that never produced a request row can be released:
+      // a claim backing durable legacy history stays in place.
+      const { data: requestRows, error: requestError } = await client.from('deal_hunter_cim_requests')
+        .select('id').eq('id', requestId).limit(1);
+      if (requestError) throw requestError;
+      if ((requestRows || []).length > 0) return { released: false };
+      const { data, error } = await client.from('deal_hunter_cim_opportunity_claims').delete()
+        .eq('opportunity_id', opportunityId).eq('request_id', requestId).select('opportunity_id');
+      if (error) throw error;
+      return { released: (data || []).length > 0 };
     },
 
     async getDealHunterCimOpportunityClaim(opportunityId) {
@@ -5222,10 +5820,12 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeScheduledJobRow(data);
     },
 
-    async listScheduledJobs({ limit = 100 } = {}) {
-      const { data, error } = await client
+    async listScheduledJobs({ limit = 100, jobName = '' } = {}) {
+      let query = client
         .from('scheduled_job_runs')
-        .select('*')
+        .select('*');
+      if (jobName) query = query.eq('job_name', String(jobName));
+      const { data, error } = await query
         .order('updated_at', { ascending: false })
         .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
       if (error) throw error;

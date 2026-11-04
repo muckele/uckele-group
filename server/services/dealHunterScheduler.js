@@ -98,13 +98,13 @@ export function projectDailyDealHunterJobStatus(run) {
   };
 }
 
-function parseScheduleTime(value = '08:00') {
+export function parseScheduleTime(value = '08:00') {
   const match = String(value || '').match(/^(\d{2}):(\d{2})$/);
   if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return null;
   return { hour: Number(match[1]), minute: Number(match[2]) };
 }
 
-function getZonedParts(date, timezone) {
+export function getZonedParts(date, timezone) {
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
     hour12: false,
@@ -113,11 +113,13 @@ function getZonedParts(date, timezone) {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    weekday: 'short',
   });
   const parts = Object.fromEntries(formatter.formatToParts(date).map((part) => [part.type, part.value]));
   const hour = Number(parts.hour) === 24 ? 0 : Number(parts.hour);
 
   return {
+    weekday: parts.weekday,
     dateKey: `${parts.year}-${parts.month}-${parts.day}`,
     minutesSinceMidnight: hour * 60 + Number(parts.minute),
   };

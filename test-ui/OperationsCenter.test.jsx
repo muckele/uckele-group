@@ -2,11 +2,20 @@
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
 import { cleanup, render, screen, within } from '@testing-library/react';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import OperationsCenter from '../src/components/admin/OperationsCenter.jsx';
 import EmailReadinessPanel from '../src/components/admin/EmailReadinessPanel.jsx';
 
-afterEach(cleanup);
+// The Email sending card loads its own status; keep that request pending so these tests stay
+// about the Operations data they pass in.
+beforeEach(() => {
+  vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe('Operations Center partial failures', () => {
   test.each([
@@ -69,6 +78,14 @@ describe('Operations Center partial failures', () => {
     expect(container.querySelector('[data-admin-tour="operations-readiness"]')).toBeInTheDocument();
     expect(container.querySelector('[data-admin-tour="operations-history"]')).toBeInTheDocument();
     expect(container.querySelector('[data-admin-tour="operations-storage"]')).toBeInTheDocument();
+  });
+
+  test('renders the Email sending card and links to it', () => {
+    render(<OperationsCenter data={{ scheduler: { runs: [] }, sources: {}, audit: {}, cleanup: {}, storage: {}, backup: {} }} />);
+
+    expect(screen.getByRole('heading', { name: 'Email sending' })).toBeVisible();
+    expect(screen.getByRole('link', { name: 'Email sending' })).toHaveAttribute('href', '#email-sending-heading');
+    expect(fetch).toHaveBeenCalledWith('/api/admin/deal-hunter/email-sending', expect.objectContaining({ credentials: 'same-origin' }));
   });
 
   test('shows configured, evidence, effective, activation, every gate, and zero-send/live summaries without granting viewer controls', () => {
@@ -208,5 +225,79 @@ describe('Operations Center partial failures', () => {
     const aiFallbackCard = screen.getByText('AI fallback').closest('div');
     expect(within(aiFallbackCard).getByText('Not observed')).toBeVisible();
     expect(screen.getByRole('link', { name: 'Open Resend Domains' })).toHaveAttribute('href', 'https://resend.com/domains');
+  });
+
+  describe('Sheet sync job history', () => {
+    function renderRuns(runs) {
+      return render(<OperationsCenter readOnly data={{
+        scheduler: { runs, failures: 0, pending: 0 },
+        sources: { current: { healthy: true, issues: [] }, history: [] },
+        audit: { events: [] },
+        cleanup: { failures: [] },
+        storage: { disk: {}, database: {} },
+        backup: {},
+        communications: {},
+      }} />);
+    }
+
+    test('shows per-sheet status, groups and the automatic Pursue outcome for a healthy run', () => {
+      renderRuns([{
+        job_key: 'deal-hunter-sheet-sync:2026-11-03', job_name: 'deal-hunter-sheet-sync', status: 'completed',
+        updated_at: '2026-11-03T15:31:00.000Z', attempt_count: 1, last_error: '',
+        sheetSync: {
+          ok: true,
+          sheets: [
+            { sourceId: 'sheet-0', fetched: true, rowCount: 40, error: '' },
+            { sourceId: 'sheet-1', fetched: true, rowCount: 12, error: '' },
+          ],
+          groupCounts: { auto: 3, review: 30, 'needs-info': 5, 'near-miss': 2 },
+          autoPursue: { runKey: 'k', status: 200, mode: 'shadow', skipped: '', error: '', commands: 0,
+            reason: 'warmup_not_ready', duplicateInvocation: false },
+        },
+      }]);
+      const summary = screen.getByTestId('sheet-sync-summary');
+      expect(within(summary).getByText('sheet-0: fetched 40 rows · sheet-1: fetched 12 rows')).toBeVisible();
+      expect(within(summary).getByText('Automatic Pursue: shadow · 0 decisions · warmup_not_ready')).toBeVisible();
+      expect(within(summary).getByText('auto 3 · review 30 · needs-info 5 · near-miss 2')).toBeVisible();
+    });
+
+    test('shows a failed sheet and a skipped automatic Pursue, and leaves other jobs plain', () => {
+      renderRuns([
+        {
+          job_key: 'deal-hunter-sheet-sync:2026-11-04', job_name: 'deal-hunter-sheet-sync', status: 'failed',
+          updated_at: '2026-11-04T15:31:00.000Z', attempt_count: 2, last_error: 'Scheduled job needs attention.',
+          sheetSync: {
+            ok: false,
+            sheets: [{ sourceId: 'sheet-0', fetched: false, rowCount: 0, error: 'HTTP 500' }],
+            groupCounts: {},
+            autoPursue: { runKey: '', status: null, mode: '', skipped: 'required_source_failed', error: '' },
+          },
+        },
+        { job_key: 'backup:2026-11-04', job_name: 'backup', status: 'completed', updated_at: '2026-11-04T11:00:00.000Z', attempt_count: 1, last_error: '' },
+      ]);
+      const summary = screen.getByTestId('sheet-sync-summary');
+      expect(within(summary).getByText('sheet-0: failed: HTTP 500')).toBeVisible();
+      expect(within(summary).getByText('Automatic Pursue: skipped: required_source_failed')).toBeVisible();
+      expect(screen.getAllByTestId('sheet-sync-summary')).toHaveLength(1);
+    });
+
+    test('shows a duplicate automatic Pursue invocation with its decisions count', () => {
+      renderRuns([{
+        job_key: 'deal-hunter-sheet-sync:2026-11-06', job_name: 'deal-hunter-sheet-sync', status: 'completed',
+        updated_at: '2026-11-06T15:31:00.000Z', attempt_count: 1, last_error: '',
+        sheetSync: { ok: true, sheets: [], groupCounts: {}, autoPursue: { runKey: 'k', status: 200, mode: 'canary',
+          skipped: '', error: '', commands: 1, reason: 'run_in_progress', duplicateInvocation: true } },
+      }]);
+      expect(screen.getByText('Automatic Pursue: canary · 1 decision · run_in_progress · duplicate invocation')).toBeVisible();
+    });
+
+    test('shows an automatic Pursue error without the raw text', () => {
+      renderRuns([{
+        job_key: 'deal-hunter-sheet-sync:2026-11-05', job_name: 'deal-hunter-sheet-sync', status: 'completed',
+        updated_at: '2026-11-05T15:31:00.000Z', attempt_count: 1, last_error: '',
+        sheetSync: { ok: true, sheets: [], groupCounts: {}, autoPursue: { error: 'runner exploded' } },
+      }]);
+      expect(screen.getByText('Automatic Pursue: error')).toBeVisible();
+    });
   });
 });

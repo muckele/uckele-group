@@ -3,6 +3,8 @@ import {
   EXPLICIT_TIMEZONE_VERSION,
   STRUCTURED_SOURCE_TIMEZONE_VERSION,
   TIMEZONE_DATASET_DIGEST,
+  derivedTimezoneEvidenceDigest,
+  resolveLocationTimezone,
   resolveOpportunityTimezone,
   timezoneEvidenceDigest,
   validateIanaTimezone,
@@ -103,4 +105,52 @@ export async function appendStructuredSourceTimezoneRevision({ storage, opportun
   }
   return { ok: true, status: 200, applied: result.applied, replay: result.replay,
     timezone: publicRevision(result.timezoneRevision) };
+}
+
+const DERIVED_EVIDENCE_TYPE = 'target-state';
+const DERIVED_ACTOR = 'system-timezone-resolver';
+const sendable = (revision) => ['verified', 'derived'].includes(revision?.state);
+
+/**
+ * Server-only writer: appends a derived zone from the deal's target state when nothing sendable
+ * exists yet. It never writes over a verified or derived revision, so an owner's choice and an
+ * earlier derivation always stand. A failed or skipped derivation is not an error.
+ */
+export async function appendDerivedOpportunityTimezoneRevision({ storage, opportunityId,
+  state, location, now } = {}) {
+  if (typeof storage?.appendOpportunityTimezoneRevision !== 'function'
+    || typeof storage.readPursuitEnrollmentAuthority !== 'function') {
+    throw new Error('Timezone revision storage is unavailable.');
+  }
+  if (!bounded(opportunityId, 200) || typeof now !== 'string' || !Number.isFinite(Date.parse(now))) {
+    throw new Error('A derived timezone needs an opportunity id and an instant.');
+  }
+  const resolved = resolveLocationTimezone({ state, location });
+  if (!resolved.eligible) return { written: false, reason: resolved.reasonCode };
+  const readLatest = async () =>
+    (await storage.readPursuitEnrollmentAuthority({ opportunityId, now }))?.timezone ?? null;
+  const evidenceId = `target-state:${resolved.state}`;
+  // Spec 3.2: the digest covers the normalized inputs, so re-deriving from unchanged inputs is a no-op.
+  const evidenceDigest = derivedTimezoneEvidenceDigest({ opportunityId, state, location });
+  const latest = await readLatest();
+  if (sendable(latest)) return { written: false, reason: 'timezone_already_set' };
+  if (latest?.evidence_digest === evidenceDigest) return { written: false, reason: 'same_evidence' };
+  const expectedPriorRevision = Number(latest?.revision ?? 0);
+  const idempotencyKey = createHash('sha256').update(JSON.stringify([
+    'derived-timezone-command:v1', opportunityId, expectedPriorRevision, evidenceDigest,
+  ])).digest('hex');
+  const result = await storage.appendOpportunityTimezoneRevision({
+    opportunityId, expectedPriorRevision, idempotencyKey, state: 'derived',
+    ianaTimezone: resolved.ianaTimezone, evidenceType: DERIVED_EVIDENCE_TYPE, evidenceId,
+    evidenceDigest, resolverVersion: resolved.resolverVersion,
+    datasetDigest: TIMEZONE_DATASET_DIGEST, actor: DERIVED_ACTOR, now,
+  });
+  if (result.staleRevision) {
+    // Someone else wrote first. Look once more so an owner's revision is respected, then stop.
+    return { written: false, reason: sendable(await readLatest())
+      ? 'timezone_already_set' : 'stale_timezone_revision' };
+  }
+  if (result.applied) return { written: true, reason: 'written' };
+  if (result.replay) return { written: false, reason: 'replay' };
+  throw new Error('Derived timezone revision result is incomplete.');
 }

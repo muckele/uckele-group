@@ -8,6 +8,9 @@ import {
   shouldRunDailyDealHunterEmail,
   startDealHunterDailyEmailScheduler,
 } from '../server/services/dealHunterScheduler.js';
+import { startDealHunterSheetSyncScheduler } from '../server/services/dealHunterSheetSyncScheduler.js';
+import { runDealHunterSheetSync } from '../server/services/dealHunterSheetSync.js';
+import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { buildDailyDealHunterEmailEnvelope } from '../server/services/dailyDealHunterDigest.js';
 import { writeDailyDealHunterMarker } from '../server/services/dailyDealHunterReconciliation.js';
 
@@ -742,3 +745,293 @@ test('display-name recipient reconciles the exact local event after acceptance f
   assert.equal(storage.run.provider_message_id, 'display-recipient-accepted-1');
   assert.equal(providerCalls, 1);
 });
+
+// ---- Daily Sheet sync scheduler (spec 2026-11-02 MVP send readiness, section 5) ----
+
+const sheetSyncKeyPrefix = 'deal-hunter-sheet-sync:';
+
+function sheetSyncConfig(overrides = {}) {
+  return {
+    dealHunter: {
+      sheetSync: {
+        enabled: true,
+        runAt: '07:30',
+        timezone: 'America/Los_Angeles',
+        retryIntervalMs: 1_800_000,
+        retryUntil: '12:00',
+        checkIntervalMs: 60_000,
+        ...overrides,
+      },
+    },
+  };
+}
+
+function sheetSyncHarness(t, { enabled = true, start = '2026-11-03T15:00:00.000Z', run } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-sheet-sync-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(root, 'sync.sqlite') } });
+  let current = new Date(start);
+  const timers = [];
+  const cleared = [];
+  const logs = [];
+  const harness = {
+    storage,
+    timers,
+    cleared,
+    logs,
+    runs: [],
+    set(iso) { current = new Date(iso); },
+    scheduler: null,
+    start(extra = {}) {
+      const scheduler = startDealHunterSheetSyncScheduler({
+        storage,
+        config: sheetSyncConfig({ enabled }),
+        now: () => current,
+        setTimer: (fn, ms) => { const timer = { fn, ms, unref() {} }; timers.push(timer); return timer; },
+        clearTimer: (timer) => { cleared.push(timer); },
+        logger: { log: (line) => logs.push(line), error: (line) => logs.push(line) },
+        run: run || (async (input) => { harness.runs.push(input); return { ok: true, sheets: [], autoPursue: { skipped: 'none' } }; }),
+        ...extra,
+      });
+      harness.scheduler = scheduler;
+      return scheduler;
+    },
+    job(date) { return storage.getScheduledJob(`${sheetSyncKeyPrefix}${date}`); },
+  };
+  t.after(() => {
+    harness.scheduler?.stop();
+    storage.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return harness;
+}
+
+test('sheet sync does not run before 07:30 PT', async (t) => {
+  const harness = sheetSyncHarness(t, { start: '2026-11-03T15:29:00.000Z' });
+  const scheduler = harness.start();
+  await scheduler.tick();
+  assert.equal(harness.runs.length, 0);
+  assert.equal(await harness.job('2026-11-03'), null);
+});
+
+test('sheet sync runs at 07:30 PT on a weekday and records the result', async (t) => {
+  const harness = sheetSyncHarness(t, { start: '2026-11-03T15:30:00.000Z' });
+  const scheduler = harness.start();
+  await scheduler.tick();
+  assert.equal(harness.runs.length, 1);
+  assert.equal(harness.runs[0].triggeredBy, 'scheduler');
+  assert.equal(harness.runs[0].storage, harness.storage);
+  const job = await harness.job('2026-11-03');
+  assert.equal(job.status, 'completed');
+  assert.equal(job.job_name, 'deal-hunter-sheet-sync');
+  assert.equal(job.metadata.businessDate, '2026-11-03');
+  assert.equal(job.metadata.ok, true);
+  assert.deepEqual(job.metadata.autoPursue, { skipped: 'none' });
+});
+
+test('sheet sync does not run on Saturday', async (t) => {
+  const harness = sheetSyncHarness(t, { start: '2026-11-07T16:00:00.000Z' });
+  const scheduler = harness.start();
+  await scheduler.tick();
+  harness.set('2026-11-08T16:00:00.000Z');
+  await scheduler.tick();
+  assert.equal(harness.runs.length, 0);
+});
+
+test('sheet sync does not run twice on the same date, including after scheduler restart', async (t) => {
+  const harness = sheetSyncHarness(t, { start: '2026-11-03T15:30:00.000Z' });
+  await harness.start().tick();
+  harness.set('2026-11-03T16:30:00.000Z');
+  await harness.scheduler.tick();
+  assert.equal(harness.runs.length, 1);
+
+  harness.scheduler.stop();
+  const restarted = harness.start();
+  await restarted.tick();
+  assert.equal(harness.runs.length, 1, 'a restarted scheduler must find the completed claim');
+  assert.equal((await harness.job('2026-11-03')).attempt_count, 1);
+});
+
+test('sheet sync runs again on the next weekday', async (t) => {
+  const harness = sheetSyncHarness(t, { start: '2026-11-03T15:30:00.000Z' });
+  const scheduler = harness.start();
+  await scheduler.tick();
+  harness.set('2026-11-04T15:30:00.000Z');
+  await scheduler.tick();
+  assert.equal(harness.runs.length, 2);
+  assert.equal((await harness.job('2026-11-04')).status, 'completed');
+});
+
+test('sheet sync failed run retries after 30 minutes and stops after 12:00 PT', async (t) => {
+  let attempts = 0;
+  const harness = sheetSyncHarness(t, {
+    start: '2026-11-03T15:30:00.000Z',
+    run: async () => {
+      attempts += 1;
+      return { ok: false, sheets: [{ sourceId: 'sheet-0', fetched: false, rowCount: 0, error: 'HTTP 500' }], autoPursue: { skipped: 'required_source_failed' } };
+    },
+  });
+  const scheduler = harness.start();
+  await scheduler.tick();
+  assert.equal(attempts, 1);
+  assert.equal((await harness.job('2026-11-03')).status, 'failed');
+
+  harness.set('2026-11-03T15:59:00.000Z');
+  await scheduler.tick();
+  assert.equal(attempts, 1, 'no retry before 30 minutes have passed');
+
+  // 08:00 PT through 11:30 PT retries every 30 minutes: eight more attempts.
+  for (let minutes = 16 * 60; minutes <= 19 * 60 + 30; minutes += 30) {
+    harness.set(new Date(Date.UTC(2026, 10, 3, 0, minutes)).toISOString());
+    await scheduler.tick();
+  }
+  assert.equal(attempts, 9);
+
+  harness.set('2026-11-03T20:00:00.000Z'); // 12:00 PT
+  await scheduler.tick();
+  harness.set('2026-11-03T22:00:00.000Z'); // 14:00 PT
+  await scheduler.tick();
+  assert.equal(attempts, 9, 'no attempt at or after the 12:00 PT cutoff');
+  const job = await harness.job('2026-11-03');
+  assert.equal(job.status, 'failed');
+  assert.equal(job.attempt_count, 9);
+});
+
+test('sheet sync retry after a restart still honors the 30 minute wait', async (t) => {
+  const harness = sheetSyncHarness(t, {
+    start: '2026-11-03T15:30:00.000Z',
+    run: async (input) => { harness.runs.push(input); return { ok: false, sheets: [], autoPursue: { skipped: 'required_source_failed' } }; },
+  });
+  await harness.start().tick();
+  harness.scheduler.stop();
+  harness.set('2026-11-03T15:45:00.000Z');
+  const restarted = harness.start();
+  await restarted.tick();
+  assert.equal(harness.runs.length, 1, 'the durable failed claim is not due yet');
+  harness.set('2026-11-03T16:00:00.000Z');
+  await restarted.tick();
+  assert.equal(harness.runs.length, 2);
+});
+
+test('sheet sync a run that throws is recorded failed and retried', async (t) => {
+  let attempts = 0;
+  const harness = sheetSyncHarness(t, {
+    start: '2026-11-03T15:30:00.000Z',
+    run: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('refresh blew up');
+      return { ok: true, sheets: [], autoPursue: { skipped: 'none' } };
+    },
+  });
+  const scheduler = harness.start();
+  await scheduler.tick();
+  const failed = await harness.job('2026-11-03');
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.metadata.ok, false);
+  assert.equal(failed.metadata.error, 'refresh blew up');
+  harness.set('2026-11-03T16:00:00.000Z');
+  await scheduler.tick();
+  assert.equal((await harness.job('2026-11-03')).status, 'completed');
+});
+
+test('sheet sync retry success after failure calls autoPursue exactly once that day', async (t) => {
+  let refreshes = 0;
+  let pursues = 0;
+  const refresh = async () => {
+    refreshes += 1;
+    const healthy = refreshes > 1;
+    return {
+      ok: true,
+      status: 200,
+      review: { sources: [{ id: 'sheet-0', fetched: healthy, required: true, sourceRole: 'required-primary', rowCount: healthy ? 9 : 0, ...(healthy ? {} : { error: 'HTTP 503' }) }] },
+      currentFingerprints: { 'opp-1': 'fp' },
+    };
+  };
+  const autoPursue = async () => { pursues += 1; return { ok: true, status: 200, mode: 'shadow', runKey: 'k' }; };
+  const harness = sheetSyncHarness(t, {
+    start: '2026-11-03T15:30:00.000Z',
+    run: (input) => runDealHunterSheetSync({ ...input, refresh, autoPursue }),
+  });
+  const scheduler = harness.start();
+  await scheduler.tick();
+  assert.equal(pursues, 0);
+  assert.deepEqual((await harness.job('2026-11-03')).metadata.autoPursue, { skipped: 'required_source_failed' });
+
+  for (const iso of ['2026-11-03T16:00:00.000Z', '2026-11-03T16:30:00.000Z', '2026-11-03T18:00:00.000Z']) {
+    harness.set(iso);
+    await scheduler.tick();
+  }
+  assert.equal(refreshes, 2);
+  assert.equal(pursues, 1);
+  const job = await harness.job('2026-11-03');
+  assert.equal(job.status, 'completed');
+  assert.deepEqual(job.metadata.autoPursue, { runKey: 'k', status: 200, mode: 'shadow', commands: 0 });
+});
+
+test('sheet sync disabled flag starts no timer', async (t) => {
+  const harness = sheetSyncHarness(t, { enabled: false, start: '2026-11-03T15:30:00.000Z' });
+  const scheduler = harness.start();
+  assert.equal(harness.timers.length, 0);
+  scheduler.stop();
+  assert.equal(harness.runs.length, 0);
+  assert.equal(harness.cleared.length, 0);
+});
+
+test('sheet sync schedules its own check timer and stop clears it', async (t) => {
+  const harness = sheetSyncHarness(t, { start: '2026-11-03T15:30:00.000Z' });
+  const scheduler = harness.start();
+  assert.equal(harness.timers.length, 1);
+  assert.equal(harness.timers[0].ms, 1000);
+  await harness.timers[0].fn();
+  assert.equal(harness.runs.length, 1);
+  assert.equal(harness.timers.length, 2);
+  assert.equal(harness.timers[1].ms, 60_000);
+  scheduler.stop();
+  assert.deepEqual(harness.cleared, [harness.timers[1]]);
+  await harness.timers[1].fn();
+  assert.equal(harness.timers.length, 2, 'a stopped scheduler schedules nothing further');
+});
+
+for (const [label, wrap] of [
+  ['throws', (storage) => {
+    const original = storage.transitionScheduledJob.bind(storage);
+    storage.transitionScheduledJob = async (input) => {
+      if (input.status === 'completed') throw new Error('database is locked');
+      return original(input);
+    };
+  }],
+  ['is refused', (storage) => {
+    const original = storage.transitionScheduledJob.bind(storage);
+    storage.transitionScheduledJob = async (input) => {
+      if (input.status === 'completed') return { applied: false, claimed: false, reason: 'not-owner', run: null };
+      return original(input);
+    };
+  }],
+]) {
+  test(`sheet sync runs automatic Pursue exactly once when the completion write ${label}`, async (t) => {
+    let pursues = 0;
+    const refresh = async () => ({
+      ok: true,
+      status: 200,
+      review: { sources: [{ id: 'sheet-0', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 9 }] },
+      currentFingerprints: { 'opp-1': 'fp' },
+    });
+    const autoPursue = async () => { pursues += 1; return { ok: true, status: 200, mode: 'shadow', runKey: 'k' }; };
+    const harness = sheetSyncHarness(t, {
+      start: '2026-11-03T15:30:00.000Z',
+      run: (input) => runDealHunterSheetSync({ ...input, refresh, autoPursue }),
+    });
+    wrap(harness.storage);
+    const scheduler = harness.start();
+    await scheduler.tick();
+    assert.equal(pursues, 1);
+    assert.ok(harness.logs.some((line) => line.includes('completion not recorded')), 'the failure is logged');
+    assert.equal((await harness.job('2026-11-03')).status, 'pending', 'the claim was never completed');
+
+    // Well past the 60 minute stale cutoff and the 30 minute retry interval, still before noon.
+    for (const iso of ['2026-11-03T16:30:00.000Z', '2026-11-03T17:45:00.000Z', '2026-11-03T19:30:00.000Z']) {
+      harness.set(iso);
+      await scheduler.tick();
+    }
+    assert.equal(pursues, 1, 'a stale reclaim must not run Pursue a second time');
+  });
+}

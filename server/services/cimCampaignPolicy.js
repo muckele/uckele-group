@@ -1,7 +1,14 @@
 import { validateIanaTimezone } from './opportunityTimezone.js';
 
 export const CIM_CAMPAIGN_POLICY_VERSION = 'deal-hunter-cim-autopilot-v1';
-export const CIM_CADENCE_POLICY_VERSION = 'deal-hunter-cim-cadence-v2';
+export const CIM_CADENCE_POLICY_VERSION_V2 = 'deal-hunter-cim-cadence-v2';
+export const CIM_CADENCE_POLICY_VERSION_V3 = 'deal-hunter-cim-cadence-v3';
+// The version stamped on new initial acceptances. A campaign keeps the version stamped on
+// its expiry derivation for its whole life, so every supported version stays derivable.
+export const CIM_CADENCE_POLICY_VERSION = CIM_CADENCE_POLICY_VERSION_V3;
+export const SUPPORTED_CIM_CADENCE_POLICY_VERSIONS = Object.freeze([
+  CIM_CADENCE_POLICY_VERSION_V2, CIM_CADENCE_POLICY_VERSION_V3,
+]);
 const HOUR_MS = 3_600_000;
 const CAMPAIGN_EXPIRY_DAYS = 28;
 const FOLLOW_UP_INTERVAL_DAYS = 2;
@@ -158,9 +165,37 @@ export function calculateCampaignExpiry(initialAcceptedAt, timezone, sendTime = 
     resolverVersion: 'intl-iana-v1' };
 }
 
-export function calculateNextCimSlot({ policyVersion, timezone, kind, readyAt,
-  priorAcceptedAt, priorOutcome = 'accepted', expiryAt, sendTime = '08:00' } = {}) {
+function supportedCadencePolicyVersion(value) {
+  if (!SUPPORTED_CIM_CADENCE_POLICY_VERSIONS.includes(value)) {
+    throw new Error('Unknown CIM cadence policy.');
+  }
+  return value;
+}
+
+// v2: follow-up-1 waits two business days, later touches two calendar days, and the
+// repeating slot is keyed `calendar:`. v3: every follow-up waits two business days and the
+// repeating slot is keyed `business:`.
+function followUpRule(cadencePolicyVersion, kind) {
+  if (cadencePolicyVersion === CIM_CADENCE_POLICY_VERSION_V3) {
+    return { businessDays: true, repeatingSlotPrefix: 'business' };
+  }
+  if (cadencePolicyVersion === CIM_CADENCE_POLICY_VERSION_V2) {
+    return { businessDays: kind === 'follow-up-1', repeatingSlotPrefix: 'calendar' };
+  }
+  throw new Error('Unknown CIM cadence policy.');
+}
+
+export function cimRepeatingSlotPrefix(cadencePolicyVersion) {
+  return followUpRule(supportedCadencePolicyVersion(cadencePolicyVersion),
+    'weekday-follow-up').repeatingSlotPrefix;
+}
+
+export function calculateNextCimSlot({ policyVersion, cadencePolicyVersion, timezone, kind,
+  readyAt, priorAcceptedAt, priorOutcome = 'accepted', expiryAt, sendTime = '08:00' } = {}) {
   if (policyVersion !== CIM_CAMPAIGN_POLICY_VERSION) throw new Error('Unknown CIM cadence policy.');
+  // The initial touch is version-independent; every follow-up needs the campaign's stamp.
+  const cadence = kind === 'initial' && cadencePolicyVersion === undefined
+    ? CIM_CADENCE_POLICY_VERSION : supportedCadencePolicyVersion(cadencePolicyVersion);
   formatter(timezone);
   if (kind !== 'initial' && !expiryAt) throw new Error('Campaign expiry is required for follow-ups.');
   const expiry = expiryAt ? instant(expiryAt).getTime() : Infinity;
@@ -169,23 +204,21 @@ export function calculateNextCimSlot({ policyVersion, timezone, kind, readyAt,
   if (kind === 'initial') raw = instant(readyAt);
   else {
     if (priorOutcome !== 'accepted' || !priorAcceptedAt) return null;
-    const accepted = instant(priorAcceptedAt);
-    if (kind === 'follow-up-1') {
-      ({ instant: raw, disambiguation } = scheduledFollowUpInstant(accepted, timezone,
-        sendTime, { businessDays: true }));
-    } else if (['follow-up-2', 'follow-up-3', 'weekday-follow-up'].includes(kind)) {
-      // `weekday-follow-up` is retained as the durable kind for compatibility. Under the
-      // v2 cadence its logical identity is calendar-based and weekend dates are eligible.
-      ({ instant: raw, disambiguation } = scheduledFollowUpInstant(accepted, timezone,
-        sendTime, { businessDays: false }));
-    } else throw new Error('Unknown CIM logical slot kind.');
+    if (!['follow-up-1', 'follow-up-2', 'follow-up-3', 'weekday-follow-up'].includes(kind)) {
+      throw new Error('Unknown CIM logical slot kind.');
+    }
+    // `weekday-follow-up` is retained as the durable kind for compatibility. Under v2 its
+    // logical identity is calendar-based and weekend dates are eligible; under v3 it is
+    // business-day based and weekends are never scheduled.
+    ({ instant: raw, disambiguation } = scheduledFollowUpInstant(instant(priorAcceptedAt),
+      timezone, sendTime, { businessDays: followUpRule(cadence, kind).businessDays }));
   }
   const due = kind === 'initial' ? rollToEligibleWindow(raw.toISOString(), timezone)
     : { dueAt: raw.toISOString(), dueLocal: isoLocal(parts(raw, timezone)),
       disambiguation };
   if (new Date(due.dueAt).getTime() >= expiry) return null;
   return { kind, slotKey: kind === 'weekday-follow-up'
-    ? `calendar:${due.dueLocal.slice(0, 10)}` : kind,
+    ? `${followUpRule(cadence, kind).repeatingSlotPrefix}:${due.dueLocal.slice(0, 10)}` : kind,
     rawDueAt: raw.toISOString(), ...due, timezone, policyVersion,
-    cadencePolicyVersion: CIM_CADENCE_POLICY_VERSION };
+    cadencePolicyVersion: cadence };
 }

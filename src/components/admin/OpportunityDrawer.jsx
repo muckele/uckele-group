@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
 import BrokerMaterialsCard, { BrokerMaterialsAttachmentStatus } from './BrokerMaterialsCard.jsx';
 import PursueNextAction from './PursueNextAction.jsx';
+import { NearMissConfirmPanel, isNearMiss } from './AcquisitionCriteria.jsx';
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
 import { financialFactFields, financialFactCurrencies, financialFactPeriods, financialFactMetrics,
   normalizeFinancialFact, parseFinancialFact, financialFactDescription } from '../../../shared/opportunityFinancialFacts.js';
@@ -113,9 +114,9 @@ export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit
   );
 }
 
-function DetailActions({ name, onAction, onPass, pending }) {
+function DetailActions({ name, onAction, onPass, onRequestSim, pending }) {
   if (!onAction) return null;
-  return <div className="flex flex-wrap gap-2"><button aria-label={`Pursue ${name}`} className={primaryButton} disabled={pending} onClick={() => onAction('pursue')} type="button">Pursue</button><button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
+  return <div className="flex flex-wrap gap-2"><button aria-label={`Request SIM ${name}`} className={primaryButton} disabled={pending} onClick={onRequestSim} type="button">Request SIM</button><button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
 }
 
 function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
@@ -212,8 +213,62 @@ function shortDigest(value) {
   return typeof value === 'string' && value ? value.slice(0, 12) : 'Unavailable';
 }
 
-function CimReleaseCard({ error = '', loading = false, onStop, pending = false,
+const timezoneChoices = ['America/New_York', 'America/Chicago', 'America/Denver',
+  'America/Phoenix', 'America/Los_Angeles'];
+
+function TimezonePicker({ expectedPriorRevision, onSet, opportunityId, pending = false }) {
+  const [choice, setChoice] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const keyRef = useRef(null);
+  async function confirm() {
+    if (!choice || saving) return;
+    // A retry of the same choice against the same revision reuses its key, so it cannot double-write.
+    const signature = `${opportunityId}:${choice}:${expectedPriorRevision}`;
+    if (keyRef.current?.signature !== signature) {
+      keyRef.current = { signature, key: globalThis.crypto.randomUUID() };
+    }
+    setSaving(true); setError('');
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/timezone`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ianaTimezone: choice, evidenceType: 'operator-verified',
+          evidenceId: 'owner-drawer', expectedPriorRevision, idempotencyKey: keyRef.current.key }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (response.status === 409) {
+        setError('Timezone changed elsewhere — reload and try again.');
+      } else if (!response.ok || result.success === false) {
+        setError(result.error || 'Unable to set the timezone. Try again.');
+      } else {
+        keyRef.current = null; setChoice('');
+        onSet?.();
+      }
+    } catch (failure) {
+      setError(failure.message || 'Unable to set the timezone. Try again.');
+    } finally { setSaving(false); }
+  }
+  return (
+    <div className="mt-4 rounded-xl border border-sky-200 bg-white p-3">
+      <p className="text-xs font-semibold text-sky-950" id="cim-timezone-label">Set timezone</p>
+      <p className="mt-1 text-xs text-ink/65">No sendable timezone is on record, so the first email cannot be scheduled. After you set one, click Request SIM again to schedule the email.</p>
+      <div aria-labelledby="cim-timezone-label" className="mt-2 flex flex-wrap gap-2" role="group">
+        {timezoneChoices.map((zone) => <button aria-pressed={choice === zone} className={`${secondaryButton} min-h-8 px-3 py-1 text-xs`} disabled={pending || saving} key={zone} onClick={() => { setChoice(zone); setError(''); }} type="button">{zone}</button>)}
+      </div>
+      {choice ? <div className="mt-3 flex flex-wrap items-center gap-2">
+        <p className="text-sm text-ink">Use {choice} for this deal&apos;s send times?</p>
+        <button className={primaryButton} disabled={pending || saving} onClick={confirm} type="button">{saving ? 'Saving…' : 'Confirm timezone'}</button>
+        <button className={secondaryButton} disabled={saving} onClick={() => setChoice('')} type="button">Cancel</button>
+      </div> : null}
+      {error ? <p className="mt-3 rounded-lg border border-red-200 bg-white p-3 text-sm text-red-800" role="alert">{error}</p> : null}
+    </div>
+  );
+}
+
+function CimReleaseCard({ error = '', loading = false, onStop, onTimezoneSet, opportunityId = '', pending = false,
   readOnly = false, release }) {
+  // Setting a timezone does not resume a blocked enrollment; the owner must request again.
+  const [timezoneSavedFor, setTimezoneSavedFor] = useState('');
   if (!release && !loading && !error) return null;
   const transmission = release?.transmission;
   const addressing = transmission?.addressing;
@@ -247,6 +302,12 @@ function CimReleaseCard({ error = '', loading = false, onStop, pending = false,
           <p className="mt-3 break-all text-[11px] text-ink/55">Transmission {transmission.id} · Payload {shortDigest(transmission.payloadDigest)} · Membership {shortDigest(transmission.memberDigest)}</p>
           {release.campaign?.localExpiryAt ? <p className="mt-1 text-[11px] text-ink/55">Campaign expiry {formatDate(release.campaign.localExpiryAt)}</p> : <p className="mt-1 text-[11px] text-ink/55">Campaign expiry is established after initial provider acceptance.</p>}
         </div> : null}
+        {!readOnly && opportunityId && (!release.timezoneAuthority
+          || ['missing', 'ambiguous'].includes(release.timezoneAuthority.state))
+          ? <TimezonePicker expectedPriorRevision={release.timezoneAuthority?.revision ?? 0}
+            key={opportunityId} onSet={() => { setTimezoneSavedFor(opportunityId); onTimezoneSet?.(); }}
+            opportunityId={opportunityId} pending={pending} /> : null}
+        {timezoneSavedFor && timezoneSavedFor === opportunityId ? <p aria-live="polite" className="mt-4 rounded-lg border border-moss/20 bg-white p-3 text-sm font-medium text-moss" role="status">Timezone saved. Click Request SIM again to schedule the email.</p> : null}
         {!readOnly && release.actions?.canStop && onStop ? <button className={`${secondaryButton} mt-4 text-red-700`} disabled={pending} onClick={() => onStop({
           campaignId: release.actions.campaignId,
           expectedRowVersion: release.actions.expectedRowVersion,
@@ -264,11 +325,12 @@ function conflictKey(observation) {
 export default function OpportunityDrawer({
   actionsBlocked = false, brokerMaterialsState = {}, cimRelease = null, cimReleaseError = '', cimReleaseLoading = false, cimReleaseReadOnly = false, cimReleaseStopping = false, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
-  onCimReleaseStop,
+  onCimReleaseStop, onCimTimezoneSet,
   onRestore, onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
   onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, pursueChoice = null, readOnly = false,
 }) {
   const [passOpen, setPassOpen] = useState(false);
+  const [simConfirmOpen, setSimConfirmOpen] = useState(false);
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [brokerEmailFocusRequest, setBrokerEmailFocusRequest] = useState(0);
   const dialogRef = useRef(null);
@@ -286,6 +348,7 @@ export default function OpportunityDrawer({
   const changedState = opportunity?.changedSinceReview ? 'Changed' : 'Current';
   useLayoutEffect(() => {
     closeButtonRef.current?.focus();
+    setSimConfirmOpen(false);
   }, [opportunity?.opportunityId]);
   useLayoutEffect(() => {
     // A disabled decision button can move native browser focus to the body.
@@ -370,7 +433,8 @@ export default function OpportunityDrawer({
                   : <button className={secondaryButton} disabled={pending || actionsBlocked} onClick={() => setRestoreOpen(true)} type="button">Restore opportunity</button>}
               </div> : null}
               <div className="mt-4"><PursueNextAction brokerMaterials={detail.brokerMaterials} cimRelease={cimRelease} linkedCrmId={linkedCrmId} opportunity={opportunity} pursueCimReleaseAvailable={detail.pursueCimReleaseAvailable} /></div>
-              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending || actionsBlocked} /></div>
+              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} onRequestSim={() => (isNearMiss(opportunity) ? setSimConfirmOpen(true) : onAction('pursue'))} pending={pending || actionsBlocked} /></div>
+              {simConfirmOpen && actionable && isNearMiss(opportunity) ? <NearMissConfirmPanel onCancel={() => setSimConfirmOpen(false)} onConfirm={() => { setSimConfirmOpen(false); onAction('pursue'); }} pending={pending || actionsBlocked} row={opportunity} /> : null}
               {pursueChoice?.options?.length > 1 && actionable ? <div aria-label="Choose Pursue recipient" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
                 <p className="text-sm font-semibold text-amber-950">Choose the authoritative broker recipient to continue Pursue</p>
                 <p className="mt-1 text-xs text-amber-900">The choice is checked against current contact authority before a campaign can be created.</p>
@@ -383,7 +447,7 @@ export default function OpportunityDrawer({
               </div> : null}
               {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} submitDisabled={actionsBlocked} /></div> : null}
               {linkedCrmId ? <a className={`${secondaryButton} mt-4 gap-2`} href={`/admin/crm/${encodeURIComponent(linkedCrmId)}`}><ExternalLink aria-hidden="true" className="h-4 w-4" />Open linked CRM record</a> : null}
-              <div className="mt-4"><CimReleaseCard error={cimReleaseError} loading={cimReleaseLoading} onStop={onCimReleaseStop} pending={cimReleaseStopping} readOnly={cimReleaseReadOnly} release={cimRelease} /></div>
+              <div className="mt-4"><CimReleaseCard error={cimReleaseError} loading={cimReleaseLoading} onStop={onCimReleaseStop} onTimezoneSet={onCimTimezoneSet} opportunityId={opportunity.opportunityId} pending={cimReleaseStopping} readOnly={cimReleaseReadOnly} release={cimRelease} /></div>
               {detail.pursueCimReleaseAvailable || cimRelease?.campaign
                 ? <div className="mt-4"><BrokerMaterialsAttachmentStatus value={detail.brokerMaterials?.attachmentStatus} /></div>
                 : null}

@@ -70,11 +70,13 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
   const migration = fs.readFileSync(path.join(root, 'supabase/migrations/20260923120000_deal_hunter_freshness_provenance.sql'), 'utf8');
   const campaignMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20260925120000_pursue_cim_autopilot.sql'), 'utf8');
   const safetyMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20260928120000_pursue_cim_intake_safety.sql'), 'utf8');
+  const bestFirstMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20261102120000_best_first_deal_list.sql'), 'utf8');
   psql(container, 'fl01_fresh', currentSchema);
   psql(container, 'fl01_upgrade', previousSchema);
   psql(container, 'fl01_upgrade', migration);
   psql(container, 'fl01_upgrade', campaignMigration);
   psql(container, 'fl01_upgrade', safetyMigration);
+  psql(container, 'fl01_upgrade', bestFirstMigration);
   for (const database of ['fl01_fresh', 'fl01_upgrade']) {
     const catalog = psql(container, database, `
       select jsonb_build_object(
@@ -910,13 +912,16 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
         values ('${id}', now(), '${id}', 'Old priority', 90, 'high',
           'old-reader-fingerprint', 'test', 'test', 'test', 'test', true, 'high');`);
     }
+    // One shared acceptance a day ago keeps both rows new to UG (the inbox's 0-7 day window)
+    // and tied on discovery, whatever day the suite runs.
+    const exploreAcceptedAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     for (const [suffix, priority] of [['a', 'normal'], ['z', 'urgent']]) {
       const id = `${suffix}-explore-${database}`;
       psql(container, database, `insert into public.deal_hunter_opportunities
         (opportunity_id, created_at, updated_at, canonical_name, identity_version,
           discovery_state, first_accepted_at, discovery_revision)
         values ('${id}', now(), now(), 'Equal discovery', 'test',
-          'known_prospective', '2026-09-23T12:00:00Z', 1);
+          'known_prospective', '${exploreAcceptedAt}', 1);
         insert into public.deal_hunter_opportunity_scores
         (opportunity_id, scored_at, deal_key, name, fit_score, confidence,
           score_fingerprint, engine_version, rules_version, profile_version,
@@ -926,10 +931,13 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     }
     const inbox = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('inbox');"));
-    assert.deepEqual(inbox.areas.map((area) => area.id), ['action-preview', 'new-important']);
+    assert.deepEqual(inbox.areas.map((area) => area.id),
+      ['action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss']);
+    const freshArea = () => JSON.parse(psql(container, database,
+      "select public.list_deal_hunter_fresh_inbox_v1('new-important');")).areas[0];
     assert.equal(inbox.areas[0].counts.ownerPriority, 16);
     assert.equal(inbox.areas[0].rows.length, 3);
-    assert.ok(inbox.areas[1].rows.some((row) => row.opportunity_id === freshId));
+    assert.ok(freshArea().rows.some((row) => row.opportunity_id === freshId));
     const sorted = (sort, offset = 0, limit = 25) => JSON.parse(psql(container, database,
       `select public.list_deal_hunter_fresh_inbox_v1('all-active', ${offset}, ${limit},
         '', '', '', '', now(), '${sort}');`)).areas[0];
@@ -952,7 +960,7 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.equal(secondFitPage.anchorId, firstFitPage.lastId);
     assert.equal(new Set([...firstFitPage.rows, ...secondFitPage.rows]
       .map((row) => row.opportunity_id)).size, 10);
-    assert.equal(inbox.areas[1].rows.find((row) => row.opportunity_id === freshId).primary_submission_id, null);
+    assert.equal(freshArea().rows.find((row) => row.opportunity_id === freshId).primary_submission_id, null);
     const allPriorities = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('owner-priorities', 0, 10);"));
     assert.equal(allPriorities.areas[0].total, 16);
@@ -1015,7 +1023,11 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.equal(withDue.areas[0].counts.due, 5);
     assert.equal(withDue.areas[0].rows.length, 3);
     assert.equal(new Set(withDue.areas[0].rows.map((row) => row.opportunity_id)).size, 3);
-    assert.deepEqual(withDue.areas[1].rows.map((row) => row.opportunity_id), newIds);
+    assert.deepEqual(withDue.areas.map((area) => area.id),
+      ['action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss']);
+    assert.deepEqual(JSON.parse(psql(container, database,
+      "select public.list_deal_hunter_fresh_inbox_v1('new-important');")).areas[0].rows
+      .map((row) => row.opportunity_id), newIds);
     const allDue = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('due-actions');"));
     assert.equal(allDue.areas[0].total, 5);
@@ -1130,12 +1142,8 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     const quote = (value) => `'${JSON.stringify(value).replaceAll("'", "''")}'`;
     psql(container, database, `select public.accept_admitted_complete_google_sheet_freshness_v1(
       ${quote(captured.admission)}::jsonb, ${quote(captured.records)});`);
-    const supported = JSON.parse(psql(container, database,
-      "select public.list_deal_hunter_fresh_inbox_v1('new-important');"));
-    const row = supported.areas[0].rows.find((item) => item.opportunity_id === opportunityId);
-    assert.equal(row.discovery_group, 1);
-    assert.equal(row.recently_listed, true);
-    assert.equal(row.publication_precision, 'date');
+    // The 2026-09-22 publication date is fixed, so read the inbox as of the fixture's own
+    // acceptance moment rather than today: "recently listed" lasts only thirty days.
     psql(container, database, `update public.deal_hunter_opportunities
       set first_accepted_at = '2026-09-23T18:00:00.000Z'
       where opportunity_id = '${opportunityId}';`);
@@ -1143,6 +1151,10 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       `select public.list_deal_hunter_fresh_inbox_v1('${area}', 0, 25,
         '', '', '', '', '${asOf}'::timestamptz);`)).areas[0].rows
       .find((item) => item.opportunity_id === opportunityId);
+    const row = boundaryRow('new-important', '2026-09-23T18:00:00.000Z');
+    assert.equal(row.discovery_group, 1);
+    assert.equal(row.recently_listed, true);
+    assert.equal(row.publication_precision, 'date');
     assert.equal(boundaryRow('new-important', '2026-09-30T18:00:00.000Z')?.discovery_group, 1,
       'seven Pacific calendar days remains fresh');
     assert.equal(boundaryRow('new-important', '2026-10-01T18:00:00.000Z'), undefined,
@@ -1179,9 +1191,7 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       values ('peer-observation-${database}', '${opportunityId}', 'synthetic-peer',
         'Synthetic peer', 'external:PEER', 'date_added', '2026-09-20',
         '${at}', '${at}', '${at}', 'peer-core-${database}');`);
-    const conflicted = JSON.parse(psql(container, database,
-      "select public.list_deal_hunter_fresh_inbox_v1('new-important');"));
-    const conflictRow = conflicted.areas[0].rows.find((item) => item.opportunity_id === opportunityId);
+    const conflictRow = boundaryRow('new-important', '2026-09-23T18:00:00.000Z');
     assert.equal(conflictRow.discovery_group, 2);
     assert.equal(conflictRow.recently_listed, false);
     assert.equal(conflictRow.publication_distinct_count, 2);
@@ -1317,7 +1327,9 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       const response = JSON.parse(psql(container, database,
         "select public.list_deal_hunter_fresh_inbox_v1('inbox');"));
       durations.push(performance.now() - started);
-      assert.ok(response.areas[1].rows.length >= 3 && response.areas[1].rows.length <= 10);
+      assert.equal(response.areas.length, 5);
+      const review = response.areas.find((area) => area.id === 'your-review');
+      assert.ok(review.rows.length >= 3 && review.rows.length <= 10);
     }
     const sorted = durations.sort((left, right) => left - right);
     const baselineSorted = baselineDurations.sort((left, right) => left - right);

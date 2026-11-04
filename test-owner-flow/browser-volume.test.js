@@ -175,7 +175,7 @@ test('FL05 rendered volume: real UI at1000 current /5000 archived, desktop and n
         assert.deepEqual(detailDispatches.slice(previousDetails), [{
           path: '/api/admin/deal-hunter/triage/volume-archive-00000', method: 'GET',
         }], 'Opening one archive dispatches exactly its detail read');
-        await expect(page.getByRole('dialog').getByRole('button', { name: /^(Pursue |Watch |Pass |Save verified fact|Mark reviewed|Prepare |Approve |Start |Stop )/ })).toHaveCount(0);
+        await expect(page.getByRole('dialog').getByRole('button', { name: /^(Request SIM |Pursue |Watch |Pass |Save verified fact|Mark reviewed|Prepare |Approve |Start |Stop )/ })).toHaveCount(0);
         await expect(page.getByRole('dialog').getByRole('textbox')).toHaveCount(0);
         await page.keyboard.press('Tab');
         assert.equal(await page.getByRole('dialog').evaluate((element) => element.contains(document.activeElement)), true);

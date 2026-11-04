@@ -883,6 +883,29 @@ test('Approve Follow-Up reproduces the exact signed greeting subject text html t
   assert.equal(Object.hasOwn(trusted, 'approvedProposalDigest'), false);
 });
 
+test('Approve Follow-Up refuses a deal in a SIM request campaign with 409 before any provider work', async (t) => {
+  for (const [label, projection, code] of [
+    ['pursued', async () => ({ decision: { action: 'pursue' }, enrollment: null, campaign: null }), 'pursue_owns_opportunity'],
+    ['projection unavailable', async () => { throw new Error('projection offline'); }, 'pursue_authority_unavailable'],
+  ]) {
+    await t.test(label, async () => {
+      const storage = task3Storage({ request: markedRequest() });
+      const prepared = await prepare(storage);
+      storage.readPursueCimProjection = projection;
+      const result = await approveDealHunterManualFollowUp({
+        opportunityId, requestId, preparationToken: prepared.preparationToken,
+        approvedProposalDigest: prepared.proposalDigest, session: administrator, storage, now: new Date(), dependencies,
+      });
+      assert.equal(result.success, false);
+      assert.equal(result.status, 409);
+      assert.equal(result.code, code);
+      assert.equal(result.error, 'This deal is in a SIM request campaign — manage it from the drawer.');
+      assert.equal(storage.state.calls.provider, 0);
+      assert.equal(storage.state.request.follow_up_count ?? 0, markedRequest().follow_up_count ?? 0);
+    });
+  }
+});
+
 test('definitive failure retry prepares exact persisted read-only content and uses a fresh approval', async () => {
   const communicationId = buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 });
   const first = markedRequest({ follow_up_state: 'failed', status: 'follow_up_failed' });

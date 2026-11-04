@@ -724,7 +724,7 @@ describe('Acquisition Inbox queue', () => {
     expect(within(briefing).getByRole('button', { name: 'Opportunity details for Evergreen Fire Protection' })).toBeEnabled();
     expect(within(briefing).queryByRole('link', { name: 'Open original listing for Evergreen Fire Protection' }))
       .not.toBeInTheDocument();
-    for (const action of ['Pursue', 'Watch', 'Pass']) {
+    for (const action of ['Request SIM', 'Watch', 'Pass']) {
       expect(within(briefing).getByRole('button', { name: `${action} shortlist lead Evergreen Fire Protection` })).toBeEnabled();
     }
 
@@ -811,7 +811,7 @@ describe('Acquisition Inbox queue', () => {
     expect(within(briefing).getAllByRole('status')).toHaveLength(1);
     expect(within(briefing).getByText(/Optional Deal OS context is unavailable/)).toBeVisible();
     expect(within(briefing).getByText('4')).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeEnabled();
   });
 
   test('Acquisition Inbox renders prominent required-source action and hides trusted recommendations', async () => {
@@ -839,7 +839,7 @@ describe('Acquisition Inbox queue', () => {
 
     renderInbox();
     expect(await screen.findByText(/last known/i)).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' })).toBeDisabled();
   });
@@ -849,7 +849,7 @@ describe('Acquisition Inbox queue', () => {
     renderInbox({ readOnly: true });
 
     expect(await screen.findByRole('region', { name: 'Morning briefing' })).toBeVisible();
-    expect(screen.queryByRole('button', { name: /Pursue|Watch|Pass|Run Daily Digest|Send Daily Digest|Retry Daily Digest/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Request SIM|Pursue|Watch|Pass|Run Daily Digest|Send Daily Digest|Retry Daily Digest/i })).not.toBeInTheDocument();
     expect(screen.getByText(/Read-only access/)).toBeVisible();
   });
 
@@ -920,7 +920,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByText('Decision note: Price exceeds the approved range.')).toBeVisible();
     expect(screen.getByText('Passed Aug 28, 2026')).toBeVisible();
     const passedRow = screen.getByRole('button', { name: 'Open Passed Plumbing' }).closest('li');
-    expect(within(passedRow).queryByRole('button', { name: 'Pursue Passed Plumbing' })).not.toBeInTheDocument();
+    expect(within(passedRow).queryByRole('button', { name: 'Request SIM Passed Plumbing' })).not.toBeInTheDocument();
     expect(within(passedRow).queryByRole('button', { name: 'Watch Passed Plumbing' })).not.toBeInTheDocument();
     expect(within(passedRow).queryByRole('button', { name: 'Pass Passed Plumbing' })).not.toBeInTheDocument();
   });
@@ -1059,7 +1059,7 @@ describe('Acquisition Inbox queue', () => {
 
     renderInbox();
     await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ });
-    fireEvent.click(screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
     await waitFor(() => expect(writes).toHaveLength(1));
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
     await waitFor(() => expect(writes).toHaveLength(2));
@@ -1160,7 +1160,7 @@ describe('Acquisition Inbox queue', () => {
       return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
     }));
     renderInbox();
-    fireEvent.click(await screen.findByRole('button', { name: 'Pursue Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
     const choice = await screen.findByLabelText('Choose Pursue recipient');
     fireEvent.click(within(choice).getByRole('button', { name: /Alex Broker/ }));
     await waitFor(() => expect(writes).toHaveLength(2));
@@ -1321,7 +1321,7 @@ describe('Acquisition Inbox queue', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
     expect(await screen.findByText('Passed: Valuation')).toBeVisible();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(screen.queryByRole('button', { name: action })).not.toBeInTheDocument();
     }
     expect(screen.getByRole('alert')).toHaveTextContent('Authoritative queue refresh is unavailable.');
@@ -1438,7 +1438,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByText('Review: Needs Review')).toBeVisible();
     expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
     expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(screen.getByRole('button', { name: action })).toBeEnabled();
     }
     fireEvent.click(queuePass);
@@ -1456,7 +1456,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByText('Review: Needs Review')).toBeVisible();
     expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
     expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(screen.getByRole('button', { name: action })).toBeEnabled();
     }
     expect(reads).toHaveLength(1);
@@ -1484,7 +1484,7 @@ describe('Acquisition Inbox queue', () => {
     expect(within(drawer).getByText('Needs Review · Current')).toBeVisible();
     expect(within(drawer).getByText('Priority: Normal')).toBeVisible();
     expect(within(drawer).queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(within(drawer).getByRole('button', { name: action })).toBeEnabled();
     }
     fireEvent.click(within(drawer).getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
@@ -1500,7 +1500,7 @@ describe('Acquisition Inbox queue', () => {
     expect(within(drawer).getByText('Needs Review · Current')).toBeVisible();
     expect(within(drawer).getByText('Priority: Normal')).toBeVisible();
     expect(within(drawer).queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(within(drawer).getByRole('button', { name: action })).toBeEnabled();
     }
     expect(reads).toHaveLength(2);
@@ -1573,7 +1573,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByText('Review: Needs Review')).toBeVisible();
     expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
     expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(screen.getByRole('button', { name: action })).toBeEnabled();
     }
     fireEvent.click(watch);
@@ -1584,7 +1584,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByText('Review: Needs Review')).toBeVisible();
     expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
     expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
-    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+    for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
       expect(screen.getByRole('button', { name: action })).toBeEnabled();
     }
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
@@ -1772,7 +1772,7 @@ describe('Acquisition Inbox queue', () => {
       const queueControls = [
         ...within(tablist).getAllByRole('tab'),
         screen.getByRole('button', { name: 'Open Evergreen Fire Protection' }),
-        screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' }),
+        screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }),
         screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }),
         screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' }),
         screen.getByRole('button', { name: 'Previous page' }),
@@ -1808,7 +1808,7 @@ describe('Acquisition Inbox queue', () => {
       activateWithKeyboard(screen.getByRole('button', { name: 'Previous page' }), ' ');
       await waitFor(() => expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled());
 
-      for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection']) {
+      for (const action of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection']) {
         const button = screen.getByRole('button', { name: action });
         activateWithKeyboard(button, 'Enter');
         await waitFor(() => expect(writes).toHaveLength(action.startsWith('Watch') ? 2 : 1));
@@ -1830,7 +1830,7 @@ describe('Acquisition Inbox queue', () => {
       expectMobileReachable(retry, retryDrawer);
       activateWithKeyboard(retry, ' ');
       let drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
-      for (const control of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection', 'Save verified fact', 'Close opportunity detail']) {
+      for (const control of ['Request SIM Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection', 'Save verified fact', 'Close opportunity detail']) {
         expectMobileReachable(within(drawer).getByRole('button', { name: control }), drawer);
       }
       expect(drawer).toHaveClass('h-full');
@@ -1843,7 +1843,7 @@ describe('Acquisition Inbox queue', () => {
       activateWithKeyboard(within(drawer).getByRole('button', { name: 'Save verified fact' }), 'Enter');
       await waitFor(() => expect(writes).toHaveLength(4));
       drawer = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
-      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Pursue Evergreen Fire Protection' }), 'Enter');
+      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }), 'Enter');
       await waitFor(() => expect(writes).toHaveLength(5));
       drawer = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
       activateWithKeyboard(within(drawer).getByRole('button', { name: 'Watch Evergreen Fire Protection' }), ' ');
@@ -2042,7 +2042,7 @@ describe('Acquisition Inbox queue', () => {
 
     expect(await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
     expect(screen.getByRole('button', { name: /Open Evergreen Fire Protection/ })).toBeVisible();
-    expect(screen.queryByRole('button', { name: 'Pursue Evergreen Fire Protection' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Save verified fact/ })).not.toBeInTheDocument();
   });
 
@@ -2796,4 +2796,407 @@ test('a server-confirmed save with failed detail refresh explicitly distinguishe
   fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
   expect(await within(drawer).findByText(/Seller name saved\. Reload to view the saved value/)).toBeVisible();
   expect(within(drawer).getByRole('alert')).toHaveTextContent('Detail refresh unavailable.');
+});
+
+describe('Criteria-grouped Acquisition Inbox', () => {
+  const mustHaves = (overrides = {}) => [
+    { id: 'profit', outcome: 'pass', observed: 420000, limit: { min: 300000, max: 750000 } },
+    { id: 'multiple', outcome: 'pass', observed: 3.2, limit: { max: 4 } },
+    { id: 'geography', outcome: 'pass', observed: 'Phoenix, AZ | AZ', targetStates: ['AZ', 'CA', 'NV'] },
+    { id: 'industry', outcome: 'pass', observed: 'Desert HVAC' },
+    { id: 'gates', outcome: 'pass', observed: 0 },
+  ].map((entry) => ({ ...entry, ...(overrides[entry.id] || {}) }));
+  const criteriaRow = (overrides = {}) => queueRow({
+    industry: 'HVAC', criteriaCurrent: true, autoPursueBlocker: '',
+    criteriaGroup: 'review',
+    criteriaResult: { mustHaves: mustHaves(), failed: [], unknown: [] },
+    ...overrides,
+  });
+  const autoRow = criteriaRow({ opportunityId: 'auto-1', name: 'Auto Air', criteriaGroup: 'auto' });
+  const reviewRow = criteriaRow({
+    opportunityId: 'review-1', name: 'Review Air', criteriaGroup: 'auto', autoPursueBlocker: 'generic_mailbox',
+  });
+  const needsInfoRow = criteriaRow({
+    opportunityId: 'info-1', name: 'Info Air', criteriaGroup: 'needs-info',
+    criteriaResult: { mustHaves: mustHaves({ profit: { outcome: 'unknown', observed: null } }), failed: [], unknown: ['profit'] },
+  });
+  const nearMissRow = criteriaRow({
+    opportunityId: 'near-1', name: 'Near Air', criteriaGroup: 'near-miss',
+    criteriaResult: { mustHaves: mustHaves({ multiple: { outcome: 'fail', observed: 5.1 } }), failed: ['multiple'], unknown: [] },
+  });
+  const areas = () => [
+    { id: 'action-preview', rows: [], total: 0, counts: {} },
+    { id: 'auto-pursue', rows: [autoRow], total: 1, counts: {} },
+    { id: 'your-review', rows: [reviewRow], total: 1, counts: {} },
+    { id: 'needs-info', rows: [needsInfoRow], total: 1, counts: {} },
+    { id: 'near-miss', rows: [nearMissRow], total: 1, counts: {} },
+  ];
+  const allRows = () => [autoRow, reviewRow, needsInfoRow, nearMissRow];
+  const autoStatus = (overrides = {}) => ({
+    success: true, mode: 'canary', dailyCap: 1, todayCommands: 1, warmup: { ready: true }, latestRun: null, ...overrides,
+  });
+  function stubCriteriaFetch({ status = autoStatus(), writes = [], digest = digestProjection() } = {}) {
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.includes('/auto-pursue')) {
+        return status ? jsonResponse(status) : jsonResponse({ error: 'nope' }, { ok: false, status: 503 });
+      }
+      if (url.endsWith('/triage/near-1')) return jsonResponse({ success: true, ...detailResponse(nearMissRow) });
+      if (url.endsWith('/triage/review-1')) return jsonResponse({ success: true, ...detailResponse(reviewRow) });
+      if (url.endsWith('/action')) {
+        writes.push({ url, body: JSON.parse(options.body) });
+        return jsonResponse({ success: true, action: 'pursue' });
+      }
+      return jsonResponse(queueResponse({ view: 'inbox', areas: areas(), rows: allRows(), dailyDigest: digest }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  test('renders the criteria areas in order with Request SIM', async () => {
+    stubCriteriaFetch();
+    renderInbox({ initialView: 'inbox' });
+    await screen.findByRole('region', { name: 'Pursuing automatically' });
+    const headings = screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent);
+    expect(headings.slice(0, 5)).toEqual(['Needs Your Action', 'Pursuing automatically', 'Your review', 'Needs info', 'Near misses']);
+    expect(screen.queryByRole('region', { name: 'New & Important' })).not.toBeInTheDocument();
+    const review = screen.getByRole('region', { name: 'Your review' });
+    expect(within(review).getByRole('button', { name: 'Request SIM Review Air' })).toBeEnabled();
+    expect(within(review).getByRole('button', { name: 'Watch Review Air' })).toBeEnabled();
+    expect(within(review).getByRole('button', { name: 'Pass Review Air' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: /^Pursue / })).not.toBeInTheDocument();
+  });
+
+  test('collapses near misses until toggled', async () => {
+    stubCriteriaFetch();
+    renderInbox({ initialView: 'inbox' });
+    const region = await screen.findByRole('region', { name: 'Near misses' });
+    expect(within(region).queryByRole('button', { name: 'Open Near Air' })).not.toBeInTheDocument();
+    const toggle = within(region).getByRole('button', { name: 'Show near misses (1)' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(toggle);
+    expect(within(region).getByRole('button', { name: 'Open Near Air' })).toBeVisible();
+    expect(within(region).getByRole('button', { name: 'Hide near misses' })).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.click(within(region).getByRole('button', { name: 'Hide near misses' }));
+    expect(within(region).queryByRole('button', { name: 'Open Near Air' })).not.toBeInTheDocument();
+  });
+
+  test('shows the criteria line and the not-automatic reason', async () => {
+    stubCriteriaFetch();
+    renderInbox({ initialView: 'inbox' });
+    const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+    expect(within(auto).getByText('Profit $420K ✓ · 3.2× ✓ · AZ ✓ · HVAC ✓')).toBeVisible();
+    expect(within(auto).queryByText(/Not automatic/)).not.toBeInTheDocument();
+    const review = screen.getByRole('region', { name: 'Your review' });
+    expect(within(review).getByText('Not automatic: only a generic mailbox')).toBeVisible();
+    expect(within(screen.getByRole('region', { name: 'Needs info' })).getByText('Profit not disclosed · 3.2× ✓ · AZ ✓ · HVAC ✓')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Show near misses (1)' }));
+    expect(within(screen.getByRole('region', { name: 'Near misses' })).getByText('Profit $420K ✓ · Multiple 5.1× (max 4×) · AZ ✓ · HVAC ✓')).toBeVisible();
+    expect(document.body.textContent).not.toMatch(/generic_mailbox|criteria_out_of_date/);
+  });
+
+  test.each([
+    ['recipient_not_single', 'no single verified broker'],
+    ['prior_outreach', 'this broker or deal was contacted before'],
+    ['identity_unresolved', 'identity needs review'],
+    ['suppressed', 'the broker opted out or bounced'],
+    ['criteria_out_of_date', 'criteria out of date'],
+    ['criteria_stale', 'facts changed since scoring'],
+    ['owner_decision_exists', 'you already decided on this deal'],
+    ['authority_unavailable', 'broker details could not be checked'],
+    ['some_future_code', 'not eligible right now'],
+  ])('maps blocker %s without leaking the raw code', async (code, reason) => {
+    const row = criteriaRow({ opportunityId: 'blocked', name: 'Blocked Air', criteriaGroup: 'auto', autoPursueBlocker: code });
+    vi.stubGlobal('fetch', vi.fn(async (input) => (String(input).includes('/auto-pursue')
+      ? jsonResponse({ error: 'x' }, { ok: false, status: 503 })
+      : jsonResponse(queueResponse({ view: 'inbox', rows: [row], areas: [{ id: 'your-review', rows: [row], total: 1, counts: {} }] })))));
+    renderInbox({ initialView: 'inbox' });
+    const review = await screen.findByRole('region', { name: 'Your review' });
+    expect(within(review).getByText(`Not automatic: ${reason}`)).toBeVisible();
+    expect(review.textContent).not.toContain(code);
+  });
+
+  test('omits the criteria line when there is no criteria result', async () => {
+    const row = criteriaRow({ opportunityId: 'plain', name: 'Plain Air', criteriaResult: null });
+    stubCriteriaFetch();
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox', rows: [row],
+      areas: [{ id: 'your-review', rows: [row], total: 1, counts: {} }] }))));
+    renderInbox({ initialView: 'inbox' });
+    const review = await screen.findByRole('region', { name: 'Your review' });
+    expect(within(review).getByText('Plain Air')).toBeVisible();
+    expect(review.textContent).not.toMatch(/✓|not disclosed/);
+  });
+
+  test('confirms before requesting on a near miss', async () => {
+    const writes = [];
+    stubCriteriaFetch({ writes });
+    renderInbox({ initialView: 'inbox' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Show near misses (1)' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Near Air' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('This deal misses the multiple limit. Request the SIM anyway?')).toBeVisible();
+    expect(writes).toHaveLength(0);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(writes).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Near Air' }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Request SIM' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].url).toContain('/triage/near-1/action');
+    expect(writes[0].body).toEqual(expect.objectContaining({ action: 'pursue' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
+  test('a non-near-miss Request SIM records without a confirm', async () => {
+    const writes = [];
+    stubCriteriaFetch({ writes });
+    renderInbox({ initialView: 'inbox' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Request SIM Review Air' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(writes[0].body.action).toBe('pursue');
+  });
+
+  test.each([
+    ['multiple', { outcome: 'fail', observed: 3.9, limit: { max: 3.5 } }, 'Profit $420K ✓ · Multiple 3.9× (max 3.5×) · AZ ✓ · HVAC ✓'],
+    ['profit', { outcome: 'fail', observed: 250000, limit: { min: 275000, max: 600000 } }, 'Profit $250K (min $275K) · 3.2× ✓ · AZ ✓ · HVAC ✓'],
+    ['profit', { outcome: 'fail', observed: 900000, limit: { min: 275000, max: 600000 } }, 'Profit $900K (max $600K) · 3.2× ✓ · AZ ✓ · HVAC ✓'],
+    ['geography', { outcome: 'fail', observed: 'Austin | TX', targetStates: ['AZ', 'CA'] }, 'Profit $420K ✓ · 3.2× ✓ · Location TX (target: AZ, CA) · HVAC ✓'],
+  ])('renders the failed %s rule from the limits the server sent', async (id, entry, text) => {
+    const row = criteriaRow({ opportunityId: 'rule', name: 'Rule Air', criteriaGroup: 'review',
+      criteriaResult: { mustHaves: mustHaves({ [id]: entry }), failed: [id], unknown: [] } });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox', rows: [row],
+      areas: [{ id: 'your-review', rows: [row], total: 1, counts: {} }] }))));
+    renderInbox({ initialView: 'inbox' });
+    expect(await within(await screen.findByRole('region', { name: 'Your review' })).findByText(text)).toBeVisible();
+  });
+
+  test('older rows without limits render the failed value without a parenthetical', async () => {
+    const bare = (entry) => { const { limit: _limit, targetStates: _targetStates, ...rest } = entry; return rest; };
+    const row = criteriaRow({ opportunityId: 'old', name: 'Old Air', criteriaGroup: 'review',
+      criteriaResult: { mustHaves: mustHaves({ multiple: { outcome: 'fail', observed: 5.1 } }).map(bare), failed: ['multiple'], unknown: [] } });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox', rows: [row],
+      areas: [{ id: 'your-review', rows: [row], total: 1, counts: {} }] }))));
+    renderInbox({ initialView: 'inbox' });
+    const review = await screen.findByRole('region', { name: 'Your review' });
+    expect(within(review).getByText('Profit $420K ✓ · Multiple 5.1× · AZ ✓ · HVAC ✓')).toBeVisible();
+    expect(review.textContent).not.toMatch(/\((min|max|target)/);
+  });
+
+  test('a near miss opened in the drawer asks before Request SIM', async () => {
+    const writes = [];
+    stubCriteriaFetch({ writes });
+    renderInbox({ initialView: 'inbox' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Show near misses (1)' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open Near Air' }));
+    const drawer = await screen.findByRole('dialog', { name: /Near Air/ });
+    fireEvent.click(await within(drawer).findByRole('button', { name: 'Request SIM Near Air' }));
+    const confirm = within(drawer).getByRole('group', { name: 'Confirm Request SIM' });
+    expect(within(confirm).getByText('This deal misses the multiple limit. Request the SIM anyway?')).toBeVisible();
+    expect(writes).toHaveLength(0);
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Cancel' }));
+    expect(within(drawer).queryByRole('group', { name: 'Confirm Request SIM' })).not.toBeInTheDocument();
+    expect(writes).toHaveLength(0);
+
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Request SIM Near Air' }));
+    fireEvent.click(within(within(drawer).getByRole('group', { name: 'Confirm Request SIM' })).getByRole('button', { name: 'Request SIM' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].url).toContain('/triage/near-1/action');
+    expect(writes[0].body).toEqual(expect.objectContaining({ action: 'pursue' }));
+  });
+
+  test('a non-near-miss opened in the drawer requests without a confirm', async () => {
+    const writes = [];
+    stubCriteriaFetch({ writes });
+    renderInbox({ initialView: 'inbox' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Review Air' }));
+    const drawer = await screen.findByRole('dialog', { name: /Review Air/ });
+    fireEvent.click(await within(drawer).findByRole('button', { name: 'Request SIM Review Air' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(within(drawer).queryByRole('group', { name: 'Confirm Request SIM' })).not.toBeInTheDocument();
+  });
+
+  test('shows the mode badge and today count', async () => {
+    stubCriteriaFetch({ status: autoStatus({ mode: 'canary', dailyCap: 1, todayCommands: 1 }) });
+    renderInbox({ initialView: 'inbox' });
+    const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+    expect(await within(auto).findByText('Test')).toBeVisible();
+    expect(within(auto).getByText('1 of 1 today')).toBeVisible();
+  });
+
+  test.each([
+    ['off', 'Off — would Pursue', false], ['shadow', 'Shadow', false], ['active', 'On', true],
+  ])('mode %s reads %s', async (mode, label, counted) => {
+    stubCriteriaFetch({ status: autoStatus({ mode, dailyCap: 3, todayCommands: 2 }) });
+    renderInbox({ initialView: 'inbox' });
+    const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+    expect(await within(auto).findByText(label)).toBeVisible();
+    if (counted) expect(within(auto).getByText('2 of 3 today')).toBeVisible();
+    else expect(within(auto).queryByText(/of 3 today/)).not.toBeInTheDocument();
+  });
+
+  test('renders the group without a badge when the status request fails', async () => {
+    stubCriteriaFetch({ status: null });
+    renderInbox({ initialView: 'inbox' });
+    const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+    await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => String(url).includes('/auto-pursue'))).toBe(true));
+    expect(within(auto).getByText('Auto Air')).toBeVisible();
+    expect(within(auto).queryByText(/today|Shadow|Test|^On$|would Pursue/)).not.toBeInTheDocument();
+  });
+
+  test('read-only users see no action buttons', async () => {
+    stubCriteriaFetch();
+    renderInbox({ initialView: 'inbox', readOnly: true });
+    await screen.findByRole('region', { name: 'Your review' });
+    expect(screen.queryByRole('button', { name: /^(Request SIM|Pursue|Watch|Pass) / })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show near misses (1)' }));
+    expect(screen.getByRole('button', { name: 'Open Near Air' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: /^Request SIM/ })).not.toBeInTheDocument();
+  });
+
+  describe('stopping automatic SIM requests', () => {
+    const todayPursued = [
+      { opportunityId: 'pursued-1', name: 'Pursued Air' },
+      { opportunityId: 'pursued-2', name: 'Pursued Heat' },
+    ];
+    const stopReport = { opportunity: { id: 'pursued-1' },
+      actions: { canStop: true, campaignId: 'campaign-1', expectedRowVersion: 4, expectedTerminalRevision: 0 } };
+    function stubStopFetch({ writes = [], statuses = [], report = stopReport, stopResult } = {}) {
+      return stubCriteriaFetchWith(async (url, options) => {
+        if (url.includes('/auto-pursue')) {
+          statuses.push(url);
+          return jsonResponse(autoStatus({ todayPursued }));
+        }
+        if (url.endsWith('/triage/pursued-1/cim-release')) return jsonResponse(report);
+        if (url.endsWith('/triage/pursued-1/cim-release/stop')) {
+          writes.push({ url, method: options.method, body: JSON.parse(options.body) });
+          return stopResult || jsonResponse({ success: true, ok: true, report: { actions: { canStop: false } } });
+        }
+        return null;
+      });
+    }
+    function stubCriteriaFetchWith(handler) {
+      const fallback = stubCriteriaFetch();
+      const fetchMock = vi.fn(async (input, options = {}) => {
+        const handled = await handler(String(input), options);
+        return handled || fallback(input, options);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      return fetchMock;
+    }
+
+    test("Pursuing automatically header lists today's automatic SIM requests with Stop buttons", async () => {
+      stubStopFetch();
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      const list = await within(auto).findByRole('list', { name: 'SIM requested automatically today' });
+      expect(within(list).getByText('Pursued Air')).toBeVisible();
+      expect(within(list).getByText('Pursued Heat')).toBeVisible();
+      expect(within(list).getByRole('button', { name: 'Stop SIM request to Pursued Air' })).toBeEnabled();
+      expect(within(list).getAllByRole('button')).toHaveLength(2);
+      expect(within(list).getAllByText('Stop SIM request')).toHaveLength(2);
+      expect(within(list).getByRole('button', { name: 'Stop SIM request to Pursued Heat' })).toBeEnabled();
+    });
+
+    test('Stop SIM request confirms then POSTs to cim-release/stop', async () => {
+      const writes = [];
+      const statuses = [];
+      stubStopFetch({ writes, statuses });
+      const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(confirm).toHaveBeenCalledWith('Stop the SIM request to Pursued Air? No more emails will be sent.');
+      expect(writes[0]).toEqual({
+        url: '/api/admin/deal-hunter/triage/pursued-1/cim-release/stop',
+        method: 'POST',
+        body: expect.objectContaining({ campaignId: 'campaign-1', expectedRowVersion: 4,
+          expectedTerminalRevision: 0, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/) }),
+      });
+      await waitFor(() => expect(statuses.length).toBeGreaterThan(1));
+      expect(await within(auto).findByText('Stopped')).toBeVisible();
+    });
+
+    test('declining the confirmation sends nothing', async () => {
+      const writes = [];
+      const fetchMock = stubStopFetch({ writes });
+      vi.spyOn(window, 'confirm').mockReturnValue(false);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(window.confirm).toHaveBeenCalledTimes(1);
+      expect(writes).toHaveLength(0);
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/cim-release'))).toBe(false);
+    });
+
+    test('says so when the campaign can no longer be stopped', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' },
+        campaign: { id: 'campaign-1', state: 'completed', generation: 1 }, actions: { canStop: false } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Pursued Air can no longer be stopped');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('says no email is scheduled yet when the release has no campaign', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' }, campaign: null,
+        enrollment: { state: 'waiting' }, actions: { canStop: false } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent(
+        'No email is scheduled yet for Pursued Air; open the deal to review it.');
+      expect(within(auto).getByRole('alert')).not.toHaveTextContent('can no longer be stopped');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('refuses to stop without revision-bound authority', async () => {
+      const writes = [];
+      stubStopFetch({ writes, report: { opportunity: { id: 'pursued-1' },
+        actions: { canStop: true, campaignId: 'campaign-1', expectedRowVersion: 4 } } });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Unable to stop the Pursue CIM campaign.');
+      expect(writes).toHaveLength(0);
+    });
+
+    test('does not treat a stop response without a report as success', async () => {
+      stubStopFetch({ stopResult: jsonResponse({ success: true, ok: true }) });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Unable to stop the Pursue CIM campaign.');
+      expect(within(auto).queryByText('Stopped')).not.toBeInTheDocument();
+    });
+
+    test('shows the server error when the stop is rejected', async () => {
+      stubStopFetch({ stopResult: jsonResponse({ success: false, error: 'Campaign authority changed before the stop was saved.' },
+        { ok: false, status: 409 }) });
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Stop SIM request to Pursued Air' }));
+      expect(await within(auto).findByRole('alert')).toHaveTextContent('Campaign authority changed before the stop was saved.');
+      expect(within(auto).getByRole('button', { name: 'Stop SIM request to Pursued Air' })).toBeEnabled();
+    });
+
+    test('Stop buttons are hidden for viewers', async () => {
+      stubStopFetch();
+      renderInbox({ initialView: 'inbox', readOnly: true });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => String(url).includes('/auto-pursue'))).toBe(true));
+      expect(await within(auto).findByText('Pursued Air')).toBeVisible();
+      expect(within(auto).queryByRole('button', { name: /^Stop SIM request/ })).not.toBeInTheDocument();
+    });
+  });
 });

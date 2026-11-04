@@ -11,7 +11,14 @@ import {
   P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
   P10B_CONTROLLED_MAILBOX_TEXT,
 } from '../server/services/pursueCimControlledMailboxTemplate.js';
+import { contactPolicyDigest } from '../server/services/pursueCimContactPolicy.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
+import {
+  GATE_NOW,
+  GMAIL_PROFILE,
+  createGmailGateFixture,
+  setSendControl,
+} from './fixtures/pursueCimGmailGateFixture.js';
 
 const now = '2026-09-25T19:00:00.000Z';
 const hex = (character) => character.repeat(64);
@@ -597,4 +604,228 @@ test('P6C unknown-policy CAS conflict must re-read and prove a durable safe term
   });
   assert.equal(outcome.blockedReason, 'unknown_policy_version');
   assert.equal(reads, 2);
+});
+
+function asFollowUp(context) {
+  context.authorization.capability = 'fl04c-followup';
+  context.authorization.writer_path = 'pursue-cim-follow-up';
+  context.activation.capability = 'fl04c-followup';
+  context.activation.prerequisite_activation_id = 'initial-activation';
+  context.communication.kind = 'cim-follow-up';
+  Object.assign(context.members[0].touch, { kind: 'follow-up-1', logical_slot: 'follow-up-1',
+    ordinal: 1 });
+  context.members[0].campaign.state = 'active-follow-up';
+  context.transmission.payload_version = 'deal-hunter-cim-pursue-follow-up-v1';
+  return context;
+}
+
+async function gateOutcome(context, { readiness = ready() } = {}) {
+  const calls = { terminal: 0, providerPending: 0 };
+  const outcome = await authorizePreparedCimTransmission({
+    storage: {
+      async readCimFinalGateContext() { return context; },
+      async appendCimTerminalEvent() { calls.terminal += 1; return { applied: true }; },
+      async authorizeCimProviderPending(command) {
+        calls.providerPending += 1;
+        return { authorized: true, blockedReason: null,
+          transmission: { ...context.transmission, state: 'provider-pending', row_version: 2,
+            final_gate_authority_digest: command.finalGateAuthorityDigest,
+            boundary_nonce_digest: command.boundaryNonceDigest, invocation_authority_count: 1 },
+          boundaryNonceDigest: command.boundaryNonceDigest };
+      },
+    },
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    writerPath: context.authorization.writer_path, providerProfile: 'synthetic-provider',
+    actor: 'final-gate-worker', now,
+    loadMemberAuthority: async () => memberAuthority(),
+    readCurrentAuthority: async () => currentAuthority(),
+    readProviderReadiness: async () => readiness,
+  });
+  return { outcome, calls };
+}
+
+test('final gate accepts both new payload versions and still rejects unknown', async () => {
+  const initial = finalGateContext();
+  initial.transmission.payload_version = 'deal-hunter-cim-pursue-initial-v2';
+  const initialResult = await gateOutcome(initial);
+  assert.equal(initialResult.outcome.authorized, true);
+  assert.deepEqual(initialResult.calls, { terminal: 0, providerPending: 1 });
+
+  const followUpResult = await gateOutcome(asFollowUp(finalGateContext()));
+  assert.equal(followUpResult.outcome.authorized, true);
+  assert.deepEqual(followUpResult.calls, { terminal: 0, providerPending: 1 });
+
+  const manual = await gateOutcome(finalGateContext());
+  assert.equal(manual.outcome.authorized, true, 'manual-stage1-v1 is unchanged');
+
+  const unknown = finalGateContext();
+  unknown.transmission.payload_version = 'deal-hunter-cim-pursue-initial-v3';
+  const unknownResult = await gateOutcome(unknown);
+  assert.equal(unknownResult.outcome.blockedReason, 'unknown_policy_version');
+  assert.deepEqual(unknownResult.calls, { terminal: 1, providerPending: 0 });
+
+  // A known version under the other capability is refused without a terminal event.
+  for (const [name, context] of [
+    ['follow-up version under the initial capability', (() => {
+      const crossed = finalGateContext();
+      crossed.transmission.payload_version = 'deal-hunter-cim-pursue-follow-up-v1';
+      return crossed;
+    })()],
+    ['initial version under the follow-up capability', (() => {
+      const crossed = asFollowUp(finalGateContext());
+      crossed.transmission.payload_version = 'deal-hunter-cim-pursue-initial-v2';
+      return crossed;
+    })()],
+  ]) {
+    const { outcome, calls } = await gateOutcome(context);
+    assert.equal(outcome.blockedReason, 'capability_inactive', name);
+    assert.deepEqual(calls, { terminal: 0, providerPending: 0 }, name);
+  }
+});
+
+test('a rule-based campaign reaches the durable gate without a terminal unknown-policy event', async () => {
+  const context = finalGateContext();
+  context.transmission.payload_version = 'deal-hunter-cim-pursue-initial-v2';
+  context.members[0].campaign.permission_version = 'listing-broker-inquiry-v1';
+  context.members[0].campaign.permission_digest = contactPolicyDigest();
+  const { outcome, calls } = await gateOutcome(context);
+  assert.equal(outcome.authorized, true);
+  assert.deepEqual(calls, { terminal: 0, providerPending: 1 });
+
+  const forged = finalGateContext();
+  forged.members[0].campaign.permission_version = 'listing-broker-inquiry-v1';
+  forged.members[0].campaign.permission_digest = hex('9');
+  const refused = await gateOutcome(forged);
+  assert.equal(refused.outcome.blockedReason, 'unknown_policy_version');
+  assert.equal(refused.calls.terminal, 1);
+});
+
+test('a follow-up under the activation basis leaves the permission check to the durable chain', async () => {
+  const context = asFollowUp(finalGateContext());
+  // The campaign names the enrollment activation; the follow-up activation's prerequisite is
+  // the initial activation. That is not an unknown policy.
+  assert.notEqual(context.members[0].campaign.permission_version,
+    context.activation.prerequisite_activation_id);
+  const { outcome, calls } = await gateOutcome(context);
+  assert.equal(outcome.authorized, true);
+  assert.equal(calls.terminal, 0);
+});
+
+test('a readiness refusal carries the readiness blockers', async () => {
+  const context = finalGateContext();
+  const outcome = await authorizePreparedCimTransmission({
+    storage: {
+      async readCimFinalGateContext() { return context; },
+      async authorizeCimProviderPending() {
+        return { authorized: false, blockedReason: 'provider_readiness_unavailable',
+          transmission: null, boundaryNonceDigest: null };
+      },
+    },
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    writerPath: 'pursue-cim-initial', providerProfile: 'synthetic-provider',
+    actor: 'final-gate-worker', now,
+    loadMemberAuthority: async () => memberAuthority(),
+    readCurrentAuthority: async () => currentAuthority(),
+    readProviderReadiness: async () => ({ provider: 'gmail', reasons: ['gmail_token_invalid'],
+      ready: false, signatureComplete: true, evidenceRevision: 'r', generatedAt: now,
+      expiresAt: '2026-09-25T19:01:00.000Z' }),
+  });
+  assert.equal(outcome.blockedReason, 'provider_readiness_unavailable');
+  assert.deepEqual(outcome.readinessBlockers, ['gmail_token_invalid']);
+});
+
+const terminalEvents = (database) => database.prepare(
+  'SELECT COUNT(*) AS n FROM deal_hunter_cim_terminal_events').get().n;
+const campaignRow = (database, id) => database.prepare(
+  'SELECT state, reason_code, terminal_revision FROM deal_hunter_cim_campaigns WHERE id = ?').get(id);
+
+test('SQLite Gmail initial under the activation basis reaches provider-pending', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'activation-initial');
+  const outcome = await fixture.gate();
+  assert.equal(outcome.authorized, true, JSON.stringify(outcome));
+  assert.equal(outcome.transmission.state, 'provider-pending');
+  assert.equal(outcome.transmission.payload_version, 'deal-hunter-cim-pursue-initial-v2');
+});
+
+test('SQLite rule-based campaign: the rule off pauses without terminal events and on again resumes', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'rule-initial', { basis: 'rule' });
+  const { database, storage, ids } = fixture;
+  // Readiness is satisfied by injection so the storage contact-rule check decides alone.
+  const readyGmail = async () => ({ provider: 'gmail', providerProfile: GMAIL_PROFILE, ready: true,
+    reasons: [], signatureComplete: true, evidenceRevision: 'rule-test', generatedAt: GATE_NOW,
+    expiresAt: '2026-09-29T16:59:00.000Z' });
+  // Each attempt runs at its own instant, as separate sender runs would.
+  const minute = (offset) => new Date(Date.parse(GATE_NOW) + offset * 60_000).toISOString();
+  await setSendControl(storage, 'contact_rule', false);
+  const paused = await fixture.gate({ readProviderReadiness: readyGmail });
+  assert.equal(paused.blockedReason, 'contact_rule_off');
+  assert.deepEqual(campaignRow(database, ids.campaignId),
+    { state: 'initial-pending', reason_code: 'awaiting-window', terminal_revision: 0 });
+  assert.equal(terminalEvents(database), 0);
+  await setSendControl(storage, 'contact_rule', true, { policyVersion: 'listing-broker-inquiry-v2' });
+  assert.equal((await fixture.gate({ readProviderReadiness: readyGmail, now: minute(1) }))
+    .blockedReason, 'contact_rule_off');
+  await setSendControl(storage, 'contact_rule', true, { policyVersion: 'listing-broker-inquiry-v1' });
+  const resumed = await fixture.gate({ readProviderReadiness: readyGmail, now: minute(2) });
+  assert.equal(resumed.authorized, true, JSON.stringify(resumed));
+  assert.equal(terminalEvents(database), 0);
+});
+
+test('SQLite rule-based campaign ignores the activation permission fields', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'rule-ignores-activation', { basis: 'rule' });
+  fixture.database.prepare(`UPDATE deal_hunter_cim_capability_activations
+    SET permission_basis_digest = ?, cohort_digest = ? WHERE id = 'gmail-fl04b-initial'`)
+    .run('7'.repeat(64), '8'.repeat(64));
+  assert.equal((await fixture.gate()).authorized, true);
+});
+
+test('SQLite activation-basis campaign still refuses a changed activation permission', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'activation-permission-changed');
+  fixture.database.prepare(`UPDATE deal_hunter_cim_capability_activations
+    SET permission_basis_digest = ? WHERE id = 'gmail-fl04b-initial'`).run('7'.repeat(64));
+  assert.equal((await fixture.gate()).blockedReason, 'permission_changed');
+  assert.equal(terminalEvents(fixture.database), 0);
+});
+
+test('SQLite follow-up authorizes under fl04c-followup', async (t) => {
+  for (const basis of ['activation', 'rule']) {
+    const fixture = await createGmailGateFixture(t, `follow-up-${basis}`, { kind: 'follow-up',
+      basis });
+    const outcome = await fixture.gate();
+    assert.equal(outcome.authorized, true, `${basis}: ${JSON.stringify(outcome)}`);
+    assert.equal(outcome.transmission.state, 'provider-pending');
+    assert.equal(fixture.database.prepare(`SELECT state FROM deal_hunter_cim_capacity_reservations
+      WHERE transmission_id = ?`).get(fixture.transmission.id).state, 'consumed');
+  }
+});
+
+test('SQLite follow-up refusals are non-terminal', async (t) => {
+  for (const [name, mutate, expected] of [
+    ['wrong capability', (database) => database.prepare(`UPDATE deal_hunter_cim_live_provider_authorizations
+      SET capability = 'fl04b-initial'`).run(), 'capability_inactive'],
+    ['unclaimed touch', (database, fixture) => database.prepare(`UPDATE deal_hunter_cim_campaign_touches
+      SET claim_expires_at = ? WHERE id = ?`).run('2026-09-29T15:59:00.000Z', fixture.ids.touchId),
+    'lifecycle_conflict'],
+    ['touch claimed under another token', (database, fixture) => database.prepare(`UPDATE deal_hunter_cim_campaign_touches
+      SET claim_token_digest = ? WHERE id = ?`).run('0'.repeat(64), fixture.ids.touchId),
+    'capacity_reservation_invalid'],
+    ['released reservation', (database, fixture) => database.prepare(`UPDATE deal_hunter_cim_capacity_reservations
+      SET state = 'released', released_at = ?, release_reason = 'synthetic',
+        row_version = row_version + 1 WHERE transmission_id = ?`)
+      .run(new Date().toISOString(), fixture.transmission.id), 'capacity_reservation_invalid'],
+    ['wrong campaign state', (database, fixture) => database.prepare(`UPDATE deal_hunter_cim_campaigns
+      SET state = 'initial-pending' WHERE id = ?`).run(fixture.ids.campaignId), 'lifecycle_conflict'],
+  ]) {
+    const fixture = await createGmailGateFixture(t, `follow-up-${name.replaceAll(' ', '-')}`,
+      { kind: 'follow-up' });
+    mutate(fixture.database, fixture);
+    const before = campaignRow(fixture.database, fixture.ids.campaignId);
+    const outcome = await fixture.gate();
+    assert.equal(outcome.authorized, false, name);
+    assert.equal(outcome.blockedReason, expected, name);
+    assert.deepEqual(campaignRow(fixture.database, fixture.ids.campaignId), before, name);
+    assert.equal(terminalEvents(fixture.database), 0, name);
+    assert.equal(fixture.database.prepare(`SELECT state FROM deal_hunter_cim_transmissions
+      WHERE id = ?`).get(fixture.transmission.id).state, 'prepared', name);
+  }
 });

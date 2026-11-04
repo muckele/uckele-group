@@ -421,6 +421,8 @@ test('fingerprint lookup returns only the columns the refresh gate needs', async
     Object.keys(fingerprints[0]).sort(),
     [
       'completeness_policy_version',
+      'criteria_group',
+      'criteria_profile_version',
       'engine_version',
       'opportunity_id',
       'profile_version',
@@ -443,6 +445,7 @@ test('Supabase fingerprint lookup projects the same complete currentness contrac
     engine_version: 'deal-scoring-engine-v1',
     profile_version: 'deal-hunter-profile-v1',
     completeness_policy_version: 'deal-hunter-completeness-v1',
+    criteria_profile_version: 'uckele-criteria-v1',
     reviewed_at: null,
   };
   const chain = {
@@ -471,6 +474,8 @@ test('Supabase fingerprint lookup projects the same complete currentness contrac
   );
   assert.deepEqual(selected.split(/,\s*/).sort(), [
     'completeness_policy_version',
+    'criteria_group',
+    'criteria_profile_version',
     'engine_version',
     'opportunity_id',
     'profile_version',

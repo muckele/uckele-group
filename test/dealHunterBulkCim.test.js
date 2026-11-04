@@ -354,6 +354,10 @@ function createCimStorage() {
     async getDealHunterCimSafetySettings() {
       return null;
     },
+    async readPursueCimProjection() {
+      return { decision: null, enrollment: null, campaign: null, initialTouch: null, transmission: null,
+        legacySummary: { count: 0, accepted: 0, ambiguous: 0 }, actions: [] };
+    },
     async claimDealHunterCimOpportunity({ opportunityId, requestId, recipientEmail, allowedRequestIds = [], nowIso, metadata = {} }) {
       const existing = opportunityClaims.get(opportunityId);
       if (existing && ![requestId, ...allowedRequestIds].includes(existing.request_id)) {

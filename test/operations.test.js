@@ -620,3 +620,79 @@ test('P9 Operations exposes only bounded Pursue CIM accounting and isolates read
     'Pursue CIM operations status is temporarily unavailable.');
   assert.equal(JSON.stringify(failed).includes(privateSentinel), false);
 });
+
+test('job history shows deal-hunter-sheet-sync metadata', async () => {
+  const operations = await getOperationsCenter({
+    now: operationsNow,
+    config: operationsConfig(),
+    checks: completeOperationsChecks(),
+    storage: operationsStorage([{
+      job_key: 'deal-hunter-sheet-sync:2026-09-05',
+      job_name: 'deal-hunter-sheet-sync',
+      status: 'completed',
+      created_at: '2026-09-05T14:30:00.000Z',
+      updated_at: '2026-09-05T14:31:00.000Z',
+      completed_at: '2026-09-05T14:31:00.000Z',
+      attempt_count: 2,
+      last_error: '',
+      metadata: {
+        claimToken: 'CLAIM TOKEN SENTINEL',
+        businessDate: '2026-09-05',
+        ok: true,
+        scoredCount: 41,
+        durationMs: 8123,
+        requiredSourcesHealthy: true,
+        groupCounts: { auto: 3, review: 30, research: 8 },
+        sheets: [
+          { sourceId: 'sheet-0', fetched: true, rowCount: 40, error: null, url: 'https://private.example/sheet' },
+          { sourceId: 'sheet-1', fetched: false, rowCount: 0, error: 'HTTP 500' },
+        ],
+        autoPursue: { runKey: 'auto-pursue:2026-09-05:shadow:0', status: 200, mode: 'shadow', internal: 'PRIVATE',
+          commands: 0, reason: 'warmup_not_ready', duplicateInvocation: true },
+      },
+    }]),
+  });
+  const run = operations.scheduler.runs[0];
+  assert.equal(run.job_name, 'deal-hunter-sheet-sync');
+  assert.deepEqual(run.sheetSync, {
+    ok: true,
+    scoredCount: 41,
+    durationMs: 8123,
+    requiredSourcesHealthy: true,
+    groupCounts: { auto: 3, review: 30, research: 8 },
+    sheets: [
+      { sourceId: 'sheet-0', fetched: true, rowCount: 40, error: '' },
+      { sourceId: 'sheet-1', fetched: false, rowCount: 0, error: 'HTTP 500' },
+    ],
+    autoPursue: { runKey: 'auto-pursue:2026-09-05:shadow:0', status: 200, mode: 'shadow', skipped: '', error: '',
+      reason: 'warmup_not_ready', duplicateInvocation: true, commands: 0 },
+  });
+  assert.equal(Object.hasOwn(run, 'metadata'), false);
+  const serialized = JSON.stringify(operations);
+  for (const secret of ['CLAIM TOKEN SENTINEL', 'private.example', 'PRIVATE']) {
+    assert.equal(serialized.includes(secret), false, secret);
+  }
+});
+
+test('job history projects a skipped automatic Pursue and leaves other jobs without sheetSync', async () => {
+  const operations = await getOperationsCenter({
+    now: operationsNow,
+    config: operationsConfig(),
+    checks: completeOperationsChecks(),
+    storage: operationsStorage([
+      {
+        job_key: 'deal-hunter-sheet-sync:2026-09-04', job_name: 'deal-hunter-sheet-sync', status: 'failed',
+        created_at: '2026-09-04T14:30:00.000Z', updated_at: '2026-09-04T14:31:00.000Z', attempt_count: 1,
+        last_error: 'A required sheet is unhealthy.',
+        metadata: { ok: false, sheets: [], autoPursue: { skipped: 'required_source_failed' } },
+      },
+      { job_key: 'backup:2026-09-04', job_name: 'backup', status: 'completed', attempt_count: 1, metadata: { dateKey: '2026-09-04' } },
+    ]),
+  });
+  assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.skipped, 'required_source_failed');
+  assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.reason, '');
+  assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.duplicateInvocation, false);
+  assert.equal(operations.scheduler.runs[0].sheetSync.autoPursue.commands, null, 'no run, no decisions count');
+  assert.equal(operations.scheduler.runs[0].sheetSync.ok, false);
+  assert.equal(Object.hasOwn(operations.scheduler.runs[1], 'sheetSync'), false);
+});

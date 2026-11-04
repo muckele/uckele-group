@@ -68,8 +68,10 @@ test('representative SQLite Inbox read plan and resources', {
     const result = await storage.listDealHunterFreshInbox({ area: 'inbox' });
     inbox.push(performance.now() - started);
     peakRss = Math.max(peakRss, process.memoryUsage().rss);
-    assert.equal(result.areas[1].total, 100);
-    assert.equal(result.areas[1].rows.length, 10);
+    assert.equal(result.areas.length, 5);
+    const fresh = (await storage.listDealHunterFreshInbox({ area: 'new-important' })).areas[0];
+    assert.equal(fresh.total, 100);
+    assert.equal(fresh.rows.length, 25);
   }
   const output = { dataset: { scores: 10_000, currentObservations: 30_000 },
     explainCandidate: plan.map((row) => row.detail),

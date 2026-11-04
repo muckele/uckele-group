@@ -41,6 +41,7 @@ const DealHunterTriage = lazy(() => import('../components/admin/DealHunterTriage
 const DealHunterWorkspace = lazy(() => import('../components/admin/DealHunterWorkspace'));
 const FollowUpsWorkspace = lazy(() => import('../components/admin/FollowUpsWorkspace'));
 const OperationsCenter = lazy(() => import('../components/admin/OperationsCenter'));
+const EmailSendingCard = lazy(() => import('../components/admin/EmailSendingCard'));
 const UnassignedCommunicationsInbox = lazy(() => import('../components/admin/UnassignedCommunicationsInbox'));
 
 function WorkspaceFallback() {
@@ -3926,6 +3927,10 @@ export default function DashboardPage() {
               <NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" end to="/admin/deal-hunter">Inbox</NavLink>
               <NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" to="/admin/deal-hunter?view=operations">Operations</NavLink>
             </nav>
+          </section>
+          {/* The Gmail connect callback lands here (?view=operations&gmail=<result>). */}
+          <section className="section-shell mt-8">
+            <EmailSendingCard connectResultCode={new URLSearchParams(location.search).get('gmail')} readOnly={isReadOnly} />
           </section>
           <section className="section-shell mt-8">
             <DealHunterTriage readOnly={isReadOnly} />

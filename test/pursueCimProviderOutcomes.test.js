@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import * as providerService from '../server/services/pursueCimProvider.js';
+import {
+  BROKER,
+  GATE_NOW,
+  GMAIL_PROFILE,
+  SENDER,
+  createGmailGateFixture,
+} from './fixtures/pursueCimGmailGateFixture.js';
 
 function reconciliationTransmission(overrides = {}) {
   return { id: 'transmission-1', state: 'provider-pending', row_version: 3,
@@ -380,4 +387,252 @@ test('P6C bounded Resend lookup matches the immutable envelope and never sends',
   assert.equal(proof.outcome, 'accepted');
   assert.equal(proof.candidates[0].providerMessageId, 'provider-message-1');
   assert.deepEqual(proof.binding, proofFor(transmission).binding);
+});
+
+async function gmailSend(fixture, outcome, { now = GATE_NOW } = {}) {
+  return providerService.finalizeAuthorizedCimTransmission({ storage: fixture.storage,
+    finalGateResult: outcome, authorizationId: fixture.authorization.id,
+    writerPath: fixture.writerPath, providerProfile: GMAIL_PROFILE, actor: 'pursue-cim-sender',
+    now: new Date(now), configOverride: fixture.config, mailProvider: fixture.mailProvider });
+}
+
+const row = (database, table, id) => database.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(id);
+const terminalEventCount = (database) => database.prepare(
+  'SELECT COUNT(*) AS n FROM deal_hunter_cim_terminal_events').get().n;
+
+test('gmail normalizer maps accepted, definitive failure, quota and not-attempted', () => {
+  const normalize = providerService.normalizeCimProviderOutcome;
+  const attempted = { provider: 'gmail', providerAttempted: true, providerSeamEntered: true };
+  assert.deepEqual(normalize({ ...attempted, status: 'sent', providerMessageId: 'gmail-1' }),
+    { category: 'accepted', provider: 'gmail', providerMessageId: 'gmail-1',
+      providerResultCode: 'accepted' });
+  assert.deepEqual(normalize({ ...attempted, status: 'failed', definitiveFailure: true,
+    errorCategory: 'gmail_400' }), { category: 'definitive-failure', provider: 'gmail',
+    providerMessageId: null, providerResultCode: 'gmail_400' });
+  assert.deepEqual(normalize({ ...attempted, status: 'failed', providerUnsent: true,
+    errorCategory: 'provider_quota' }), { category: 'unsent', provider: 'gmail',
+    providerMessageId: null, providerResultCode: 'provider_quota' });
+  assert.deepEqual(normalize({ ...attempted, status: 'failed', providerUnsent: true,
+    errorCategory: 'gmail_token_invalid' }), { category: 'unsent', provider: 'gmail',
+    providerMessageId: null, providerResultCode: 'gmail_token_invalid' });
+  // An unsent claim with an unknown code is never released: it stays ambiguous.
+  assert.equal(normalize({ ...attempted, status: 'failed', providerUnsent: true,
+    errorCategory: 'gmail_500' }).category, 'ambiguous');
+  assert.equal(normalize({ ...attempted, status: 'ambiguous', errorCategory: 'gmail_timeout' })
+    .category, 'ambiguous');
+});
+
+test('gmail accepted outcome finalizes the touch with provider gmail and stores gmail threadId on the conversation', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-accepted');
+  const { database, ids, mailProvider } = fixture;
+  const gate = await fixture.gate();
+  assert.equal(gate.authorized, true, JSON.stringify(gate));
+  const result = await gmailSend(fixture, gate);
+  assert.equal(result.outcome.category, 'accepted');
+  assert.equal(result.durableResult.applied, true);
+  assert.deepEqual(result.gmailThread, { applied: true, replay: false, conflict: false });
+  assert.equal(mailProvider.sent.length, 1);
+  const [sent] = mailProvider.sent;
+  assert.equal(sent.rfcMessageId, `<${gate.transmission.id}@uckele.example.test>`);
+  assert.equal(sent.to, BROKER);
+  assert.deepEqual(sent.from, { name: 'Mathew Uckele', address: SENDER });
+  assert.equal(sent.inReplyTo, null);
+  const transmission = row(database, 'deal_hunter_cim_transmissions', gate.transmission.id);
+  assert.deepEqual({ state: transmission.state, provider: transmission.provider,
+    providerMessageId: transmission.provider_message_id },
+  { state: 'accepted', provider: 'gmail', providerMessageId: sent.messageId });
+  assert.equal(row(database, 'deal_hunter_cim_campaign_touches', ids.touchId).state, 'accepted');
+  assert.equal(row(database, 'deal_hunter_cim_campaigns', ids.campaignId).state, 'active-follow-up');
+  assert.equal(row(database, 'deal_hunter_broker_conversations', ids.conversationId).gmail_thread_id,
+    sent.threadId);
+  assert.equal(result.durableResult.nextTouch.kind, 'follow-up-1');
+});
+
+test('gmail accepted outcome keeps a different stored thread and still finalizes', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-thread-conflict');
+  const { database, ids } = fixture;
+  database.prepare(`UPDATE deal_hunter_broker_conversations SET gmail_thread_id = 'older-thread'
+    WHERE id = ?`).run(ids.conversationId);
+  const warnings = [];
+  t.mock.method(console, 'warn', (message) => warnings.push(message));
+  const result = await gmailSend(fixture, await fixture.gate());
+  assert.equal(result.outcome.category, 'accepted');
+  assert.equal(result.durableResult.applied, true);
+  assert.deepEqual(result.gmailThread, { applied: false, replay: false, conflict: true });
+  assert.equal(row(database, 'deal_hunter_broker_conversations', ids.conversationId).gmail_thread_id,
+    'older-thread');
+  assert.equal(row(database, 'deal_hunter_cim_campaign_touches', ids.touchId).state, 'accepted');
+  assert.deepEqual(warnings, ['[pursue-cim] gmail_thread_conflict: the conversation keeps its stored Gmail thread']);
+});
+
+test('gmail follow-up is sent into the conversation thread replying to the initial Message-ID', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-follow-up', { kind: 'follow-up' });
+  const gate = await fixture.gate();
+  assert.equal(gate.authorized, true, JSON.stringify(gate));
+  const result = await gmailSend(fixture, gate);
+  assert.equal(result.outcome.category, 'accepted');
+  const [sent] = fixture.mailProvider.sent;
+  assert.equal(sent.threadId, 'gmail-thread-gmail-follow-up');
+  assert.equal(sent.inReplyTo, '<initial-gmail-follow-up@uckele.example.test>');
+  assert.deepEqual(sent.references, ['<initial-gmail-follow-up@uckele.example.test>']);
+  assert.match(sent.subject, /^Re: CIM \/ NDA request for Acme Plumbing$/);
+  assert.equal(result.gmailThread.replay, true);
+});
+
+test('quota leaves the touch scheduled and not attempted', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-quota');
+  const { database, storage, ids, mailProvider } = fixture;
+  mailProvider.quotaNext();
+  const gate = await fixture.gate();
+  const result = await gmailSend(fixture, gate);
+  assert.equal(result.outcome.category, 'unsent');
+  assert.equal(result.outcome.providerResultCode, 'provider_quota');
+  assert.equal(result.durableResult.applied, true);
+  assert.equal(mailProvider.sent.length, 0);
+  const touch = row(database, 'deal_hunter_cim_campaign_touches', ids.touchId);
+  assert.deepEqual({ state: touch.state, transmission: touch.transmission_id,
+    claim: touch.claim_token_digest }, { state: 'scheduled', transmission: null, claim: null });
+  const transmission = row(database, 'deal_hunter_cim_transmissions', gate.transmission.id);
+  assert.deepEqual({ state: transmission.state, provider: transmission.provider,
+    code: transmission.provider_result_code, messageId: transmission.provider_message_id },
+  { state: 'cancelled-before-provider', provider: 'gmail', code: 'provider_quota',
+    messageId: null });
+  assert.deepEqual({ ...row(database, 'deal_hunter_cim_campaigns', ids.campaignId) },
+    { ...row(database, 'deal_hunter_cim_campaigns', ids.campaignId), state: 'initial-pending',
+      terminal_revision: 0 });
+  assert.equal(row(database, 'deal_hunter_broker_conversations', ids.conversationId).state, 'open');
+  assert.equal(terminalEventCount(database), 0);
+  // A replay of the release is idempotent.
+  const replay = await storage.releaseCimProviderPendingUnsent({ transmissionId: gate.transmission.id,
+    payloadDigest: gate.transmission.payload_digest, expectedRowVersion: gate.transmission.row_version + 1,
+    provider: 'gmail', providerResultCode: 'provider_quota', actor: 'pursue-cim-sender', now: GATE_NOW });
+  assert.equal(replay.replay, true);
+
+  // The next run lists, claims, prepares (next generation) and sends the same touch.
+  const later = '2026-09-30T16:00:00.000Z';
+  const [candidate] = await storage.listDueCimInitialTouches({ now: later });
+  assert.equal(candidate.touch_id, ids.touchId);
+  assert.equal(candidate.preparation_generation, 2);
+  const claim = await storage.claimDueCimTouch({ touchId: ids.touchId,
+    expectedRowVersion: candidate.row_version, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest: 'd'.repeat(64),
+    claimOwner: 'gmail-worker', claimExpiresAt: '2026-09-30T16:04:00.000Z', now: later });
+  assert.equal(claim.claimed, true, JSON.stringify(claim));
+  const communication = database.prepare('SELECT * FROM crm_communications WHERE id = ?')
+    .get(gate.transmission.communication_id);
+  const prepared = await storage.prepareCimTransmission({ touchIds: [ids.touchId],
+    claimTokenDigest: 'd'.repeat(64), expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, preparationGeneration: 2,
+    payloadVersion: 'deal-hunter-cim-pursue-initial-v2', fromAddress: SENDER,
+    toAddresses: [BROKER], ccAddresses: [], bccAddresses: [], replyToAddress: SENDER,
+    subject: communication.subject, bodyText: communication.body_text,
+    bodyHtmlSanitized: communication.body_html_sanitized,
+    tags: JSON.parse(communication.metadata).tags, actor: 'gmail-worker', now: later });
+  assert.equal(prepared.prepared, true, JSON.stringify(prepared));
+  assert.notEqual(prepared.transmission.id, gate.transmission.id);
+  const issued = await storage.issueCimLiveProviderAuthorization({ id: 'authorization-retry',
+    activationId: 'gmail-fl04b-initial', capability: 'fl04b-initial',
+    writerPath: 'pursue-cim-initial', transmissionId: prepared.transmission.id,
+    payloadDigest: prepared.transmission.payload_digest,
+    recipientAuthorityDigest: fixture.recipientFingerprint, providerProfile: GMAIL_PROFILE,
+    expiresAt: '2026-09-30T17:00:00.000Z', actor: 'fixture-owner', reason: 'retry', now: later });
+  assert.equal(issued.issued, true);
+  const retryGate = await fixture.gate({ transmissionId: prepared.transmission.id,
+    authorizationId: 'authorization-retry', now: later });
+  assert.equal(retryGate.authorized, true, JSON.stringify(retryGate));
+  const retry = await providerService.finalizeAuthorizedCimTransmission({ storage,
+    finalGateResult: retryGate, authorizationId: 'authorization-retry',
+    writerPath: 'pursue-cim-initial', providerProfile: GMAIL_PROFILE, actor: 'pursue-cim-sender',
+    now: new Date(later), configOverride: fixture.config, mailProvider });
+  assert.equal(retry.outcome.category, 'accepted');
+  assert.equal(mailProvider.sent.length, 1);
+  assert.equal(row(database, 'deal_hunter_cim_campaign_touches', ids.touchId).state, 'accepted');
+});
+
+test('not-attempted (revoked token on send) releases the touch with the provider code', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-not-attempted');
+  fixture.mailProvider.failNext('not-attempted', { code: 'gmail_token_invalid' });
+  const gate = await fixture.gate();
+  const result = await gmailSend(fixture, gate);
+  assert.equal(result.outcome.category, 'unsent');
+  assert.equal(row(fixture.database, 'deal_hunter_cim_transmissions', gate.transmission.id)
+    .provider_result_code, 'gmail_token_invalid');
+  assert.equal(row(fixture.database, 'deal_hunter_cim_campaign_touches', fixture.ids.touchId).state,
+    'scheduled');
+  assert.equal(row(fixture.database, 'deal_hunter_cim_campaigns', fixture.ids.campaignId).state,
+    'initial-pending');
+  assert.equal(terminalEventCount(fixture.database), 0);
+});
+
+test('gmail definitive failure moves the campaign to action-required', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-definitive');
+  fixture.mailProvider.failNext('definitive-failure', { code: 'gmail_400' });
+  const result = await gmailSend(fixture, await fixture.gate());
+  assert.equal(result.outcome.category, 'definitive-failure');
+  assert.equal(row(fixture.database, 'deal_hunter_cim_campaigns', fixture.ids.campaignId).state,
+    'action-required');
+});
+
+test('gmail ambiguous outcome is reconciled through findSent before anything else', async (t) => {
+  const found = await createGmailGateFixture(t, 'gmail-ambiguous-found');
+  found.mailProvider.failNext('ambiguous', { delivered: true });
+  const foundResult = await gmailSend(found, await found.gate());
+  assert.equal(foundResult.reconciled, true);
+  assert.equal(foundResult.outcome.category, 'accepted');
+  assert.equal(found.mailProvider.sent.length, 1);
+  const foundTransmission = found.database.prepare(`SELECT * FROM deal_hunter_cim_transmissions
+    WHERE state = 'accepted'`).get();
+  assert.equal(foundTransmission.provider, 'gmail');
+  assert.equal(foundTransmission.provider_message_id, found.mailProvider.sent[0].messageId);
+  assert.equal(row(found.database, 'deal_hunter_broker_conversations', found.ids.conversationId)
+    .gmail_thread_id, found.mailProvider.sent[0].threadId);
+
+  const lost = await createGmailGateFixture(t, 'gmail-ambiguous-lost');
+  lost.mailProvider.failNext('ambiguous');
+  const lostResult = await gmailSend(lost, await lost.gate());
+  assert.equal(lostResult.outcome.category, 'ambiguous');
+  assert.equal(lost.mailProvider.sent.length, 0);
+  assert.equal(row(lost.database, 'deal_hunter_cim_campaigns', lost.ids.campaignId).state,
+    'provider-ambiguous');
+});
+
+test('the central pause still blocks with gmail ready', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-paused');
+  fixture.database.prepare(`UPDATE deal_hunter_cim_safety_settings SET outreach_paused = 1`).run();
+  const outcome = await fixture.gate();
+  assert.equal(outcome.authorized, false);
+  assert.equal(outcome.blockedReason, 'central_pause');
+  assert.equal(fixture.mailProvider.sent.length, 0);
+  assert.equal(row(fixture.database, 'deal_hunter_cim_transmissions', fixture.transmission.id).state,
+    'prepared');
+});
+
+test('revoked token: final gate refuses with gmail_token_invalid and the campaign state is unchanged', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-revoked');
+  const { database, ids } = fixture;
+  const before = row(database, 'deal_hunter_cim_campaigns', ids.campaignId);
+  fixture.mailProvider.setReadinessReasons(['gmail_token_invalid']);
+  const outcome = await fixture.gate();
+  assert.equal(outcome.authorized, false);
+  assert.equal(outcome.blockedReason, 'provider_readiness_unavailable');
+  assert.deepEqual(outcome.readinessBlockers, ['gmail_token_invalid']);
+  assert.deepEqual(row(database, 'deal_hunter_cim_campaigns', ids.campaignId), before);
+  assert.equal(terminalEventCount(database), 0);
+  assert.equal(row(database, 'deal_hunter_cim_transmissions', fixture.transmission.id).state,
+    'prepared');
+  assert.equal(fixture.mailProvider.attempts.length, 0);
+});
+
+test('a Gmail profile without a mail provider never reaches Resend', async (t) => {
+  const fixture = await createGmailGateFixture(t, 'gmail-no-provider');
+  const gate = await fixture.gate();
+  let fetches = 0;
+  const providerResult = await providerService.sendAuthorizedCimTransmission({
+    storage: fixture.storage, finalGateResult: gate, authorizationId: fixture.authorization.id,
+    writerPath: fixture.writerPath, providerProfile: GMAIL_PROFILE, actor: 'pursue-cim-sender',
+    now: new Date(GATE_NOW), configOverride: fixture.config,
+    fetcher: async () => { fetches += 1; return Response.json({ id: 'resend-id' }); } });
+  assert.equal(providerResult.errorCategory, 'cim-provider-profile-mismatch');
+  assert.notEqual(providerResult.providerSeamEntered, true);
+  assert.equal(fetches, 0);
 });

@@ -447,6 +447,27 @@ test('P4A owner command applies Pursue once, replays, conflicts, and never alloc
   });
 });
 
+test('owner route always records owner-decision-v1 and ignores a client policy version', async () => {
+  const { opportunityId } = await seedCurrentOpportunity('opp-http-owner-policy-version');
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify(ownerActionPayload('pursue', {
+        decisionPolicyVersion: 'auto-pursue-v1', policyVersion: 'auto-pursue-v1' })) });
+    assert.equal(response.status, 200);
+    const database = new Database(process.env.SQLITE_PATH, { readonly: true });
+    try {
+      const events = database.prepare(`SELECT policy_version FROM deal_hunter_owner_decision_events
+        WHERE opportunity_id = ?`).all(opportunityId);
+      assert.deepEqual(events.map((event) => event.policy_version), ['owner-decision-v1']);
+      const evidence = database.prepare(`SELECT policy_version FROM deal_hunter_auto_pursue_decision_evidence
+        WHERE opportunity_id = ?`).all(opportunityId);
+      assert.deepEqual(evidence.map((row) => row.policy_version), ['owner-decision-v1']);
+    } finally { database.close(); }
+  });
+});
+
 test('P4B Pursue binds the exact opaque contact reference into immutable idempotency', async () => {
   const { opportunityId } = await seedCurrentOpportunity('opp-http-p4b-contact-selection');
   const command = { action: 'pursue', idempotencyKey: randomUUID(),

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 import { deriveAcceptedCimCadence } from '../server/services/pursueCimCadence.js';
 import { calculateCampaignExpiry } from '../server/services/cimCampaignPolicy.js';
+import { CONTACT_POLICY_VERSION, contactPolicyDigest } from '../server/services/pursueCimContactPolicy.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -55,6 +56,22 @@ const operatorFactIdempotencyMigrationPath = path.join(root,
   'supabase/migrations/20261014130000_operator_fact_idempotency.sql');
 const fl04cCapacityMigrationPath = path.join(root,
   'supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql');
+const cadenceV3MigrationPath = path.join(root,
+  'supabase/migrations/20261102140000_pursue_cim_cadence_v3.sql');
+// The Gmail send runner migration adds pursue_cim_list_due_followup_touches_v1 and
+// pursue_cim_read_followup_authority_v1, so the P1C upgrade database replays it last.
+const gmailSendRunnersMigrationPath = path.join(root,
+  'supabase/migrations/20261103120000_gmail_send_runners.sql');
+// Migrations between the FL04C capacity and cadence v3 files. The best-first deal list one
+// adds pursue_cim_record_auto_pursue_decision_v1, so the P1C upgrade database replays them
+// in order to match the fresh schema's function inventory.
+const preCadenceV3MigrationPaths = [
+  '20261018120000_atomic_crm_restore.sql',
+  '20261019120000_operator_financial_facts.sql',
+  '20261019130000_current_unlinked_restore.sql',
+  '20261102120000_best_first_deal_list.sql',
+  '20261102130000_mvp_send_readiness_guards.sql',
+].map((name) => path.join(root, 'supabase/migrations', name));
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -107,17 +124,20 @@ const expectedP1cFunctions = [
   'pursue_cim_finalize_with_cadence_v1',
   'pursue_cim_issue_live_authorization_v1',
   'pursue_cim_json_stringify_v1',
+  'pursue_cim_list_due_followup_touches_v1',
   'pursue_cim_list_due_initial_touches_v1',
   'pursue_cim_materialize_campaign_v1',
   'pursue_cim_prepare_reserved_followup_v1',
   'pursue_cim_prepare_transmission_v1',
   'pursue_cim_read_cadence_context_v1',
   'pursue_cim_read_final_gate_context_v1',
+  'pursue_cim_read_followup_authority_v1',
   'pursue_cim_read_import_outreach_counters_v1',
   'pursue_cim_read_operations_snapshot_v1',
   'pursue_cim_read_projection_v1',
   'pursue_cim_reconcile_transmission_v1',
   'pursue_cim_reconcile_with_cadence_v1',
+  'pursue_cim_record_auto_pursue_decision_v1',
   'pursue_cim_record_boundary_rejection_v1',
   'pursue_cim_record_capability_activation_v1',
   'pursue_cim_record_owner_decision_v1',
@@ -298,6 +318,42 @@ test('P6D v2 cadence correction is additive, mirrored, bounded, and calendar-exa
   assert.doesNotMatch(migration, /while extract\(isodow from v_date\) in \(6,7\)/);
   assert.match(migration, /v_due := v_raw/);
   assert.match(migration, /v_due>=v_expiry/);
+});
+
+test('cadence v3 migration is mirrored exactly, follows v2, and branches on the stamped version', () => {
+  const migration = fs.readFileSync(cadenceV3MigrationPath, 'utf8').trim();
+  const v2 = fs.readFileSync(p6dV2MigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact cadence v3 block');
+  assert.ok(schema.indexOf(migration) > schema.indexOf(v2),
+    'cadence v3 must replace the cadence v2 functions in the fresh schema');
+  for (const name of ['pursue_cim_expected_initial_expiry_v1', 'pursue_cim_validate_accepted_cadence_v1']) {
+    const last = schema.lastIndexOf(`create or replace function public.${name}(`);
+    assert.ok(last > schema.indexOf(migration)
+      && last < schema.indexOf(migration) + migration.length,
+    `no later fresh-schema block may redefine ${name}`);
+  }
+  // Same names and signatures as the functions it replaces.
+  assert.match(migration, /create or replace function public\.pursue_cim_expected_initial_expiry_v1\(\s+p_accepted timestamptz, p_timezone text\)/);
+  assert.match(migration, /create or replace function public\.pursue_cim_validate_accepted_cadence_v1\(p_command jsonb\)/);
+  assert.match(migration, /revoke all on function public\.pursue_cim_validate_accepted_cadence_v1\(jsonb\)\s+from public, anon, authenticated, service_role;/);
+  // New acceptances stamp v3; both versions are accepted and nothing else.
+  assert.match(migration, /'cadencePolicyVersion','deal-hunter-cim-cadence-v3'/);
+  assert.doesNotMatch(migration, /'cadencePolicyVersion','deal-hunter-cim-cadence-v2'/);
+  assert.match(migration, /coalesce\(v_cadence#>>'\{expiryDerivation,cadencePolicyVersion\}',''\)\s+not in \('deal-hunter-cim-cadence-v2','deal-hunter-cim-cadence-v3'\)/);
+  assert.doesNotMatch(migration, /is distinct from 'deal-hunter-cim-cadence-v2'/);
+  // v3 counts Mon-Fri for every follow-up; v2 keeps calendar days after follow-up-1.
+  assert.match(migration, /if v_kind='follow-up-1' or v_cadence_version='deal-hunter-cim-cadence-v3' then\s+v_remaining := 2;\s+while v_remaining>0 loop\s+v_date := v_date\+1;\s+if extract\(isodow from v_date\) between 1 and 5 then/);
+  assert.match(migration, /\selse\s+v_date := v_date\+2;\s+end if;/);
+  assert.equal((migration.match(/::date\+2/g) || []).length, 0);
+  // Repeating slot keys and the next touch follow the stamped version.
+  assert.match(migration, /logical_slot~'\^\(calendar\|business\):/);
+  assert.match(migration, /then 'business:' else 'calendar:' end/);
+  assert.match(migration, /then 'business' else 'calendar' end\)\s+then raise exception 'Invalid current Pursue CIM cadence touch'/);
+  assert.match(migration, /'cadencePolicyVersion',120\)\s+<>v_cadence_version/);
+  assert.match(migration, /v_raw := \(v_date\+v_send_clock\) at time zone v_timezone\.iana_timezone/);
+  assert.match(migration, /v_due>=v_expiry/);
+  assert.doesNotMatch(migration, /drop function|grant execute/i);
 });
 
 test('P7A PostgreSQL inbound resolver is additive, mirrored, read-only, and service-role constrained', () => {
@@ -782,6 +838,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactGuardMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactIdempotencyMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(fl04cCapacityMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(cadenceV3MigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -1079,6 +1136,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactGuardMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(operatorFactIdempotencyMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(fl04cCapacityMigrationPath, 'utf8'));
+  for (const migrationFile of preCadenceV3MigrationPaths) {
+    psql(container, 'pursue_cim_upgrade', fs.readFileSync(migrationFile, 'utf8'));
+  }
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(cadenceV3MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(gmailSendRunnersMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -1175,27 +1237,27 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   ];
   const ownerCommands = [
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-1',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-1',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'watch', idempotencyKey: 'owner-decision-1',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-2',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-decision', action: 'pursue', idempotencyKey: 'owner-decision-3',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 1, expectedMaterialRevision: 0 },
   ];
   const ownerStopCommands = [
     { opportunityId: 'opp-parity', action: 'watch', idempotencyKey: 'owner-watch-parity',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
     { opportunityId: 'opp-parity', action: 'pass', idempotencyKey: 'owner-pass-parity',
-      actor: 'fixture-owner', policyVersion: 'owner-v1', reason: 'not a fit', now,
+      actor: 'fixture-owner', policyVersion: 'owner-decision-v1', reason: 'not a fit', now,
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
   ];
   const campaignCommand = { opportunityId: 'opp-decision', expectedEnrollmentRowVersion: 1,
@@ -1245,7 +1307,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           where event_type='owner-decision' and opportunity_id='${opportunityId}';`));
         const ownerCommand = { opportunityId, action,
           idempotencyKey: `p4a-race-${database}-${stage}-${action}`, actor: 'fixture-owner',
-          policyVersion: 'owner-v1', now, expectedDiscoveryRevision: 0,
+          policyVersion: 'owner-decision-v1', now, expectedDiscoveryRevision: 0,
           expectedMaterialRevision: 0,
           ...(action === 'pass' ? { reason: 'not a fit', note: 'Owner declined.' } : {}) };
         const committedRpc = (name, command) => new Promise((resolve, reject) => {
@@ -1305,7 +1367,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       for (const action of ['watch', 'pass']) {
         const command = { opportunityId, action,
           idempotencyKey: `p4a-${database}-${stage}-${action}`, actor: 'fixture-owner',
-          policyVersion: 'owner-v1', now, expectedDiscoveryRevision: 0,
+          policyVersion: 'owner-decision-v1', now, expectedDiscoveryRevision: 0,
           expectedMaterialRevision: 0,
           ...(action === 'pass' ? { reason: 'not a fit', note: 'Owner declined.' } : {}) };
         const payload = JSON.stringify(command).replaceAll("'", "''");
@@ -1337,7 +1399,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
          expected_discovery_revision, expected_material_revision, observed_discovery_revision,
          observed_material_revision, policy_version, created_at)
       values ('decision-parity', 'idem-parity', repeat('a',64), 'opp-parity', 'pursue',
-        'fixture', 0, 0, 0, 0, 'v1', '${now}');
+        'fixture', 0, 0, 0, 0, 'owner-decision-v1', '${now}');
       insert into public.deal_hunter_pursuit_enrollments
         (id, decision_event_id, opportunity_id, state, reason_code, authority_digest,
          created_at, updated_at, row_version)
@@ -1411,7 +1473,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
            expected_discovery_revision, expected_material_revision,
            observed_discovery_revision, observed_material_revision, policy_version, created_at)
         values ('decision-p7b-${suffix}', 'idem-p7b-${suffix}', repeat('a',64),
-          'opp-p7b-${suffix}', 'pursue', 'fixture', 0, 0, 0, 0, 'v1', '${now}');
+          'opp-p7b-${suffix}', 'pursue', 'fixture', 0, 0, 0, 0, 'owner-decision-v1', '${now}');
         insert into public.deal_hunter_pursuit_enrollments
           (id, decision_event_id, opportunity_id, state, reason_code, authority_digest,
            created_at, updated_at)
@@ -1709,10 +1771,10 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
          observed_discovery_revision,observed_material_revision,policy_version,created_at)
       values
         ('p9-order-decision-early','p9-order-idem-early',repeat('1',64),
-          'p9-order-early','pursue','fixture',0,0,0,0,'owner-v1',
+          'p9-order-early','pursue','fixture',0,0,0,0,'owner-decision-v1',
           '2026-09-25T19:00:01.000Z'),
         ('p9-order-decision-late','p9-order-idem-late',repeat('2',64),
-          'p9-order-late','pursue','fixture',0,0,0,0,'owner-v1',
+          'p9-order-late','pursue','fixture',0,0,0,0,'owner-decision-v1',
           '2026-09-25T19:00:03.000Z');
       insert into public.deal_hunter_pursuit_enrollments
         (id,decision_event_id,opportunity_id,state,authority_digest,created_at,updated_at)
@@ -1977,7 +2039,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       (opportunity_id, created_at, updated_at, canonical_name, identity_version)
       values ('opp-owner-race', '${now}', '${now}', 'Synthetic owner race', 'cim-identity-v1');`);
     const concurrentOwnerCommand = { opportunityId: 'opp-owner-race', action: 'pursue',
-      idempotencyKey: 'p4a-postgres-owner-race', actor: 'fixture-owner', policyVersion: 'owner-v1',
+      idempotencyKey: 'p4a-postgres-owner-race', actor: 'fixture-owner', policyVersion: 'owner-decision-v1',
       now, expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 };
     const runConcurrentOwner = () => new Promise((resolve, reject) => {
       const payload = JSON.stringify(concurrentOwnerCommand).replaceAll("'", "''");
@@ -2053,7 +2115,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         when (new.opportunity_id = 'opp-pass-rollback' and new.reviewed_at is not null)
         execute function public.p4a_fail_pass_review();`);
     const rollbackPass = { opportunityId: 'opp-pass-rollback', action: 'pass',
-      idempotencyKey: 'p4a-pass-rollback', actor: 'fixture-owner', policyVersion: 'owner-v1',
+      idempotencyKey: 'p4a-pass-rollback', actor: 'fixture-owner', policyVersion: 'owner-decision-v1',
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0,
       reason: 'not a fit', now };
     const rejectedPass = rejectedSql(container, database, `set role service_role;
@@ -2176,6 +2238,57 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       assert.equal(JSON.parse(output.at(-2)).actionRequired, true, `${database}: ${label}`);
       assert.deepEqual(JSON.parse(output.at(-1)), { conversations: 0, campaigns: 0,
         touches: 0, enrollment: 'queued' }, `${database}: ${label}`);
+    }
+    if (database === 'pursue_cim_fresh') {
+      // The standing contact rule allocates without the fl04b-enrollment activation while it is
+      // on under the same policy version, whatever its revision; off pauses, on again resumes.
+      // Fresh schema only: the P1C upgrade stops before that migration.
+      const ruleDigest = contactPolicyDigest();
+      const ruleCommand = JSON.stringify({ ...postgresCampaignCommands[0],
+        permissionVersion: CONTACT_POLICY_VERSION, permissionDigest: ruleDigest,
+        permissionRevision: 1, policyHash: ruleDigest }).replaceAll("'", "''");
+      const withdrawActivation = `select public.pursue_cim_withdraw_capability_activation_v1(
+        '{"id":"activation-enrollment","actor":"fixture","reason":"contact rule","now":"${now}"}'::jsonb);`;
+      const setRule = (enabled, expectedRevision, policyVersion = CONTACT_POLICY_VERSION) => `select
+        public.deal_hunter_pursue_set_send_control_v1('${JSON.stringify({ controlKey: 'contact_rule',
+    enabled, valueDigest: null, policyVersion, expectedRevision, actor: 'fixture', reason: 'synthetic',
+    now })}'::jsonb);`;
+      for (const [label, mutation, allocated] of [
+        ['rule-on', `${withdrawActivation} ${setRule(true, 0)}`, true],
+        ['rule-never-set', withdrawActivation, false],
+        ['rule-off', `${withdrawActivation} ${setRule(true, 0)} ${setRule(false, 1)}`, false],
+        ['rule-off-then-on', `${withdrawActivation} ${setRule(true, 0)} ${setRule(false, 1)}
+          ${setRule(true, 2)}`, true],
+        ['rule-no-policy-version', `${withdrawActivation} ${setRule(true, 0, null)}`, false],
+        ['rule-other-policy-version', `${withdrawActivation}
+          ${setRule(true, 0, 'listing-broker-inquiry-v2')}`, false],
+      ]) {
+        const output = psql(container, database, `begin; ${mutation}
+          select public.pursue_cim_materialize_campaign_v2('${ruleCommand}'::jsonb);
+          select jsonb_build_object(
+            'campaigns', (select count(*) from public.deal_hunter_cim_campaigns
+              where opportunity_id='opp-decision'),
+            'permission', (select jsonb_build_object('version', permission_version,
+              'digest', permission_digest, 'revision', permission_revision)
+              from public.deal_hunter_cim_campaigns where opportunity_id='opp-decision'));
+          rollback;`).split('\n').filter((line) => line.startsWith('{'));
+        assert.equal(JSON.parse(output.at(-2)).applied, allocated, `${database}: ${label}`);
+        assert.deepEqual(JSON.parse(output.at(-1)), allocated
+          ? { campaigns: 1, permission: { version: CONTACT_POLICY_VERSION, digest: ruleDigest, revision: 1 } }
+          : { campaigns: 0, permission: null }, `${database}: ${label}`);
+      }
+      // Replay of the allocated campaign: off pauses it, on again resumes it, and another
+      // policy version refuses it.
+      const step = (name) => `select jsonb_build_object('step', '${name}', 'result',
+        public.pursue_cim_materialize_campaign_v2('${ruleCommand}'::jsonb));`;
+      const replay = psql(container, database, `begin; ${withdrawActivation} ${setRule(true, 0)}
+        ${step('allocate')} ${setRule(false, 1)} ${step('off')} ${setRule(true, 2)} ${step('on-again')}
+        ${setRule(true, 3, 'listing-broker-inquiry-v2')} ${step('other-version')}
+        rollback;`).split('\n').filter((line) => line.includes('"step"'))
+        .map((line) => JSON.parse(line))
+        .map(({ step: name, result }) => [name, result.applied, result.existing, result.actionRequired]);
+      assert.deepEqual(replay, [['allocate', true, false, false], ['off', false, false, true],
+        ['on-again', false, true, false], ['other-version', false, false, true]], database);
     }
     const raceDatabase = `p4b_race_${database.endsWith('fresh') ? 'f' : 'u'}`;
     run(dockerCommand, ['exec', container, 'createdb', '-U', 'postgres',
@@ -3026,7 +3139,20 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       join public.deal_hunter_cim_campaigns c on c.id=t.campaign_id
       join public.deal_hunter_broker_conversations v on v.id=c.conversation_id
       where m.transmission_id='${acceptedFinalizationCommand.transmissionId}' limit 1;`;
+    // The capacity RPCs read the wall clock, but the fixture campaign was accepted at the
+    // pinned parity instant, so its 28-local-day window closed on 2026-10-23. Inside each
+    // rolled-back probe, re-derive the expiry from an initial accepted now so the fence
+    // under test, not the expiry gate, decides the outcome on any date.
+    const anchorCampaignExpiryToNow = `update public.deal_hunter_cim_campaigns c
+      set initial_accepted_at=pg_catalog.clock_timestamp(),
+        local_expiry_at=(e.expiry->>'localExpiryAt')::timestamptz,
+        expiry_derivation=e.expiry->'expiryDerivation'
+      from (select public.pursue_cim_expected_initial_expiry_v1(
+        pg_catalog.clock_timestamp(),'America/Los_Angeles') expiry) e
+      where c.id=(select campaign_id from public.deal_hunter_cim_campaign_touches
+        where id='${chain.nextTouch.id}');`;
     const prepareCampaignCapacity = psql(container, chainDatabase, `begin;
+      ${anchorCampaignExpiryToNow}
       set role service_role;
       select public.pursue_cim_record_capability_activation_v1(
         '${JSON.stringify(followUpActivation)}'::jsonb
@@ -3056,6 +3182,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       claimOwner: 'fl04c-capacity-renew-test', actor: 'fixture',
     };
     const renewCapacityOutput = psql(container, chainDatabase, `begin;
+      ${anchorCampaignExpiryToNow}
       set role service_role;
       select public.pursue_cim_record_capability_activation_v1(
         '${JSON.stringify(followUpActivation)}'::jsonb
@@ -3121,6 +3248,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       'weekday-follow-up'];
     const chainObservedAt = [chain.nextTouch.due_at, '2026-10-01T12:00:07.000Z',
       '2026-10-03T12:00:07.000Z', '2026-10-22T12:00:00.000Z'];
+    const v3Stages = [];
+    let v3Thursday = null;
     for (const [index, expectedKind] of chainKinds.entries()) {
       assert.equal(chain.nextTouch.kind, expectedKind, `${chainDatabase}:${expectedKind}`);
       const stageTransmissionId = `p6d-chain-transmission-${index + 1}`;
@@ -3221,7 +3350,53 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         assert.match(bindingRejection.stderr,
           /Ineligible Pursue CIM outcome cannot advance cadence/);
       }
+      if (index === 1) {
+        // follow-up-2 accepted Thursday 2026-10-01 05:00 America/Los_Angeles. Under v3 the
+        // next touch is Monday 2026-10-05 08:00; a v2-stamped campaign keeps Saturday.
+        const campaignId = context.members[0].campaign.id;
+        const v2Context = structuredClone(context);
+        v2Context.members[0].campaign.expiry_derivation = {
+          ...context.members[0].campaign.expiry_derivation,
+          cadencePolicyVersion: 'deal-hunter-cim-cadence-v2' };
+        const v2Cadence = deriveAcceptedCimCadence(v2Context, chainObservedAt[index]);
+        const stampCampaign = (version) => `update public.deal_hunter_cim_campaigns
+          set expiry_derivation=pg_catalog.jsonb_set(expiry_derivation,
+            '{cadencePolicyVersion}',pg_catalog.to_jsonb('${version}'::text))
+          where id='${campaignId}';`;
+        const finalize = (command) => `set role service_role;
+          select public.pursue_cim_finalize_with_cadence_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);`;
+        v3Thursday = {
+          context, stageCadence, v2Cadence,
+          v2Result: JSON.parse(psql(container, chainDatabase, `begin;
+            ${stampCampaign('deal-hunter-cim-cadence-v2')}
+            ${finalize({ ...stageCommand, cadence: v2Cadence })}
+            rollback;`)),
+          saturdayForgery: rejectedSql(container, chainDatabase, `begin;
+            ${finalize({ ...stageCommand, cadence: { ...stageCadence,
+              nextTouch: { ...v2Cadence.nextTouch,
+                cadencePolicyVersion: 'deal-hunter-cim-cadence-v3' } } })}
+            rollback;`),
+          v2CadenceOnV3Campaign: rejectedSql(container, chainDatabase, `begin;
+            ${finalize({ ...stageCommand, cadence: v2Cadence })}
+            rollback;`),
+          unknownVersion: rejectedSql(container, chainDatabase, `begin;
+            ${stampCampaign('deal-hunter-cim-cadence-v4')}
+            ${finalize({ ...stageCommand, cadence: { ...stageCadence,
+              expiryDerivation: { ...stageCadence.expiryDerivation,
+                cadencePolicyVersion: 'deal-hunter-cim-cadence-v4' } } })}
+            rollback;`),
+        };
+      }
       if (index === 3) {
+        v3Thursday.calendarSlotOnV3Campaign = rejectedSql(container, chainDatabase, `begin;
+          update public.deal_hunter_cim_campaign_touches
+            set logical_slot='calendar:'||pg_catalog.split_part(logical_slot,':',2)
+            where id='${chain.nextTouch.id}';
+          set role service_role;
+          select public.pursue_cim_finalize_with_cadence_v1(
+            '${JSON.stringify(stageCommand).replaceAll("'", "''")}'::jsonb);
+          rollback;`);
         const calendarIdentityRejection = rejectedSql(container, chainDatabase, `begin;
           update public.deal_hunter_cim_campaign_touches set ordinal=3
             where id='${chain.nextTouch.id}';
@@ -3236,7 +3411,50 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       }
       chain = committedCadenceRpc('pursue_cim_finalize_with_cadence_v1', stageCommand);
       assert.equal(chain.applied, true, chainDatabase);
+      v3Stages.push({ observedAt: chainObservedAt[index], js: stageCadence.nextTouch,
+        sql: chain.nextTouch });
     }
+    await t.test(`v3 accepted cadence validates in Postgres for the Thursday→Monday case (${database})`, () => {
+      const sqlInstant = (value) => new Date(value).toISOString();
+      assert.equal(v3Thursday.context.members[0].timezone.iana_timezone, 'America/Los_Angeles');
+      assert.equal(v3Thursday.context.members[0].campaign.expiry_derivation.cadencePolicyVersion,
+        'deal-hunter-cim-cadence-v3', 'the PostgreSQL initial acceptance stamps v3');
+      // JS and SQL agree on every stage of the v3 sequence.
+      for (const { observedAt, js, sql } of v3Stages) {
+        if (js === null) { assert.equal(sql, null, observedAt); continue; }
+        assert.deepEqual({ id: sql.id, logicalSlot: sql.logical_slot, kind: sql.kind,
+          ordinal: Number(sql.ordinal), dueAt: sqlInstant(sql.due_at), dueLocal: sql.due_local }, {
+          id: js.id, logicalSlot: js.logicalSlot, kind: js.kind, ordinal: js.ordinal,
+          dueAt: js.dueAt, dueLocal: js.dueLocal }, observedAt);
+        assert.equal(js.cadencePolicyVersion, 'deal-hunter-cim-cadence-v3', observedAt);
+      }
+      assert.deepEqual(v3Stages.map(({ js }) => js && [js.kind, js.logicalSlot, js.dueLocal]), [
+        ['follow-up-2', 'follow-up-2', '2026-10-01T08:00:00'],
+        ['follow-up-3', 'follow-up-3', '2026-10-05T08:00:00'],
+        ['weekday-follow-up', 'business:2026-10-06', '2026-10-06T08:00:00'],
+        null,
+      ]);
+      // Thursday acceptance: Monday 08:00 PDT under v3.
+      assert.equal(sqlInstant(v3Stages[1].sql.due_at), '2026-10-05T15:00:00.000Z');
+      // v2-stamped campaign: the same acceptance keeps the v2 Saturday date in PostgreSQL.
+      assert.equal(v3Thursday.v2Cadence.nextTouch.dueLocal, '2026-10-03T08:00:00');
+      assert.equal(v3Thursday.v2Result.applied, true);
+      assert.equal(sqlInstant(v3Thursday.v2Result.nextTouch.due_at), '2026-10-03T15:00:00.000Z');
+      assert.equal(v3Thursday.v2Result.nextTouch.id, v3Thursday.v2Cadence.nextTouch.id);
+      // A v3 campaign refuses v2 dates and v2 authority; an unknown version fails closed.
+      assert.notEqual(v3Thursday.saturdayForgery.status, 0);
+      assert.match(v3Thursday.saturdayForgery.stderr,
+        /Pursue CIM next slot does not match accepted cadence/);
+      assert.notEqual(v3Thursday.v2CadenceOnV3Campaign.status, 0);
+      assert.match(v3Thursday.v2CadenceOnV3Campaign.stderr,
+        /Pursue CIM campaign expiry authority mismatch/);
+      assert.notEqual(v3Thursday.unknownVersion.status, 0);
+      assert.match(v3Thursday.unknownVersion.stderr,
+        /Accepted Pursue CIM cadence authority mismatch/);
+      assert.notEqual(v3Thursday.calendarSlotOnV3Campaign.status, 0);
+      assert.match(v3Thursday.calendarSlotOnV3Campaign.stderr,
+        /Invalid current Pursue CIM cadence touch/);
+    });
     assert.equal(chain.nextTouch, null,
       `${chainDatabase}: calendar progression must stop at local expiry`);
     assert.deepEqual(JSON.parse(psql(container, chainDatabase, `select jsonb_build_object(
@@ -3445,7 +3663,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
          expected_discovery_revision, expected_material_revision, observed_discovery_revision,
          observed_material_revision, policy_version, created_at)
       values ('decision-safety', 'key-safety', repeat('a',64), 'opp-safety', 'pursue',
-        'fixture', 0, 0, 0, 0, 'policy-v1', '${now}');
+        'fixture', 0, 0, 0, 0, 'owner-decision-v1', '${now}');
       insert into public.deal_hunter_pursuit_enrollments
         (id, decision_event_id, opportunity_id, state, authority_digest, created_at, updated_at)
       values ('enrollment-safety', 'decision-safety', 'opp-safety',
