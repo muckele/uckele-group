@@ -11,6 +11,7 @@ process.env.DEAL_HUNTER_SHEET_CSV_URL = sheetUrl;
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 const { importDealOsExport, parseSheetCsvDeals } = await import('../server/services/dealHunter.js');
 const { refreshOpportunityScores } = await import('../server/services/dealHunterScoreStore.js');
+const { runDealHunterSheetSync } = await import('../server/services/dealHunterSheetSync.js');
 
 test('Sheet CSV rejects unfinished quoted cells even beyond the selected row cap', () => {
   for (const csv of [
@@ -25,7 +26,35 @@ test('Sheet CSV rejects unfinished quoted cells even beyond the selected row cap
 
 test('Sheet CSV rejects populated extra columns even beyond the selected row cap', () => {
   const csv = 'Name,Description\nAlpha,Complete\nBeta,Recurring maintenance,unretained data';
-  assert.throws(() => parseSheetCsvDeals(csv, 0, 1), /record 3.*more populated fields than the header/i);
+  assert.throws(() => parseSheetCsvDeals(csv, 0, 1), /line 3.*more populated fields than the header/i);
+});
+
+test('Sheet CSV errors name the physical line, counting blank lines and multiline cells', () => {
+  assert.throws(
+    () => parseSheetCsvDeals('Name,Description\n\nAlpha,"two\nlines"\nBeta,y,extra', 0, 1),
+    /line 5.*more populated fields than the header/i,
+  );
+  assert.throws(
+    () => parseSheetCsvDeals('Name,Description\nAlpha,x\nBeta,"never\nclosed', 0, 1),
+    /unterminated quoted field.*line 3/i,
+  );
+});
+
+test('Sheet CSV rejects stray quote marks instead of merging listings', () => {
+  for (const [csv, pattern] of [
+    ['Name,Size,Notes\nAlpha,5" pipe,a\nBeta,6" pipe,b\nGamma,x,y', /line 2.*quote mark inside an unquoted field/i],
+    ['Name,Description\n"Alpha"Junk,x', /line 2.*text after a closing quote/i],
+  ]) {
+    assert.throws(() => parseSheetCsvDeals(csv, 0, 1), pattern);
+  }
+});
+
+test('Sheet CSV still accepts whitespace around quoted cells', () => {
+  const csv = 'Name,Description\nAlpha, "Recurring, service" \r\nBeta,"say ""hi"""';
+  assert.deepEqual(parseSheetCsvDeals(csv).deals.map(({ name, description }) => ({ name, description })), [
+    { name: 'Alpha', description: 'Recurring, service' },
+    { name: 'Beta', description: 'say "hi"' },
+  ]);
 });
 
 test('Sheet CSV retains omitted trailing fields and accepts spare empty cells', () => {
@@ -88,6 +117,9 @@ test('malformed Sheet CSV cannot replace the last complete source snapshot or sc
       pattern: /unterminated quoted field/i },
     { csv: completeCsv.replace(',475000,Recurring maintenance', ',475000,Recurring maintenance,unretained data'),
       pattern: /more populated fields than the header/i },
+    // An even number of stray quotes used to pair up across rows and silently merge them.
+    { csv: completeCsv.replace('Beta Plumbing', 'Beta 5" Plumbing').replace('Gamma Electric', 'Gamma 6" Electric'),
+      pattern: /quote mark inside an unquoted field/i },
   ]) {
     sourceCsv = csv;
     const failed = await refresh();
@@ -100,6 +132,15 @@ test('malformed Sheet CSV cannot replace the last complete source snapshot or sc
     assert.match(sheet.error, pattern);
     assert.deepEqual(snapshot(), before);
     assert.deepEqual(await storage.readCimOutreachCounters(), outreachBefore);
+
+    let pursued = 0;
+    const sync = await runDealHunterSheetSync({
+      storage, refresh, autoPursue: async () => { pursued += 1; return {}; },
+    });
+    assert.equal(pursued, 0, 'a malformed required sheet must never reach automatic Pursue');
+    assert.equal(sync.ok, false);
+    assert.deepEqual(sync.autoPursue, { skipped: 'required_source_failed' });
+    assert.deepEqual(snapshot(), before);
   }
 });
 

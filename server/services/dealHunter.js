@@ -1202,49 +1202,75 @@ export function scoreDeal(deal, ledger = null) {
 
 function parseCsvRows(csvText = '') {
   const rows = [];
+  const rowLines = [];
   let row = [];
   let value = '';
   let inQuotes = false;
+  let quoteClosed = false;
+  let line = 1;
+  let rowLine = 1;
+  let quoteLine = 1;
+
+  const endRow = () => {
+    row.push(value);
+    if (row.some((item) => item.trim() !== '')) {
+      rows.push(row);
+      rowLines.push(rowLine);
+    }
+    row = [];
+    value = '';
+    quoteClosed = false;
+  };
 
   for (let index = 0; index < csvText.length; index += 1) {
     const character = csvText[index];
     const nextCharacter = csvText[index + 1];
+    const isLineBreak = character === '\n' || character === '\r';
 
-    if (character === '"' && inQuotes && nextCharacter === '"') {
-      value += '"';
-      index += 1;
-    } else if (character === '"') {
-      inQuotes = !inQuotes;
-    } else if (character === ',' && !inQuotes) {
+    if (inQuotes) {
+      if (character === '"' && nextCharacter === '"') {
+        value += '"';
+        index += 1;
+      } else if (character === '"') {
+        inQuotes = false;
+        quoteClosed = true;
+      } else {
+        value += character;
+        if (character === '\n' || (character === '\r' && nextCharacter !== '\n')) {
+          line += 1;
+        }
+      }
+    } else if (character === ',') {
       row.push(value);
       value = '';
-    } else if ((character === '\n' || character === '\r') && !inQuotes) {
+      quoteClosed = false;
+    } else if (isLineBreak) {
       if (character === '\r' && nextCharacter === '\n') {
         index += 1;
       }
-
-      row.push(value);
-      value = '';
-
-      if (row.some((item) => item.trim() !== '')) {
-        rows.push(row);
+      endRow();
+      line += 1;
+      rowLine = line;
+    } else if (quoteClosed) {
+      if (character !== ' ' && character !== '\t') {
+        throw new Error(`CSV line ${line} has text after a closing quote. Check quoting and export again.`);
       }
-
-      row = [];
+    } else if (character === '"') {
+      if (value.trim() !== '') {
+        throw new Error(`CSV line ${line} has a quote mark inside an unquoted field. Check quoting and export again.`);
+      }
+      inQuotes = true;
+      quoteLine = line;
     } else {
       value += character;
     }
   }
 
   if (inQuotes) {
-    throw new Error('CSV contains an unterminated quoted field. Export or fetch the complete file and try again.');
+    throw new Error(`CSV contains an unterminated quoted field starting on line ${quoteLine}. Export or fetch the complete file and try again.`);
   }
 
-  row.push(value);
-
-  if (row.some((item) => item.trim() !== '')) {
-    rows.push(row);
-  }
+  endRow();
 
   if (rows.length < 2) {
     return [];
@@ -1268,7 +1294,7 @@ function parseCsvRows(csvText = '') {
   });
   return rows.slice(1).map((values, recordIndex) => {
     if (values.slice(headers.length).some((item) => item.trim() !== '')) {
-      throw new Error(`CSV record ${recordIndex + 2} has more populated fields than the header. Check delimiters and export again.`);
+      throw new Error(`CSV line ${rowLines[recordIndex + 1]} has more populated fields than the header. Check delimiters and export again.`);
     }
     return headers.reduce((record, header, index) => {
       record[header] = normalizeText(values[index] || '', 5000);
