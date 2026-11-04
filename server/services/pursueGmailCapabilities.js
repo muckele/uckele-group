@@ -44,7 +44,8 @@ function intact(row, parent, providerProfile, now) {
  * Records (enabled) or withdraws (disabled) the production-gmail-v1 capability chain.
  * Turning on keeps every link that is already current and correctly chained under the profile
  * and records new links from the first one that is not; turning off withdraws every current
- * link under the profile, child first. Returns `{ applied, activations?, withdrawn? }`.
+ * link under the profile, child first, then releases every prepared, never-authorized
+ * transmission (Ruling N). Returns `{ applied, activations? , withdrawn?, released? }`.
  */
 export async function syncPursueGmailCapabilities({ storage, enabled, actor, now,
   providerProfile = PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE } = {}) {
@@ -55,7 +56,8 @@ export async function syncPursueGmailCapabilities({ storage, enabled, actor, now
   const at = requiredInstant(now);
   if (typeof storage?.listCurrentCimCapabilityActivations !== 'function'
     || typeof storage?.recordCimCapabilityActivation !== 'function'
-    || typeof storage?.withdrawCimCapabilityActivation !== 'function') {
+    || typeof storage?.withdrawCimCapabilityActivation !== 'function'
+    || typeof storage?.releasePreparedCimTransmissions !== 'function') {
     throw new Error('CIM capability storage is unavailable');
   }
   const current = new Map((await storage.listCurrentCimCapabilityActivations())
@@ -70,7 +72,16 @@ export async function syncPursueGmailCapabilities({ storage, enabled, actor, now
         reason: 'live_sending_off', now: at });
       if (result.applied) withdrawn.push(row.id);
     }
-    return { applied: withdrawn.length > 0, withdrawn };
+    // Ruling N: a prepared transmission is bound to the withdrawn chain (a follow-up's
+    // reservation can only be renewed under the same activation), so it could never be sent
+    // under the chain the next "on" records. Each is cancelled before the provider and its
+    // touch returns to scheduled, to be prepared again under the new chain.
+    let released = 0;
+    if (withdrawn.length > 0) {
+      released = (await storage.releasePreparedCimTransmissions({ reasonCode: 'live_sending_off',
+        actor: actor.trim(), now: at })).released;
+    }
+    return { applied: withdrawn.length > 0, withdrawn, released };
   }
 
   const activations = {};

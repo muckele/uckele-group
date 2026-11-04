@@ -12,7 +12,13 @@ export const PURSUE_SEND_CONTROL_KEYS = Object.freeze({
 // Codes a provider-pending transmission may be released under (Ruling D): Gmail refused it
 // before acceptance (quota) or nothing reached Gmail (a not-attempted outcome, Ruling E).
 export const CIM_PROVIDER_RELEASE_CODES = Object.freeze(['provider_quota', 'gmail_token_invalid',
-  'gmail_token_refresh_failed', 'gmail_not_connected', 'gmail_access_denied']);
+  'gmail_token_refresh_failed', 'gmail_not_connected', 'gmail_access_denied',
+  'provider_seam_not_entered']);
+// Ruling M: a provider-pending transmission whose provider seam was never entered cannot have
+// reached the provider (the seam is durable before any provider call). It is released under
+// this code once its authorization was consumed at least this long ago.
+export const CIM_PROVIDER_SEAM_NOT_ENTERED = 'provider_seam_not_entered';
+export const CIM_PROVIDER_SEAM_NOT_ENTERED_GRACE_MS = 10 * 60 * 1000;
 // The membership cancellation reason a release records; it is the only cancelled membership
 // that does not block the touch from being claimed again.
 export const CIM_PROVIDER_RELEASE_CANCELLATION = 'provider-unsent-release';

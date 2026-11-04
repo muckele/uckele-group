@@ -7,6 +7,8 @@ import { buildPursueFollowUpPayload, loadPursueFollowUpAuthority } from '../serv
 import { runCimFollowUpPreparation } from '../server/services/pursueCimFollowUpPreparation.js';
 import { runDueCimInitialPreparations } from '../server/services/pursueCimInitialPreparation.js';
 import { reevaluateWaitingPursuitEnrollments, sweepExpiredPursueCampaigns } from '../server/services/pursueCimSender.js';
+import { startPursueCimSenderScheduler } from '../server/services/pursueCimSenderScheduler.js';
+import { syncPursueGmailCapabilities } from '../server/services/pursueGmailCapabilities.js';
 import { orchestratePursuitEnrollment } from '../server/services/pursueCimEnrollment.js';
 import { runDealHunterSheetSync } from '../server/services/dealHunterSheetSync.js';
 import { MINUTE, createSenderFixture } from './fixtures/pursueCimSenderFixture.js';
@@ -202,6 +204,30 @@ test('a follow-up missed by more than a day goes out the next weekday morning on
   assert.equal(fixture.mailProvider.sent.length, 2);
   // The next follow-up counts from Thursday's acceptance: Monday 08:00 PST.
   assert.equal(scheduledFollowUp(fixture, 'a').due_local, '2030-11-04T08:00:00');
+});
+
+test('a follow-up picked up the day after it was due is held until a weekday 08:00 window, then sent once', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, campaigns: [due('a')] });
+  await sendInitial(fixture);
+  // Due Wednesday 2030-10-30 08:00 PDT. On its own day it may go out any time in the window.
+  fixture.clock.set('2030-10-30T21:00:00.000Z'); // Wednesday 14:00 PDT
+  const sameDay = await fixture.run();
+  assert.equal(sameDay.sentFollowUps, 1, JSON.stringify(sameDay));
+  // The next one is due Friday 08:00; picked up Monday 14:00 (after the weekend) it is held.
+  const next = scheduledFollowUp(fixture, 'a');
+  assert.equal(next.due_local, '2030-11-01T08:00:00');
+  fixture.clock.set('2030-11-04T22:00:00.000Z'); // Monday 14:00 PST
+  const held = await fixture.run();
+  assert.equal(held.sentFollowUps, 0);
+  assert.equal(held.skipped.outside_send_window, 1, JSON.stringify(held));
+  fixture.clock.set('2030-11-04T17:10:00.000Z'); // Monday 09:10 PST: past the 08:00 window
+  assert.equal((await fixture.run()).sentFollowUps, 0);
+  fixture.clock.set('2030-11-05T16:00:30.000Z'); // Tuesday 08:00:30 PST
+  assert.equal((await fixture.run()).sentFollowUps, 1);
+  fixture.clock.set('2030-11-05T16:20:00.000Z');
+  assert.equal((await fixture.run()).sentFollowUps, 0);
+  assert.equal(fixture.mailProvider.sent.length, 3);
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', next.id).state, 'accepted');
 });
 
 test('day-28 expiry sweep expires and cancels scheduled touches', async (t) => {
@@ -400,7 +426,8 @@ test('a lapsed initial claim with a prepared transmission is renewed and that tr
     now: fixture.clock.peek().toISOString() });
   // The same row shape as the PostgreSQL adapter.
   assert.deepEqual(Object.keys(lapsed).sort(), ['campaign_id', 'campaign_state',
-    'claim_expires_at', 'conversation_id', 'kind', 'opportunity_id', 'preparation_generation',
+    'claim_expires_at', 'conversation_id', 'due_local', 'kind', 'opportunity_id',
+    'preparation_generation',
     'recipient_fingerprint', 'row_version', 'touch_id', 'transmission_id']);
   assert.equal(lapsed.transmission_id, prepared.transmissionId);
   const summary = await fixture.run();
@@ -514,4 +541,164 @@ test('a sync that fails does not re-evaluate waiting enrollments', async () => {
     reevaluate: async () => { called += 1; return { enrolled: 0, stillWaiting: 0 }; } });
   assert.equal(sync.ok, false);
   assert.equal(called, 0);
+});
+
+test('the scheduler runs the sender on a live clock: each gate attempt has its own instant', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805,
+    campaigns: [due('a'), due('b')] });
+  const scheduler = startPursueCimSenderScheduler({ storage: fixture.storage,
+    config: { dealHunter: { pursueSender: { enabled: true, intervalMinutes: 15 } } },
+    now: fixture.clock, setTimer: () => ({ unref() {} }), clearTimer: () => {},
+    logger: { log() {}, error() {} },
+    // The run gets only what the scheduler passes: no clock means a frozen tick instant.
+    run: ({ storage, now, clock }) => fixture.run({ storage, now, clock }) });
+  t.after(() => scheduler.stop());
+  await scheduler.tick();
+  assert.equal(fixture.mailProvider.sent.length, 2);
+  const times = (sql) => fixture.database.prepare(sql).all().map((row) => row.at);
+  const issued = times(`SELECT issued_at AS at FROM deal_hunter_cim_live_provider_authorizations`);
+  const seams = times(`SELECT provider_seam_entered_at AS at FROM deal_hunter_cim_transmissions`);
+  const gates = times(`SELECT occurred_at AS at FROM deal_hunter_cim_audit_events
+    WHERE event_type = 'provider-pending'`);
+  for (const values of [issued, seams]) {
+    assert.equal(values.length, 2);
+    assert.equal(new Set(values).size, 2, JSON.stringify(values));
+  }
+  assert.equal(new Set([...issued, ...seams, ...gates]).size, issued.length + seams.length
+    + gates.length);
+  const [job] = (await fixture.storage.listScheduledJobs({ limit: 10 }))
+    .filter((row) => row.job_name === 'pursue-cim-sender');
+  assert.equal(job.metadata.sentInitial, 2);
+});
+
+/** Storage whose `method` always throws for calls that match `when`. */
+function throwingFor(storage, method, when) {
+  return new Proxy(storage, { get(target, name) {
+    const value = target[name];
+    if (name === method) {
+      return async (command) => {
+        if (when(command)) throw new Error('synthetic storage failure');
+        return value.call(target, command);
+      };
+    }
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+
+test('a touch that always throws never blocks the rest of the list', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805,
+    campaigns: [due('a'), due('b'), due('c')] });
+  const { touchId } = fixture.campaigns.a;
+  const storage = throwingFor(fixture.storage, 'readCimFollowUpAuthority',
+    (command) => command.touchId === touchId);
+  const first = await fixture.run({ storage });
+  assert.equal(first.sentInitial, 2, JSON.stringify(first));
+  assert.equal(first.skipped.initial_failed, 1);
+  fixture.clock.advance(15 * MINUTE);
+  const again = await fixture.run({ storage });
+  assert.equal(again.skipped.initial_failed, 1);
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', touchId).state, 'scheduled');
+  // Failures after preparation are isolated too, and recovered once the claim lapses.
+  const failing = throwingFor(fixture.storage, 'issueCimLiveProviderAuthorization', () => true);
+  const thrown = await fixture.run({ storage: failing });
+  assert.equal(thrown.skipped.initial_failed, 1, JSON.stringify(thrown));
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', touchId).state, 'claimed');
+  fixture.clock.advance(6 * MINUTE);
+  assert.equal((await fixture.run()).sentInitial, 1);
+  assert.equal(fixture.mailProvider.sent.length, 3);
+});
+
+test('a send whose provider seam was never entered is released after ten minutes and sent once', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, campaigns: [due('a')] });
+  const { touchId } = fixture.campaigns.a;
+  // The process dies between the final gate and the provider seam.
+  const crashed = await fixture.run({ storage: throwingFor(fixture.storage,
+    'enterCimProviderSeam', () => true) });
+  assert.equal(crashed.sentInitial, 0, JSON.stringify(crashed));
+  assert.equal(fixture.mailProvider.attempts.length, 0);
+  const stuck = fixture.row('deal_hunter_cim_transmissions',
+    fixture.row('deal_hunter_cim_campaign_touches', touchId).transmission_id);
+  assert.equal(stuck.state, 'provider-pending');
+  assert.equal(stuck.provider_seam_entered_at, null);
+  // Not before ten minutes from its authorization.
+  fixture.clock.set(at(MONDAY_0805, 5 * MINUTE));
+  const early = await fixture.run();
+  assert.equal(early.released, 0);
+  assert.equal(fixture.row('deal_hunter_cim_transmissions', stuck.id).state, 'provider-pending');
+  fixture.clock.set(at(MONDAY_0805, 15 * MINUTE));
+  const released = await fixture.run();
+  assert.equal(released.released, 1, JSON.stringify(released));
+  assert.equal(released.sentInitial, 1);
+  const cancelled = fixture.row('deal_hunter_cim_transmissions', stuck.id);
+  assert.equal(cancelled.state, 'cancelled-before-provider');
+  assert.equal(cancelled.provider_result_code, 'provider_seam_not_entered');
+  assert.equal(fixture.mailProvider.attempts.length, 1);
+  assert.equal(fixture.row('deal_hunter_cim_campaigns', fixture.campaigns.a.campaignId).state,
+    'active-follow-up');
+  assert.equal(fixture.count('deal_hunter_cim_terminal_events'), 0);
+});
+
+test('the seam-never-entered release refuses an entered seam and anything before its grace', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805,
+    campaigns: [due('a'), due('b')] });
+  const entered = crashingOnce(fixture.storage, 'finalizeCimTransmission');
+  await fixture.run({ storage: throwingFor(entered, 'enterCimProviderSeam',
+    (command) => command.transmissionId === fixture.database.prepare(`SELECT transmission_id
+      FROM deal_hunter_cim_campaign_touches WHERE id = ?`).get(fixture.campaigns.b.touchId)
+      .transmission_id) });
+  const transmissionOf = (suffix) => fixture.row('deal_hunter_cim_transmissions',
+    fixture.row('deal_hunter_cim_campaign_touches', fixture.campaigns[suffix].touchId)
+      .transmission_id);
+  const seamEntered = transmissionOf('a');
+  const unentered = transmissionOf('b');
+  assert.ok(seamEntered.provider_seam_entered_at);
+  assert.equal(unentered.provider_seam_entered_at, null);
+  const release = (transmission, now) => fixture.storage.releaseCimProviderPendingUnsent({
+    transmissionId: transmission.id, payloadDigest: transmission.payload_digest,
+    expectedRowVersion: transmission.row_version, provider: 'gmail',
+    providerResultCode: 'provider_seam_not_entered', actor: 'test', now });
+  assert.equal((await release(seamEntered, at(MONDAY_0805, 30 * MINUTE))).conflict, true);
+  assert.equal((await release(unentered, at(MONDAY_0805, 5 * MINUTE))).conflict, true);
+  assert.equal((await release(unentered, at(MONDAY_0805, 30 * MINUTE))).applied, true);
+  assert.equal(transmissionOf('a').state, 'provider-pending');
+});
+
+test('Live sending off and on again: a prepared follow-up is prepared again and sent exactly once', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, campaigns: [due('a')] });
+  await sendInitial(fixture);
+  const touch = scheduledFollowUp(fixture, 'a');
+  fixture.clock.set(at(touch.due_at, 30_000));
+  const [candidate] = await fixture.storage.listDueCimFollowUpTouches({
+    now: fixture.clock.peek().toISOString() });
+  const prepared = await runCimFollowUpPreparation({ storage: fixture.storage, candidate,
+    clock: fixture.clock, actor: 'crashed-worker', claimTokenDigest: fill('9'),
+    loadAuthority: (input) => loadPursueFollowUpAuthority({ ...input, config: fixture.config,
+      loadMemberAuthority: fixture.loadMemberAuthority }),
+    buildPayload: (input) => buildPursueFollowUpPayload({ ...input, config: fixture.config }) });
+  assert.equal(prepared.prepared, true);
+  const toggle = async (enabled) => {
+    await setSendControl(fixture.storage, 'live_sending', enabled);
+    return syncPursueGmailCapabilities({ storage: fixture.storage, enabled, actor: 'owner',
+      now: fixture.clock().toISOString() });
+  };
+  const off = await toggle(false);
+  assert.equal(off.released, 1);
+  assert.equal(fixture.row('deal_hunter_cim_transmissions', prepared.transmission.id).state,
+    'cancelled-before-provider');
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', touch.id).state, 'scheduled');
+  assert.deepEqual(fixture.database.prepare(`SELECT state FROM
+    deal_hunter_cim_capacity_reservations WHERE transmission_id = ?`)
+    .all(prepared.transmission.id).map(({ state }) => state), ['released']);
+  await toggle(true);
+  fixture.clock.advance(MINUTE);
+  const summary = await fixture.run();
+  assert.equal(summary.sentFollowUps, 1, JSON.stringify(summary));
+  assert.equal(fixture.mailProvider.sent.length, 2);
+  assert.deepEqual(fixture.database.prepare(`SELECT tr.preparation_generation AS g, tr.state
+    FROM deal_hunter_cim_transmission_touches m JOIN deal_hunter_cim_transmissions tr
+      ON tr.id = m.transmission_id WHERE m.touch_id = ? ORDER BY g`).all(touch.id),
+  [{ g: 1, state: 'cancelled-before-provider' }, { g: 2, state: 'accepted' }]);
+  fixture.clock.advance(15 * MINUTE);
+  assert.equal((await fixture.run()).sentFollowUps, 0);
+  assert.equal(fixture.mailProvider.sent.length, 2);
 });

@@ -98,13 +98,17 @@ test('one Job history row per run carries the counts and no secrets or bodies', 
   assert.equal(inputs.length, 1);
   assert.equal(inputs[0].storage, h.storage);
   assert.equal(inputs[0].now.toISOString(), '2030-10-28T15:07:00.000Z');
+  // The run reads a live clock, not the frozen tick instant.
+  assert.equal(typeof inputs[0].clock, 'function');
+  h.set('2030-10-28T15:07:42.000Z');
+  assert.equal(inputs[0].clock().toISOString(), '2030-10-28T15:07:42.000Z');
   const [job] = await h.jobs();
   assert.equal(job.job_name, 'pursue-cim-sender');
   assert.equal(job.status, 'completed');
   const { claimToken, claimedAt, ...metadata } = job.metadata;
   assert.ok(claimToken && claimedAt);
   assert.deepEqual(metadata, { slot: '2030-10-28T15:00:00.000Z', trigger: 'scheduler',
-    ok: true, sentInitial: 2, sentFollowUps: 1, expired: 1, reconciled: 0,
+    ok: true, sentInitial: 2, sentFollowUps: 1, expired: 1, reconciled: 0, released: 0,
     skipped: { outside_send_window: 3 }, failed: 0, ambiguous: 0,
     stoppedFor: 'provider_quota', error: null });
   assert.equal(JSON.stringify(job).includes(SECRET), false);

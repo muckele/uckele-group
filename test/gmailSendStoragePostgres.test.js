@@ -144,6 +144,7 @@ test('the Gmail send runner migration is mirrored exactly at the end of the fres
     'deal_hunter_gmail_set_conversation_thread_v1',
     'deal_hunter_gmail_update_checkpoint_v1',
     'deal_hunter_pursue_contact_rule_basis_v1',
+    'deal_hunter_pursue_release_prepared_v1',
     'deal_hunter_pursue_release_unsent_v1',
     'deal_hunter_pursue_renew_initial_claim_v1',
     'deal_hunter_pursue_set_send_control_v1',

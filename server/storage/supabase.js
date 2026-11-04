@@ -1465,11 +1465,52 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         const campaign = campaigns.get(touch.campaign_id);
         return { touch_id: touch.id, kind: touch.kind, campaign_id: touch.campaign_id,
           opportunity_id: touch.opportunity_id, row_version: touch.row_version,
-          claim_expires_at: touch.claim_expires_at, transmission_id: touch.transmission_id,
+          claim_expires_at: touch.claim_expires_at, due_local: touch.due_local,
+          transmission_id: touch.transmission_id,
           preparation_generation: transmissions.get(touch.transmission_id).preparation_generation,
           conversation_id: campaign.conversation_id,
           recipient_fingerprint: campaign.recipient_fingerprint, campaign_state: campaign.state };
       });
+    },
+
+    async listCimUnenteredProviderPendingTransmissions({ authorizedBefore, limit = 50 } = {}) {
+      const before = pursueCimSelectionInstant(authorizedBefore, 'provider-pending');
+      pursueCimSelectionLimit(limit, 100, 'provider-pending');
+      const { data: transmissions, error } = await client.from('deal_hunter_cim_transmissions')
+        .select('*').eq('state', 'provider-pending').is('provider_seam_entered_at', null)
+        .is('provider_message_id', null).order('id').limit(500);
+      if (error) throw error;
+      if (!transmissions?.length) return [];
+      const { data: authorizations, error: authorizationError } = await client
+        .from('deal_hunter_cim_live_provider_authorizations')
+        .select('transmission_id, provider_profile, consumed_at')
+        .in('transmission_id', transmissions.map((row) => row.id))
+        .not('consumed_at', 'is', null);
+      if (authorizationError) throw authorizationError;
+      const consumed = new Map((authorizations ?? []).map((row) => [row.transmission_id, row]));
+      const beforeMs = Date.parse(before);
+      return transmissions.map(pursueCimNumericRow).filter((row) => {
+        const authorization = consumed.get(row.id);
+        return row.invocation_authority_count === 1 && authorization
+          && Date.parse(authorization.consumed_at) <= beforeMs;
+      }).map((row) => ({ ...row,
+        authorization_provider_profile: consumed.get(row.id).provider_profile,
+        authorization_consumed_at: consumed.get(row.id).consumed_at }))
+        .sort((left, right) => Date.parse(left.authorization_consumed_at)
+          - Date.parse(right.authorization_consumed_at) || left.id.localeCompare(right.id))
+        .slice(0, limit);
+    },
+
+    async releasePreparedCimTransmissions(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_release_prepared_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || !Number.isSafeInteger(Number(data.released))
+        || !Array.isArray(data.transmissionIds)) {
+        throw new Error('Malformed Pursue CIM prepared release result');
+      }
+      return { released: Number(data.released), transmissionIds: [...data.transmissionIds] };
     },
 
     async renewLapsedCimInitialClaim(command) {

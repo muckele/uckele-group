@@ -12,6 +12,8 @@ import {
 } from '../services/pursueCimContactPolicy.js';
 import {
   CIM_PROVIDER_RELEASE_CANCELLATION,
+  CIM_PROVIDER_SEAM_NOT_ENTERED,
+  CIM_PROVIDER_SEAM_NOT_ENTERED_GRACE_MS,
   validateCimProviderRelease,
 } from './gmailSendStorageContract.js';
 
@@ -988,16 +990,28 @@ export function createPursueCimSqliteTransitions(database, {
         if (!transmission || transmission.payload_digest !== payloadDigest) {
           return outcome({ conflict: true }, transmission ?? null);
         }
+        // Ruling M: the seam-never-entered release is the only one without an entered seam.
+        const unentered = providerResultCode === CIM_PROVIDER_SEAM_NOT_ENTERED;
         if (transmission.state === 'cancelled-before-provider') {
           const replay = transmission.provider === 'gmail'
             && transmission.provider_result_code === providerResultCode
-            && transmission.provider_seam_entered_at !== null;
+            && (transmission.provider_seam_entered_at === null) === unentered;
           return outcome({ replay, conflict: !replay }, transmission);
         }
         if (transmission.state !== 'provider-pending' || transmission.row_version !== expectedRowVersion
-          || transmission.invocation_authority_count !== 1 || !transmission.provider_seam_entered_at
+          || transmission.invocation_authority_count !== 1
+          || Boolean(transmission.provider_seam_entered_at) === unentered
           || transmission.provider || transmission.provider_message_id
           || transmission.provider_result_code) return outcome({ conflict: true }, transmission);
+        if (unentered) {
+          const authorized = database.prepare(`SELECT MAX(consumed_at) AS at
+            FROM deal_hunter_cim_live_provider_authorizations
+            WHERE transmission_id = ? AND consumed_at IS NOT NULL`).get(transmissionId)?.at;
+          if (!authorized || Date.parse(authorized)
+            > Date.parse(now) - CIM_PROVIDER_SEAM_NOT_ENTERED_GRACE_MS) {
+            return outcome({ conflict: true }, transmission);
+          }
+        }
         const members = database.prepare(`
           SELECT t.* FROM deal_hunter_cim_transmission_touches m
           JOIN deal_hunter_cim_campaign_touches t ON t.id = m.touch_id
@@ -3361,6 +3375,96 @@ export function createPursueCimSqliteTransitions(database, {
       `).all(before, limit);
     },
     /**
+     * Provider-pending transmissions whose provider seam was never entered and whose
+     * authorization was consumed at or before `authorizedBefore` (Ruling M): nothing reached
+     * the provider, so they are released back to scheduled.
+     */
+    async listCimUnenteredProviderPendingTransmissions({ authorizedBefore, limit = 50 } = {}) {
+      const before = canonicalInstant(authorizedBefore);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid provider-pending limit');
+      }
+      return database.prepare(`
+        SELECT tr.*, a.provider_profile AS authorization_provider_profile,
+          a.consumed_at AS authorization_consumed_at
+        FROM deal_hunter_cim_transmissions AS tr
+        JOIN deal_hunter_cim_live_provider_authorizations AS a
+          ON a.transmission_id = tr.id AND a.consumed_at IS NOT NULL
+        WHERE tr.state = 'provider-pending' AND tr.provider_seam_entered_at IS NULL
+          AND tr.provider_message_id IS NULL AND tr.invocation_authority_count = 1
+          AND a.consumed_at <= ?
+        ORDER BY a.consumed_at, tr.id
+        LIMIT ?
+      `).all(before, limit);
+    },
+    /**
+     * Ruling N: when Live sending is turned off its capability chain is withdrawn, so a prepared
+     * transmission could never be authorized (and a follow-up's reservation never renewed)
+     * under the chain recorded when it is turned on again. Every prepared, never-authorized
+     * transmission is cancelled before the provider and its touches return to scheduled, to be
+     * prepared again under the next generation. No terminal event, no campaign change.
+     */
+    async releasePreparedCimTransmissions(command = {}) {
+      const reasonCode = requiredText(command.reasonCode, 'reasonCode', 160);
+      const actor = requiredText(command.actor, 'actor', 200);
+      const now = canonicalInstant(command.now);
+      return database.transaction(() => {
+        const prepared = database.prepare(`SELECT * FROM deal_hunter_cim_transmissions
+          WHERE state IN ('prepared', 'final-gate-blocked') AND invocation_authority_count = 0
+          ORDER BY id`).all();
+        const released = [];
+        for (const transmission of prepared) {
+          const members = database.prepare(`
+            SELECT t.* FROM deal_hunter_cim_transmission_touches m
+            JOIN deal_hunter_cim_campaign_touches t ON t.id = m.touch_id
+            WHERE m.transmission_id = ? AND m.cancelled_at IS NULL ORDER BY t.id
+          `).all(transmission.id);
+          if (!members.length || members.some((member) => member.state !== 'claimed'
+            || member.transmission_id !== transmission.id)) continue;
+          for (const member of members) {
+            database.prepare(`UPDATE deal_hunter_cim_transmission_touches SET cancelled_at = ?,
+              cancellation_reason = ? WHERE transmission_id = ? AND touch_id = ?
+                AND cancelled_at IS NULL`)
+              .run(now, CIM_PROVIDER_RELEASE_CANCELLATION, transmission.id, member.id);
+            database.prepare(`UPDATE deal_hunter_cim_campaign_touches SET state = 'scheduled',
+              transmission_id = NULL, claim_token_digest = NULL, claim_owner = NULL,
+              claimed_at = NULL, claim_expires_at = NULL, row_version = row_version + 1,
+              updated_at = ? WHERE id = ? AND state = 'claimed' AND transmission_id = ?
+                AND row_version = ?`).run(now, member.id, transmission.id, member.row_version);
+            appendAudit(database, { eventType: 'touch-released',
+              authorityId: `${member.id}:${member.row_version + 1}`,
+              opportunityId: member.opportunity_id, campaignId: member.campaign_id,
+              touchId: member.id, transmissionId: transmission.id, priorState: 'claimed',
+              nextState: 'scheduled', reasonCode, actor, occurredAt: now });
+          }
+          database.prepare(`UPDATE deal_hunter_cim_transmissions
+            SET state = 'cancelled-before-provider', row_version = row_version + 1, updated_at = ?
+            WHERE id = ? AND state IN ('prepared', 'final-gate-blocked')
+              AND invocation_authority_count = 0`).run(now, transmission.id);
+          database.prepare(`UPDATE crm_email_outbox SET state = 'cancelled', updated_at = ?
+            WHERE id = ? AND state IN ('prepared', 'final-gate-blocked')`)
+            .run(now, transmission.outbox_id);
+          for (const { id } of database.prepare(`SELECT id
+            FROM deal_hunter_cim_live_provider_authorizations WHERE transmission_id = ?
+              AND consumed_at IS NULL AND withdrawn_at IS NULL`).all(transmission.id)) {
+            database.prepare(`UPDATE deal_hunter_cim_live_provider_authorizations
+              SET withdrawn_at = ? WHERE id = ? AND consumed_at IS NULL AND withdrawn_at IS NULL`)
+              .run(now, id);
+            appendAudit(database, { eventType: 'authorization-withdrawn', authorityId: id,
+              transmissionId: transmission.id, authorizationId: id, priorState: 'issued',
+              nextState: 'withdrawn', reasonCode, actor, occurredAt: now });
+          }
+          appendAudit(database, { eventType: 'transmission-released',
+            authorityId: transmission.id, conversationId: transmission.conversation_id,
+            transmissionId: transmission.id, priorState: transmission.state,
+            nextState: 'cancelled-before-provider', reasonCode,
+            payloadDigest: transmission.payload_digest, actor, occurredAt: now });
+          released.push(transmission.id);
+        }
+        return { released: released.length, transmissionIds: released };
+      }).immediate();
+    },
+    /**
      * Touches whose claim lapsed while they held a prepared transmission that never reached the
      * final gate's provider-pending step (Ruling L): an initial is renewed with
      * renewLapsedCimInitialClaim, a follow-up with renewReservedCimFollowUp. A transmission that
@@ -3373,7 +3477,7 @@ export function createPursueCimSqliteTransitions(database, {
       }
       return database.prepare(`
         SELECT t.id AS touch_id, t.kind, t.campaign_id, t.opportunity_id, t.row_version,
-          t.claim_expires_at, t.transmission_id, tr.preparation_generation,
+          t.claim_expires_at, t.due_local, t.transmission_id, tr.preparation_generation,
           c.conversation_id, c.recipient_fingerprint, c.state AS campaign_state
         FROM deal_hunter_cim_campaign_touches AS t
         JOIN deal_hunter_cim_transmission_touches AS m

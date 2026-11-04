@@ -23931,3 +23931,247 @@ revoke all on function public.deal_hunter_pursue_renew_initial_claim_v1(jsonb)
   from public, anon, authenticated;
 grant execute on function public.deal_hunter_pursue_renew_initial_claim_v1(jsonb)
   to service_role;
+
+-- Task 8 fix round 1.
+--
+-- Ruling M: a provider-pending transmission whose provider seam was never entered cannot have
+-- reached the provider (the seam is durable before any provider call). The release accepts it
+-- under code provider_seam_not_entered once its authorization was consumed at least ten
+-- minutes ago; every other code still requires an entered seam. Redefines the body above with
+-- only that change.
+create or replace function public.deal_hunter_pursue_release_unsent_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_id text := public.pursue_cim_required_text_v1(p_command, 'transmissionId', 240);
+  v_payload_digest text := public.pursue_cim_required_text_v1(p_command, 'payloadDigest', 64);
+  v_expected bigint := public.pursue_cim_required_revision_v1(p_command, 'expectedRowVersion');
+  v_code text := public.pursue_cim_required_text_v1(p_command, 'providerResultCode', 160);
+  v_actor text := public.pursue_cim_required_text_v1(p_command, 'actor', 200);
+  v_now timestamptz := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_transmission public.deal_hunter_cim_transmissions%rowtype;
+  v_member record;
+  v_touch_ids text[] := array[]::text[];
+  v_touches jsonb := '[]'::jsonb;
+  v_replay boolean;
+  v_unentered boolean := false;
+  v_authorized timestamptz;
+begin
+  if v_payload_digest !~ '^[0-9a-f]{64}$'
+    or p_command ->> 'provider' is distinct from 'gmail'
+    or v_code not in ('provider_quota','gmail_token_invalid','gmail_token_refresh_failed',
+      'gmail_not_connected','gmail_access_denied','provider_seam_not_entered') then
+    raise exception 'Invalid Pursue CIM provider release command';
+  end if;
+  v_unentered := v_code = 'provider_seam_not_entered';
+  perform pg_catalog.pg_advisory_xact_lock(17499,48146);
+  select * into v_transmission from public.deal_hunter_cim_transmissions
+    where id = v_id for update;
+  if v_transmission.id is null or v_transmission.payload_digest <> v_payload_digest then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'transmission', case when v_transmission.id is null then null
+        else pg_catalog.to_jsonb(v_transmission) end, 'touches', '[]'::jsonb);
+  end if;
+  if v_transmission.state = 'cancelled-before-provider' then
+    v_replay := coalesce(v_transmission.provider = 'gmail'
+      and v_transmission.provider_result_code = v_code
+      and (v_transmission.provider_seam_entered_at is null) = v_unentered, false);
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', v_replay,
+      'conflict', not v_replay, 'transmission', pg_catalog.to_jsonb(v_transmission),
+      'touches', '[]'::jsonb);
+  end if;
+  if v_transmission.state <> 'provider-pending' or v_transmission.row_version <> v_expected
+    or v_transmission.invocation_authority_count <> 1
+    or (v_transmission.provider_seam_entered_at is null) <> v_unentered
+    or v_transmission.provider is not null or v_transmission.provider_message_id is not null
+    or v_transmission.provider_result_code is not null then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'transmission', pg_catalog.to_jsonb(v_transmission), 'touches', '[]'::jsonb);
+  end if;
+  if v_unentered then
+    select max(a.consumed_at) into v_authorized
+      from public.deal_hunter_cim_live_provider_authorizations a
+      where a.transmission_id = v_id and a.consumed_at is not null;
+    if v_authorized is null or v_authorized > v_now - interval '10 minutes' then
+      return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+        'transmission', pg_catalog.to_jsonb(v_transmission), 'touches', '[]'::jsonb);
+    end if;
+  end if;
+  -- Campaigns precede memberships/touches so terminal writers share this order.
+  perform 1 from public.deal_hunter_cim_campaigns c
+    join public.deal_hunter_cim_transmission_touches m on m.campaign_id = c.id
+    where m.transmission_id = v_id order by c.id for update of c;
+  for v_member in select t.* from public.deal_hunter_cim_transmission_touches m
+      join public.deal_hunter_cim_campaign_touches t on t.id = m.touch_id
+      where m.transmission_id = v_id and m.cancelled_at is null
+      order by t.id for update of m,t
+  loop
+    if v_member.state <> 'provider-pending' or v_member.transmission_id <> v_id then
+      return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+        'transmission', pg_catalog.to_jsonb(v_transmission), 'touches', '[]'::jsonb);
+    end if;
+    v_touch_ids := pg_catalog.array_append(v_touch_ids, v_member.id);
+  end loop;
+  if pg_catalog.cardinality(v_touch_ids) = 0 then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'transmission', pg_catalog.to_jsonb(v_transmission), 'touches', '[]'::jsonb);
+  end if;
+  update public.deal_hunter_cim_transmissions set state = 'cancelled-before-provider',
+    provider = 'gmail', provider_result_code = v_code, row_version = row_version + 1,
+    updated_at = v_now
+    where id = v_id and state = 'provider-pending' and row_version = v_expected
+    returning * into v_transmission;
+  if not found then raise exception 'Concurrent Pursue CIM provider release'; end if;
+  update public.deal_hunter_cim_transmission_touches
+    set cancelled_at = v_now, cancellation_reason = 'provider-unsent-release'
+    where transmission_id = v_id and cancelled_at is null;
+  for v_member in select * from public.deal_hunter_cim_campaign_touches
+      where id = any(v_touch_ids) order by id
+  loop
+    update public.deal_hunter_cim_campaign_touches set state = 'scheduled',
+      transmission_id = null, claim_token_digest = null, claim_owner = null,
+      claimed_at = null, claim_expires_at = null, row_version = row_version + 1,
+      updated_at = v_now
+      where id = v_member.id and state = 'provider-pending' and transmission_id = v_id
+        and row_version = v_member.row_version;
+    if not found then raise exception 'Concurrent Pursue CIM touch release'; end if;
+    insert into public.deal_hunter_cim_audit_events
+      (id, event_type, opportunity_id, campaign_id, touch_id, transmission_id,
+       prior_state, next_state, reason_code, actor, source, occurred_at, metadata)
+    values (public.pursue_cim_digest_v1(pg_catalog.to_jsonb('cim-audit:v1'::text),
+        pg_catalog.to_jsonb('touch-released'::text),
+        pg_catalog.to_jsonb(v_member.id || ':' || (v_member.row_version + 1)::text)),
+      'touch-released', v_member.opportunity_id, v_member.campaign_id, v_member.id, v_id,
+      'provider-pending', 'scheduled', v_code, v_actor, 'postgres-transition', v_now,
+      '{}'::jsonb);
+  end loop;
+  update public.crm_communications set provider = 'gmail', delivery_state = 'not-attempted',
+    delivery_state_at = v_now, updated_at = v_now
+    where id = v_transmission.communication_id;
+  update public.crm_email_outbox set provider = 'gmail', state = 'cancelled',
+    last_error_category = v_code, updated_at = v_now
+    where id = v_transmission.outbox_id;
+  insert into public.deal_hunter_cim_audit_events
+    (id, event_type, conversation_id, transmission_id, prior_state, next_state,
+     reason_code, payload_digest, actor, source, occurred_at, metadata)
+  values (public.pursue_cim_digest_v1(pg_catalog.to_jsonb('cim-audit:v1'::text),
+      pg_catalog.to_jsonb('transmission-released'::text), pg_catalog.to_jsonb(v_id)),
+    'transmission-released', v_transmission.conversation_id, v_id, 'provider-pending',
+    'cancelled-before-provider', v_code, v_payload_digest, v_actor, 'postgres-transition',
+    v_now, '{}'::jsonb);
+  select coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(t) order by t.id), '[]'::jsonb)
+    into v_touches from public.deal_hunter_cim_campaign_touches t where t.id = any(v_touch_ids);
+  return pg_catalog.jsonb_build_object('applied', true, 'replay', false, 'conflict', false,
+    'transmission', pg_catalog.to_jsonb(v_transmission), 'touches', v_touches);
+end;
+$$;
+revoke all on function public.deal_hunter_pursue_release_unsent_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_pursue_release_unsent_v1(jsonb) to service_role;
+
+-- Ruling N: turning Live sending off withdraws its capability chain, so every prepared,
+-- never-authorized transmission is cancelled before the provider and its touches return to
+-- scheduled (memberships cancelled as provider-unsent-release, so the touch is claimed again
+-- under the next generation). Unused authorizations are withdrawn; a follow-up's reserved
+-- capacity is released by the existing transmission trigger. No terminal event, no campaign
+-- change. Mirrors releasePreparedCimTransmissions in SQLite.
+create or replace function public.deal_hunter_pursue_release_prepared_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_reason text := public.pursue_cim_required_text_v1(p_command, 'reasonCode', 160);
+  v_actor text := public.pursue_cim_required_text_v1(p_command, 'actor', 200);
+  v_now timestamptz := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_transmission public.deal_hunter_cim_transmissions%rowtype;
+  v_member record;
+  v_authorization record;
+  v_skip boolean;
+  v_released text[] := array[]::text[];
+begin
+  perform pg_catalog.pg_advisory_xact_lock(17499,48146);
+  for v_transmission in select * from public.deal_hunter_cim_transmissions
+      where state in ('prepared', 'final-gate-blocked') and invocation_authority_count = 0
+      order by id for update
+  loop
+    perform 1 from public.deal_hunter_cim_campaigns c
+      join public.deal_hunter_cim_transmission_touches m on m.campaign_id = c.id
+      where m.transmission_id = v_transmission.id order by c.id for update of c;
+    select coalesce(bool_or(t.state <> 'claimed'
+        or t.transmission_id is distinct from v_transmission.id), true) into v_skip
+      from public.deal_hunter_cim_transmission_touches m
+      join public.deal_hunter_cim_campaign_touches t on t.id = m.touch_id
+      where m.transmission_id = v_transmission.id and m.cancelled_at is null;
+    continue when v_skip;
+    for v_member in select t.* from public.deal_hunter_cim_transmission_touches m
+        join public.deal_hunter_cim_campaign_touches t on t.id = m.touch_id
+        where m.transmission_id = v_transmission.id and m.cancelled_at is null
+        order by t.id for update of m, t
+    loop
+      update public.deal_hunter_cim_transmission_touches
+        set cancelled_at = v_now, cancellation_reason = 'provider-unsent-release'
+        where transmission_id = v_transmission.id and touch_id = v_member.id
+          and cancelled_at is null;
+      update public.deal_hunter_cim_campaign_touches set state = 'scheduled',
+        transmission_id = null, claim_token_digest = null, claim_owner = null,
+        claimed_at = null, claim_expires_at = null, row_version = row_version + 1,
+        updated_at = v_now
+        where id = v_member.id and state = 'claimed' and transmission_id = v_transmission.id
+          and row_version = v_member.row_version;
+      if not found then raise exception 'Concurrent Pursue CIM prepared release'; end if;
+      insert into public.deal_hunter_cim_audit_events
+        (id, event_type, opportunity_id, campaign_id, touch_id, transmission_id,
+         prior_state, next_state, reason_code, actor, source, occurred_at, metadata)
+      values (public.pursue_cim_digest_v1(pg_catalog.to_jsonb('cim-audit:v1'::text),
+          pg_catalog.to_jsonb('touch-released'::text),
+          pg_catalog.to_jsonb(v_member.id || ':' || (v_member.row_version + 1)::text)),
+        'touch-released', v_member.opportunity_id, v_member.campaign_id, v_member.id,
+        v_transmission.id, 'claimed', 'scheduled', v_reason, v_actor, 'sqlite-transition',
+        v_now, '{}'::jsonb);
+    end loop;
+    update public.deal_hunter_cim_transmissions set state = 'cancelled-before-provider',
+      row_version = row_version + 1, updated_at = v_now
+      where id = v_transmission.id and state in ('prepared', 'final-gate-blocked')
+        and invocation_authority_count = 0;
+    update public.crm_email_outbox set state = 'cancelled', updated_at = v_now
+      where id = v_transmission.outbox_id and state in ('prepared', 'final-gate-blocked');
+    for v_authorization in select id from public.deal_hunter_cim_live_provider_authorizations
+        where transmission_id = v_transmission.id and consumed_at is null
+          and withdrawn_at is null for update
+    loop
+      update public.deal_hunter_cim_live_provider_authorizations set withdrawn_at = v_now
+        where id = v_authorization.id and consumed_at is null and withdrawn_at is null;
+      insert into public.deal_hunter_cim_audit_events
+        (id, event_type, transmission_id, authorization_id, prior_state, next_state,
+         reason_code, actor, source, occurred_at, metadata)
+      values (public.pursue_cim_digest_v1(pg_catalog.to_jsonb('cim-audit:v1'::text),
+          pg_catalog.to_jsonb('authorization-withdrawn'::text),
+          pg_catalog.to_jsonb(v_authorization.id)),
+        'authorization-withdrawn', v_transmission.id, v_authorization.id, 'issued',
+        'withdrawn', v_reason, v_actor, 'sqlite-transition', v_now, '{}'::jsonb);
+    end loop;
+    insert into public.deal_hunter_cim_audit_events
+      (id, event_type, conversation_id, transmission_id, prior_state, next_state,
+       reason_code, payload_digest, actor, source, occurred_at, metadata)
+    values (public.pursue_cim_digest_v1(pg_catalog.to_jsonb('cim-audit:v1'::text),
+        pg_catalog.to_jsonb('transmission-released'::text),
+        pg_catalog.to_jsonb(v_transmission.id)),
+      'transmission-released', v_transmission.conversation_id, v_transmission.id,
+      v_transmission.state, 'cancelled-before-provider', v_reason,
+      v_transmission.payload_digest, v_actor, 'sqlite-transition', v_now, '{}'::jsonb);
+    v_released := pg_catalog.array_append(v_released, v_transmission.id);
+  end loop;
+  return pg_catalog.jsonb_build_object('released', pg_catalog.cardinality(v_released),
+    'transmissionIds', pg_catalog.to_jsonb(v_released));
+end;
+$$;
+
+revoke all on function public.deal_hunter_pursue_release_prepared_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_pursue_release_prepared_v1(jsonb)
+  to service_role;

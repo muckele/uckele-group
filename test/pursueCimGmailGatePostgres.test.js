@@ -706,7 +706,8 @@ test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizat
   assert.deepEqual(await storage.listLapsedCimPreparedTouches({ now: at(3) }), []);
   const [lapsed] = await storage.listLapsedCimPreparedTouches({ now: at(10) });
   assert.deepEqual(Object.keys(lapsed).sort(), ['campaign_id', 'campaign_state',
-    'claim_expires_at', 'conversation_id', 'kind', 'opportunity_id', 'preparation_generation',
+    'claim_expires_at', 'conversation_id', 'due_local', 'kind', 'opportunity_id',
+    'preparation_generation',
     'recipient_fingerprint', 'row_version', 'touch_id', 'transmission_id']);
   assert.equal(lapsed.touch_id, initial.touchId);
   assert.equal(lapsed.transmission_id, transmission.id);
@@ -761,6 +762,13 @@ test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizat
     expectedRowVersion: Number(gate.transmission.row_version), actor: 'pursue-cim-sender',
     now: GATE_NOW });
   assert.equal(seam.entered, true, JSON.stringify(seam));
+  // Ruling M never applies to an entered seam.
+  const seamNotEntered = (transmission, rowVersion, now) => storage.releaseCimProviderPendingUnsent({
+    transmissionId: transmission.id, payloadDigest: transmission.payload_digest,
+    expectedRowVersion: rowVersion, provider: 'gmail',
+    providerResultCode: 'provider_seam_not_entered', actor: 'pursue-cim-sender', now });
+  assert.equal((await seamNotEntered(pending.transmission, Number(gate.transmission.row_version) + 1,
+    iso(Date.parse(GATE_NOW) + 30 * 60_000))).conflict, true);
   assert.deepEqual(await storage.listCimProviderPendingTransmissions({
     enteredBefore: iso(Date.parse(GATE_NOW) - 60_000) }), []);
   const [unrecorded] = await storage.listCimProviderPendingTransmissions({
@@ -814,6 +822,33 @@ test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizat
     where campaign_id = '${delivered.ids.campaignId}' and kind <> 'initial';`),
   'scheduled:follow-up-1');
 
+  // Ruling M: a gate-authorized send whose seam was never entered is released, after its grace.
+  const unentered = await prepareGate({ container, database, storage, suffix: 'unentered',
+    basis: 'rule' });
+  const unenteredGate = await unentered.gate({ now: iso(Date.parse(GATE_NOW) + 2000) });
+  assert.equal(unenteredGate.authorized, true, JSON.stringify(unenteredGate));
+  const authorizedAt = Date.parse(GATE_NOW) + 2000;
+  assert.deepEqual(await storage.listCimUnenteredProviderPendingTransmissions({
+    authorizedBefore: iso(authorizedAt - 60_000) }), []);
+  const [stuck] = await storage.listCimUnenteredProviderPendingTransmissions({
+    authorizedBefore: iso(authorizedAt + 10 * 60_000) });
+  assert.equal(stuck.id, unentered.transmission.id);
+  assert.equal(stuck.authorization_provider_profile, GMAIL_PROFILE);
+  assert.equal(stuck.provider_seam_entered_at, null);
+  assert.equal((await seamNotEntered(stuck, stuck.row_version,
+    iso(authorizedAt + 5 * 60_000))).conflict, true);
+  const releasedUnentered = await seamNotEntered(stuck, stuck.row_version,
+    iso(authorizedAt + 11 * 60_000));
+  assert.equal(releasedUnentered.applied, true, JSON.stringify(releasedUnentered));
+  assert.equal(releasedUnentered.transmission.provider_result_code, 'provider_seam_not_entered');
+  assert.equal(scalar(`select state || ':' || coalesce(transmission_id, '-')
+    from public.deal_hunter_cim_campaign_touches where id = '${unentered.ids.touchId}';`),
+  'scheduled:-');
+  assert.equal(scalar(`select state from public.deal_hunter_cim_campaigns
+    where id = '${unentered.ids.campaignId}';`), 'initial-pending');
+  assert.equal((await seamNotEntered(stuck, stuck.row_version,
+    iso(authorizedAt + 12 * 60_000))).replay, true);
+
   // Waiting enrollments are listed with their decisions.
   scalar(`
     insert into public.deal_hunter_opportunities (opportunity_id, created_at, updated_at,
@@ -840,6 +875,16 @@ test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizat
   const off = await syncPursueGmailCapabilities({ storage, enabled: false, actor: 'owner', now });
   assert.deepEqual(off.withdrawn.sort(), ['gmail-fl04a-safety', 'gmail-fl04b-enrollment',
     'gmail-fl04b-initial', 'gmail-fl04c-followup']);
+  // Ruling N: the prepared initial is cancelled before the provider and its touch rescheduled.
+  assert.equal(off.released, 1);
+  assert.equal(scalar(`select state from public.deal_hunter_cim_transmissions
+    where id = '${transmission.id}';`), 'cancelled-before-provider');
+  assert.equal(scalar(`select state || ':' || coalesce(transmission_id, '-')
+    from public.deal_hunter_cim_campaign_touches where id = '${initial.touchId}';`),
+  'scheduled:-');
+  assert.equal(scalar(`select (withdrawn_at is not null)::text
+    from public.deal_hunter_cim_live_provider_authorizations where id = 'authorization-second';`),
+  'true');
   assert.deepEqual(await storage.listCurrentCimCapabilityActivations(), []);
   assert.equal(scalar(`select coalesce(public.pursue_cim_current_activation_v1('fl04c-followup',
     now()), 'none');`), 'none');

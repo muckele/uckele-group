@@ -36,6 +36,8 @@ const RECONCILE_GRACE_MS = 10 * 60 * 1000;
 const LIST_LIMIT = 100;
 const WINDOW_START_MINUTE = 8 * 60;
 const WINDOW_END_MINUTE = 17 * 60;
+// A follow-up picked up after its local due date goes out only in a weekday's 08:00 window.
+const LATE_FOLLOW_UP_WINDOW_END_MINUTE = 9 * 60;
 // Gate refusals that mean nothing else can be sent this run either.
 const RUN_STOPPING_GATE_REFUSALS = new Set(['provider_readiness_unavailable', 'central_pause',
   'contact_rule_off', 'capability_inactive', 'profile_mismatch']);
@@ -66,6 +68,63 @@ export function pursueSendWindow(at, timezone) {
   } catch {
     return false;
   }
+}
+
+function localParts(at, timezone) {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone, weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(at)).map(({ type, value }) => [type, value]));
+}
+
+/**
+ * The §5.2 follow-up rule. On its local due date (`dueLocal`, `YYYY-MM-DDTHH:MM:SS` local wall
+ * time) a follow-up may go out anywhere in the weekday 08:00-17:00 window. After that date it
+ * may go out only in a weekday's 08:00 window (08:00-08:59 local), never later in a day.
+ */
+export function pursueFollowUpSendable(at, timezone, dueLocal) {
+  if (!pursueSendWindow(at, timezone)) return false;
+  const dueDate = /^\d{4}-\d{2}-\d{2}/.exec(String(dueLocal ?? ''))?.[0];
+  if (!dueDate) return false;
+  try {
+    const parts = localParts(at, timezone);
+    const localDate = `${parts.year}-${parts.month}-${parts.day}`;
+    if (localDate <= dueDate) return true;
+    return Number(parts.hour) * 60 + Number(parts.minute) < LATE_FOLLOW_UP_WINDOW_END_MINUTE;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ruling M: a provider-pending transmission whose provider seam was never entered cannot have
+ * reached Gmail (the seam is durable before any provider call). Ten minutes after its
+ * authorization it is released back to scheduled, with no terminal event or campaign change.
+ * A transmission whose seam was entered is never touched here.
+ */
+export async function releaseUnenteredPursueSends({ storage, providerProfile, now, clock,
+  actor = PURSUE_CIM_SENDER_ACTOR, graceMs = RECONCILE_GRACE_MS, limit = 50 } = {}) {
+  const outcome = { released: 0, skipped: {} };
+  const skip = (reason) => { outcome.skipped[reason] = (outcome.skipped[reason] || 0) + 1; };
+  if (typeof storage?.listCimUnenteredProviderPendingTransmissions !== 'function') return outcome;
+  const instant = () => isoInstant(clock ? clock() : now ?? new Date());
+  const authorizedBefore = new Date(instant().getTime() - graceMs).toISOString();
+  for (const transmission of await storage.listCimUnenteredProviderPendingTransmissions({
+    authorizedBefore, limit })) {
+    if (!providerProfile || transmission.authorization_provider_profile !== providerProfile) continue;
+    try {
+      const result = await storage.releaseCimProviderPendingUnsent({
+        transmissionId: transmission.id, payloadDigest: transmission.payload_digest,
+        expectedRowVersion: Number(transmission.row_version), provider: 'gmail',
+        providerResultCode: 'provider_seam_not_entered', actor,
+        now: instant().toISOString() });
+      if (result?.applied) outcome.released += 1;
+      else if (!result?.replay) skip('release_conflict');
+    } catch (error) {
+      skip(errorCode(error, 'release_failed'));
+    }
+  }
+  return outcome;
 }
 
 function quotaJobKey(businessDate) {
@@ -224,8 +283,8 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   if (!storage) throw new Error('Pursue sender storage is unavailable');
   const resolvedConfig = config || getConfig();
   const instant = () => isoInstant(clock ? clock() : now ?? new Date());
-  const summary = { sentInitial: 0, sentFollowUps: 0, expired: 0, reconciled: 0, skipped: {},
-    failed: 0, ambiguous: 0 };
+  const summary = { sentInitial: 0, sentFollowUps: 0, expired: 0, reconciled: 0, released: 0,
+    skipped: {}, failed: 0, ambiguous: 0 };
   const skip = (reason) => { summary.skipped[reason] = (summary.skipped[reason] || 0) + 1; };
   const stop = (stoppedFor, reason) => {
     if (reason) skip(reason);
@@ -251,10 +310,29 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   }
 
   // 2. Day-28 expiry.
-  summary.expired = await sweepExpiredPursueCampaigns({ storage, now: instant(), actor });
+  try {
+    summary.expired = await sweepExpiredPursueCampaigns({ storage, now: instant(), actor });
+  } catch (error) {
+    skip(errorCode(error, 'expiry_sweep_failed'));
+  }
 
-  // 3. Sends that entered the provider seam and never recorded an outcome.
-  await reconcileUnrecordedSends();
+  // 3. Sends that entered the provider seam and never recorded an outcome, then sends that
+  // never entered it (Ruling M).
+  try {
+    await reconcileUnrecordedSends();
+  } catch (error) {
+    skip(errorCode(error, 'reconcile_failed'));
+  }
+  try {
+    const released = await releaseUnenteredPursueSends({ storage, providerProfile,
+      clock: instant, actor });
+    summary.released = released.released;
+    for (const [reason, value] of Object.entries(released.skipped)) {
+      summary.skipped[reason] = (summary.skipped[reason] || 0) + value;
+    }
+  } catch (error) {
+    skip(errorCode(error, 'release_failed'));
+  }
 
   if (await quotaMarked(storage, instant())) {
     skip('provider_quota_wait');
@@ -262,24 +340,33 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   }
 
   const chain = await currentChain();
-  // A recovered or due touch whose claim lapsed with a prepared transmission (Ruling L).
-  for (const row of await storage.listLapsedCimPreparedTouches({
-    now: instant().toISOString(), limit: LIST_LIMIT })) {
-    const outcome = await recoverLapsedPreparation(row);
-    if (outcome) return outcome;
-  }
+  // Each touch is isolated: anything one touch throws is recorded by code and the run goes on
+  // to the next. A touch left claimed by it is recovered once its claim lapses (Ruling L).
+  const each = async (rows, handle, fallback) => {
+    for (const row of rows) {
+      let outcome;
+      try {
+        outcome = await handle(row);
+      } catch (error) {
+        skip(errorCode(error, fallback));
+        continue;
+      }
+      if (outcome) return outcome;
+    }
+    return null;
+  };
+  // A touch whose claim lapsed while it held a prepared transmission (Ruling L).
+  const recovered = await each(await storage.listLapsedCimPreparedTouches({
+    now: instant().toISOString(), limit: LIST_LIMIT }), recoverLapsedPreparation, 'recovery_failed');
+  if (recovered) return recovered;
   // 4. Initial emails.
-  for (const candidate of await storage.listDueCimInitialTouches({
-    now: instant().toISOString(), limit: LIST_LIMIT })) {
-    const outcome = await sendDueInitial(candidate);
-    if (outcome) return outcome;
-  }
+  const initials = await each(await storage.listDueCimInitialTouches({
+    now: instant().toISOString(), limit: LIST_LIMIT }), sendDueInitial, 'initial_failed');
+  if (initials) return initials;
   // 5. Follow-ups.
-  for (const candidate of await storage.listDueCimFollowUpTouches({
-    now: instant().toISOString(), limit: LIST_LIMIT })) {
-    const outcome = await sendDueFollowUp(candidate);
-    if (outcome) return outcome;
-  }
+  const followUps = await each(await storage.listDueCimFollowUpTouches({
+    now: instant().toISOString(), limit: LIST_LIMIT }), sendDueFollowUp, 'follow_up_failed');
+  if (followUps) return followUps;
   return summary;
 
   async function currentChain() {
@@ -299,12 +386,16 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
     return authority?.timezone?.iana_timezone || '';
   }
 
-  // Inside the campaign's weekday 08:00-17:00 local window. A follow-up due earlier the same
-  // local day goes out that day; one missed past its day goes out at the next weekday window,
-  // once (the next touch is scheduled from its acceptance, so nothing doubles up).
-  async function inWindow(touchId) {
+  // Inside the campaign's weekday 08:00-17:00 local window (spec §5.2). A follow-up (given its
+  // `dueLocal`) goes out any time in the window on its own local due date; once that date has
+  // passed it waits for a weekday's 08:00 window, so a missed follow-up goes out the next
+  // weekday morning, once (the next touch is scheduled from its acceptance).
+  async function inWindow(touchId, dueLocal) {
     const timezone = await timezoneOf(touchId);
-    return Boolean(timezone) && pursueSendWindow(instant(), timezone);
+    if (!timezone) return false;
+    const at = instant();
+    return dueLocal === undefined ? pursueSendWindow(at, timezone)
+      : pursueFollowUpSendable(at, timezone, dueLocal);
   }
 
   async function liveSendingOn() {
@@ -407,7 +498,7 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
     const followUp = row.kind !== 'initial';
     const activation = followUp ? chain.followUp : chain.initial;
     if (!activation) return stop('not_ready', 'capability_inactive');
-    if (!(await inWindow(row.touch_id))) {
+    if (!(await inWindow(row.touch_id, followUp ? String(row.due_local ?? '') : undefined))) {
       skip('outside_send_window');
       return null;
     }
@@ -459,7 +550,7 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
     if (!chain.followUp || chain.followUp.id !== candidate.activation_id) {
       return stop('not_ready', 'capability_inactive');
     }
-    if (!(await inWindow(candidate.touch_id))) {
+    if (!(await inWindow(candidate.touch_id, String(candidate.dueLocal ?? '')))) {
       skip('outside_send_window');
       return null;
     }

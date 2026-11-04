@@ -35,6 +35,7 @@ function runMetadata(result, error) {
     sentFollowUps: count(result?.sentFollowUps),
     expired: count(result?.expired),
     reconciled: count(result?.reconciled),
+    released: count(result?.released),
     skipped: codes(result?.skipped),
     failed: count(result?.failed),
     ambiguous: count(result?.ambiguous),
@@ -96,7 +97,9 @@ export function startPursueCimSenderScheduler({
     let result = null;
     let error = '';
     try {
-      result = await run({ storage: activeStorage, now: at, config: config || undefined });
+      // A live clock: each claim, gate attempt and send in the run reads its own instant.
+      result = await run({ storage: activeStorage, now: at, clock: now,
+        config: config || undefined });
     } catch (cause) {
       error = errorCode(cause);
     }
