@@ -4,10 +4,10 @@ import { sha256, stableCanonicalJson } from '../utils/security.js';
 export const CONTACT_POLICY_VERSION = 'listing-broker-inquiry-v1';
 
 /**
- * The digest a campaign enrolled under the rule records, bound to the control revision that
- * was on. Both storage adapters recompute it, so a toggled rule invalidates the basis.
+ * The digest a campaign enrolled under the rule records. It covers the policy version only,
+ * not the control revision, so turning the rule off pauses rule-based campaigns and turning
+ * it on again resumes them. The revision is recorded on the campaign for audit.
  */
-export function contactPolicyDigest(controls) {
-  return sha256(stableCanonicalJson({ policyVersion: CONTACT_POLICY_VERSION,
-    revision: Number(controls?.contactRule?.revision) }));
+export function contactPolicyDigest() {
+  return sha256(stableCanonicalJson({ policyVersion: CONTACT_POLICY_VERSION }));
 }

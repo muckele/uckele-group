@@ -21948,8 +21948,9 @@ grant execute on function public.pursue_cim_resolve_inbound_v1(jsonb) to service
 
 -- The standing listing-broker contact rule (listing-broker-inquiry-v1) is a campaign
 -- permission basis beside the fl04b-enrollment activation. True when the command names the
--- rule, the rule is on, and the command carries its current revision and that revision's
--- policy digest: sha256 of {"policyVersion":"listing-broker-inquiry-v1","revision":N}.
+-- rule, the rule is on under the same policy version, and the command carries that version's
+-- policy digest: sha256 of {"policyVersion":"listing-broker-inquiry-v1"}. The control
+-- revision is not compared, so off pauses rule-based campaigns and on again resumes them.
 -- Callers hold the CIM writer lock, which the send-control writer also takes.
 create or replace function public.deal_hunter_pursue_contact_rule_basis_v1(p_command jsonb)
 returns boolean
@@ -21960,21 +21961,18 @@ set search_path = ''
 as $$
 declare
   v_control public.deal_hunter_pursue_send_controls%rowtype;
-  v_digest text;
+  v_digest text := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+    '{"policyVersion":"listing-broker-inquiry-v1"}', 'UTF8')), 'hex');
 begin
-  if p_command ->> 'permissionVersion' is distinct from 'listing-broker-inquiry-v1'
-    or pg_catalog.jsonb_typeof(p_command -> 'permissionRevision') is distinct from 'number' then
+  if p_command ->> 'permissionVersion' is distinct from 'listing-broker-inquiry-v1' then
     return false;
   end if;
   select * into v_control from public.deal_hunter_pursue_send_controls
     where control_key = 'contact_rule';
   if v_control.control_key is null or not v_control.enabled
-    or v_control.revision::text <> p_command ->> 'permissionRevision' then
+    or v_control.policy_version is distinct from 'listing-broker-inquiry-v1' then
     return false;
   end if;
-  v_digest := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
-    '{"policyVersion":"listing-broker-inquiry-v1","revision":' || v_control.revision::text || '}',
-    'UTF8')), 'hex');
   return p_command ->> 'permissionDigest' = v_digest and p_command ->> 'policyHash' = v_digest;
 end;
 $$;

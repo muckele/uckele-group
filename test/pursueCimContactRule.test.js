@@ -19,12 +19,25 @@ function seed(t, options = {}) {
   return seedP4bEligibleFixture(t, { brokerEmail: 'jordan.lee@brokerfirm.test', ...options });
 }
 
-async function setContactRule(storage, enabled, now) {
+async function setContactRule(storage, enabled, now, policyVersion = CONTACT_POLICY_VERSION) {
   const { contactRule } = await storage.getPursueSendControls();
   await storage.setPursueSendControl({ controlKey: 'contact_rule', enabled,
-    policyVersion: CONTACT_POLICY_VERSION, expectedRevision: contactRule.revision,
+    policyVersion, expectedRevision: contactRule.revision,
     actor: 'fixture-owner', reason: 'synthetic', now });
   return storage.getPursueSendControls();
+}
+
+/** Storage whose materializePursuitCampaign commands are captured for a later replay. */
+function capturingMaterialize(storage, commands) {
+  return new Proxy(storage, { get: (target, name) => (name === 'materializePursuitCampaign'
+    ? async (command) => { commands.push(command); return target.materializePursuitCampaign(command); }
+    : target[name]?.bind?.(target) ?? target[name]) });
+}
+
+/** Storage that reports `controls` while the database holds whatever the test wrote. */
+function reportingControls(storage, controls) {
+  return new Proxy(storage, { get: (target, name) => (name === 'getPursueSendControls'
+    ? async () => controls : target[name]?.bind?.(target) ?? target[name]) });
 }
 
 function enroll({ storage, opportunityId, decision, now }) {
@@ -36,15 +49,11 @@ function count(db, table) {
   return db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count;
 }
 
-test('contactPolicyDigest is SHA-256 over the canonical policy version and control revision', () => {
-  const controls = { contactRule: { enabled: true, revision: 7 } };
+test('contactPolicyDigest is SHA-256 over the canonical policy version only', () => {
   assert.equal(CONTACT_POLICY_VERSION, 'listing-broker-inquiry-v1');
-  assert.equal(contactPolicyDigest(controls),
-    sha256(stableCanonicalJson({ policyVersion: 'listing-broker-inquiry-v1', revision: 7 })));
-  assert.equal(contactPolicyDigest(controls),
-    sha256('{"policyVersion":"listing-broker-inquiry-v1","revision":7}'));
-  assert.notEqual(contactPolicyDigest({ contactRule: { enabled: true, revision: 8 } }),
-    contactPolicyDigest(controls));
+  assert.equal(contactPolicyDigest(),
+    sha256(stableCanonicalJson({ policyVersion: 'listing-broker-inquiry-v1' })));
+  assert.equal(contactPolicyDigest(), sha256('{"policyVersion":"listing-broker-inquiry-v1"}'));
 });
 
 test('the rule permits a single structured-source listing broker with no prior outreach', async (t) => {
@@ -64,6 +73,19 @@ test('contact_rule_off: the rule refuses while the control is off or was never s
   assert.equal(controls.contactRule.revision, 2);
   assert.deepEqual(contactRulePermits({ authority, recipient, controls }),
     { permitted: false, reason: 'contact_rule_off' });
+});
+
+test('contact_rule_off: the rule refuses when the control is on under another or no policy version', async (t) => {
+  const { storage, now, authority, recipient } = await seed(t);
+  for (const policyVersion of [null, 'listing-broker-inquiry-v2']) {
+    const controls = await setContactRule(storage, true, now, policyVersion);
+    assert.equal(controls.contactRule.enabled, true);
+    assert.equal(controls.contactRule.policyVersion, policyVersion);
+    assert.deepEqual(contactRulePermits({ authority, recipient, controls }),
+      { permitted: false, reason: 'contact_rule_off' }, String(policyVersion));
+  }
+  assert.deepEqual(contactRulePermits({ authority, recipient,
+    controls: await setContactRule(storage, true, now) }), { permitted: true, reason: '' });
 });
 
 test('contact_option_not_single: the rule refuses when the listing has more than one contact option', async (t) => {
@@ -132,7 +154,7 @@ test('rule on + permitted recipient enrolls with listing-broker-inquiry-v1 and n
   assert.equal(result.enrollment.state, 'campaign-created', result.enrollment.reason_code);
   const campaign = db.prepare('SELECT * FROM deal_hunter_cim_campaigns').get();
   assert.equal(campaign.permission_version, 'listing-broker-inquiry-v1');
-  assert.equal(campaign.permission_digest, contactPolicyDigest(controls));
+  assert.equal(campaign.permission_digest, contactPolicyDigest());
   assert.equal(campaign.permission_revision, controls.contactRule.revision);
   assert.equal(campaign.permission_scope, pursuitPermissionCohortDigest(authority, recipient));
   assert.equal(campaign.state, 'initial-pending');
@@ -201,16 +223,66 @@ test('a recipient who replied stop on an earlier listing is refused recipient_su
   assert.equal(count(db, 'deal_hunter_broker_conversations'), 0);
 });
 
-test('storage refuses a listing-broker basis whose control revision is no longer current', async (t) => {
+test('rule off pauses a rule-based campaign and on again resumes it on replay', async (t) => {
   const fixture = await seed(t, { enrollmentActivation: false });
   const { storage, db, now } = fixture;
+  await setContactRule(storage, true, now);
+  const commands = [];
+  const result = await enroll({ ...fixture, storage: capturingMaterialize(storage, commands) });
+  assert.equal(result.enrollment.state, 'campaign-created', result.enrollment.reason_code);
+  assert.equal(commands.length, 1);
+  const [command] = commands;
+  assert.equal(command.permissionRevision, 1);
+  const replay = async () => {
+    const outcome = await storage.materializePursuitCampaign(command);
+    return { applied: outcome.applied, existing: outcome.existing, actionRequired: outcome.actionRequired };
+  };
+  assert.deepEqual(await replay(), { applied: false, existing: true, actionRequired: false });
+  await setContactRule(storage, false, now);
+  assert.deepEqual(await replay(), { applied: false, existing: false, actionRequired: true });
+  const resumed = await setContactRule(storage, true, now);
+  assert.equal(resumed.contactRule.revision, 3);
+  assert.deepEqual(await replay(), { applied: false, existing: true, actionRequired: false });
+  await setContactRule(storage, true, now, 'listing-broker-inquiry-v2');
+  assert.deepEqual(await replay(), { applied: false, existing: false, actionRequired: true });
+  const campaign = db.prepare('SELECT * FROM deal_hunter_cim_campaigns').get();
+  assert.equal(campaign.permission_revision, 1);
+  assert.equal(campaign.state, 'initial-pending');
+  assert.equal(count(db, 'deal_hunter_cim_campaigns'), 1);
+});
+
+test('a rule turned off and on again enrolls and records the revision for audit', async (t) => {
+  const fixture = await seed(t, { enrollmentActivation: false });
+  const { storage, now } = fixture;
+  await setContactRule(storage, true, now);
+  await setContactRule(storage, false, now);
   const stale = await setContactRule(storage, true, now);
+  assert.equal(stale.contactRule.revision, 3);
+  // A read taken before a later off/on cycle still enrolls: authority is the version, not the revision.
   await setContactRule(storage, false, now);
   await setContactRule(storage, true, now);
-  const staleReader = new Proxy(storage, { get: (target, name) => (name === 'getPursueSendControls'
-    ? async () => stale : target[name]?.bind?.(target) ?? target[name]) });
-  const result = await enroll({ ...fixture, storage: staleReader });
-  assert.notEqual(result.enrollment.state, 'campaign-created');
-  assert.equal(count(db, 'deal_hunter_cim_campaigns'), 0);
-  assert.equal(count(db, 'deal_hunter_broker_conversations'), 0);
+  const result = await enroll({ ...fixture, storage: reportingControls(storage, stale) });
+  assert.equal(result.enrollment.state, 'campaign-created', result.enrollment.reason_code);
+  assert.equal(result.campaign.permission_version, CONTACT_POLICY_VERSION);
+  assert.equal(result.campaign.permission_revision, 3);
+  assert.equal(result.campaign.permission_digest, contactPolicyDigest());
+});
+
+test('storage refuses a listing-broker basis once the rule is off or under another version', async (t) => {
+  for (const [label, finalVersion, finalEnabled] of [
+    ['off', CONTACT_POLICY_VERSION, false],
+    ['other version', 'listing-broker-inquiry-v2', true],
+    ['no version', null, true],
+  ]) {
+    await t.test(label, async (st) => {
+      const fixture = await seed(st, { enrollmentActivation: false });
+      const { storage, db, now } = fixture;
+      const read = await setContactRule(storage, true, now);
+      await setContactRule(storage, finalEnabled, now, finalVersion);
+      const result = await enroll({ ...fixture, storage: reportingControls(storage, read) });
+      assert.notEqual(result.enrollment.state, 'campaign-created');
+      assert.equal(count(db, 'deal_hunter_cim_campaigns'), 0);
+      assert.equal(count(db, 'deal_hunter_broker_conversations'), 0);
+    });
+  }
 });

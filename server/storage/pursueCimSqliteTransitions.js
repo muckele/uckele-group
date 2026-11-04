@@ -252,15 +252,16 @@ const activationPredecessor = Object.freeze({
 });
 
 /**
- * True when a campaign command's permission basis is the standing contact rule as it is on
- * now: same policy version, same control revision, and that revision's policy digest.
+ * True when a campaign command's permission basis is the standing contact rule and the rule
+ * is on now under the same policy version, with that version's digest. The control revision
+ * is not compared: off pauses rule-based campaigns and on again resumes them.
  */
 function contactRuleBasisCurrent(database, command) {
   if (command.permissionVersion !== CONTACT_POLICY_VERSION) return false;
-  const control = database.prepare(`SELECT enabled, revision FROM deal_hunter_pursue_send_controls
+  const control = database.prepare(`SELECT enabled, policy_version FROM deal_hunter_pursue_send_controls
     WHERE control_key = 'contact_rule'`).get();
-  if (!control || control.enabled !== 1 || control.revision !== command.permissionRevision) return false;
-  const policyDigest = contactPolicyDigest({ contactRule: { revision: control.revision } });
+  if (!control || control.enabled !== 1 || control.policy_version !== CONTACT_POLICY_VERSION) return false;
+  const policyDigest = contactPolicyDigest();
   return command.permissionDigest === policyDigest && command.policyHash === policyDigest;
 }
 

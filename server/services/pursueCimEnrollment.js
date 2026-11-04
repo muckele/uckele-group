@@ -43,8 +43,10 @@ const contactRuleRefusal = (reason) => ({ permitted: false, reason });
  */
 export function contactRulePermits({ authority, recipient, controls, suppression = null } = {}) {
   const rule = controls?.contactRule;
-  if (rule?.enabled !== true || !Number.isSafeInteger(Number(rule.revision))
-    || Number(rule.revision) < 1) return contactRuleRefusal('contact_rule_off');
+  if (rule?.enabled !== true || rule.policyVersion !== CONTACT_POLICY_VERSION
+    || !Number.isSafeInteger(Number(rule.revision)) || Number(rule.revision) < 1) {
+    return contactRuleRefusal('contact_rule_off');
+  }
   const contactOptions = Array.isArray(authority?.recipientOptions) ? authority.recipientOptions : [];
   if (contactOptions.length !== 1 || !recipient?.email
     || contactOptions[0].email !== recipient.email
@@ -162,7 +164,7 @@ async function contactRuleBasis({ storage, authority, recipient, suppression }) 
     return null;
   }
   if (!contactRulePermits({ authority, recipient, controls, suppression }).permitted) return null;
-  const policyDigest = contactPolicyDigest(controls);
+  const policyDigest = contactPolicyDigest();
   return { controls, permission: { permissionVersion: CONTACT_POLICY_VERSION,
     permissionDigest: policyDigest, permissionRevision: Number(controls.contactRule.revision),
     permissionScope: pursuitPermissionCohortDigest(authority, recipient), policyHash: policyDigest } };
