@@ -70,11 +70,13 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
   const migration = fs.readFileSync(path.join(root, 'supabase/migrations/20260923120000_deal_hunter_freshness_provenance.sql'), 'utf8');
   const campaignMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20260925120000_pursue_cim_autopilot.sql'), 'utf8');
   const safetyMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20260928120000_pursue_cim_intake_safety.sql'), 'utf8');
+  const bestFirstMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20261102120000_best_first_deal_list.sql'), 'utf8');
   psql(container, 'fl01_fresh', currentSchema);
   psql(container, 'fl01_upgrade', previousSchema);
   psql(container, 'fl01_upgrade', migration);
   psql(container, 'fl01_upgrade', campaignMigration);
   psql(container, 'fl01_upgrade', safetyMigration);
+  psql(container, 'fl01_upgrade', bestFirstMigration);
   for (const database of ['fl01_fresh', 'fl01_upgrade']) {
     const catalog = psql(container, database, `
       select jsonb_build_object(
@@ -926,10 +928,13 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     }
     const inbox = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('inbox');"));
-    assert.deepEqual(inbox.areas.map((area) => area.id), ['action-preview', 'new-important']);
+    assert.deepEqual(inbox.areas.map((area) => area.id),
+      ['action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss']);
+    const freshArea = () => JSON.parse(psql(container, database,
+      "select public.list_deal_hunter_fresh_inbox_v1('new-important');")).areas[0];
     assert.equal(inbox.areas[0].counts.ownerPriority, 16);
     assert.equal(inbox.areas[0].rows.length, 3);
-    assert.ok(inbox.areas[1].rows.some((row) => row.opportunity_id === freshId));
+    assert.ok(freshArea().rows.some((row) => row.opportunity_id === freshId));
     const sorted = (sort, offset = 0, limit = 25) => JSON.parse(psql(container, database,
       `select public.list_deal_hunter_fresh_inbox_v1('all-active', ${offset}, ${limit},
         '', '', '', '', now(), '${sort}');`)).areas[0];
@@ -952,7 +957,7 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.equal(secondFitPage.anchorId, firstFitPage.lastId);
     assert.equal(new Set([...firstFitPage.rows, ...secondFitPage.rows]
       .map((row) => row.opportunity_id)).size, 10);
-    assert.equal(inbox.areas[1].rows.find((row) => row.opportunity_id === freshId).primary_submission_id, null);
+    assert.equal(freshArea().rows.find((row) => row.opportunity_id === freshId).primary_submission_id, null);
     const allPriorities = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('owner-priorities', 0, 10);"));
     assert.equal(allPriorities.areas[0].total, 16);
@@ -1015,7 +1020,11 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.equal(withDue.areas[0].counts.due, 5);
     assert.equal(withDue.areas[0].rows.length, 3);
     assert.equal(new Set(withDue.areas[0].rows.map((row) => row.opportunity_id)).size, 3);
-    assert.deepEqual(withDue.areas[1].rows.map((row) => row.opportunity_id), newIds);
+    assert.deepEqual(withDue.areas.map((area) => area.id),
+      ['action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss']);
+    assert.deepEqual(JSON.parse(psql(container, database,
+      "select public.list_deal_hunter_fresh_inbox_v1('new-important');")).areas[0].rows
+      .map((row) => row.opportunity_id), newIds);
     const allDue = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('due-actions');"));
     assert.equal(allDue.areas[0].total, 5);
@@ -1317,7 +1326,9 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       const response = JSON.parse(psql(container, database,
         "select public.list_deal_hunter_fresh_inbox_v1('inbox');"));
       durations.push(performance.now() - started);
-      assert.ok(response.areas[1].rows.length >= 3 && response.areas[1].rows.length <= 10);
+      assert.equal(response.areas.length, 5);
+      const review = response.areas.find((area) => area.id === 'your-review');
+      assert.ok(review.rows.length >= 3 && review.rows.length <= 10);
     }
     const sorted = durations.sort((left, right) => left - right);
     const baselineSorted = baselineDurations.sort((left, right) => left - right);

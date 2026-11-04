@@ -800,6 +800,52 @@ test('operator decisions survive rescoring, forced refresh, and retries', async 
   assert.equal(stored.changed_since_review, true, 'the operator should see that the machine judgment moved');
 });
 
+function setStoredCriteriaProfileVersion(storage, opportunityId, version) {
+  const database = new Database(storage.testDatabasePath);
+  try {
+    database.prepare(`
+      UPDATE deal_hunter_opportunity_scores
+      SET criteria_profile_version = ?
+      WHERE opportunity_id = ?
+    `).run(version, opportunityId);
+  } finally {
+    database.close();
+  }
+}
+
+test('refresh stores the criteria group and result', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'opp-refresh-1');
+  const deal = scoredDeal({ name: 'Commercial HVAC Service Co', industry: 'HVAC maintenance and repair' });
+  const refreshed = await refreshOpportunityScores({ deals: [deal], storage });
+  assert.equal(refreshed.ok, true);
+
+  const row = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  assert.ok(row.fit_score >= 90, `expected a high fit score, got ${row.fit_score}`);
+  assert.equal(row.criteria_profile_version, 'uckele-criteria-v1');
+  assert.equal(row.criteria_group, 'auto');
+  const result = JSON.parse(row.criteria_result);
+  assert.deepEqual(result.failed, []);
+  assert.deepEqual(result.unknown, []);
+  assert.deepEqual(result.mustHaves.map((entry) => entry.id), ['profit', 'multiple', 'geography', 'industry', 'gates']);
+});
+
+test('a stale criteria profile version forces a rewrite', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'opp-refresh-1');
+  await refreshOpportunityScores({ deals: [scoredDeal()], storage });
+  setStoredCriteriaProfileVersion(storage, 'opp-refresh-1', 'uckele-criteria-v0');
+
+  const result = await refreshOpportunityScores({ deals: [scoredDeal()], storage });
+  assert.equal(result.ok, true);
+  assert.equal(result.counts.skipped, 0);
+  assert.equal(result.counts.scored, 1);
+  assert.equal(
+    (await storage.getDealHunterOpportunityScore('opp-refresh-1')).criteria_profile_version,
+    'uckele-criteria-v1',
+  );
+});
+
 test('a forced refresh over unchanged inputs rewrites without claiming a change', async (t) => {
   const storage = withStorage(t);
   await seedOpportunity(storage, 'opp-refresh-1');

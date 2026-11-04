@@ -1769,6 +1769,8 @@ test('detail closes every nested projection and strips injected storage metadata
     operatorNote: text(2000), reviewed: boolean, reviewedAt: text(80), reviewedBy: text(160),
     changedSinceReview: boolean, disposition: { type: 'object' }, dismissed: boolean, dismissedReason: text(160), scoredAt: text(80),
     scoreFingerprint: text(200), rulesVersion: text(160), freshness: { type: 'object' },
+    criteriaGroup: text(80), criteriaResult: { type: 'object', nullable: true }, criteriaCurrent: boolean,
+    autoPursueBlocker: text(80),
   };
   const operatorFactContract = { id: text(200), field: text(80), value: text(4000), verified: boolean, actor: text(160), note: text(500), createdAt: text(80), updatedAt: text(80) };
   const evidenceContract = {

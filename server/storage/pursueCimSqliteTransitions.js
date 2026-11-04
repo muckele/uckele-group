@@ -3497,6 +3497,47 @@ export function createPursueCimSqliteTransitions(database, {
       }).immediate();
     },
     async recordOwnerDecision(command) {
+      return transitions.recordOwnerDecisionSync(command);
+    },
+    /**
+     * Automatic Pursue (auto-pursue-v1) through the owner-decision writer, inside one
+     * transaction that first refuses when any owner decision already exists for the
+     * opportunity, when the command instant is outside the guarded owner business day,
+     * or when that day's automatic Pursue cap is already reached. A replay of the same
+     * idempotency key is delegated unchanged.
+     */
+    async recordAutoPursueDecision(command, guard = {}) {
+      const opportunityId = requiredText(command?.opportunityId, 'opportunityId', 200);
+      const idempotencyKey = requiredText(command?.idempotencyKey, 'idempotencyKey');
+      const now = canonicalInstant(command?.now);
+      if (command.action !== 'pursue' || command.policyVersion !== 'auto-pursue-v1'
+        || command.actor !== 'automation-auto-pursue') {
+        throw new Error('Invalid automatic Pursue decision command');
+      }
+      const since = canonicalInstant(guard?.since);
+      const until = canonicalInstant(guard?.until);
+      const dailyCap = guard?.dailyCap;
+      if (!Number.isSafeInteger(dailyCap) || dailyCap < 1 || dailyCap > 10 || since >= until) {
+        throw new Error('Invalid automatic Pursue guard');
+      }
+      const refusal = (reason) => ({ applied: false, replay: false, conflict: true, reason,
+        decision: null, enrollment: null });
+      return database.transaction(() => {
+        if (database.prepare('SELECT 1 FROM deal_hunter_owner_decision_events WHERE idempotency_key = ?')
+          .get(idempotencyKey)) return transitions.recordOwnerDecisionSync(command);
+        if (database.prepare('SELECT 1 FROM deal_hunter_owner_decision_events WHERE opportunity_id = ? LIMIT 1')
+          .get(opportunityId)) return refusal('auto_pursue_owner_decision_exists');
+        if (Date.parse(now) < Date.parse(since) || Date.parse(now) >= Date.parse(until)) {
+          return refusal('auto_pursue_business_date_changed');
+        }
+        const recorded = database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_owner_decision_events
+          WHERE policy_version = 'auto-pursue-v1'
+            AND julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?)`).get(since, until).count;
+        if (recorded >= dailyCap) return refusal('auto_pursue_daily_cap_reached');
+        return transitions.recordOwnerDecisionSync(command);
+      }).immediate();
+    },
+    recordOwnerDecisionSync(command) {
       const opportunityId = requiredText(command.opportunityId, 'opportunityId', 200);
       const action = requiredText(command.action, 'action', 20);
       if (!['pursue', 'watch', 'pass'].includes(action)) throw new Error('Invalid owner action');
@@ -3694,5 +3735,6 @@ export function createPursueCimSqliteTransitions(database, {
     },
   };
   Object.defineProperty(transitions, 'prepareCimTransmissionSync', { enumerable: false });
+  Object.defineProperty(transitions, 'recordOwnerDecisionSync', { enumerable: false });
   return transitions;
 }

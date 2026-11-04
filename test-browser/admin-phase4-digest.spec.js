@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
+import { appOrigin } from './app-origin.js';
 import { getOperationsCenter, sanitizeViewerOperations } from '../server/services/operations.js';
 
-const appOrigin = 'http://127.0.0.1:4173';
 const ownerCommandUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const privateSentinels = [
   'PRIVATE_RECIPIENT_phase4@example.test',
@@ -625,7 +625,7 @@ for (const [width, columns] of [[2560, 3], [1920, 3], [1440, 2], [1280, 2], [102
       columns: getComputedStyle(element).gridTemplateColumns.split(' ').length,
       cards: [...element.children].map((card) => {
         const bounds = card.getBoundingClientRect();
-        const button = card.querySelector('button[aria-label^="Pursue shortlist lead"]');
+        const button = card.querySelector('button[aria-label^="Request SIM shortlist lead"]');
         return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height,
           actionY: button.getBoundingClientRect().y,
           titlePx: parseFloat(getComputedStyle(card.querySelector('button[aria-label^="Open shortlist lead"]')).fontSize),
@@ -726,7 +726,7 @@ test('required source failure suppresses current authority, rejects direct mutat
   await expect(briefing.getByText('Needs Review', { exact: true })).toHaveCount(0);
   await expect(briefing.getByRole('list', { name: 'Morning briefing opportunities' })).toHaveCount(0);
   await expect(page.getByText(/Last known queue/)).toBeVisible();
-  for (const action of ['Pursue', 'Watch', 'Pass']) await expect(page.getByRole('button', { name: `${action} Alpha Fire Systems` })).toBeDisabled();
+  for (const action of ['Request SIM', 'Watch', 'Pass']) await expect(page.getByRole('button', { name: `${action} Alpha Fire Systems` })).toBeDisabled();
 
   const directCommand = { action: 'watch', idempotencyKey: globalThis.crypto.randomUUID(),
     expectedDiscoveryRevision: state.rows[0].freshness.discoveryRevision,
@@ -760,7 +760,7 @@ test('viewer can read briefing and sanitized Operations but has no mutation or d
 
   await expectBriefingCounts(page);
   await expect(page.getByText('Read-only access: decisions and verified-fact edits are unavailable.')).toBeVisible();
-  for (const action of ['Pursue', 'Watch', 'Pass']) await expect(page.getByRole('button', { name: new RegExp(`^${action} `) })).toHaveCount(0);
+  for (const action of ['Request SIM', 'Watch', 'Pass']) await expect(page.getByRole('button', { name: new RegExp(`^${action} `) })).toHaveCount(0);
   await expect(page.getByRole('button', { name: /Run Daily Digest|Send Daily Digest|Retry Daily Digest|Send Again/i })).toHaveCount(0);
 
   await page.goto('/admin/operations');

@@ -19,7 +19,7 @@ const passReasons = new Set([
   'industry', 'geography', 'valuation', 'profit', 'owner-dependence', 'duplicate',
   'recipient', 'financing', 'quality', 'timing', 'other',
 ]);
-const genericMailboxNames = new Set([
+export const genericMailboxNames = new Set([
   'admin', 'broker', 'contact', 'deals', 'enquiries', 'hello', 'info', 'inquiries',
   'listings', 'mail', 'office', 'sales', 'support', 'team',
 ]);
@@ -28,12 +28,12 @@ const adverseDeliveryStates = new Set(['bounced', 'complained', 'failed', 'suppr
 const acceptedInitialStates = new Set([
   'accepted', 'delivered', 'delayed', 'bounced', 'complained', 'failed', 'suppressed', 'replied', 'development-only',
 ]);
-const trustedIndustryTerms = [
+export const trustedIndustryTerms = [
   'hvac', 'plumbing', 'electrical', 'landscape', 'maintenance', 'repair', 'restoration',
   'field service', 'commercial service', 'environmental', 'waste', 'pet', 'veterinary',
   'healthcare service', 'professional service', 'property management',
 ];
-const trustedTargetStates = ['NY', 'CA', 'NJ', 'AZ', 'NV', 'CT'];
+export const trustedTargetStates = ['NY', 'CA', 'NJ', 'AZ', 'NV', 'CT'];
 const automationModes = new Set(['off', 'shadow', 'canary', 'active']);
 
 function normalizeText(value = '', maxLength = 1000) {
@@ -840,7 +840,7 @@ function exactSourceContact(deal, email) {
   ));
 }
 
-function containsTrustedIndustryTerm(value = '', term = '') {
+export function containsTrustedIndustryTerm(value = '', term = '') {
   const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
   return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i').test(value);
 }

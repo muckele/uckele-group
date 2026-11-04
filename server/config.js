@@ -431,6 +431,11 @@ export function getConfig() {
         sendWindowStart: process.env.DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START || '08:00',
         sendWindowEnd: process.env.DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END || '17:00',
       },
+      // Automatic Pursue ships off; its mode lives in a durable activation record.
+      // This is only the default active-mode cap per owner business date (1-10).
+      autoPursue: {
+        activeDailyCap: Math.max(1, Math.min(Math.trunc(numberFromEnv(process.env.DEAL_HUNTER_AUTO_PURSUE_ACTIVE_DAILY_CAP, 3)), 10)),
+      },
       cimOutreach: {
         paused: booleanFromEnv(process.env.DEAL_HUNTER_CIM_OUTREACH_PAUSED, false),
         recipientCap24Hours: explicitNumberFromEnv(process.env.DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP, 1),

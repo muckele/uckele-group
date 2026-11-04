@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { appOrigin } from './app-origin.js';
 
 const ownerCommandUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -922,7 +923,7 @@ async function fulfillPhase1Json(route, body, status = 200) {
   await route.fulfill({ contentType: 'application/json', status, body: JSON.stringify(body) });
 }
 
-const phase1AppOrigin = 'http://127.0.0.1:4173';
+const phase1AppOrigin = appOrigin;
 
 function phase1RequestRecord(request) {
   const url = new URL(request.url());
@@ -2040,7 +2041,7 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
   const inboxViews = page.getByRole('navigation', { name: 'Deal Hunter views' });
   await inboxViews.getByRole('link', { name: 'Operations' }).click();
 
-  await expect(page).toHaveURL('http://127.0.0.1:4173/admin/deal-hunter?view=operations');
+  await expect(page).toHaveURL(`${phase1AppOrigin}/admin/deal-hunter?view=operations`);
   const operationsViews = page.getByRole('navigation', { name: 'Deal Hunter views' });
   await expect(operationsViews.getByRole('link', { name: 'Operations' })).toHaveAttribute('aria-current', 'page');
   await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toHaveCount(0);
@@ -2082,7 +2083,7 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
   await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toBeVisible();
   await page.getByRole('navigation', { name: 'Deal Hunter views' }).getByRole('link', { name: 'Operations' }).click();
 
-  await expect(page).toHaveURL('http://127.0.0.1:4173/admin/deal-hunter?view=operations');
+  await expect(page).toHaveURL(`${phase1AppOrigin}/admin/deal-hunter?view=operations`);
   await expect(page.getByRole('heading', { level: 2, name: 'Daily source review' })).toBeVisible();
   const sheetSource = page.getByText('SMB Deal Hunter Google Sheet', { exact: true }).locator('..').locator('..');
   await expect(sheetSource).toContainText('1 rows');
@@ -2470,7 +2471,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(evergreenOriginalListing).toHaveAttribute('href', 'https://broker.example/evergreen');
   await expect(evergreenOriginalListing).toHaveAttribute('target', '_blank');
   await expect(evergreenOriginalListing).toHaveAttribute('rel', /noopener/);
-  await expect(queue.getByRole('button', { name: 'Pursue Evergreen Safety Services' }).locator('..'))
+  await expect(queue.getByRole('button', { name: 'Request SIM Evergreen Safety Services' }).locator('..'))
     .toHaveCSS('justify-content', 'flex-start');
   await page.screenshot({ path: testInfo.outputPath('phase1-opportunity-links-desktop.png'), fullPage: false });
   await evergreenTrigger.click();
@@ -2563,7 +2564,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(refreshedSources.getByText(/Observed Aug 30, 2026/).first()).toBeVisible();
   expect(state.requests.some((request) => /refresh|review|backfill|import/i.test(request.path))).toBe(false);
 
-  await dialog.getByRole('button', { name: 'Pursue Evergreen Safety Services' }).click();
+  await dialog.getByRole('button', { name: 'Request SIM Evergreen Safety Services' }).click();
   await expect.poll(() => state.actionPayloads.filter((payload) => payload.path === '/api/admin/deal-hunter/triage/opp-evergreen/action').length).toBe(1);
   await expectPhase1DetailValue(dialog, 'Operator state', 'High');
   await expectPhase1DetailValue(dialog, 'Fit', 92);
@@ -2615,7 +2616,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(dialog.getByText('Passed: Valuation').first()).toBeVisible();
   await expect(dialog.getByRole('heading', { name: 'Disposition history' })).toBeVisible();
   await expect(dialog.getByText(/Passed: Valuation · Asking price exceeds the current acquisition valuation. · phase1-admin/)).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: 'Request SIM Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Watch Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Pass Cascade Field Compliance' })).toHaveCount(0);
   await dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
@@ -2664,14 +2665,14 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const mobileSummitListing = queue.getByRole('link', { name: 'Open original listing for Summit Fire Systems' });
   await expect(mobileSummitDetails).toHaveText('Open opportunity');
   await expect(mobileSummitListing).toHaveAttribute('href', 'https://broker.example/summit');
-  const mobileSummitActions = queue.getByRole('button', { name: 'Pursue Summit Fire Systems' }).locator('..');
+  const mobileSummitActions = queue.getByRole('button', { name: 'Request SIM Summit Fire Systems' }).locator('..');
   await expect(mobileSummitActions).toHaveCSS('justify-content', 'center');
   const mobileControls = [
     page.getByRole('searchbox', { name: 'Search opportunities' }),
     page.getByRole('combobox', { name: 'Confidence', exact: true }),
     page.getByRole('combobox', { name: 'Operator priority', exact: true }),
     page.getByRole('combobox', { name: 'Sort opportunities', exact: true }),
-    page.getByRole('button', { name: 'Pursue Summit Fire Systems' }),
+    page.getByRole('button', { name: 'Request SIM Summit Fire Systems' }),
     page.getByRole('button', { name: 'Watch Summit Fire Systems' }),
     page.getByRole('button', { name: 'Pass Summit Fire Systems' }),
     mobileSummitDetails,
@@ -2690,7 +2691,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   expect(mobileDialogBox.height).toBeGreaterThanOrEqual(811);
   for (const control of [
     dialog.getByRole('button', { name: 'Close opportunity detail' }),
-    dialog.getByRole('button', { name: 'Pursue Summit Fire Systems' }),
+    dialog.getByRole('button', { name: 'Request SIM Summit Fire Systems' }),
     dialog.getByRole('button', { name: 'Watch Summit Fire Systems' }),
     dialog.getByRole('button', { name: 'Pass Summit Fire Systems' }),
     dialog.getByLabel('Verified fact field'),
@@ -2846,7 +2847,7 @@ test('Request Broker Materials desktop review sends the exact approved proposal 
   score.financials.annualProfit = null;
   const { dialog, card } = await openBrokerOpportunity(page);
 
-  await dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' }).click();
+  await dialog.getByRole('button', { name: 'Request SIM Cascade Field Compliance' }).click();
   await expect(card.getByRole('button', { name: 'Request Broker Materials' })).toBeVisible();
   await card.getByRole('button', { name: 'Request Broker Materials' }).click();
 
@@ -3025,7 +3026,7 @@ test('Request Broker Materials viewer can inspect preview and status but cannot 
   const state = await installPhase1Fixture(page, { role: 'viewer' });
   markBrokerOpportunityPursued(state);
   const { dialog, card } = await openBrokerOpportunity(page);
-  await expect(dialog.getByRole('button', { name: /Pursue|Watch|Pass/ })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: /Request SIM|Pursue|Watch|Pass/ })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Save verified fact' })).toHaveCount(0);
   await card.getByRole('button', { name: 'Preview Broker Materials' }).click();
   await expect(card.getByLabel('Greeting')).toHaveAttribute('readonly');

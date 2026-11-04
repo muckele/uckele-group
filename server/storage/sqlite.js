@@ -707,6 +707,11 @@ function normalizeDealHunterDealOsImportRow(row) {
     : null;
 }
 
+function normalizeAutoPursueRunRow(row) {
+  if (!row) return null;
+  return { ...row, commands: Number(row.commands || 0), items: parseJsonColumn(row.items, []) };
+}
+
 function normalizeDealHunterCimRequestRow(row) {
   return row
     ? {
@@ -5483,6 +5488,58 @@ export function createSqliteStorage(config, options = {}) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
+      CREATE TABLE IF NOT EXISTS deal_hunter_auto_pursue_decision_evidence (
+        decision_event_id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('pursue', 'pass')),
+        policy_version TEXT NOT NULL,
+        criteria_group TEXT,
+        criteria_profile_version TEXT,
+        recipient_unchanged INTEGER NOT NULL CHECK(recipient_unchanged IN (0, 1)),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_auto_pursue_evidence_policy
+        ON deal_hunter_auto_pursue_decision_evidence(policy_version, created_at);
+
+      -- Automatic Pursue capability: one current activation, prior ones superseded.
+      CREATE TABLE IF NOT EXISTS deal_hunter_auto_pursue_activations (
+        id TEXT PRIMARY KEY,
+        mode TEXT NOT NULL CHECK(mode IN ('off', 'shadow', 'canary', 'active')),
+        daily_cap INTEGER NOT NULL CHECK(daily_cap BETWEEN 0 AND 10),
+        actor TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        confirmation TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('current', 'superseded')),
+        created_at TEXT NOT NULL,
+        superseded_at TEXT,
+        CHECK((mode IN ('off', 'shadow') AND daily_cap = 0) OR (mode = 'canary' AND daily_cap = 1)
+          OR (mode = 'active' AND daily_cap BETWEEN 1 AND 10)),
+        CHECK(confirmation = CASE mode
+          WHEN 'off' THEN 'SET AUTO PURSUE OFF'
+          WHEN 'shadow' THEN 'ACTIVATE AUTO PURSUE SHADOW'
+          WHEN 'canary' THEN 'ACTIVATE AUTO PURSUE CANARY'
+          WHEN 'active' THEN 'ACTIVATE AUTO PURSUE ACTIVE' END)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_auto_pursue_activations_current
+        ON deal_hunter_auto_pursue_activations(status) WHERE status = 'current';
+
+      -- One row per claimed runner invocation; run_key makes a claim exclusive.
+      CREATE TABLE IF NOT EXISTS deal_hunter_auto_pursue_runs (
+        id TEXT PRIMARY KEY,
+        run_key TEXT NOT NULL UNIQUE,
+        business_date TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK(mode IN ('off', 'shadow', 'canary', 'active')),
+        status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+        triggered_by TEXT NOT NULL DEFAULT '',
+        commands INTEGER NOT NULL DEFAULT 0 CHECK(commands BETWEEN 0 AND 10),
+        items TEXT NOT NULL DEFAULT '[]',
+        reason TEXT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_auto_pursue_runs_business_date
+        ON deal_hunter_auto_pursue_runs(business_date, created_at);
+
     CREATE TABLE IF NOT EXISTS scheduled_job_runs (
       job_key TEXT PRIMARY KEY,
       job_name TEXT NOT NULL,
@@ -5775,6 +5832,14 @@ export function createSqliteStorage(config, options = {}) {
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'opportunity_id', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'semantic_digest', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_semantic_digest', 'TEXT');
+  // Machine-owned owner-criteria result, written only by the machine score write.
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_profile_version', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_group', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'criteria_result', 'TEXT');
+  // Runner-owned automatic-Pursue state, written only by the Pursue runner. It is
+  // deliberately absent from the machine score write and every operator-owned writer.
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_blocker', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'auto_pursue_checked_at', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunities', 'first_accepted_at', 'TEXT');
@@ -10520,6 +10585,9 @@ export function createSqliteStorage(config, options = {}) {
           missing_evidence: JSON.stringify(score.missing_evidence || []),
           confidence_reasons: JSON.stringify(score.confidence_reasons || []),
           summary: JSON.stringify(score.summary || {}),
+          criteria_profile_version: score.criteria_profile_version ? String(score.criteria_profile_version) : null,
+          criteria_group: score.criteria_group ? String(score.criteria_group) : null,
+          criteria_result: score.criteria_result ? JSON.stringify(score.criteria_result) : null,
           current_triage_eligible: 0,
         };
         // The score and the evidence describing it are replaced together, so no
@@ -10537,13 +10605,15 @@ export function createSqliteStorage(config, options = {}) {
               completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
               gate_count, score_fingerprint, semantic_digest, engine_version, rules_version, profile_version,
               completeness_policy_version, dimensions, gates, applied_caps, missing_evidence,
-              confidence_reasons, summary, current_triage_eligible
+              confidence_reasons, summary, criteria_profile_version, criteria_group, criteria_result,
+              current_triage_eligible
             ) VALUES (
               @opportunity_id, @created_at, @scored_at, @deal_key, @name, @state, @listing_url, @fit_score, @score_status, @confidence,
               @completeness_score, @contradiction_count, @missing_evidence_count, @should_remove, @high_fit,
               @gate_count, @score_fingerprint, @semantic_digest, @engine_version, @rules_version, @profile_version,
               @completeness_policy_version, @dimensions, @gates, @applied_caps, @missing_evidence,
-              @confidence_reasons, @summary, @current_triage_eligible
+              @confidence_reasons, @summary, @criteria_profile_version, @criteria_group, @criteria_result,
+              @current_triage_eligible
             )
             ON CONFLICT(opportunity_id) DO UPDATE SET
               scored_at = excluded.scored_at,
@@ -10571,7 +10641,10 @@ export function createSqliteStorage(config, options = {}) {
               applied_caps = excluded.applied_caps,
               missing_evidence = excluded.missing_evidence,
               confidence_reasons = excluded.confidence_reasons,
-              summary = excluded.summary
+              summary = excluded.summary,
+              criteria_profile_version = excluded.criteria_profile_version,
+              criteria_group = excluded.criteria_group,
+              criteria_result = excluded.criteria_result
           `).run(serialized);
           database.prepare('DELETE FROM deal_hunter_score_evidence WHERE opportunity_id = ?').run(opportunityId);
           const insertEvidence = database.prepare(`
@@ -10879,6 +10952,146 @@ export function createSqliteStorage(config, options = {}) {
         );
       },
 
+      /** Warm-up evidence, one row per owner decision; idempotent on decision_event_id. */
+      async insertAutoPursueDecisionEvidence(row = {}) {
+        database.prepare(`
+          INSERT OR IGNORE INTO deal_hunter_auto_pursue_decision_evidence (
+            decision_event_id, opportunity_id, action, policy_version,
+            criteria_group, criteria_profile_version, recipient_unchanged, created_at
+          ) VALUES (
+            @decision_event_id, @opportunity_id, @action, @policy_version,
+            @criteria_group, @criteria_profile_version, @recipient_unchanged, @created_at
+          )
+        `).run({
+          decision_event_id: String(row.decision_event_id || ''),
+          opportunity_id: String(row.opportunity_id || ''),
+          action: String(row.action || ''),
+          policy_version: String(row.policy_version || ''),
+          criteria_group: row.criteria_group ?? null,
+          criteria_profile_version: row.criteria_profile_version ?? null,
+          recipient_unchanged: row.recipient_unchanged ? 1 : 0,
+          created_at: String(row.created_at || new Date().toISOString()),
+        });
+      },
+
+      async listAutoPursueDecisionEvidence({ policyVersion } = {}) {
+        return database.prepare(`
+          SELECT * FROM deal_hunter_auto_pursue_decision_evidence
+          WHERE policy_version = ? ORDER BY created_at ASC, decision_event_id ASC
+        `).all(String(policyVersion || ''));
+      },
+
+      /** Authoritative count of recorded owner decisions under one policy in [since, until). */
+      async countOwnerDecisionsByPolicy({ policyVersion, since, until } = {}) {
+        const policy = String(policyVersion || '');
+        if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+          throw new Error('countOwnerDecisionsByPolicy requires a policy version and an instant range.');
+        }
+        return Number(database.prepare(`
+          SELECT COUNT(*) AS count FROM deal_hunter_owner_decision_events
+          WHERE policy_version = ?
+            AND julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?)
+        `).get(policy, new Date(since).toISOString(), new Date(until).toISOString()).count);
+      },
+
+      /** True when any Pursue campaign conversation already targets this recipient address. */
+      async hasPursueCimConversationForRecipient(recipientEmail) {
+        const address = String(recipientEmail || '').trim().toLowerCase();
+        if (!address) throw new Error('A recipient address is required.');
+        return Boolean(database.prepare(`
+          SELECT 1 AS found FROM deal_hunter_broker_conversations
+          WHERE LOWER(recipient_address) = ? LIMIT 1
+        `).get(address));
+      },
+
+      async getCurrentAutoPursueActivation() {
+        return database.prepare(`
+          SELECT * FROM deal_hunter_auto_pursue_activations WHERE status = 'current' LIMIT 1
+        `).get() ?? null;
+      },
+
+      /** Records a new current activation, superseding the prior one in the same transaction. */
+      async createAutoPursueActivation(activation = {}) {
+        const createdAt = String(activation.created_at || new Date().toISOString());
+        return database.transaction(() => {
+          database.prepare(`
+            UPDATE deal_hunter_auto_pursue_activations
+            SET status = 'superseded', superseded_at = ? WHERE status = 'current'
+          `).run(createdAt);
+          database.prepare(`
+            INSERT INTO deal_hunter_auto_pursue_activations (
+              id, mode, daily_cap, actor, reason, confirmation, status, created_at, superseded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'current', ?, NULL)
+          `).run(String(activation.id || randomUUID()), String(activation.mode || ''),
+            Number(activation.daily_cap), String(activation.actor || ''),
+            String(activation.reason || ''), String(activation.confirmation || ''), createdAt);
+          return database.prepare(`
+            SELECT * FROM deal_hunter_auto_pursue_activations WHERE status = 'current' LIMIT 1
+          `).get();
+        }).immediate();
+      },
+
+      /** Exclusive claim of a run key; a second claim of the same key returns claimed false. */
+      async claimAutoPursueRun(run = {}) {
+        const runKey = String(run.run_key || '');
+        try {
+          database.prepare(`
+            INSERT INTO deal_hunter_auto_pursue_runs (
+              id, run_key, business_date, mode, status, triggered_by, commands, items, created_at
+            ) VALUES (?, ?, ?, ?, 'running', ?, 0, '[]', ?)
+          `).run(String(run.id || randomUUID()), runKey, String(run.business_date || ''),
+            String(run.mode || ''), String(run.triggered_by || ''),
+            String(run.created_at || new Date().toISOString()));
+        } catch (error) {
+          if (!['SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_CONSTRAINT_PRIMARYKEY'].includes(error?.code)) throw error;
+          const existing = database.prepare('SELECT * FROM deal_hunter_auto_pursue_runs WHERE run_key = ?').get(runKey);
+          return { claimed: false, run: normalizeAutoPursueRunRow(existing) };
+        }
+        return { claimed: true, run: normalizeAutoPursueRunRow(database.prepare(`
+          SELECT * FROM deal_hunter_auto_pursue_runs WHERE run_key = ?
+        `).get(runKey)) };
+      },
+
+      async completeAutoPursueRun({ id, status = 'completed', commands = 0, items = [], reason = null,
+        completedAt } = {}) {
+        database.prepare(`
+          UPDATE deal_hunter_auto_pursue_runs
+          SET status = ?, commands = ?, items = ?, reason = ?, completed_at = ?
+          WHERE id = ? AND completed_at IS NULL
+        `).run(String(status), Math.max(0, Math.trunc(Number(commands)) || 0), JSON.stringify(items || []),
+          reason === null || reason === undefined ? null : String(reason),
+          String(completedAt || new Date().toISOString()), String(id || ''));
+        return normalizeAutoPursueRunRow(database.prepare('SELECT * FROM deal_hunter_auto_pursue_runs WHERE id = ?')
+          .get(String(id || '')));
+      },
+
+      /** Runs newest first; one business date when given. */
+      async listAutoPursueRuns({ businessDate, limit = 100 } = {}) {
+        const safeLimit = Math.max(1, Math.min(Math.trunc(Number(limit)) || 100, 1000));
+        const rows = businessDate
+          ? database.prepare(`SELECT * FROM deal_hunter_auto_pursue_runs WHERE business_date = ?
+              ORDER BY created_at DESC, completed_at IS NULL DESC, completed_at DESC, id DESC LIMIT ?`).all(String(businessDate), safeLimit)
+          : database.prepare(`SELECT * FROM deal_hunter_auto_pursue_runs
+              ORDER BY created_at DESC, completed_at IS NULL DESC, completed_at DESC, id DESC LIMIT ?`).all(safeLimit);
+        return rows.map(normalizeAutoPursueRunRow);
+      },
+
+      /** The only writer of the runner-owned blocker columns; returns the number of rows changed. */
+      async setDealHunterAutoPursueBlockers(entries = []) {
+        if (!Array.isArray(entries)) throw new Error('Blocker entries must be an array.');
+        const update = database.prepare(`
+          UPDATE deal_hunter_opportunity_scores
+          SET auto_pursue_blocker = ?, auto_pursue_checked_at = ?
+          WHERE opportunity_id = ? AND auto_pursue_blocker IS NOT ?
+        `);
+        return database.transaction(() => entries.reduce((changed, entry) => changed + update.run(
+          entry.blocker ? String(entry.blocker) : null,
+          String(entry.checkedAt || new Date().toISOString()),
+          String(entry.opportunityId || ''),
+          entry.blocker ? String(entry.blocker) : null,
+        ).changes, 0)).immediate();
+      },
+
       async getCurrentDealHunterOpportunityScore(opportunityId) {
         return normalizeDealHunterOpportunityScoreRow(
           database.prepare(`
@@ -10970,7 +11183,7 @@ export function createSqliteStorage(config, options = {}) {
           const batch = ids.slice(index, index + 500);
           rows.push(...database.prepare(`
             SELECT opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version,
-                   profile_version, completeness_policy_version, reviewed_at
+                   profile_version, completeness_policy_version, criteria_profile_version, reviewed_at
             FROM deal_hunter_opportunity_scores
             WHERE opportunity_id IN (${batch.map(() => '?').join(', ')})
           `).all(...batch));
@@ -11220,7 +11433,11 @@ export function createSqliteStorage(config, options = {}) {
           scores.contradiction_count, scores.operator_priority,
           scores.reviewed_at, scores.reviewed_discovery_revision,
           scores.reviewed_material_revision, scores.score_fingerprint,
-          scores.semantic_digest,
+          scores.semantic_digest, scores.criteria_profile_version, scores.criteria_group,
+          scores.criteria_result, scores.auto_pursue_blocker,
+          (SELECT decision.action FROM deal_hunter_owner_decision_events AS decision
+            WHERE decision.opportunity_id = scores.opportunity_id
+            ORDER BY decision.created_at DESC, decision.id DESC LIMIT 1) AS latest_owner_action,
           (SELECT MAX(source.updated_at)
             FROM deal_hunter_opportunity_source_observations AS source
             WHERE source.opportunity_id = scores.opportunity_id) AS source_snapshot_updated_at,

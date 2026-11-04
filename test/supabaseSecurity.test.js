@@ -119,6 +119,10 @@ const pursueCimFollowUpCapacityMigrationUrl = new URL(
   '../supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql',
   import.meta.url,
 );
+const bestFirstDealListMigrationUrl = new URL(
+  '../supabase/migrations/20261102120000_best_first_deal_list.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -481,7 +485,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const pursueCimFollowUpCapacityMigration = fs.readFileSync(
     pursueCimFollowUpCapacityMigrationUrl, 'utf8',
   );
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${pursueCimFollowUpCapacityMigration}`;
+  const bestFirstDealListMigration = fs.readFileSync(bestFirstDealListMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${pursueCimFollowUpCapacityMigration}\n${bestFirstDealListMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -513,6 +518,43 @@ test('Supabase migration and fresh schema isolate every current app table to the
     pursueCimFollowUpCapacityMigration,
     /grant select, insert, update on table public\.deal_hunter_cim_capacity_reservations to service_role;/i,
   );
+  assert.doesNotMatch(
+    bestFirstDealListMigration,
+    /create\s+policy/i,
+    'Warm-up evidence table must not add public RLS policies',
+  );
+  assert.match(
+    bestFirstDealListMigration,
+    /revoke all on table public\.deal_hunter_auto_pursue_decision_evidence\s+from public, anon, authenticated, service_role;/i,
+  );
+  assert.match(
+    bestFirstDealListMigration,
+    /grant select, insert on table public\.deal_hunter_auto_pursue_decision_evidence to service_role;/i,
+  );
+  for (const table of ['deal_hunter_auto_pursue_activations', 'deal_hunter_auto_pursue_runs']) {
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`alter table public\\.${table} enable row level security;`, 'i'));
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`revoke all on table public\\.${table}\\s+from public, anon, authenticated, service_role;`, 'i'));
+  }
+  // Activations are written only through the superseding RPC; service_role may read them.
+  assert.match(bestFirstDealListMigration,
+    /grant select on table public\.deal_hunter_auto_pursue_activations to service_role;/i);
+  assert.doesNotMatch(bestFirstDealListMigration,
+    /grant [^;]*(insert|update|delete)[^;]* on table public\.deal_hunter_auto_pursue_activations/i);
+  assert.match(bestFirstDealListMigration,
+    /grant select, insert, update on table public\.deal_hunter_auto_pursue_runs to service_role;/i);
+  for (const fn of ['create_deal_hunter_auto_pursue_activation_v1', 'set_deal_hunter_auto_pursue_blockers_v1']) {
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`revoke all on function public\\.${fn}\\(jsonb\\)\\s+from public, anon, authenticated;`, 'i'));
+    assert.match(bestFirstDealListMigration,
+      new RegExp(`grant execute on function public\\.${fn}\\(jsonb\\) to service_role;`, 'i'));
+  }
+  assert.match(bestFirstDealListMigration, /function public\.pursue_cim_record_auto_pursue_decision_v1[\s\S]*?security definer\s+set search_path = ''[\s\S]*?pg_advisory_xact_lock\(17499,48146\)/i);
+  assert.match(bestFirstDealListMigration,
+    /revoke all on function public\.pursue_cim_record_auto_pursue_decision_v1\(jsonb, jsonb\)\s+from public, anon, authenticated;/i);
+  assert.match(bestFirstDealListMigration,
+    /grant execute on function public\.pursue_cim_record_auto_pursue_decision_v1\(jsonb, jsonb\) to service_role;/i);
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactWriteBoundaryMigration, /create\s+policy/i, 'opportunity fact write boundary must not add public RLS policies');

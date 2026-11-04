@@ -1537,6 +1537,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
     },
 
+    /** Automatic Pursue through the owner-decision writer under the same lock (see the RPC). */
+    async recordAutoPursueDecision(command, guard = {}) {
+      const { data, error } = await client.rpc('pursue_cim_record_auto_pursue_decision_v1', {
+        p_command: command,
+        p_guard: { since: guard.since, until: guard.until, dailyCap: guard.dailyCap },
+      });
+      if (error) {
+        if (/FL01_STALE_REVIEW/.test(error.message || '')) {
+          const stale = new Error('Freshness changed since this opportunity was shown. Reload before acting.');
+          stale.code = 'DEAL_HUNTER_FRESHNESS_STALE'; stale.status = 409; throw stale;
+        }
+        throw error;
+      }
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['decision', 'enrollment'],
+        { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
+    },
+
     async materializePursuitCampaign(command) {
       const { data, error } = await client.rpc('pursue_cim_materialize_campaign_v2', {
         p_command: command,
@@ -3824,6 +3842,160 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityScoreRow(data);
     },
 
+    /** Warm-up evidence, one row per owner decision; idempotent on decision_event_id. */
+    async insertAutoPursueDecisionEvidence(row = {}) {
+      const { error } = await client
+        .from('deal_hunter_auto_pursue_decision_evidence')
+        .upsert({
+          decision_event_id: String(row.decision_event_id || ''),
+          opportunity_id: String(row.opportunity_id || ''),
+          action: String(row.action || ''),
+          policy_version: String(row.policy_version || ''),
+          criteria_group: row.criteria_group ?? null,
+          criteria_profile_version: row.criteria_profile_version ?? null,
+          recipient_unchanged: Boolean(row.recipient_unchanged),
+          created_at: String(row.created_at || new Date().toISOString()),
+        }, { onConflict: 'decision_event_id', ignoreDuplicates: true });
+      if (error) throw error;
+    },
+
+    async listAutoPursueDecisionEvidence({ policyVersion } = {}) {
+      const rows = [];
+      for (let from = 0; ; from += 1000) {
+        const { data, error } = await client
+          .from('deal_hunter_auto_pursue_decision_evidence')
+          .select('*')
+          .eq('policy_version', String(policyVersion || ''))
+          .order('created_at', { ascending: true })
+          .order('decision_event_id', { ascending: true })
+          .range(from, from + 999);
+        if (error) throw error;
+        rows.push(...(data || []));
+        if (!data || data.length < 1000) break;
+      }
+      // Match the SQLite storage shape so callers compare recipient_unchanged the same way.
+      return rows.map((row) => ({ ...row, recipient_unchanged: row.recipient_unchanged ? 1 : 0 }));
+    },
+
+    /** Authoritative count of recorded owner decisions under one policy in [since, until). */
+    async countOwnerDecisionsByPolicy({ policyVersion, since, until } = {}) {
+      const policy = String(policyVersion || '');
+      if (!policy || !Number.isFinite(Date.parse(since)) || !Number.isFinite(Date.parse(until))) {
+        throw new Error('countOwnerDecisionsByPolicy requires a policy version and an instant range.');
+      }
+      const { count, error } = await client
+        .from('deal_hunter_owner_decision_events')
+        .select('id', { count: 'exact', head: true })
+        .eq('policy_version', policy)
+        .gte('created_at', new Date(since).toISOString())
+        .lt('created_at', new Date(until).toISOString());
+      if (error) throw error;
+      if (!Number.isSafeInteger(count) || count < 0) throw new Error('Owner decision count is unavailable.');
+      return count;
+    },
+
+    /**
+     * True when any Pursue campaign conversation already targets this recipient address,
+     * compared case-insensitively like SQLite's LOWER(recipient_address) = ?. LIKE
+     * metacharacters are escaped so the ILIKE is an exact match; PostgREST also reads
+     * '*' as a wildcard, which can only over-match and so fails toward prior_outreach.
+     */
+    async hasPursueCimConversationForRecipient(recipientEmail) {
+      const address = String(recipientEmail || '').trim().toLowerCase();
+      if (!address) throw new Error('A recipient address is required.');
+      const pattern = address.replace(/[\\%_]/g, (character) => `\\${character}`);
+      const { data, error } = await client.from('deal_hunter_broker_conversations')
+        .select('id').ilike('recipient_address', pattern).limit(1);
+      if (error) throw error;
+      return Array.isArray(data) && data.length > 0;
+    },
+
+    async getCurrentAutoPursueActivation() {
+      const { data, error } = await client.from('deal_hunter_auto_pursue_activations')
+        .select('*').eq('status', 'current').maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
+    /** Records a new current activation; the RPC supersedes the prior one in one transaction. */
+    async createAutoPursueActivation(activation = {}) {
+      const { data, error } = await client.rpc('create_deal_hunter_auto_pursue_activation_v1', {
+        p_activation: {
+          id: String(activation.id || randomUUID()),
+          mode: String(activation.mode || ''),
+          daily_cap: Number(activation.daily_cap),
+          actor: String(activation.actor || ''),
+          reason: String(activation.reason || ''),
+          confirmation: String(activation.confirmation || ''),
+          created_at: String(activation.created_at || new Date().toISOString()),
+        },
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || data.status !== 'current') {
+        throw new Error('Malformed automatic Pursue activation result');
+      }
+      return data;
+    },
+
+    /** Exclusive claim of a run key; a second claim of the same key returns claimed false. */
+    async claimAutoPursueRun(run = {}) {
+      const runKey = String(run.run_key || '');
+      const { data, error } = await client.from('deal_hunter_auto_pursue_runs').insert({
+        id: String(run.id || randomUUID()), run_key: runKey,
+        business_date: String(run.business_date || ''), mode: String(run.mode || ''),
+        status: 'running', triggered_by: String(run.triggered_by || ''), commands: 0, items: [],
+        created_at: String(run.created_at || new Date().toISOString()),
+      }).select('*').single();
+      if (!error) return { claimed: true, run: data };
+      if (!isUniqueViolation(error)) throw error;
+      const existing = await client.from('deal_hunter_auto_pursue_runs').select('*')
+        .eq('run_key', runKey).maybeSingle();
+      if (existing.error) throw existing.error;
+      return { claimed: false, run: existing.data ?? null };
+    },
+
+    async completeAutoPursueRun({ id, status = 'completed', commands = 0, items = [], reason = null,
+      completedAt } = {}) {
+      const { data, error } = await client.from('deal_hunter_auto_pursue_runs').update({
+        status: String(status), commands: Math.max(0, Math.trunc(Number(commands)) || 0),
+        items: Array.isArray(items) ? items : [],
+        reason: reason === null || reason === undefined ? null : String(reason),
+        completed_at: String(completedAt || new Date().toISOString()),
+      }).eq('id', String(id || '')).is('completed_at', null).select('*').maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
+    /** Runs newest first; one business date when given. */
+    async listAutoPursueRuns({ businessDate, limit = 100 } = {}) {
+      let query = client.from('deal_hunter_auto_pursue_runs').select('*');
+      if (businessDate) query = query.eq('business_date', String(businessDate));
+      const { data, error } = await query
+        .order('created_at', { ascending: false })
+        .order('completed_at', { ascending: false, nullsFirst: true })
+        .order('id', { ascending: false })
+        .limit(Math.max(1, Math.min(Math.trunc(Number(limit)) || 100, 1000)));
+      if (error) throw error;
+      return (data || []).map((row) => ({ ...row, commands: Number(row.commands || 0),
+        items: Array.isArray(row.items) ? row.items : [] }));
+    },
+
+    /** The only writer of the runner-owned blocker columns; returns the number of rows changed. */
+    async setDealHunterAutoPursueBlockers(entries = []) {
+      if (!Array.isArray(entries)) throw new Error('Blocker entries must be an array.');
+      const { data, error } = await client.rpc('set_deal_hunter_auto_pursue_blockers_v1', {
+        p_entries: entries.map((entry) => ({
+          opportunity_id: String(entry.opportunityId || ''),
+          blocker: entry.blocker ? String(entry.blocker) : null,
+          checked_at: String(entry.checkedAt || new Date().toISOString()),
+        })),
+      });
+      if (error) throw error;
+      const changed = typeof data === 'string' ? Number(data) : data;
+      if (!Number.isSafeInteger(changed) || changed < 0) throw new Error('Malformed blocker write result');
+      return changed;
+    },
+
     async getCurrentDealHunterOpportunityScore(opportunityId) {
       const { data, error } = await client
         .from('deal_hunter_opportunity_scores')
@@ -3880,7 +4052,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           .from('deal_hunter_opportunity_scores')
           .select(
             'opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, '
-            + 'profile_version, completeness_policy_version, reviewed_at',
+            + 'profile_version, completeness_policy_version, criteria_profile_version, reviewed_at',
           )
           .in('opportunity_id', batch);
         if (error) throw error;

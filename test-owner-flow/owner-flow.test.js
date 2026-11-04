@@ -69,18 +69,21 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     await measure('password-login-to-inbox', async () => {
       await page.getByRole('button', { name: 'Sign In With Password' }).click();
       await expect(page.getByRole('heading', { name: 'Acquisition Inbox', exact: true })).toBeVisible();
-      await expect(page.getByRole('region', { name: 'New & Important', exact: true })
+      // Fixture scores carry no criteria version, so 75+ rows sit in Your review as out of date.
+      await expect(page.getByRole('region', { name: 'Your review', exact: true })
         .getByRole('button', { name: 'Open Synthetic Fresh High Fit', exact: true })).toBeVisible();
     });
     assert.match(await page.title(), /Uckele/);
     assert.equal(new URL(page.url()).pathname, '/admin/deal-hunter');
+    await expect(page.getByRole('region', { name: 'Needs Your Action', exact: true })).toContainText('Synthetic Broker Reply');
+    await expect(page.getByRole('region', { name: 'Needs Your Action', exact: true })).toContainText('Synthetic Broker Materials');
+    await page.screenshot({ path: path.join(fixture.root, 'desktop-inbox.png') });
+    await page.getByRole('navigation', { name: 'Fresh Inbox areas' })
+      .getByRole('button', { name: 'New & Important', exact: true }).click();
     const fresh = page.getByRole('region', { name: 'New & Important', exact: true });
     await expect(fresh.getByText('Recently listed', { exact: false })).toBeVisible();
     await expect(fresh.getByRole('button', { name: 'Open Synthetic Older High Fit', exact: true })).toHaveCount(0);
     await expect(fresh.getByRole('button', { name: 'Open Synthetic New Low Fit', exact: true })).toHaveCount(0);
-    await expect(page.getByRole('region', { name: 'Needs Your Action', exact: true })).toContainText('Synthetic Broker Reply');
-    await expect(page.getByRole('region', { name: 'Needs Your Action', exact: true })).toContainText('Synthetic Broker Materials');
-    await page.screenshot({ path: path.join(fixture.root, 'desktop-inbox.png') });
 
     const open = page.getByRole('button', { name: 'Open Synthetic Fresh High Fit', exact: true });
     await open.focus(); await page.keyboard.press('Enter');
@@ -161,7 +164,7 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
     await page.screenshot({ path: path.join(fixture.root, 'mobile-financial-cards.png') });
     await page.setViewportSize({ width: 1440, height: 1000 });
-    await dialog.getByRole('button', { name: 'Pursue Synthetic Fresh High Fit', exact: true }).click();
+    await dialog.getByRole('button', { name: 'Request SIM Synthetic Fresh High Fit', exact: true }).click();
     await expect(dialog.getByRole('region', { name: 'Pursue next action' })).toContainText('Create or link the CRM record');
     await dialog.getByRole('button', { name: 'Pass Synthetic Fresh High Fit', exact: true }).click();
     await dialog.getByLabel('Pass reason', { exact: true }).fill('Synthetic owner Pass');
@@ -181,7 +184,7 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     const restoreResponse = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().endsWith('/triage/fresh/restore'));
     await dialog.getByRole('button', { name: 'Confirm Restore opportunity', exact: true }).click();
     assert.equal((await restoreResponse).status(), 200);
-    await expect(dialog.getByRole('button', { name: 'Pursue Synthetic Fresh High Fit', exact: true })).toBeEnabled();
+    await expect(dialog.getByRole('button', { name: 'Request SIM Synthetic Fresh High Fit', exact: true })).toBeEnabled();
     const restoredUnlinked = await detail('fresh');
     assert.equal(restoredUnlinked.opportunity.dismissed, false);
     assert.equal(restoredUnlinked.opportunity.factEditRevision.primarySubmissionId, null);
@@ -266,7 +269,7 @@ test('FL05 backend walkthrough: owner persistence, CRM restore boundary, mobile 
     await page.getByRole('button', { name: 'All active', exact: true }).click();
     await page.getByRole('button', { name: 'Open Synthetic Unknown Age', exact: true }).click();
     await expect(dialog.getByRole('button', { name: 'Save verified fact' })).toHaveCount(0);
-    await expect(dialog.getByRole('button', { name: 'Pursue Synthetic Unknown Age', exact: true })).toHaveCount(0);
+    await expect(dialog.getByRole('button', { name: 'Request SIM Synthetic Unknown Age', exact: true })).toHaveCount(0);
     const forbidden = await context.request.post(`${fixture.origin}/api/admin/deal-hunter/triage/unknown/action`, {
       data: { action: 'pursue', idempotencyKey: 'fc58ba29-b4d1-408f-bf64-fb99c9f18b75',
         expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },

@@ -12,6 +12,7 @@
 import { randomUUID } from 'node:crypto';
 import { sha256 } from '../utils/security.js';
 import { freshInboxAreaIds } from './dealHunterFreshInboxPolicy.js';
+import { DEAL_CRITERIA_PROFILE_VERSION } from './dealCriteriaProfile.js';
 import { recordCrmActivity } from './activity.js';
 import { getStorage } from '../storage/index.js';
 import {
@@ -34,7 +35,11 @@ import {
 import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.js';
 import { normalizeCanonicalCimRequestId } from './cimRequestIdPolicy.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
-import { projectDealHunterBrokerMaterials } from './dealHunterBrokerMaterials.js';
+import {
+  loadBrokerMaterialsAuthority,
+  projectDealHunterBrokerMaterials,
+  resolveBrokerMaterialsRecipientContactRef,
+} from './dealHunterBrokerMaterials.js';
 import { financialFactFields, parseFinancialFact } from '../../shared/opportunityFinancialFacts.js';
 import { orchestratePursuitEnrollment } from './pursueCimEnrollment.js';
 
@@ -243,6 +248,13 @@ export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) 
   if (typeof annualProfitEvidence === 'string') {
     try { annualProfitEvidence = JSON.parse(annualProfitEvidence); } catch { annualProfitEvidence = null; }
   }
+  // SQLite returns criteria_result as a JSON string, Supabase as a parsed object.
+  // This is the one place the two shapes are reconciled.
+  let criteriaResult = row.criteria_result ?? null;
+  if (typeof criteriaResult === 'string') {
+    try { criteriaResult = JSON.parse(criteriaResult); } catch { criteriaResult = null; }
+  }
+  if (!criteriaResult || typeof criteriaResult !== 'object' || Array.isArray(criteriaResult)) criteriaResult = null;
   return {
     opportunityId: row.opportunity_id,
     dealKey: row.deal_key || '',
@@ -291,6 +303,10 @@ export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) 
     scoredAt: row.scored_at || '',
     scoreFingerprint: row.score_fingerprint || '',
     rulesVersion: row.rules_version || '',
+    criteriaGroup: row.criteria_group || '',
+    criteriaResult,
+    criteriaCurrent: row.criteria_profile_version === DEAL_CRITERIA_PROFILE_VERSION,
+    autoPursueBlocker: row.auto_pursue_blocker || '',
     freshness: row.discovery_state !== undefined ? {
       discoveryState: row.discovery_state || 'untracked_legacy',
       firstAcceptedAt: row.first_accepted_at || '',
@@ -759,6 +775,9 @@ function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceR
       profitMultiple: currentDetailSourceNumber(sources, ['profit_multiple', 'ebitda_multiple'], row.financials?.profitMultiple),
     },
     topStrength, topConcern, workflow: { crmStatus, cimStatus }, observationFreshness, operatorPriority: detailText(row.operatorPriority, 40) || 'normal', operatorNote: detailText(row.operatorNote, 2000), reviewed: Boolean(row.reviewed), reviewedAt: detailText(row.reviewedAt, 80), reviewedBy: detailText(row.reviewedBy, 160), changedSinceReview: Boolean(row.changedSinceReview), disposition, dismissed, dismissedReason: dismissed ? disposition.reason : '', scoredAt: detailText(row.scoredAt, 80), scoreFingerprint: detailText(row.scoreFingerprint, 200), rulesVersion: detailText(row.rulesVersion, 160),
+    // The drawer gates Request SIM on these, so they must match the list row.
+    criteriaGroup: row.criteriaGroup, criteriaResult: row.criteriaResult,
+    criteriaCurrent: row.criteriaCurrent, autoPursueBlocker: row.autoPursueBlocker,
     freshness: { discoveryState: detailText(currentOpportunity?.discovery_state, 40) || 'untracked_legacy',
       firstAcceptedAt: detailText(currentOpportunity?.first_accepted_at, 80),
       latestAcceptedObservationAt,
@@ -1133,13 +1152,67 @@ function publicPassDisposition(disposition = {}) {
   };
 }
 
+const OWNER_DECISION_POLICY_VERSION = 'owner-decision-v1';
+const AUTO_PURSUE_DECISION_POLICY_VERSION = 'auto-pursue-v1';
+const AUTO_PURSUE_ACTOR = 'automation-auto-pursue';
+const ownerCommandPolicyVersions = [OWNER_DECISION_POLICY_VERSION, AUTO_PURSUE_DECISION_POLICY_VERSION];
+
+/** True only when the chosen recipient is the single, unchanged default. Never throws. */
+async function ownerCommandRecipientUnchanged({ storage, opportunityId, recipientContactRef }) {
+  if (recipientContactRef === undefined) return true;
+  try {
+    const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage });
+    const options = authority?.recipientOptions;
+    if (!Array.isArray(options) || options.length !== 1) return false;
+    const resolved = resolveBrokerMaterialsRecipientContactRef(authority, recipientContactRef);
+    return Boolean(resolved?.provenanceFingerprint)
+      && resolved.provenanceFingerprint === options[0].provenanceFingerprint;
+  } catch {
+    return false;
+  }
+}
+
+/** Warm-up evidence is best effort: a failed write never fails the owner's command. */
+async function recordOwnerDecisionEvidence({
+  storage, opportunityId, action, decision, score, policyVersion, recipientContactRef,
+  enrollmentState,
+}) {
+  try {
+    if (typeof storage.insertAutoPursueDecisionEvidence !== 'function') return;
+    const decisionEventId = decision?.id;
+    if (typeof decisionEventId !== 'string' || !decisionEventId) {
+      throw new Error('decision event id unavailable');
+    }
+    await storage.insertAutoPursueDecisionEvidence({
+      decision_event_id: decisionEventId,
+      opportunity_id: opportunityId,
+      action,
+      policy_version: policyVersion,
+      criteria_group: score?.criteria_group ?? null,
+      criteria_profile_version: score?.criteria_profile_version ?? null,
+      // An enrollment that ended action-required never resolved the recipient (it was
+      // ambiguous, missing, or changed), so it cannot count as an unchanged recipient.
+      recipient_unchanged: enrollmentState === 'action-required' ? false
+        : await ownerCommandRecipientUnchanged({ storage, opportunityId, recipientContactRef }),
+      created_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn(`[auto-pursue:evidence] could not record decision evidence for ${opportunityId}: ${
+      error?.message || error}`);
+  }
+}
+
 /** Immutable acquisition intent; the score row returned below is only a compatibility projection. */
 export async function recordAcquisitionOwnerCommand({
   opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
   expectedMaterialRevision, reason, note, submissionId, recipientContactRef, actor,
+  decisionPolicyVersion = OWNER_DECISION_POLICY_VERSION, autoPursueGuard,
   storage = getStorage(),
   getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
 } = {}) {
+  if (!ownerCommandPolicyVersions.includes(decisionPolicyVersion)) {
+    return { ok: false, status: 400, error: 'Unknown decision policy version.' };
+  }
   if (typeof opportunityId !== 'string' || !opportunityId || opportunityId.length > 200
     || opportunityId.trim() !== opportunityId) {
     return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
@@ -1176,8 +1249,18 @@ export async function recordAcquisitionOwnerCommand({
       return { ok: false, status: 400, error: 'Invalid linked submission context.' };
     }
   }
+  const automatic = decisionPolicyVersion === AUTO_PURSUE_DECISION_POLICY_VERSION;
+  if (automatic && (action !== 'pursue' || actor !== AUTO_PURSUE_ACTOR
+    || !autoPursueGuard || typeof autoPursueGuard !== 'object'
+    || !Number.isFinite(Date.parse(autoPursueGuard.since)) || !Number.isFinite(Date.parse(autoPursueGuard.until))
+    || !Number.isSafeInteger(autoPursueGuard.dailyCap) || autoPursueGuard.dailyCap < 1
+    || autoPursueGuard.dailyCap > 10)) {
+    return { ok: false, status: 400,
+      error: 'Automatic Pursue requires the automation actor, a Pursue action, and a business-day cap guard.' };
+  }
   if (typeof storage.recordOwnerDecision !== 'function'
-    || typeof storage.getDealHunterOpportunityScore !== 'function') {
+    || typeof storage.getDealHunterOpportunityScore !== 'function'
+    || (automatic && typeof storage.recordAutoPursueDecision !== 'function')) {
     return { ok: false, status: 503, error: 'Owner command storage is unavailable.' };
   }
   const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
@@ -1190,20 +1273,31 @@ export async function recordAcquisitionOwnerCommand({
   }
   let result;
   try {
-    result = await storage.recordOwnerDecision({
+    const decisionCommand = {
       opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
-      expectedMaterialRevision, actor: actor.trim(), policyVersion: 'owner-decision-v1',
+      expectedMaterialRevision, actor: actor.trim(), policyVersion: decisionPolicyVersion,
       ...(recipientContactRef !== undefined
         ? { selectedContactReferenceDigest: sha256(recipientContactRef) } : {}),
       now: new Date().toISOString(),
       ...(action === 'pass' ? { reason: normalizedReason, note: note?.trim() || '',
         submissionId: submissionId || '' } : {}),
-    });
+    };
+    // The automatic writer refuses, under the owner-decision lock, any opportunity that
+    // already has an owner decision, a command outside the guarded business day, or a full cap.
+    result = automatic
+      ? await storage.recordAutoPursueDecision(decisionCommand, {
+        since: new Date(autoPursueGuard.since).toISOString(),
+        until: new Date(autoPursueGuard.until).toISOString(), dailyCap: autoPursueGuard.dailyCap })
+      : await storage.recordOwnerDecision(decisionCommand);
   } catch (error) {
     if (error?.code === 'DEAL_HUNTER_FRESHNESS_STALE') {
       return { ok: false, status: 409, code: 'stale_freshness_review', error: error.message };
     }
     throw error;
+  }
+  if (result.conflict && typeof result.reason === 'string' && result.reason.startsWith('auto_pursue_')) {
+    return { ok: false, status: 409, code: result.reason,
+      error: 'Automatic Pursue was refused by the current owner decision or daily cap authority.' };
   }
   if (result.conflict) {
     const stale = result.reason === 'stale_revision';
@@ -1222,6 +1316,11 @@ export async function recordAcquisitionOwnerCommand({
     recipientOptions = orchestration.recipientOptions;
   }
   const score = await storage.getDealHunterOpportunityScore(opportunityId);
+  if (result.applied && !result.replay && ['pursue', 'pass'].includes(action)) {
+    await recordOwnerDecisionEvidence({ storage, opportunityId, action, decision: result.decision,
+      score, policyVersion: decisionPolicyVersion, recipientContactRef,
+      enrollmentState: action === 'pursue' ? enrollment?.state : undefined });
+  }
   const disposition = action === 'pass' && score?.deal_key
     ? await storage.getDealHunterDisposition({ dealKey: score.deal_key }) : null;
   let archived = Boolean(result.passResult?.archived);

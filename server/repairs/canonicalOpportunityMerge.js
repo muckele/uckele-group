@@ -327,6 +327,24 @@ const relationshipInventoryEntries = [
     scannerPath: 'dependentState.records.pursueCimAuthorities',
     reason: inertPursueCimAuthorityBlockingReason,
   }),
+  // Warm-up evidence is written only beside an owner decision event, which is
+  // itself scanned above, so any opportunity carrying evidence already blocks.
+  ...relationshipEntries({
+    table: 'deal_hunter_auto_pursue_decision_evidence',
+    columns: ['decision_event_id', 'opportunity_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: redundantRelationshipReason,
+  }),
+  // The automatic Pursue run key names only a runner invocation (business date, mode,
+  // sequence); like the Stage 2 run key it carries no canonical opportunity identity.
+  ...relationshipEntries({
+    table: 'deal_hunter_auto_pursue_runs',
+    columns: ['run_key'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
+    scannerPath: 'excluded.autoPursueRunIdentity',
+    reason: excludedRelationshipReason,
+  }),
   ...relationshipEntries({
     table: 'deal_hunter_opportunity_timezone_revisions',
     columns: ['evidence_id', 'opportunity_id'],

@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 const {
   DAILY_DEAL_HUNTER_DIGEST_VERSION,
@@ -406,6 +409,54 @@ test('daily digest authority never calls CRM CIM follow-up Stage 2 or operator m
 
   assert.equal(projection.notificationType, 'normal-digest');
   assert.deepEqual(forbiddenCalls, []);
+});
+
+const autoPursueModulePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../server/services/autoPursue.js');
+
+function localImportGraph(entryFiles) {
+  const seen = new Set();
+  const visit = (file) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const source = fs.readFileSync(file, 'utf8');
+    for (const match of source.matchAll(/(?:\bfrom|\bimport)\s*\(?\s*['"](\.[^'"]+)['"]/g)) {
+      visit(path.resolve(path.dirname(file), match[1]));
+    }
+  };
+  entryFiles.forEach(visit);
+  return seen;
+}
+
+test('daily digest job never invokes the auto-Pursue runner', async () => {
+  const serverServices = path.dirname(autoPursueModulePath);
+  const digestFiles = ['dailyDealHunterDigest.js', 'dealHunterScheduler.js'].map((name) => path.join(serverServices, name));
+
+  // Static boundary: the digest and its scheduler must not reach the runner module
+  // through any chain of local imports, and must not name the runner at all.
+  const graph = localImportGraph(digestFiles);
+  assert.ok(graph.size > digestFiles.length, 'the import walk must follow local imports');
+  assert.equal(graph.has(autoPursueModulePath), false, 'autoPursue.js is reachable from the daily digest job');
+  for (const file of digestFiles) {
+    assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /runAutoPursue|autoPursue/i, `${path.basename(file)} references auto-Pursue`);
+  }
+
+  // Runtime boundary: building the digest touches no auto-Pursue storage seam.
+  const autoPursueCalls = [];
+  const storage = new Proxy({}, {
+    get(_target, property) {
+      if (/autopursue/i.test(String(property))) autoPursueCalls.push(String(property));
+      return async () => { throw new Error(`forbidden ${String(property)}`); };
+    },
+  });
+  const projection = await buildCurrentDailyDealHunterDigest({
+    businessDate,
+    storage,
+    refreshScores: async () => healthyScoreRefresh(),
+    readSourceHealth: async () => healthySourceHealth(),
+    readTriageQueue: async () => healthyQueue(),
+  });
+  assert.equal(projection.notificationType, 'normal-digest');
+  assert.deepEqual(autoPursueCalls, []);
 });
 
 test('daily digest alert never includes raw refresh source-health or queue diagnostics', async (t) => {

@@ -6536,7 +6536,12 @@ create table if not exists public.deal_hunter_opportunity_scores (
   reviewed_by text,
   reviewed_fingerprint text,
   reviewed_semantic_digest text,
-  operator_updated_at timestamptz
+  operator_updated_at timestamptz,
+  criteria_profile_version text,
+  criteria_group text,
+  criteria_result jsonb,
+  auto_pursue_blocker text,
+  auto_pursue_checked_at text
 );
 
 create table if not exists public.deal_hunter_score_evidence (
@@ -6604,7 +6609,8 @@ begin
     opportunity_id, created_at, scored_at, deal_key, name, state, listing_url, fit_score, score_status,
     confidence, completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
     gate_count, score_fingerprint, semantic_digest, engine_version, rules_version, profile_version,
-    completeness_policy_version, dimensions, gates, applied_caps, missing_evidence, confidence_reasons, summary
+    completeness_policy_version, dimensions, gates, applied_caps, missing_evidence, confidence_reasons, summary,
+    criteria_profile_version, criteria_group, criteria_result
   ) values (
     v_opportunity_id, v_scored_at, v_scored_at, nullif(p_score->>'deal_key', ''), nullif(p_score->>'name', ''),
     nullif(p_score->>'state', ''), nullif(p_score->>'listing_url', ''),
@@ -6617,7 +6623,9 @@ begin
     p_score->>'rules_version', p_score->>'profile_version', p_score->>'completeness_policy_version',
     coalesce(p_score->'dimensions', '[]'::jsonb), coalesce(p_score->'gates', '[]'::jsonb),
     coalesce(p_score->'applied_caps', '[]'::jsonb), coalesce(p_score->'missing_evidence', '[]'::jsonb),
-    coalesce(p_score->'confidence_reasons', '[]'::jsonb), coalesce(p_score->'summary', '{}'::jsonb)
+    coalesce(p_score->'confidence_reasons', '[]'::jsonb), coalesce(p_score->'summary', '{}'::jsonb),
+    nullif(p_score->>'criteria_profile_version', ''), nullif(p_score->>'criteria_group', ''),
+    nullif(p_score->'criteria_result', 'null'::jsonb)
   )
   on conflict (opportunity_id) do update set
     scored_at = excluded.scored_at,
@@ -6645,7 +6653,10 @@ begin
     applied_caps = excluded.applied_caps,
     missing_evidence = excluded.missing_evidence,
     confidence_reasons = excluded.confidence_reasons,
-    summary = excluded.summary
+    summary = excluded.summary,
+    criteria_profile_version = excluded.criteria_profile_version,
+    criteria_group = excluded.criteria_group,
+    criteria_result = excluded.criteria_result
   returning * into v_score;
 
   delete from public.deal_hunter_score_evidence where opportunity_id = v_opportunity_id;
@@ -9264,6 +9275,10 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         where source.opportunity_id = scores.opportunity_id) as source_snapshot_updated_at,
       scores.operator_priority, scores.reviewed_at,
       scores.reviewed_discovery_revision, scores.reviewed_material_revision,
+      scores.criteria_profile_version, scores.criteria_group, scores.auto_pursue_blocker,
+      (select decision.action from public.deal_hunter_owner_decision_events as decision
+        where decision.opportunity_id = scores.opportunity_id
+        order by decision.created_at desc, decision.id desc limit 1) as latest_owner_action,
       opportunity.first_accepted_at, opportunity.discovery_state,
       opportunity.discovery_revision, opportunity.material_revision,
       opportunity.last_material_change_at,
@@ -9362,7 +9377,16 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
     select classified.*,
       case when new_to_ug and fit_score >= 75 and confidence <> 'low'
         and discovery_revision > reviewed_discovery_revision then
-          case when recently_listed then 1 else 2 end else 6 end as discovery_group
+          case when recently_listed then 1 else 2 end else 6 end as discovery_group,
+      case when fit_score < 75 then null
+        when latest_owner_action in ('watch', 'pursue') then null
+        when criteria_profile_version is distinct from 'uckele-criteria-v1' then 'your-review'
+        when criteria_group = 'auto' then
+          case when nullif(auto_pursue_blocker, '') is not null then 'your-review'
+            else 'auto-pursue' end
+        when criteria_group = 'review' then 'your-review'
+        when criteria_group = 'needs-info' then 'needs-info'
+        when criteria_group = 'near-miss' then 'near-miss' end as criteria_area
     from classified
   ), ordered as materialized (
     select eligible.*,
@@ -9381,7 +9405,9 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
     union all select 'owner-priorities', ordered.*, null::bigint from ordered
       where p_area = 'owner-priorities' and owner_priority
     union all select 'new-important', ordered.*, null::bigint from ordered
-      where p_area in ('inbox', 'new-important') and discovery_group <= 2
+      where p_area = 'new-important' and discovery_group <= 2
+    union all select ordered.criteria_area, ordered.*, null::bigint from ordered
+      where criteria_area is not null and p_area in ('inbox', criteria_area)
     union all select 'updated', ordered.*, null::bigint from ordered
       where p_area = 'updated' and updated_since_review
     union all select 'research', ordered.*, null::bigint from ordered
@@ -9397,7 +9423,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         case when area_id = 'all-active' and p_sort = 'newest-discovery'
           then first_accepted_at end desc nulls last,
         case when area_id = 'all-active' and p_sort = 'highest-fit' then fit_score end desc,
-        case when area_id = 'new-important' then discovery_group end,
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then discovery_group end,
         case when area_id = 'new-important' and p_area <> 'inbox'
           and p_sort = 'newest-discovery' then first_accepted_at end desc nulls last,
         case when area_id = 'new-important' and p_area <> 'inbox'
@@ -9414,13 +9441,18 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
           then due_ordinal end,
         case when area_id = 'action-preview' and owner_priority
           and priority_ordinal = first_remaining_priority then priority_ordinal end,
-        case when area_id in ('action-preview', 'owner-priorities', 'new-important') then
+        case when area_id in ('action-preview', 'owner-priorities', 'new-important', 'auto-pursue',
+          'your-review', 'needs-info', 'near-miss') then
           case operator_priority when 'urgent' then 0 when 'high' then 1 else 2 end end,
-        case when area_id = 'new-important' then due_at end asc nulls last,
-        case when area_id = 'new-important' then fit_score end desc,
-        case when area_id = 'new-important' then
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then due_at end asc nulls last,
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then fit_score end desc,
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss') then
           case confidence when 'high' then 0 when 'medium' then 1 else 2 end end,
-        case when area_id in ('new-important', 'research', 'all-active')
+        case when area_id in ('new-important', 'auto-pursue', 'your-review', 'needs-info',
+          'near-miss', 'research', 'all-active')
           then first_accepted_at end desc nulls last,
         case when area_id = 'updated' then last_material_change_at end desc nulls last,
         fit_score desc, opportunity_id
@@ -9428,7 +9460,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
     from memberships
   ), selected as materialized (
     select * from numbered where (p_area = 'inbox' and area_id in
-      ('action-preview', 'new-important')) or area_id = p_area
+      ('action-preview', 'auto-pursue', 'your-review', 'needs-info', 'near-miss'))
+      or area_id = p_area
   ), totals as (
     select area_id, count(*)::integer as total,
       public.deal_hunter_fresh_inbox_hash_v1(
@@ -9442,6 +9475,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         || ':' || coalesce(publication_date::text, '')
         || ':' || source_conflict_count || ':' || coalesce(material_field, '')
         || ':' || coalesce(source_snapshot_updated_at::text, '')
+        || ':' || coalesce(criteria_profile_version, '') || ':' || coalesce(criteria_group, '')
+        || ':' || coalesce(auto_pursue_blocker, '') || ':' || coalesce(latest_owner_action, '')
         order by ordinal) as revision
     from selected where area_id <> 'action-preview' or ordinal <= 3
     group by area_id
@@ -9580,7 +9615,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         and evidence.publication_meaning = 'listing_publication'
     ) as display_publication_stats on true
     cross join parameters
-    where ((p_area = 'inbox' and area_id in ('action-preview', 'new-important'))
+    where ((p_area = 'inbox' and area_id in ('action-preview', 'auto-pursue', 'your-review',
+      'needs-info', 'near-miss'))
       or area_id = p_area)
       and ordinal > case when p_area = 'inbox' then 0 else parameters.page_offset end
       and ordinal <= case when area_id = 'action-preview' then 3
@@ -9588,9 +9624,11 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         else parameters.page_offset + parameters.page_limit end
     group by area_id
   ), requested as (
-    select id from (values ('action-preview'), ('new-important'), ('due-actions'),
+    select id from (values ('action-preview'), ('auto-pursue'), ('your-review'), ('needs-info'),
+      ('near-miss'), ('new-important'), ('due-actions'),
       ('owner-priorities'), ('updated'), ('research'), ('all-active')) as ids(id)
-    where (p_area = 'inbox' and id in ('action-preview', 'new-important')) or id = p_area
+    where (p_area = 'inbox' and id in ('action-preview', 'auto-pursue', 'your-review',
+      'needs-info', 'near-miss')) or id = p_area
   )
   select jsonb_build_object('asOf', p_as_of, 'businessDate', parameters.business_date,
     'areas', coalesce((select jsonb_agg(jsonb_build_object(
@@ -9608,7 +9646,8 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         'ownerPriority', (select count(*) from ordered where owner_priority),
         'urgent', (select count(*) from ordered where operator_priority = 'urgent'))
         else '{}'::jsonb end
-    ) order by case requested.id when 'action-preview' then 0 else 1 end)
+    ) order by case requested.id when 'action-preview' then 0 when 'auto-pursue' then 1
+      when 'your-review' then 2 when 'needs-info' then 3 when 'near-miss' then 4 else 5 end)
       from requested left join totals on totals.area_id = requested.id
       left join pages on pages.area_id = requested.id), '[]'::jsonb),
     'counts', jsonb_build_object(
@@ -20494,3 +20533,215 @@ end;
 $$;
 revoke all privileges on function public.restore_current_unlinked_opportunity(jsonb) from public,anon,authenticated;
 grant execute on function public.restore_current_unlinked_opportunity(jsonb) to service_role;
+
+-- Best-first deal list, Task 4: warm-up evidence for owner decisions.
+create table if not exists public.deal_hunter_auto_pursue_decision_evidence (
+  decision_event_id text primary key
+    references public.deal_hunter_owner_decision_events(id) on delete restrict,
+  opportunity_id text not null,
+  action text not null check (action in ('pursue', 'pass')),
+  policy_version text not null
+    check (policy_version = btrim(policy_version) and char_length(policy_version) between 1 and 120),
+  criteria_group text,
+  criteria_profile_version text,
+  recipient_unchanged boolean not null,
+  created_at timestamptz not null
+);
+create index if not exists idx_auto_pursue_evidence_policy
+  on public.deal_hunter_auto_pursue_decision_evidence (policy_version, created_at);
+
+alter table public.deal_hunter_auto_pursue_decision_evidence enable row level security;
+revoke all on table public.deal_hunter_auto_pursue_decision_evidence
+  from public, anon, authenticated, service_role;
+grant select, insert on table public.deal_hunter_auto_pursue_decision_evidence to service_role;
+
+-- Best-first deal list, Task 5: automatic Pursue activation, runs, and blockers.
+create table if not exists public.deal_hunter_auto_pursue_activations (
+  id text primary key check (id = btrim(id) and char_length(id) between 1 and 120),
+  mode text not null check (mode in ('off', 'shadow', 'canary', 'active')),
+  daily_cap integer not null check (daily_cap between 0 and 10),
+  actor text not null check (actor = btrim(actor) and char_length(actor) between 1 and 160),
+  reason text not null default '' check (char_length(reason) <= 500),
+  confirmation text not null,
+  status text not null check (status in ('current', 'superseded')),
+  created_at timestamptz not null,
+  superseded_at timestamptz,
+  constraint deal_hunter_auto_pursue_activations_mode_cap check (
+    (mode in ('off', 'shadow') and daily_cap = 0)
+    or (mode = 'canary' and daily_cap = 1)
+    or (mode = 'active' and daily_cap between 1 and 10)),
+  constraint deal_hunter_auto_pursue_activations_confirmation check (confirmation = case mode
+    when 'off' then 'SET AUTO PURSUE OFF'
+    when 'shadow' then 'ACTIVATE AUTO PURSUE SHADOW'
+    when 'canary' then 'ACTIVATE AUTO PURSUE CANARY'
+    when 'active' then 'ACTIVATE AUTO PURSUE ACTIVE' end)
+);
+create unique index if not exists idx_auto_pursue_activations_current
+  on public.deal_hunter_auto_pursue_activations (status) where status = 'current';
+
+create table if not exists public.deal_hunter_auto_pursue_runs (
+  id text primary key check (id = btrim(id) and char_length(id) between 1 and 120),
+  run_key text not null unique check (char_length(run_key) between 1 and 200),
+  business_date text not null check (business_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
+  mode text not null check (mode in ('off', 'shadow', 'canary', 'active')),
+  status text not null check (status in ('running', 'completed', 'failed')),
+  triggered_by text not null default '' check (char_length(triggered_by) <= 120),
+  commands integer not null default 0 check (commands between 0 and 10),
+  items jsonb not null default '[]'::jsonb check (jsonb_typeof(items) = 'array'),
+  reason text check (reason is null or char_length(reason) <= 120),
+  created_at timestamptz not null,
+  completed_at timestamptz
+);
+create index if not exists idx_auto_pursue_runs_business_date
+  on public.deal_hunter_auto_pursue_runs (business_date, created_at);
+
+alter table public.deal_hunter_auto_pursue_activations enable row level security;
+alter table public.deal_hunter_auto_pursue_runs enable row level security;
+revoke all on table public.deal_hunter_auto_pursue_activations
+  from public, anon, authenticated, service_role;
+revoke all on table public.deal_hunter_auto_pursue_runs
+  from public, anon, authenticated, service_role;
+grant select on table public.deal_hunter_auto_pursue_activations to service_role;
+grant select, insert, update on table public.deal_hunter_auto_pursue_runs to service_role;
+
+-- The only activation writer: supersedes the current row and inserts the new one
+-- in one transaction, serialized so two concurrent mode changes cannot both win.
+create or replace function public.create_deal_hunter_auto_pursue_activation_v1(p_activation jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_row public.deal_hunter_auto_pursue_activations%rowtype;
+  v_created_at timestamptz;
+begin
+  if p_activation is null or pg_catalog.jsonb_typeof(p_activation) <> 'object'
+    or pg_catalog.jsonb_typeof(p_activation -> 'daily_cap') <> 'number'
+    or p_activation ->> 'created_at' is null
+  then
+    raise exception 'Invalid automatic Pursue activation';
+  end if;
+  v_created_at := (p_activation ->> 'created_at')::timestamptz;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('deal_hunter_auto_pursue_activation'));
+  update public.deal_hunter_auto_pursue_activations
+    set status = 'superseded', superseded_at = v_created_at
+    where status = 'current';
+  insert into public.deal_hunter_auto_pursue_activations
+    (id, mode, daily_cap, actor, reason, confirmation, status, created_at, superseded_at)
+  values (p_activation ->> 'id', p_activation ->> 'mode', (p_activation ->> 'daily_cap')::integer,
+    p_activation ->> 'actor', coalesce(p_activation ->> 'reason', ''), p_activation ->> 'confirmation',
+    'current', v_created_at, null)
+  returning * into v_row;
+  return pg_catalog.to_jsonb(v_row);
+end;
+$$;
+revoke all on function public.create_deal_hunter_auto_pursue_activation_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.create_deal_hunter_auto_pursue_activation_v1(jsonb) to service_role;
+
+-- The only writer of the runner-owned score columns. Rows whose blocker is
+-- unchanged are left alone: the blocker is part of the inbox cursor revision.
+create or replace function public.set_deal_hunter_auto_pursue_blockers_v1(p_entries jsonb)
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_changed integer;
+begin
+  if p_entries is null or pg_catalog.jsonb_typeof(p_entries) <> 'array'
+    or pg_catalog.jsonb_array_length(p_entries) > 10000
+    or exists (
+      select 1 from pg_catalog.jsonb_array_elements(p_entries) as entry
+      where pg_catalog.jsonb_typeof(entry) <> 'object'
+        or coalesce(entry ->> 'opportunity_id', '') = ''
+        or pg_catalog.jsonb_typeof(entry -> 'blocker') not in ('string', 'null')
+        or (entry ->> 'blocker' is not null and entry ->> 'blocker' !~ '^[a-z_]{1,80}$')
+        or coalesce(entry ->> 'checked_at', '') = '')
+  then
+    raise exception 'Invalid automatic Pursue blocker entries';
+  end if;
+  update public.deal_hunter_opportunity_scores as scores
+    set auto_pursue_blocker = entry.blocker, auto_pursue_checked_at = entry.checked_at
+    from (
+      select distinct on (value ->> 'opportunity_id')
+        value ->> 'opportunity_id' as opportunity_id,
+        value ->> 'blocker' as blocker,
+        value ->> 'checked_at' as checked_at
+      from pg_catalog.jsonb_array_elements(p_entries)
+    ) as entry
+    where scores.opportunity_id = entry.opportunity_id
+      and scores.auto_pursue_blocker is distinct from entry.blocker;
+  get diagnostics v_changed = row_count;
+  return v_changed;
+end;
+$$;
+revoke all on function public.set_deal_hunter_auto_pursue_blockers_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.set_deal_hunter_auto_pursue_blockers_v1(jsonb) to service_role;
+
+-- Automatic Pursue (auto-pursue-v1) goes through the owner-decision writer under the
+-- same advisory lock (re-entrant), after refusing when any owner decision exists for the
+-- opportunity (so an owner Watch, Pass, or Pursue always wins), when the command instant
+-- is outside the guarded owner business day, or when that day's cap is reached. A replay
+-- of the same idempotency key is delegated unchanged. The locked writer itself is unchanged.
+create or replace function public.pursue_cim_record_auto_pursue_decision_v1(p_command jsonb, p_guard jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_opportunity_id text := p_command ->> 'opportunityId';
+  v_key text := p_command ->> 'idempotencyKey';
+  v_now timestamptz;
+  v_since timestamptz;
+  v_until timestamptz;
+  v_cap integer;
+  v_recorded bigint;
+begin
+  if p_command is null or pg_catalog.jsonb_typeof(p_command) <> 'object'
+    or p_guard is null or pg_catalog.jsonb_typeof(p_guard) <> 'object'
+    or p_command ->> 'action' is distinct from 'pursue'
+    or p_command ->> 'policyVersion' is distinct from 'auto-pursue-v1'
+    or p_command ->> 'actor' is distinct from 'automation-auto-pursue'
+    or v_opportunity_id is null or v_key is null or p_command ->> 'now' is null
+    or pg_catalog.jsonb_typeof(p_guard -> 'dailyCap') <> 'number'
+    or p_guard ->> 'since' is null or p_guard ->> 'until' is null
+  then
+    raise exception 'Invalid automatic Pursue decision command';
+  end if;
+  v_cap := (p_guard ->> 'dailyCap')::integer;
+  v_now := (p_command ->> 'now')::timestamptz;
+  v_since := (p_guard ->> 'since')::timestamptz;
+  v_until := (p_guard ->> 'until')::timestamptz;
+  if v_cap is null or v_cap not between 1 and 10 or v_since >= v_until then
+    raise exception 'Invalid automatic Pursue guard';
+  end if;
+  perform pg_catalog.pg_advisory_xact_lock(17499,48146);
+  if exists (select 1 from public.deal_hunter_owner_decision_events where idempotency_key = v_key) then
+    return public.pursue_cim_record_owner_decision_v1(p_command);
+  end if;
+  if exists (select 1 from public.deal_hunter_owner_decision_events
+    where opportunity_id = v_opportunity_id) then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'reason', 'auto_pursue_owner_decision_exists', 'decision', null, 'enrollment', null);
+  end if;
+  if v_now < v_since or v_now >= v_until then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'reason', 'auto_pursue_business_date_changed', 'decision', null, 'enrollment', null);
+  end if;
+  select pg_catalog.count(*) into v_recorded from public.deal_hunter_owner_decision_events
+    where policy_version = 'auto-pursue-v1' and created_at >= v_since and created_at < v_until;
+  if v_recorded >= v_cap then
+    return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
+      'reason', 'auto_pursue_daily_cap_reached', 'decision', null, 'enrollment', null);
+  end if;
+  return public.pursue_cim_record_owner_decision_v1(p_command);
+end;
+$$;
+revoke all on function public.pursue_cim_record_auto_pursue_decision_v1(jsonb, jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_record_auto_pursue_decision_v1(jsonb, jsonb) to service_role;
