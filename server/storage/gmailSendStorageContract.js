@@ -204,3 +204,74 @@ export function validateCimProviderRelease(command = {}) {
     now: instant(command.now),
   };
 }
+
+// The reply poller's processed-message log (spec §6): only the classification, the Gmail ids,
+// a fingerprint of the From address and timestamps. Never a body, subject or snippet.
+export const GMAIL_REPLY_CLASSIFICATIONS = Object.freeze(['ours', 'owner', 'bounce', 'auto-reply',
+  'stop', 'reply']);
+const gmailIdPattern = /^[A-Za-z0-9_-]{1,240}$/;
+const MAX_REPLY_LOOKUP = 500;
+const MAX_CONVERSATION_LOOKUP = 500;
+
+function gmailId(value, name) {
+  if (typeof value !== 'string' || !gmailIdPattern.test(value)) throw invalid(name);
+  return value;
+}
+
+function uniqueList(value, name, maximum, item) {
+  if (!Array.isArray(value) || value.length > maximum) throw invalid(name);
+  const items = value.map((entry) => item(entry, name));
+  if (new Set(items).size !== items.length) throw invalid(name);
+  return items;
+}
+
+export function validateGmailReplyMessage(command = {}) {
+  if (!GMAIL_REPLY_CLASSIFICATIONS.includes(command.classification)) throw invalid('classification');
+  const fromFingerprint = command.fromFingerprint ?? null;
+  if (fromFingerprint !== null && (typeof fromFingerprint !== 'string'
+    || !digestPattern.test(fromFingerprint))) throw invalid('fromFingerprint');
+  const messageAt = command.messageAt === null || command.messageAt === undefined
+    ? null : instant(command.messageAt, 'messageAt');
+  return {
+    gmailMessageId: gmailId(command.gmailMessageId, 'gmailMessageId'),
+    gmailThreadId: gmailId(command.gmailThreadId, 'gmailThreadId'),
+    conversationId: text(command.conversationId, 'conversationId', 240),
+    classification: command.classification,
+    fromFingerprint,
+    messageAt,
+    now: instant(command.now),
+  };
+}
+
+export function validateGmailReplyMessageLookup(command = {}) {
+  return { gmailMessageIds: uniqueList(command.gmailMessageIds, 'gmailMessageIds',
+    MAX_REPLY_LOOKUP, gmailId) };
+}
+
+export function validateGmailSentIdentityLookup(command = {}) {
+  return { conversationIds: uniqueList(command.conversationIds, 'conversationIds',
+    MAX_CONVERSATION_LOOKUP, (value, name) => text(value, name, 240)) };
+}
+
+export function normalizeGmailReplyMessageRow(row) {
+  return {
+    gmailMessageId: row.gmail_message_id,
+    gmailThreadId: row.gmail_thread_id,
+    conversationId: row.conversation_id,
+    classification: row.classification,
+    fromFingerprint: row.from_fingerprint ?? null,
+    messageAt: optionalInstant(row.message_at),
+    processedAt: optionalInstant(row.processed_at),
+  };
+}
+
+/** One transmission of a polled conversation: what makes a thread message "ours". */
+export function normalizeGmailSentIdentityRow(row) {
+  return {
+    conversationId: row.conversation_id,
+    transmissionId: row.transmission_id,
+    fromAddress: row.from_address ?? null,
+    providerMessageId: row.provider === 'gmail' ? row.provider_message_id ?? null : null,
+    rfcMessageId: row.rfc_message_id ?? null,
+  };
+}

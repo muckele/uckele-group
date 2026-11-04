@@ -4,6 +4,24 @@ const terminalConversationStates = new Set(['responded', 'stopped', 'closed']);
 const ambiguityContainedConversationStates = new Set([
   ...terminalConversationStates, 'reply-review-required', 'provider-ambiguous',
 ]);
+const reviewContainedConversationStates = new Set([
+  ...terminalConversationStates, 'reply-review-required',
+]);
+
+// What exact reply evidence does to its conversation (and, through terminal convergence, to
+// every campaign of it). A broker reply responds; the owner writing in the thread himself
+// stops the campaign (he has taken over); a bounce sends it to the owner as action-required.
+export const PURSUE_CIM_INBOUND_OUTCOMES = Object.freeze({
+  reply: Object.freeze({ nextState: 'responded', reasonCode: 'reply_received',
+    fromStates: Object.freeze(['open', 'reply-review-required']),
+    durableStates: terminalConversationStates }),
+  owner_replied: Object.freeze({ nextState: 'stopped', reasonCode: 'owner_replied',
+    fromStates: Object.freeze(['open', 'reply-review-required']),
+    durableStates: terminalConversationStates }),
+  recipient_bounced: Object.freeze({ nextState: 'reply-review-required',
+    reasonCode: 'recipient_bounced', fromStates: Object.freeze(['open']),
+    durableStates: reviewContainedConversationStates }),
+});
 
 function text(value, maximum = 240) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maximum);
@@ -62,6 +80,7 @@ function resolutionCommand(event, profileBinding) {
   const tags = metadata.tags;
   const rawType = text(metadata.rawType, 80).toLowerCase().replace(/_/g, '.');
   const taggedTouchIds = tagValues(tags, ['cim_touch_id', 'cimTouchId', 'touch_id']);
+  const gmailThreadId = text(event.provider, 80) === 'gmail' ? text(metadata.gmailThreadId) : '';
   return {
     replyToAddresses: unique(values(metadata.to || metadata.toEmail).map(email)),
     provider: text(event.provider, 80) || 'resend',
@@ -79,6 +98,9 @@ function resolutionCommand(event, profileBinding) {
     taggedTransmissionId: profileBinding?.requireExactReplyAlias ? '' : tagValues(tags,
       ['cim_transmission_id', 'cimTransmissionId', 'transmission_id'])[0] || '',
     taggedTouchIds: profileBinding?.requireExactReplyAlias ? [] : taggedTouchIds,
+    // Gmail evidence only: the thread the message arrived in (spec §6, method gmail-thread).
+    ...(gmailThreadId && !profileBinding?.requireExactReplyAlias
+      ? { gmailThreadIds: [gmailThreadId] } : {}),
   };
 }
 
@@ -92,6 +114,10 @@ function terminalEvidenceId(event) {
   return text(event?.provider_event_id) || text(event?.id);
 }
 
+function evidenceTypePrefix(event) {
+  return text(event?.provider, 80) === 'gmail' ? 'gmail-inbound' : 'signed-inbound';
+}
+
 function inboundTerminalCommand({
   event,
   conversation,
@@ -100,6 +126,7 @@ function inboundTerminalCommand({
   evidenceType,
   evidence,
   now,
+  actor = 'signed-email-webhook',
 }) {
   const observedAt = new Date(event.created_at).toISOString();
   const committedAt = new Date(now ?? Date.now()).toISOString();
@@ -118,7 +145,7 @@ function inboundTerminalCommand({
     evidenceType: text(evidenceType, 120),
     evidenceId,
     observedAt,
-    actor: 'signed-email-webhook',
+    actor,
     source: 'pursue-cim-inbound',
     metadataDigest: canonicalDigest(evidence),
     now: committedAt,
@@ -136,9 +163,10 @@ async function appendInboundTerminal({
   evidence,
   now,
   durableStates,
+  actor,
 }) {
   const terminalCommand = inboundTerminalCommand({ event, conversation, nextState,
-    reasonCode, evidenceType, evidence, now });
+    reasonCode, evidenceType, evidence, now, actor });
   const result = await storage.appendCimTerminalEvent(terminalCommand);
   if (!result.conflict) return { result, conflict: false };
 
@@ -150,8 +178,19 @@ async function appendInboundTerminal({
   return { result: { ...result, cancelledTouchIds: [] }, conflict: true, durable };
 }
 
-export async function applyVerifiedPursueCimInbound(event, { storage, now, profileBinding } = {}) {
+/**
+ * Applies verified inbound evidence to its Pursue conversation. `outcome` is `reply` (default),
+ * `owner_replied` or `recipient_bounced` (PURSUE_CIM_INBOUND_OUTCOMES); `actor` names the
+ * writer on the terminal event. Replays are idempotent: the terminal event id is derived from
+ * the evidence id, the conversation and the next state.
+ */
+export async function applyVerifiedPursueCimInbound(event, { storage, now, profileBinding,
+  outcome = 'reply', actor } = {}) {
   if (event?.event_type !== 'replied') return { handled: false };
+  const terminal = PURSUE_CIM_INBOUND_OUTCOMES[outcome];
+  if (!Object.hasOwn(PURSUE_CIM_INBOUND_OUTCOMES, outcome) || !terminal) {
+    throw new Error('Unknown Pursue CIM inbound outcome');
+  }
   if (!storage?.resolvePursueCimInboundEvidence || !storage?.appendCimTerminalEvent) {
     throw new Error('Pursue CIM inbound storage transitions unavailable');
   }
@@ -191,9 +230,10 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now, profi
         event, conversation,
         nextState: 'reply-review-required',
         reasonCode: 'ambiguous_reply_evidence',
-        evidenceType: `signed-inbound-${evidence.method}`,
+        evidenceType: `${evidenceTypePrefix(event)}-${evidence.method}`,
         evidence,
         now,
+        actor,
       }));
     }
     let batch = { applied: false, replay: false, conflict: false, cancelledTouchIds: [] };
@@ -258,7 +298,25 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now, profi
       cancelledTouchIds: [],
     };
   }
-  if (!['open', 'reply-review-required'].includes(resolution.conversation.state)) {
+  if (outcome === 'recipient_bounced'
+    && resolution.conversation.state === 'reply-review-required') {
+    return {
+      handled: true,
+      exact: true,
+      ambiguous: false,
+      reviewRequired: true,
+      terminalized: false,
+      alreadyTerminal: false,
+      alreadyContained: true,
+      conversationId: resolution.conversation.id,
+      transmissionId: text(resolution.transmission?.id),
+      campaignIds: unique(resolution.campaignIds || [], 50).sort(),
+      touchIds: unique(resolution.touchIds || [], 50).sort(),
+      method: resolution.method,
+      cancelledTouchIds: [],
+    };
+  }
+  if (!terminal.fromStates.includes(resolution.conversation.state)) {
     return {
       handled: true,
       exact: true,
@@ -287,12 +345,13 @@ export async function applyVerifiedPursueCimInbound(event, { storage, now, profi
   };
   const appended = await appendInboundTerminal({
     storage, command, event, conversation: resolution.conversation,
-    nextState: 'responded',
-    reasonCode: 'reply_received',
-    evidenceType: `signed-inbound-${evidence.method}`,
+    nextState: terminal.nextState,
+    reasonCode: terminal.reasonCode,
+    evidenceType: `${evidenceTypePrefix(event)}-${evidence.method}`,
     evidence,
     now,
-    durableStates: terminalConversationStates,
+    durableStates: terminal.durableStates,
+    actor,
   });
   const { result } = appended;
   if (appended.conflict) {

@@ -453,6 +453,9 @@ export function createPursueCimSqliteTransitions(database, {
         command.rfcMessageIds, 'rfcMessageIds', 50, 500);
       const taggedTouchIds = boundedInboundEvidenceList(
         command.taggedTouchIds, 'taggedTouchIds', 50, 240);
+      // The Gmail thread a reply arrived in (the reply poller); absent for webhook evidence.
+      const gmailThreadIds = boundedInboundEvidenceList(
+        command.gmailThreadIds ?? [], 'gmailThreadIds', 20, 240);
       const taggedConversationId = command.taggedConversationId
         ? requiredText(command.taggedConversationId, 'taggedConversationId') : '';
       const taggedTransmissionId = command.taggedTransmissionId
@@ -472,6 +475,12 @@ export function createPursueCimSqliteTransitions(database, {
         }
         candidates.set(row.conversation_id, current);
       };
+      for (const gmailThreadId of gmailThreadIds) {
+        for (const row of database.prepare(`
+          SELECT id AS conversation_id FROM deal_hunter_broker_conversations
+          WHERE gmail_thread_id = ? ORDER BY id
+        `).all(gmailThreadId)) addCandidate(row, 'gmail-thread');
+      }
       for (const address of replyToAddresses) {
         for (const row of database.prepare(`
           SELECT id AS transmission_id, conversation_id
@@ -551,7 +560,8 @@ export function createPursueCimSqliteTransitions(database, {
         JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
         WHERE c.conversation_id = ? ORDER BY t.id
       `).all(conversation.id).map(({ id }) => id);
-      const methodOrder = ['reply-alias', 'provider-message', 'rfc-thread', 'protected-tag'];
+      const methodOrder = ['gmail-thread', 'reply-alias', 'provider-message', 'rfc-thread',
+        'protected-tag'];
       const method = methodOrder.find((value) => candidate.methods.has(value)) || 'protected-tag';
       return { exact: true, ambiguous: false, method, conversation,
         transmission: candidate.transmission, campaignIds, touchIds,

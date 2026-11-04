@@ -42,7 +42,8 @@ import {
   normalizeOpenGmailConversationRow, normalizeSendControlRow, normalizeSendControlRows,
   sendControlConflictError, validateConversationGmailThread, validateGmailCheckpointUpdate,
   validateGmailTokenCheck, validateRevokeGmailConnection, validateSaveGmailConnection,
-  validateSetPursueSendControl,
+  validateSetPursueSendControl, normalizeGmailReplyMessageRow, normalizeGmailSentIdentityRow,
+  validateGmailReplyMessage, validateGmailReplyMessageLookup, validateGmailSentIdentityLookup,
 } from './gmailSendStorageContract.js';
 
 function cimSafetyDigest(...parts) {
@@ -5603,6 +5604,26 @@ ${cimCapacityConsumeTriggerSql}
         revision INTEGER NOT NULL CHECK(revision >= 1),
         CHECK(control_key <> 'wording_approval' OR enabled = 0 OR value_digest IS NOT NULL)
       );
+
+      -- The reply poller's processed-message log: one row per Gmail message it applied. Only
+      -- the classification, the Gmail ids, a From-address fingerprint and timestamps; never a
+      -- body, subject or snippet.
+      CREATE TABLE IF NOT EXISTS deal_hunter_gmail_reply_messages (
+        gmail_message_id TEXT NOT NULL PRIMARY KEY CHECK(length(gmail_message_id) BETWEEN 1 AND 240
+          AND gmail_message_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        gmail_thread_id TEXT NOT NULL CHECK(length(gmail_thread_id) BETWEEN 1 AND 240
+          AND gmail_thread_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+        conversation_id TEXT NOT NULL
+          CHECK(conversation_id = trim(conversation_id) AND length(conversation_id) BETWEEN 1 AND 240),
+        classification TEXT NOT NULL
+          CHECK(classification IN ('ours', 'owner', 'bounce', 'auto-reply', 'stop', 'reply')),
+        from_fingerprint TEXT CHECK(from_fingerprint IS NULL OR (length(from_fingerprint) = 64
+          AND from_fingerprint NOT GLOB '*[^0-9a-f]*')),
+        message_at TEXT CHECK(message_at IS NULL OR julianday(message_at) IS NOT NULL),
+        processed_at TEXT NOT NULL CHECK(julianday(processed_at) IS NOT NULL)
+      );
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_gmail_reply_messages_conversation
+        ON deal_hunter_gmail_reply_messages(conversation_id, processed_at);
 
     CREATE TABLE IF NOT EXISTS scheduled_job_runs (
       job_key TEXT PRIMARY KEY,
@@ -11240,6 +11261,47 @@ ${cimCapacityConsumeTriggerSql}
             AND v.state IN ('open', 'reply-review-required', 'provider-ambiguous')
           ORDER BY v.id
         `).all().map(normalizeOpenGmailConversationRow);
+      },
+
+      /**
+       * Every transmission of the given conversations, in any state, with its sender address,
+       * Gmail id and stored RFC Message-ID: what lets the reply poller recognize our own sends.
+       */
+      async listGmailConversationSentIdentities(command = {}) {
+        const { conversationIds } = validateGmailSentIdentityLookup(command);
+        if (conversationIds.length === 0) return [];
+        return database.prepare(`
+          SELECT tr.conversation_id, tr.id AS transmission_id, tr.from_address, tr.provider,
+            tr.provider_message_id, communication.message_id AS rfc_message_id
+          FROM deal_hunter_cim_transmissions tr
+          LEFT JOIN crm_communications communication ON communication.id = tr.communication_id
+          WHERE tr.conversation_id IN (${conversationIds.map(() => '?').join(', ')})
+          ORDER BY tr.conversation_id, tr.id
+        `).all(...conversationIds).map(normalizeGmailSentIdentityRow);
+      },
+
+      /** The processed-message rows among the given Gmail message ids. */
+      async listGmailReplyMessages(command = {}) {
+        const { gmailMessageIds } = validateGmailReplyMessageLookup(command);
+        if (gmailMessageIds.length === 0) return [];
+        return database.prepare(`
+          SELECT * FROM deal_hunter_gmail_reply_messages
+          WHERE gmail_message_id IN (${gmailMessageIds.map(() => '?').join(', ')})
+          ORDER BY gmail_message_id
+        `).all(...gmailMessageIds).map(normalizeGmailReplyMessageRow);
+      },
+
+      /** Marks a Gmail message processed once; the same message again is a replay. */
+      async recordGmailReplyMessage(command = {}) {
+        const row = validateGmailReplyMessage(command);
+        const changes = database.prepare(`
+          INSERT INTO deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
+            conversation_id, classification, from_fingerprint, message_at, processed_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(gmail_message_id) DO NOTHING
+        `).run(row.gmailMessageId, row.gmailThreadId, row.conversationId, row.classification,
+          row.fromFingerprint, row.messageAt, row.now).changes;
+        return { applied: changes === 1, replay: changes === 0 };
       },
 
       async getCurrentAutoPursueActivation() {

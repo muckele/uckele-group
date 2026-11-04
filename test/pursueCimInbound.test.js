@@ -612,3 +612,63 @@ test('P0 scenario 54 harness: inbound evidence cannot increment outbound seam or
   assert.equal(provider.seamEntries.length, 0);
   assert.equal(provider.providerCalls.length, 0);
 });
+
+test('Gmail thread evidence carries gmailThreadIds and the owner_replied / recipient_bounced outcomes', async () => {
+  const calls = [];
+  let state = 'open';
+  const storage = {
+    async resolvePursueCimInboundEvidence(command) {
+      calls.push(['resolve', structuredClone(command)]);
+      return exactResolution({ method: 'gmail-thread', conversation: {
+        id: 'conversation-1', state, terminal_revision: 2, row_version: 4 } });
+    },
+    async appendCimTerminalEvent(command) {
+      calls.push(['terminal', structuredClone(command)]);
+      return { applied: true, replay: false, conflict: false,
+        campaignRevision: null, conversationRevision: 3, cancelledTouchIds: ['touch-1'] };
+    },
+  };
+  const gmailEvent = { id: 'gmail-message:18c2', provider: 'gmail',
+    provider_event_id: 'gmail-message:18c2', event_type: 'replied', created_at: observedAt,
+    metadata: { rawType: 'email.received', gmailThreadId: 'gmail-thread-1',
+      inReplyTo: '<transmission-1@uckele.example.test>', references: '' } };
+
+  const owner = await applyVerifiedPursueCimInbound(gmailEvent, { storage, now: observedAt,
+    outcome: 'owner_replied', actor: 'pursue-cim-reply-poller' });
+  assert.equal(owner.terminalized, true);
+  assert.deepEqual(calls[0][1].gmailThreadIds, ['gmail-thread-1']);
+  assert.deepEqual(calls[0][1].rfcMessageIds, ['<transmission-1@uckele.example.test>']);
+  assert.deepEqual(calls[0][1].providerMessageIds, []);
+  assert.equal(calls[1][1].nextState, 'stopped');
+  assert.equal(calls[1][1].reasonCode, 'owner_replied');
+  assert.equal(calls[1][1].evidenceType, 'gmail-inbound-gmail-thread');
+  assert.equal(calls[1][1].actor, 'pursue-cim-reply-poller');
+
+  calls.length = 0;
+  const bounced = await applyVerifiedPursueCimInbound(gmailEvent, { storage, now: observedAt,
+    outcome: 'recipient_bounced' });
+  assert.equal(bounced.terminalized, true);
+  assert.equal(calls[1][1].nextState, 'reply-review-required');
+  assert.equal(calls[1][1].reasonCode, 'recipient_bounced');
+  assert.equal(calls[1][1].actor, 'signed-email-webhook');
+
+  // A bounce on a conversation already under review changes nothing.
+  calls.length = 0;
+  state = 'reply-review-required';
+  const contained = await applyVerifiedPursueCimInbound(gmailEvent, { storage, now: observedAt,
+    outcome: 'recipient_bounced' });
+  assert.equal(contained.terminalized, false);
+  assert.equal(contained.alreadyContained, true);
+  assert.deepEqual(calls.map(([name]) => name), ['resolve']);
+
+  // Webhook evidence never carries the Gmail thread key, even with the metadata present.
+  calls.length = 0;
+  state = 'open';
+  await applyVerifiedPursueCimInbound(repliedEvent({ metadata: { gmailThreadId: 'gmail-thread-1' } }),
+    { storage, now: observedAt });
+  assert.equal(Object.hasOwn(calls[0][1], 'gmailThreadIds'), false);
+  assert.equal(calls[1][1].evidenceType, 'signed-inbound-gmail-thread');
+
+  await assert.rejects(applyVerifiedPursueCimInbound(gmailEvent, { storage, now: observedAt,
+    outcome: 'toString' }), /Unknown Pursue CIM inbound outcome/);
+});

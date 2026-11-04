@@ -7,6 +7,7 @@ import {
   startDealHunterDailyEmailScheduler,
 } from './services/dealHunterScheduler.js';
 import { startDealHunterSheetSyncScheduler } from './services/dealHunterSheetSyncScheduler.js';
+import { startPursueCimReplyPollerScheduler } from './services/pursueCimReplyPollerScheduler.js';
 import { startPursueCimSenderScheduler } from './services/pursueCimSenderScheduler.js';
 import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler } from './services/submissions.js';
 import { startBackupScheduler } from './services/backups.js';
@@ -31,6 +32,7 @@ const server = app.listen(config.server.port, host, () => {
     startDealHunterDailyEmailScheduler(),
     startDealHunterSheetSyncScheduler(),
     startPursueCimSenderScheduler(),
+    startPursueCimReplyPollerScheduler(),
     startDealHunterCimStage2Scheduler(),
     startDealHunterCimFollowUpScheduler(),
     startSecureDocumentCleanupScheduler(),

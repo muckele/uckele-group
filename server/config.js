@@ -552,6 +552,11 @@ export function getConfig() {
         enabled: process.env.DEAL_HUNTER_PURSUE_SENDER_ENABLED === 'true',
         intervalMinutes: 15,
       },
+      // The 5-minute Gmail reply poller (spec 2026-11-03 §6). Ships off.
+      replyPoller: {
+        enabled: process.env.DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED === 'true',
+        intervalMinutes: 5,
+      },
       cimFollowUp: {
         enabled: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED, false),
         checkIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS, 1000 * 60 * 60),

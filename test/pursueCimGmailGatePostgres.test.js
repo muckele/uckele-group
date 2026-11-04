@@ -14,7 +14,9 @@ import {
   isFinalPursueFollowUp,
   loadPursueFollowUpAuthority,
 } from '../server/services/pursueCimFollowUpHooks.js';
+import { createFakeCimProvider } from '../server/services/fakeCimProvider.js';
 import { runCimFollowUpPreparation } from '../server/services/pursueCimFollowUpPreparation.js';
+import { runPursueCimReplyPoll } from '../server/services/pursueCimReplyPoller.js';
 import { reconcileUnrecordedPursueSends, sweepExpiredPursueCampaigns } from '../server/services/pursueCimSender.js';
 import { syncPursueGmailCapabilities } from '../server/services/pursueGmailCapabilities.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
@@ -112,6 +114,27 @@ function serviceRoleClient(container, database) {
           return builder;
         },
         lte(name, item) { where.push(`${column(name)} <= ${value(item)}`); return builder; },
+        // insert ... on conflict (onConflict) do update, returning the row (select().single()).
+        upsert(payload, { onConflict }) {
+          const names = Object.keys(payload).map((name) => column(name).slice(2));
+          const target = column(onConflict).slice(2);
+          const updates = names.filter((name) => name !== target)
+            .map((name) => `${name} = excluded.${name}`).join(', ');
+          return { select() { return this; }, single() { return this; },
+            then(resolve, reject) {
+              try {
+                const output = sql(`with input as (select * from jsonb_populate_record(
+                  null::public.${table}, $json$${JSON.stringify(payload)}$json$::jsonb))
+                  insert into public.${table} as t (${names.join(', ')})
+                  select ${names.join(', ')} from input
+                  on conflict (${target}) do update set ${updates}
+                  returning to_jsonb(t)::text;`);
+                return Promise.resolve({ data: JSON.parse(output), error: null }).then(resolve, reject);
+              } catch (error) {
+                return Promise.resolve({ data: null, error }).then(resolve, reject);
+              }
+            } };
+        },
         order(name, { ascending = true } = {}) {
           orders.push(`${column(name)} ${ascending ? 'asc' : 'desc'}`);
           return builder;
@@ -900,4 +923,130 @@ test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizat
   assert.equal(scalar(`select count(*) from public.deal_hunter_cim_audit_events
     where event_type in ('capability-activation', 'capability-withdrawn')
       and actor = 'owner';`), '8');
+});
+
+test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-reply, stop and replay', {
+  skip: integrationEnabled ? false : 'set DEAL_HUNTER_POSTGRES_INTEGRATION=1 for disposable PostgreSQL integration',
+  timeout: 240_000,
+}, async (t) => {
+  const database = 'reply_poller';
+  const { container, storage } = await startPostgres(t, 'uckele-reply-poller', database);
+  const scalar = (sql) => psql(container, database, sql);
+  const marker = 'PG-BODY-MARKER-51c2';
+  const recipientFingerprint = (suffix) => sha256(stableCanonicalJson({
+    opportunityId: `opp-gmail-${suffix}`, emailHash: sha256(BROKER),
+    provenanceFingerprint: fill('9'), contactAuthorityRevision: fill('b') }));
+  const seeded = {};
+  for (const suffix of ['reply', 'owner', 'bounce', 'auto', 'stop']) {
+    seeded[suffix] = seedCampaign(container, database, `poll-${suffix}`,
+      recipientFingerprint(`poll-${suffix}`), { followUp: true, basis: 'rule' });
+  }
+  // A conversation whose prepared transmission is in the thread: our own message is ignored.
+  const ours = seedCampaign(container, database, 'poll-ours', recipientFingerprint('poll-ours'),
+    { followUp: false, basis: 'rule' });
+  const t0 = Date.parse('2026-09-29T15:30:00.000Z');
+  const at = (minutes) => new Date(t0 + minutes * 60_000).toISOString();
+  assert.equal((await storage.claimDueCimTouch({ touchId: ours.touchId, expectedRowVersion: 1,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    claimTokenDigest: fill('e'), claimOwner: 'pursue-cim-sender', claimExpiresAt: at(4),
+    now: at(0) })).claimed, true);
+  const prepared = await storage.prepareCimTransmission({ touchIds: [ours.touchId],
+    claimTokenDigest: fill('e'), expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, preparationGeneration: 1,
+    payloadVersion: 'deal-hunter-cim-pursue-initial-v2', fromAddress: SENDER,
+    toAddresses: [BROKER], ccAddresses: [], bccAddresses: [], replyToAddress: SENDER,
+    subject: 'CIM / NDA request for Acme Plumbing', bodyText: 'Synthetic body',
+    bodyHtmlSanitized: '<p>Synthetic body</p>', tags: [`cim_touch_id=${ours.touchId}`],
+    actor: 'pursue-cim-sender', now: at(1) });
+  assert.equal(prepared.prepared, true, JSON.stringify(prepared));
+  await storage.setCimConversationGmailThread({ conversationId: ours.conversationId,
+    gmailThreadId: 'gmail-thread-poll-ours', now: at(2) });
+  assert.deepEqual((await storage.listGmailConversationSentIdentities({
+    conversationIds: [ours.conversationId, seeded.reply.conversationId] }))
+    .map((row) => [row.conversationId, row.transmissionId, row.fromAddress]),
+  [[ours.conversationId, prepared.transmission.id, SENDER]]);
+
+  // gmail-thread is the first evidence method; commands without the key are unchanged.
+  const resolve = (extra = {}) => storage.resolvePursueCimInboundEvidence({ replyToAddresses: [],
+    provider: 'gmail', providerMessageIds: [], rfcMessageIds: [], taggedConversationId: '',
+    taggedTransmissionId: '', taggedTouchIds: [], ...extra });
+  const exact = await resolve({ gmailThreadIds: ['gmail-thread-poll-reply'],
+    taggedConversationId: seeded.reply.conversationId });
+  assert.equal(exact.exact, true);
+  assert.equal(exact.method, 'gmail-thread');
+  assert.equal(exact.conversation.id, seeded.reply.conversationId);
+  assert.equal((await resolve({ gmailThreadIds: ['gmail-thread-poll-reply'],
+    taggedConversationId: seeded.owner.conversationId })).ambiguous, true);
+  assert.equal((await resolve()).method, 'none');
+  await assert.rejects(resolve({ gmailThreadIds: ['x', 'x'] }), /Invalid Pursue CIM inbound evidence/);
+
+  await storage.saveGmailConnection({ emailAddress: SENDER,
+    refreshTokenCiphertext: 'v1.aXYtYnl0ZXM=.dGFnLWJ5dGVz.Y2lwaGVydGV4dA==',
+    grantedScopes: ['https://www.googleapis.com/auth/gmail.send',
+      'https://www.googleapis.com/auth/gmail.readonly'], historyCheckpoint: '0',
+    connectedBy: 'owner', now: seededAt });
+  let clock = Date.parse(GATE_NOW);
+  const now = () => new Date(clock += 1000);
+  const mailbox = createFakeCimProvider({ senderAddress: SENDER, now });
+  const inject = (suffix, headers, body) => mailbox.injectReply(`gmail-thread-poll-${suffix}`, {
+    internalDate: now().toISOString(), bodyPrefix: `${body} ${marker}`,
+    headers: { from: `Jordan Lee <${BROKER}>`, contentType: 'text/plain', ...headers } });
+  inject('ours', { from: SENDER, messageId: `<${prepared.transmission.id}@uckele.example.test>` },
+    'Our own initial email');
+  inject('reply', { from: 'Assistant <assistant@brokerage.test>' }, 'NDA attached.');
+  inject('owner', { from: SENDER, messageId: '<CAowner@mail.gmail.com>' }, 'Calling you now.');
+  inject('bounce', { from: 'MAILER-DAEMON@googlemail.com',
+    contentType: 'multipart/report; report-type=delivery-status' }, 'Delivery failed.');
+  inject('auto', { autoSubmitted: 'auto-replied' }, 'Out of office.');
+  const poll = () => runPursueCimReplyPoll({ storage, mailProvider: mailbox, now });
+
+  const first = await poll();
+  assert.deepEqual(first, { processed: 5, responded: 1, ownerReplied: 1, bounced: 1,
+    autoReplies: 1, stopped: 0, failed: 0, checkpointExpired: false, checkpointAdvanced: true });
+  const campaign = (ids) => scalar(`select state || ':' || coalesce(reason_code, '-')
+    from public.deal_hunter_cim_campaigns where id = '${ids.campaignId}';`);
+  const touch = (ids) => scalar(`select state || ':' || coalesce(terminal_reason, '-')
+    from public.deal_hunter_cim_campaign_touches where id = '${ids.touchId}';`);
+  assert.equal(campaign(seeded.reply), 'responded:reply_received');
+  assert.equal(touch(seeded.reply), 'cancelled-before-provider:reply_received');
+  assert.equal(campaign(seeded.owner), 'stopped:owner_replied');
+  assert.equal(touch(seeded.owner), 'cancelled-before-provider:owner_replied');
+  assert.equal(campaign(seeded.bounce), 'action-required:recipient_bounced');
+  assert.equal(touch(seeded.bounce), 'cancelled-before-provider:recipient_bounced');
+  assert.equal(scalar(`select state from public.deal_hunter_broker_conversations
+    where id = '${seeded.bounce.conversationId}';`), 'reply-review-required');
+  assert.equal(campaign(seeded.auto), 'active-follow-up:-');
+  assert.equal(touch(seeded.auto), 'scheduled:-');
+  assert.equal(campaign(ours), 'initial-pending:awaiting-window');
+  assert.equal(scalar(`select string_agg(distinct evidence_type || '/' || actor, ',')
+    from public.deal_hunter_cim_terminal_events where scope = 'conversation';`),
+  'gmail-inbound-gmail-thread/pursue-cim-reply-poller');
+  assert.equal(scalar(`select string_agg(classification, ',' order by classification)
+    from public.deal_hunter_gmail_reply_messages;`), 'auto-reply,bounce,ours,owner,reply');
+  assert.equal((await storage.getGmailConnection()).history_checkpoint, '5');
+  const terminalEvents = scalar('select count(*) from public.deal_hunter_cim_terminal_events;');
+
+  // An expired checkpoint returns every message of the open threads; none is applied twice.
+  mailbox.expireCheckpointNext();
+  const replay = await poll();
+  assert.equal(replay.checkpointExpired, true);
+  assert.equal(replay.processed, 0, JSON.stringify(replay));
+  assert.equal(scalar('select count(*) from public.deal_hunter_cim_terminal_events;'), terminalEvents);
+  assert.deepEqual(await storage.recordGmailReplyMessage({ gmailMessageId: 'fake-msg-2',
+    gmailThreadId: 'gmail-thread-poll-reply', conversationId: seeded.reply.conversationId,
+    classification: 'reply', fromFingerprint: null, messageAt: null, now: GATE_NOW }),
+  { applied: false, replay: true });
+
+  // A stop word responds and suppresses the recipient through the existing suppression write.
+  inject('stop', {}, 'Please remove me from your list.');
+  const stop = await poll();
+  assert.equal(stop.stopped, 1, JSON.stringify(stop));
+  assert.equal(campaign(seeded.stop), 'responded:reply_received');
+  const suppression = await storage.getActiveEmailSuppression(BROKER);
+  assert.equal(suppression.reason, 'explicit-opt-out');
+  assert.equal(suppression.source, 'gmail-reply');
+  assert.equal(scalar(`select count(*) from public.deal_hunter_gmail_reply_messages t
+    where to_jsonb(t)::text like '%${marker}%' or to_jsonb(t)::text like '%brokerage.test%';`), '0');
+  assert.equal(scalar(`select count(*) from public.deal_hunter_cim_terminal_events t
+    where to_jsonb(t)::text like '%${marker}%';`), '0');
 });

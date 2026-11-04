@@ -296,3 +296,61 @@ test('open gmail conversations list excludes terminal conversations', async (t) 
       campaignId: 'campaign-open', recipientFingerprint: hex('recipient-open') },
   ]);
 });
+
+test('gmail-thread evidence resolves the conversation that owns the thread, ahead of other methods', async (t) => {
+  const { storage, database } = openStorage(t);
+  seedConversation(database, 'a');
+  seedConversation(database, 'b');
+  await storage.setCimConversationGmailThread({ conversationId: 'conversation-a',
+    gmailThreadId: 'gmail-thread-a', now: at });
+  const resolve = (extra = {}) => storage.resolvePursueCimInboundEvidence({ replyToAddresses: [],
+    provider: 'gmail', providerMessageIds: [], rfcMessageIds: [], taggedConversationId: '',
+    taggedTransmissionId: '', taggedTouchIds: [], ...extra });
+  const exact = await resolve({ gmailThreadIds: ['gmail-thread-a'] });
+  assert.equal(exact.exact, true);
+  assert.equal(exact.method, 'gmail-thread');
+  assert.equal(exact.conversation.id, 'conversation-a');
+  assert.deepEqual(exact.campaignIds, ['campaign-a']);
+  // Gmail-thread comes first even when a protected tag names the same conversation.
+  assert.equal((await resolve({ gmailThreadIds: ['gmail-thread-a'],
+    taggedConversationId: 'conversation-a' })).method, 'gmail-thread');
+  // Evidence for two conversations is ambiguous.
+  const conflicting = await resolve({ gmailThreadIds: ['gmail-thread-a'],
+    taggedConversationId: 'conversation-b' });
+  assert.equal(conflicting.ambiguous, true);
+  assert.deepEqual(conflicting.candidateConversations.map(({ id }) => id),
+    ['conversation-a', 'conversation-b']);
+  assert.equal((await resolve({ gmailThreadIds: ['unknown-thread'] })).method, 'none');
+  // Commands without the key (webhook evidence) are unchanged.
+  assert.equal((await resolve()).method, 'none');
+  await assert.rejects(resolve({ gmailThreadIds: ['x', 'x'] }), /must not contain duplicates/);
+  await assert.rejects(resolve({ gmailThreadIds: 'gmail-thread-a' }), /bounded array/);
+});
+
+test('gmail reply messages are recorded once with classification, ids and a fingerprint only', async (t) => {
+  const { storage, database } = openStorage(t);
+  seedConversation(database, 'a');
+  const row = { gmailMessageId: '18c2f0a1b2c3d4e5', gmailThreadId: 'gmail-thread-a',
+    conversationId: 'conversation-a', classification: 'reply', fromFingerprint: hex('broker'),
+    messageAt: at, now: later };
+  assert.deepEqual(await storage.recordGmailReplyMessage(row), { applied: true, replay: false });
+  assert.deepEqual(await storage.recordGmailReplyMessage({ ...row, classification: 'stop' }),
+    { applied: false, replay: true });
+  assert.deepEqual(await storage.listGmailReplyMessages({
+    gmailMessageIds: ['18c2f0a1b2c3d4e5', 'unknown'] }), [{ gmailMessageId: '18c2f0a1b2c3d4e5',
+    gmailThreadId: 'gmail-thread-a', conversationId: 'conversation-a', classification: 'reply',
+    fromFingerprint: hex('broker'), messageAt: at, processedAt: later }]);
+  assert.deepEqual(await storage.listGmailReplyMessages({ gmailMessageIds: [] }), []);
+  await assert.rejects(storage.recordGmailReplyMessage({ ...row, gmailMessageId: 'x',
+    classification: 'body' }), /Invalid classification/);
+  await assert.rejects(storage.recordGmailReplyMessage({ ...row, gmailMessageId: 'y',
+    fromFingerprint: 'broker@example.test' }), /Invalid fromFingerprint/);
+  await assert.rejects(storage.recordGmailReplyMessage({ ...row, gmailMessageId: 'bad id' }),
+    /Invalid gmailMessageId/);
+  await assert.rejects(storage.listGmailReplyMessages({ gmailMessageIds: ['a', 'a'] }),
+    /Invalid gmailMessageIds/);
+  assert.deepEqual(await storage.listGmailConversationSentIdentities({
+    conversationIds: ['conversation-a'] }), []);
+  await assert.rejects(storage.listGmailConversationSentIdentities({ conversationIds: 'x' }),
+    /Invalid conversationIds/);
+});

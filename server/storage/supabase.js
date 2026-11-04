@@ -4,7 +4,9 @@ import {
   normalizeSendControlRows, sendControlConflictError, validateCimProviderRelease,
   validateConversationGmailThread,
   validateGmailCheckpointUpdate, validateGmailTokenCheck, validateRevokeGmailConnection,
-  validateSaveGmailConnection, validateSetPursueSendControl,
+  validateSaveGmailConnection, validateSetPursueSendControl, normalizeGmailReplyMessageRow,
+  normalizeGmailSentIdentityRow, validateGmailReplyMessage, validateGmailReplyMessageLookup,
+  validateGmailSentIdentityLookup,
 } from './gmailSendStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -4247,6 +4249,40 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) throw error;
       if (!Array.isArray(data)) throw new Error('Malformed open Gmail conversation list');
       return data.map(normalizeOpenGmailConversationRow);
+    },
+
+    /** Every transmission of the given conversations: what makes a thread message "ours". */
+    async listGmailConversationSentIdentities(command = {}) {
+      const { conversationIds } = validateGmailSentIdentityLookup(command);
+      if (conversationIds.length === 0) return [];
+      const { data, error } = await client.rpc('deal_hunter_gmail_list_sent_identities_v1', {
+        p_command: { conversationIds },
+      });
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed Gmail sent identity list');
+      return data.map(normalizeGmailSentIdentityRow);
+    },
+
+    /** The processed-message rows among the given Gmail message ids. */
+    async listGmailReplyMessages(command = {}) {
+      const { gmailMessageIds } = validateGmailReplyMessageLookup(command);
+      if (gmailMessageIds.length === 0) return [];
+      const { data, error } = await client.from('deal_hunter_gmail_reply_messages').select('*')
+        .in('gmail_message_id', gmailMessageIds).order('gmail_message_id', { ascending: true });
+      if (error) throw error;
+      return (data || []).map(normalizeGmailReplyMessageRow);
+    },
+
+    /** Marks a Gmail message processed once; the same message again is a replay. */
+    async recordGmailReplyMessage(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_record_reply_message_v1', {
+        p_command: validateGmailReplyMessage(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean') {
+        throw new Error('Malformed Gmail reply message result');
+      }
+      return { applied: data.applied, replay: data.replay };
     },
 
     async getCurrentAutoPursueActivation() {

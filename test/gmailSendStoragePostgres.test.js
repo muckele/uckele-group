@@ -15,7 +15,8 @@ const dockerCommand = fs.existsSync('/usr/local/bin/docker') ? '/usr/local/bin/d
 // The schema as it stood before the Gmail send runner work began.
 const schemaBeforeGmail = '62a3b526820977ed6462ac6743f0af4b588a88e0';
 const migrationPath = path.join(root, 'supabase/migrations/20261103120000_gmail_send_runners.sql');
-const newTables = ['deal_hunter_gmail_connections', 'deal_hunter_pursue_send_controls'];
+const newTables = ['deal_hunter_gmail_connections', 'deal_hunter_pursue_send_controls',
+  'deal_hunter_gmail_reply_messages'];
 const at = '2026-11-03T15:00:00.000Z';
 const later = '2026-11-03T16:00:00.000Z';
 const ciphertext = 'v1.aXYtYnl0ZXM=.dGFnLWJ5dGVz.Y2lwaGVydGV4dA==';
@@ -138,6 +139,8 @@ test('the Gmail send runner migration is mirrored exactly at the end of the fres
   const names = migrationFunctionNames(migration);
   assert.deepEqual(names, [
     'deal_hunter_gmail_list_open_conversations_v1',
+    'deal_hunter_gmail_list_sent_identities_v1',
+    'deal_hunter_gmail_record_reply_message_v1',
     'deal_hunter_gmail_record_token_check_v1',
     'deal_hunter_gmail_revoke_connection_v1',
     'deal_hunter_gmail_save_connection_v1',
@@ -167,7 +170,8 @@ test('the Gmail send runner migration is mirrored exactly at the end of the fres
     assert.ok(last > start && last < end, `no later fresh-schema block may redefine ${name}`);
   }
   // Every provider pin now accepts gmail, and no resend-only pin remains in the block.
-  assert.equal([...migration.matchAll(/not in \('resend','gmail'\)/g)].length, 4);
+  // Four redefinitions from Task 1, plus the Task 9 inbound resolution redefinition.
+  assert.equal([...migration.matchAll(/not in \('resend','gmail'\)/g)].length, 5);
   assert.doesNotMatch(migration, /<> 'resend'|is distinct from 'resend'/);
   for (const table of newTables) {
     assert.match(migration, new RegExp(`alter table public\\.${table} enable row level security;`));
@@ -229,14 +233,16 @@ test('PostgreSQL Gmail connection, send controls, threads and gmail provider out
     select string_agg(table_name || '.' || column_name || ':' || data_type || ':' || is_nullable, ','
       order by table_name, column_name)
     from information_schema.columns where table_schema = 'public'
-      and (table_name = any(array['deal_hunter_gmail_connections', 'deal_hunter_pursue_send_controls'])
+      and (table_name = any(array['deal_hunter_gmail_connections', 'deal_hunter_pursue_send_controls',
+        'deal_hunter_gmail_reply_messages'])
         or (table_name = 'deal_hunter_broker_conversations' and column_name = 'gmail_thread_id'));`);
   assert.equal(columns('gmail_upgrade'), columns('gmail_fresh'));
   const constraints = (database) => psql(container, database, `
     select string_agg(conrelid::regclass || ':' || pg_get_constraintdef(oid), E'\\n' order by conrelid::regclass::text,
       pg_get_constraintdef(oid))
     from pg_constraint where conrelid = any(array['public.deal_hunter_gmail_connections'::regclass,
-      'public.deal_hunter_pursue_send_controls'::regclass]);`);
+      'public.deal_hunter_pursue_send_controls'::regclass,
+      'public.deal_hunter_gmail_reply_messages'::regclass]);`);
   assert.equal(constraints('gmail_upgrade'), constraints('gmail_fresh'));
 
   for (const database of ['gmail_fresh', 'gmail_upgrade']) {

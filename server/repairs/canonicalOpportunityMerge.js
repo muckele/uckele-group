@@ -376,6 +376,13 @@ const relationshipInventoryEntries = [
     reason: inertPursueCimAuthorityBlockingReason,
   }),
   ...relationshipEntries({
+    table: 'deal_hunter_gmail_reply_messages',
+    columns: ['conversation_id', 'gmail_message_id', 'gmail_thread_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
     table: 'deal_hunter_cim_campaigns',
     columns: [
       'conversation_id', 'crm_submission_id', 'decision_event_id', 'enrollment_id',

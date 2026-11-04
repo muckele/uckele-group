@@ -3172,3 +3172,312 @@ revoke all on function public.deal_hunter_pursue_release_prepared_v1(jsonb)
   from public, anon, authenticated;
 grant execute on function public.deal_hunter_pursue_release_prepared_v1(jsonb)
   to service_role;
+
+
+-- Task 9: the Gmail reply poller (spec 2026-11-03 §6).
+
+-- The poller's processed-message log: one row per Gmail message it applied. Only the
+-- classification, the Gmail ids, a From-address fingerprint and timestamps; never a body,
+-- subject or snippet. Written only through deal_hunter_gmail_record_reply_message_v1.
+create table if not exists public.deal_hunter_gmail_reply_messages (
+  gmail_message_id text primary key check (gmail_message_id ~ '^[A-Za-z0-9_-]{1,240}$'),
+  gmail_thread_id text not null check (gmail_thread_id ~ '^[A-Za-z0-9_-]{1,240}$'),
+  conversation_id text not null
+    check (conversation_id = btrim(conversation_id) and char_length(conversation_id) between 1 and 240),
+  classification text not null
+    check (classification in ('ours', 'owner', 'bounce', 'auto-reply', 'stop', 'reply')),
+  from_fingerprint text check (from_fingerprint is null or from_fingerprint ~ '^[0-9a-f]{64}$'),
+  message_at timestamptz,
+  processed_at timestamptz not null
+);
+create index if not exists idx_deal_hunter_gmail_reply_messages_conversation
+  on public.deal_hunter_gmail_reply_messages (conversation_id, processed_at);
+alter table public.deal_hunter_gmail_reply_messages enable row level security;
+revoke all on table public.deal_hunter_gmail_reply_messages
+  from public, anon, authenticated, service_role;
+grant select on table public.deal_hunter_gmail_reply_messages to service_role;
+
+-- Marks a Gmail message processed once; the same message again is a replay.
+create or replace function public.deal_hunter_gmail_record_reply_message_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_now timestamptz := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_conversation_id text := public.pursue_cim_required_text_v1(p_command, 'conversationId', 240);
+  v_message_id text := p_command ->> 'gmailMessageId';
+  v_thread_id text := p_command ->> 'gmailThreadId';
+  v_classification text := p_command ->> 'classification';
+  v_fingerprint text := p_command ->> 'fromFingerprint';
+  v_message_at timestamptz;
+begin
+  if pg_catalog.jsonb_typeof(p_command -> 'gmailMessageId') is distinct from 'string'
+    or v_message_id !~ '^[A-Za-z0-9_-]{1,240}$'
+    or pg_catalog.jsonb_typeof(p_command -> 'gmailThreadId') is distinct from 'string'
+    or v_thread_id !~ '^[A-Za-z0-9_-]{1,240}$'
+    or coalesce(v_classification, '') not in ('ours', 'owner', 'bounce', 'auto-reply', 'stop', 'reply')
+    or coalesce(pg_catalog.jsonb_typeof(p_command -> 'fromFingerprint'), 'null') not in ('string', 'null')
+    or (v_fingerprint is not null and v_fingerprint !~ '^[0-9a-f]{64}$')
+    or coalesce(pg_catalog.jsonb_typeof(p_command -> 'messageAt'), 'null') not in ('string', 'null') then
+    raise exception 'Invalid Gmail reply message';
+  end if;
+  if p_command ->> 'messageAt' is not null then
+    v_message_at := public.pursue_cim_required_instant_v1(p_command, 'messageAt');
+  end if;
+  insert into public.deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
+    conversation_id, classification, from_fingerprint, message_at, processed_at)
+  values (v_message_id, v_thread_id, v_conversation_id, v_classification, v_fingerprint,
+    v_message_at, v_now)
+  on conflict (gmail_message_id) do nothing;
+  return pg_catalog.jsonb_build_object('applied', found, 'replay', not found);
+end;
+$$;
+revoke all on function public.deal_hunter_gmail_record_reply_message_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_gmail_record_reply_message_v1(jsonb) to service_role;
+
+-- Every transmission of the given conversations, in any state, with its sender address, Gmail
+-- id and stored RFC Message-ID: what lets the poller recognize our own sends in a thread.
+create or replace function public.deal_hunter_gmail_list_sent_identities_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  v_ids jsonb := p_command -> 'conversationIds';
+begin
+  if pg_catalog.jsonb_typeof(v_ids) is distinct from 'array'
+    or pg_catalog.jsonb_array_length(v_ids) > 500
+    or exists (select 1 from pg_catalog.jsonb_array_elements(v_ids) as item
+      where pg_catalog.jsonb_typeof(item.value) <> 'string'
+        or pg_catalog.length(item.value #>> '{}') not between 1 and 240
+        or item.value #>> '{}' <> pg_catalog.btrim(item.value #>> '{}'))
+    or (select count(*) from pg_catalog.jsonb_array_elements_text(v_ids))
+       <> (select count(distinct value) from pg_catalog.jsonb_array_elements_text(v_ids)) then
+    raise exception 'Invalid conversationIds';
+  end if;
+  return (select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+      'conversation_id', tr.conversation_id, 'transmission_id', tr.id,
+      'from_address', tr.from_address, 'provider', tr.provider,
+      'provider_message_id', tr.provider_message_id,
+      'rfc_message_id', communication.message_id)
+    order by tr.conversation_id, tr.id), '[]'::jsonb)
+    from public.deal_hunter_cim_transmissions as tr
+    left join public.crm_communications as communication on communication.id = tr.communication_id
+    where tr.conversation_id in (select value from pg_catalog.jsonb_array_elements_text(v_ids)));
+end;
+$$;
+revoke all on function public.deal_hunter_gmail_list_sent_identities_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_gmail_list_sent_identities_v1(jsonb) to service_role;
+
+-- Inbound resolution accepts the gmail-thread evidence method: the conversation whose stored
+-- Gmail thread the message arrived in. It is listed first in the method order. Commands without
+-- gmailThreadIds (webhook evidence) resolve exactly as before. Redefines the body above with
+-- only that change.
+create or replace function public.pursue_cim_resolve_inbound_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  v_provider text := p_command ->> 'provider';
+  v_tagged_conversation text := coalesce(p_command ->> 'taggedConversationId', '');
+  v_tagged_transmission text := coalesce(p_command ->> 'taggedTransmissionId', '');
+  v_gmail_threads jsonb := coalesce(p_command -> 'gmailThreadIds', '[]'::jsonb);
+  v_conversation_ids text[] := array[]::text[];
+  v_campaign_ids text[] := array[]::text[];
+  v_touch_ids text[] := array[]::text[];
+  v_conversation public.deal_hunter_broker_conversations%rowtype;
+  v_transmission public.deal_hunter_cim_transmissions%rowtype;
+  v_candidate_conversations jsonb := '[]'::jsonb;
+  v_method text := 'none';
+  v_invalid_protected boolean := false;
+begin
+  if p_command is null or pg_catalog.jsonb_typeof(p_command) <> 'object'
+    or pg_catalog.jsonb_typeof(p_command -> 'replyToAddresses') <> 'array'
+    or pg_catalog.jsonb_typeof(p_command -> 'providerMessageIds') <> 'array'
+    or pg_catalog.jsonb_typeof(p_command -> 'rfcMessageIds') <> 'array'
+    or pg_catalog.jsonb_typeof(p_command -> 'taggedTouchIds') <> 'array'
+    or pg_catalog.jsonb_array_length(p_command -> 'replyToAddresses') > 20
+    or pg_catalog.jsonb_array_length(p_command -> 'providerMessageIds') > 20
+    or pg_catalog.jsonb_array_length(p_command -> 'rfcMessageIds') > 50
+    or pg_catalog.jsonb_array_length(p_command -> 'taggedTouchIds') > 50
+    or pg_catalog.jsonb_typeof(v_gmail_threads) <> 'array'
+    or pg_catalog.jsonb_array_length(v_gmail_threads) > 20
+    or coalesce(v_provider,'') not in ('resend','gmail')
+    or pg_catalog.length(v_tagged_conversation) > 240
+    or pg_catalog.length(v_tagged_transmission) > 240
+  then
+    raise exception 'Invalid Pursue CIM inbound evidence';
+  end if;
+  if exists (select 1 from pg_catalog.jsonb_array_elements(p_command -> 'replyToAddresses') as item
+      where pg_catalog.jsonb_typeof(item.value) <> 'string'
+        or pg_catalog.length(item.value #>> '{}') not between 1 and 320)
+    or exists (select 1 from pg_catalog.jsonb_array_elements(p_command -> 'providerMessageIds') as item
+      where pg_catalog.jsonb_typeof(item.value) <> 'string'
+        or pg_catalog.length(item.value #>> '{}') not between 1 and 240)
+    or exists (select 1 from pg_catalog.jsonb_array_elements(p_command -> 'rfcMessageIds') as item
+      where pg_catalog.jsonb_typeof(item.value) <> 'string'
+        or pg_catalog.length(item.value #>> '{}') not between 1 and 500)
+    or exists (select 1 from pg_catalog.jsonb_array_elements(p_command -> 'taggedTouchIds') as item
+      where pg_catalog.jsonb_typeof(item.value) <> 'string'
+        or pg_catalog.length(item.value #>> '{}') not between 1 and 240)
+    or (select count(*) from pg_catalog.jsonb_array_elements_text(p_command -> 'replyToAddresses'))
+       <> (select count(distinct value) from pg_catalog.jsonb_array_elements_text(p_command -> 'replyToAddresses'))
+    or (select count(*) from pg_catalog.jsonb_array_elements_text(p_command -> 'providerMessageIds'))
+       <> (select count(distinct value) from pg_catalog.jsonb_array_elements_text(p_command -> 'providerMessageIds'))
+    or (select count(*) from pg_catalog.jsonb_array_elements_text(p_command -> 'rfcMessageIds'))
+       <> (select count(distinct value) from pg_catalog.jsonb_array_elements_text(p_command -> 'rfcMessageIds'))
+    or (select count(*) from pg_catalog.jsonb_array_elements_text(p_command -> 'taggedTouchIds'))
+       <> (select count(distinct value) from pg_catalog.jsonb_array_elements_text(p_command -> 'taggedTouchIds'))
+    or exists (select 1 from pg_catalog.jsonb_array_elements(v_gmail_threads) as item
+      where pg_catalog.jsonb_typeof(item.value) <> 'string'
+        or pg_catalog.length(item.value #>> '{}') not between 1 and 240)
+    or (select count(*) from pg_catalog.jsonb_array_elements_text(v_gmail_threads))
+       <> (select count(distinct value) from pg_catalog.jsonb_array_elements_text(v_gmail_threads))
+  then
+    raise exception 'Invalid Pursue CIM inbound evidence item';
+  end if;
+
+  if v_tagged_conversation <> '' and not exists (
+      select 1 from public.deal_hunter_broker_conversations where id = v_tagged_conversation) then
+    v_invalid_protected := true;
+  end if;
+  if v_tagged_transmission <> '' and not exists (
+      select 1 from public.deal_hunter_cim_transmissions where id = v_tagged_transmission) then
+    v_invalid_protected := true;
+  end if;
+  if (select count(*) from public.deal_hunter_cim_campaign_touches
+      where id in (select value from pg_catalog.jsonb_array_elements_text(
+        p_command -> 'taggedTouchIds')))
+      <> pg_catalog.jsonb_array_length(p_command -> 'taggedTouchIds') then
+    v_invalid_protected := true;
+  end if;
+
+  with candidates as (
+    select conversation.id as conversation_id
+      from public.deal_hunter_broker_conversations as conversation
+      join pg_catalog.jsonb_array_elements_text(v_gmail_threads) as thread
+        on conversation.gmail_thread_id = thread.value
+    union all
+    select tr.conversation_id from public.deal_hunter_cim_transmissions as tr
+      join pg_catalog.jsonb_array_elements_text(p_command -> 'replyToAddresses') as alias
+        on pg_catalog.lower(tr.reply_to_address) = pg_catalog.lower(alias.value)
+    union all
+    select tr.conversation_id from public.deal_hunter_cim_transmissions as tr
+      join pg_catalog.jsonb_array_elements_text(p_command -> 'providerMessageIds') as provider_id
+        on tr.provider = v_provider and tr.provider_message_id = provider_id.value
+    union all
+    select tr.conversation_id from public.crm_communications as communication
+      join public.deal_hunter_cim_transmissions as tr on tr.communication_id = communication.id
+      join pg_catalog.jsonb_array_elements_text(p_command -> 'rfcMessageIds') as rfc_id
+        on communication.message_id = rfc_id.value
+    union all
+    select tr.conversation_id from public.deal_hunter_cim_transmissions as tr
+      where v_tagged_transmission <> '' and tr.id = v_tagged_transmission
+    union all
+    select conversation.id from public.deal_hunter_broker_conversations as conversation
+      where v_tagged_conversation <> '' and conversation.id = v_tagged_conversation
+    union all
+    select campaign.conversation_id from public.deal_hunter_cim_campaign_touches as touch
+      join public.deal_hunter_cim_campaigns as campaign on campaign.id = touch.campaign_id
+      join pg_catalog.jsonb_array_elements_text(p_command -> 'taggedTouchIds') as tagged_touch
+        on touch.id = tagged_touch.value
+  )
+  select coalesce(pg_catalog.array_agg(distinct conversation_id order by conversation_id),
+    array[]::text[]) into v_conversation_ids from candidates;
+
+  if pg_catalog.cardinality(v_conversation_ids) > 50 then
+    raise exception 'Pursue CIM inbound evidence exceeds the bounded candidate set';
+  end if;
+  select coalesce(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(conversation)
+      order by conversation.id), '[]'::jsonb)
+    into v_candidate_conversations
+    from public.deal_hunter_broker_conversations as conversation
+    where conversation.id = any(v_conversation_ids);
+
+  if v_invalid_protected or pg_catalog.cardinality(v_conversation_ids) > 1 then
+    return pg_catalog.jsonb_build_object('exact', false, 'ambiguous', true,
+      'method', 'conflicting-exact-evidence', 'conversation', null,
+      'transmission', null, 'campaignIds', '[]'::jsonb, 'touchIds', '[]'::jsonb,
+      'candidateConversations', v_candidate_conversations);
+  end if;
+  if pg_catalog.cardinality(v_conversation_ids) = 0 then
+    return pg_catalog.jsonb_build_object('exact', false, 'ambiguous', false,
+      'method', 'none', 'conversation', null, 'transmission', null,
+      'campaignIds', '[]'::jsonb, 'touchIds', '[]'::jsonb,
+      'candidateConversations', '[]'::jsonb);
+  end if;
+
+  select * into v_conversation from public.deal_hunter_broker_conversations
+    where id = v_conversation_ids[1];
+  if v_conversation.id is null then
+    return pg_catalog.jsonb_build_object('exact', false, 'ambiguous', true,
+      'method', 'conflicting-exact-evidence', 'conversation', null,
+      'transmission', null, 'campaignIds', '[]'::jsonb, 'touchIds', '[]'::jsonb,
+      'candidateConversations', v_candidate_conversations);
+  end if;
+  if exists (select 1 from pg_catalog.jsonb_array_elements_text(v_gmail_threads) as thread
+      where thread.value = v_conversation.gmail_thread_id) then
+    v_method := 'gmail-thread';
+  elsif exists (select 1 from public.deal_hunter_cim_transmissions as tr
+      join pg_catalog.jsonb_array_elements_text(p_command -> 'replyToAddresses') as alias
+        on pg_catalog.lower(tr.reply_to_address) = pg_catalog.lower(alias.value)
+      where tr.conversation_id = v_conversation.id) then
+    v_method := 'reply-alias';
+  elsif exists (select 1 from public.deal_hunter_cim_transmissions as tr
+      join pg_catalog.jsonb_array_elements_text(p_command -> 'providerMessageIds') as provider_id
+        on tr.provider = v_provider and tr.provider_message_id = provider_id.value
+      where tr.conversation_id = v_conversation.id) then
+    v_method := 'provider-message';
+  elsif exists (select 1 from public.crm_communications as communication
+      join public.deal_hunter_cim_transmissions as tr on tr.communication_id = communication.id
+      join pg_catalog.jsonb_array_elements_text(p_command -> 'rfcMessageIds') as rfc_id
+        on communication.message_id = rfc_id.value
+      where tr.conversation_id = v_conversation.id) then
+    v_method := 'rfc-thread';
+  else
+    v_method := 'protected-tag';
+  end if;
+
+  select tr.* into v_transmission from public.deal_hunter_cim_transmissions as tr
+    where tr.conversation_id = v_conversation.id
+      and (tr.id = nullif(v_tagged_transmission, '')
+        or pg_catalog.lower(tr.reply_to_address) in (select pg_catalog.lower(value)
+          from pg_catalog.jsonb_array_elements_text(p_command -> 'replyToAddresses'))
+        or (tr.provider = v_provider and tr.provider_message_id in (select value
+          from pg_catalog.jsonb_array_elements_text(p_command -> 'providerMessageIds')))
+        or tr.communication_id in (select communication.id
+          from public.crm_communications as communication
+          where communication.message_id in (select value
+            from pg_catalog.jsonb_array_elements_text(p_command -> 'rfcMessageIds'))))
+    order by case when tr.id = nullif(v_tagged_transmission, '') then 0 else 1 end,
+      tr.updated_at desc, tr.id desc limit 1;
+  select coalesce(pg_catalog.array_agg(id order by id), array[]::text[])
+    into v_campaign_ids from public.deal_hunter_cim_campaigns
+    where conversation_id = v_conversation.id;
+  select coalesce(pg_catalog.array_agg(touch.id order by touch.id), array[]::text[])
+    into v_touch_ids from public.deal_hunter_cim_campaign_touches as touch
+    join public.deal_hunter_cim_campaigns as campaign on campaign.id = touch.campaign_id
+    where campaign.conversation_id = v_conversation.id;
+  return pg_catalog.jsonb_build_object('exact', true, 'ambiguous', false,
+    'method', v_method, 'conversation', pg_catalog.to_jsonb(v_conversation),
+    'transmission', case when v_transmission.id is null then null
+      else pg_catalog.to_jsonb(v_transmission) end,
+    'campaignIds', pg_catalog.to_jsonb(v_campaign_ids),
+    'touchIds', pg_catalog.to_jsonb(v_touch_ids),
+    'candidateConversations', '[]'::jsonb);
+end;
+$$;
+
+
+revoke all on function public.pursue_cim_resolve_inbound_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_resolve_inbound_v1(jsonb) to service_role;

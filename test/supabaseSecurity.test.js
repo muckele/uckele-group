@@ -562,7 +562,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
     /grant execute on function public\.pursue_cim_record_auto_pursue_decision_v1\(jsonb, jsonb\) to service_role;/i);
   // The Gmail connection and send controls are read by service_role and written only through RPCs.
   assert.doesNotMatch(gmailSendRunnersMigration, /create\s+policy/i);
-  for (const table of ['deal_hunter_gmail_connections', 'deal_hunter_pursue_send_controls']) {
+  for (const table of ['deal_hunter_gmail_connections', 'deal_hunter_pursue_send_controls',
+    'deal_hunter_gmail_reply_messages']) {
     assert.match(gmailSendRunnersMigration,
       new RegExp(`revoke all on table public\\.${table}\\s+from public, anon, authenticated, service_role;`, 'i'));
     assert.match(gmailSendRunnersMigration,
