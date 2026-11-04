@@ -347,6 +347,37 @@ test('a stop word is never lost: suppression and terminal survive a crash at eit
   assert.equal(other.replyRows().find((row) => row.classification === 'stop').applied, 1);
 });
 
+test('a stop word suppresses the recipient even while the terminal write keeps failing', async (t) => {
+  const world = await sentWorld(t);
+  world.inject({}, 'Stop emailing me.');
+  // The terminal write throws on every attempt.
+  const terminalAlwaysFails = new Proxy(world.storage, { get(target, name) {
+    if (name === 'appendCimTerminalEvent') {
+      return async () => { throw new Error('synthetic terminal failure'); };
+    }
+    const value = target[name];
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const first = await world.poll({ storage: terminalAlwaysFails });
+  assert.deepEqual([first.pending, first.stopped], [1, 0], JSON.stringify(first));
+  const suppression = await world.storage.getActiveEmailSuppression(BROKER);
+  assert.ok(suppression, 'the opt-out is honored on the first attempt');
+  assert.deepEqual([suppression.reason, suppression.source], ['explicit-opt-out', 'gmail-reply']);
+  assert.equal(world.replyRows().find((row) => row.classification === 'stop').applied, 0,
+    'the record stays pending until the terminal is written too');
+  // The suppression alone already stops the campaign, so no follow-up can go out meanwhile.
+  assert.deepEqual([world.campaign().state, world.campaign().reason_code], ['stopped', 'recipient_suppressed']);
+  assert.equal(world.followUp().state, 'cancelled-before-provider');
+  const second = await world.poll({ storage: terminalAlwaysFails });
+  assert.equal(second.pending, 1, JSON.stringify(second));
+  assert.equal(world.count('email_suppressions'), 1, 'suppression is written once');
+  // Once the terminal write works, the record settles and the campaign stops.
+  const settled = await world.poll();
+  assert.equal(settled.stopped, 1, JSON.stringify(settled));
+  assert.equal(world.conversation().state, 'responded');
+  assert.equal(world.replyRows().find((row) => row.classification === 'stop').applied, 1);
+});
+
 /** World with follow-up-1 sent ambiguous and not found: the conversation is provider-ambiguous. */
 async function ambiguousWorld(t) {
   const world = await sentWorld(t);

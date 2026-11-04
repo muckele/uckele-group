@@ -137,11 +137,16 @@ async function suppressRecipient(storage, { record, at }) {
  */
 async function applyRecorded({ storage, record, now }) {
   const at = instantOf(now);
-  const result = await applyVerifiedPursueCimInbound(inboundEvent(record, record.messageAt ?? at), {
-    storage, now: at, outcome: INBOUND_OUTCOME[record.classification],
-    actor: PURSUE_CIM_REPLY_POLLER_ACTOR });
-  // An opt-out is honored even while the conversation cannot take the terminal yet.
-  if (record.classification === 'stop') await suppressRecipient(storage, { record, at });
+  let result;
+  try {
+    result = await applyVerifiedPursueCimInbound(inboundEvent(record, record.messageAt ?? at), {
+      storage, now: at, outcome: INBOUND_OUTCOME[record.classification],
+      actor: PURSUE_CIM_REPLY_POLLER_ACTOR });
+  } finally {
+    // An opt-out is honored even while the conversation cannot take the terminal yet, or the
+    // terminal write keeps failing. The record settles only once both have succeeded.
+    if (record.classification === 'stop') await suppressRecipient(storage, { record, at });
+  }
   if (result?.deferred) return false;
   await storage.recordGmailReplyMessage({ gmailMessageId: record.gmailMessageId,
     gmailThreadId: record.gmailThreadId, conversationId: record.conversationId,
