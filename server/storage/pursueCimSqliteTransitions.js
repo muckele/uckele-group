@@ -78,8 +78,12 @@ function requiredText(value, name, maximum = 240) {
   return value;
 }
 
+const approvedCimProviders = new Set(['resend', 'gmail']);
+
 function requiredProvider(value) {
-  if (value !== 'resend') throw new Error('Provider outcome must use the approved Resend adapter');
+  if (!approvedCimProviders.has(value)) {
+    throw new Error('Provider outcome must use the approved Resend adapter or the approved Gmail adapter');
+  }
   return value;
 }
 
@@ -539,7 +543,7 @@ export function createPursueCimSqliteTransitions(database, {
         if (!identity || typeof identity !== 'object' || Array.isArray(identity)
           || Object.keys(identity).sort().join(',')
             !== 'evidenceDigest,evidenceId,provider,providerMessageId'
-          || identity.provider !== 'resend') {
+          || !approvedCimProviders.has(identity.provider)) {
           throw new Error('Invalid provider identity conflict evidence');
         }
         const providerMessageId = requiredProviderMessageId(identity?.providerMessageId);

@@ -1,4 +1,10 @@
 import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRestore.js';
+import {
+  normalizeGmailConnectionRow, normalizeOpenGmailConversationRow, normalizeSendControlRow,
+  normalizeSendControlRows, sendControlConflictError, validateConversationGmailThread,
+  validateGmailCheckpointUpdate, validateGmailTokenCheck, validateRevokeGmailConnection,
+  validateSaveGmailConnection, validateSetPursueSendControl,
+} from './gmailSendStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
@@ -3927,6 +3933,93 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .select('id').ilike('recipient_address', pattern).limit(1);
       if (error) throw error;
       return Array.isArray(data) && data.length > 0;
+    },
+
+    async getGmailConnection() {
+      const { data, error } = await client.from('deal_hunter_gmail_connections')
+        .select('*').is('revoked_at', null).maybeSingle();
+      if (error) throw error;
+      return normalizeGmailConnectionRow(data);
+    },
+
+    /** Stores a new active connection; the RPC revokes any prior active row in one transaction. */
+    async saveGmailConnection(command = {}) {
+      const connection = validateSaveGmailConnection(command);
+      const { data, error } = await client.rpc('deal_hunter_gmail_save_connection_v1', {
+        p_command: { id: randomUUID(), ...connection },
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || typeof data.id !== 'string') {
+        throw new Error('Malformed Gmail connection result');
+      }
+      return normalizeGmailConnectionRow(data);
+    },
+
+    async revokeGmailConnection(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_revoke_connection_v1', {
+        p_command: validateRevokeGmailConnection(command),
+      });
+      if (error) throw error;
+      return normalizeGmailConnectionRow(data);
+    },
+
+    /** A successful check clears the error; a failed one keeps the last good instant. */
+    async recordGmailTokenCheck(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_record_token_check_v1', {
+        p_command: validateGmailTokenCheck(command),
+      });
+      if (error) throw error;
+      return normalizeGmailConnectionRow(data);
+    },
+
+    /** Compare-and-set of the active connection's reply checkpoint. */
+    async updateGmailHistoryCheckpoint(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_update_checkpoint_v1', {
+        p_command: validateGmailCheckpointUpdate(command),
+      });
+      if (error) throw error;
+      if (typeof data !== 'boolean') throw new Error('Malformed Gmail checkpoint result');
+      return data;
+    },
+
+    async getPursueSendControls() {
+      const { data, error } = await client.from('deal_hunter_pursue_send_controls').select('*');
+      if (error) throw error;
+      return normalizeSendControlRows(data || []);
+    },
+
+    /** Revisioned write of one send control plus its audit event; a stale revision conflicts. */
+    async setPursueSendControl(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_set_send_control_v1', {
+        p_command: validateSetPursueSendControl(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || typeof data.applied !== 'boolean'
+        || typeof data.conflict !== 'boolean') {
+        throw new Error('Malformed Pursue send control result');
+      }
+      if (data.conflict) throw sendControlConflictError();
+      return normalizeSendControlRow(data.control);
+    },
+
+    /** Records a conversation's Gmail thread once; same thread is a replay, another a conflict. */
+    async setCimConversationGmailThread(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_set_conversation_thread_v1', {
+        p_command: validateConversationGmailThread(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object'
+        || ['applied', 'replay', 'conflict'].some((key) => typeof data[key] !== 'boolean')) {
+        throw new Error('Malformed Pursue CIM conversation thread result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict };
+    },
+
+    async listOpenGmailConversations() {
+      const { data, error } = await client.rpc('deal_hunter_gmail_list_open_conversations_v1');
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed open Gmail conversation list');
+      return data.map(normalizeOpenGmailConversationRow);
     },
 
     async getCurrentAutoPursueActivation() {

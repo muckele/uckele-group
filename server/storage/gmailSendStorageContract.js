@@ -1,0 +1,169 @@
+// Input validation and row shapes shared by the SQLite and Supabase adapters for the
+// Gmail connection, the Pursue send controls and the conversation Gmail thread.
+// Validation messages name the field only, never its value, so a refresh token can
+// never reach an error message.
+
+export const PURSUE_SEND_CONTROL_KEYS = Object.freeze({
+  live_sending: 'liveSending',
+  contact_rule: 'contactRule',
+  wording_approval: 'wordingApproval',
+});
+
+export const SEND_CONTROL_AUDIT_EVENT = 'send-control-changed';
+export const SEND_CONTROL_AUDIT_SOURCE = 'pursue-send-controls';
+
+// The Task 2 token format: v1.<iv b64>.<tag b64>.<ciphertext b64>.
+const ciphertextPattern = /^v1\.[A-Za-z0-9+/_=-]+\.[A-Za-z0-9+/_=-]+\.[A-Za-z0-9+/_=-]+$/;
+const checkpointPattern = /^[0-9]{1,30}$/;
+const errorCodePattern = /^[a-z0-9_]{1,80}$/;
+const digestPattern = /^[0-9a-f]{64}$/;
+const threadIdPattern = /^[A-Za-z0-9_-]{1,240}$/;
+
+function invalid(name) {
+  return new Error(`Invalid ${name}`);
+}
+
+function text(value, name, maximum, minimum = 1) {
+  if (typeof value !== 'string' || value.length < minimum || value.length > maximum
+    || value.trim() !== value) throw invalid(name);
+  return value;
+}
+
+function instant(value, name = 'now') {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw invalid(name);
+  return new Date(value).toISOString();
+}
+
+function checkpoint(value, name = 'historyCheckpoint') {
+  if (value === null || value === undefined) return null;
+  const normalized = Number.isSafeInteger(value) && value >= 0 ? String(value) : value;
+  if (typeof normalized !== 'string' || !checkpointPattern.test(normalized)) throw invalid(name);
+  return normalized;
+}
+
+function optionalInstant(value) {
+  return value === null || value === undefined ? null : new Date(value).toISOString();
+}
+
+export function sendControlConflictError() {
+  const error = new Error('send_control_conflict');
+  error.code = 'send_control_conflict';
+  return error;
+}
+
+export function validateSaveGmailConnection(command = {}) {
+  const { grantedScopes } = command;
+  if (!Array.isArray(grantedScopes) || grantedScopes.length > 20
+    || grantedScopes.some((scope) => typeof scope !== 'string' || scope.length < 1
+      || scope.length > 200 || /\s/.test(scope))) throw invalid('grantedScopes');
+  const refreshTokenCiphertext = command.refreshTokenCiphertext;
+  if (typeof refreshTokenCiphertext !== 'string' || refreshTokenCiphertext.length > 8192
+    || !ciphertextPattern.test(refreshTokenCiphertext)) throw invalid('refreshTokenCiphertext');
+  return {
+    emailAddress: text(command.emailAddress, 'emailAddress', 320, 3),
+    refreshTokenCiphertext,
+    grantedScopes: [...grantedScopes],
+    historyCheckpoint: checkpoint(command.historyCheckpoint),
+    connectedBy: text(command.connectedBy, 'connectedBy', 200),
+    now: instant(command.now),
+  };
+}
+
+export function validateRevokeGmailConnection(command = {}) {
+  return { revokedBy: text(command.revokedBy, 'revokedBy', 200), now: instant(command.now) };
+}
+
+export function validateGmailTokenCheck(command = {}) {
+  if (typeof command.ok !== 'boolean') throw invalid('ok');
+  if (command.ok) return { ok: true, errorCode: null, now: instant(command.now) };
+  if (typeof command.errorCode !== 'string' || !errorCodePattern.test(command.errorCode)) {
+    throw invalid('errorCode');
+  }
+  return { ok: false, errorCode: command.errorCode, now: instant(command.now) };
+}
+
+export function validateGmailCheckpointUpdate(command = {}) {
+  const next = checkpoint(command.next);
+  if (next === null) throw invalid('historyCheckpoint');
+  return { expected: checkpoint(command.expected), next, now: instant(command.now) };
+}
+
+export function validateSetPursueSendControl(command = {}) {
+  const controlKey = command.controlKey;
+  if (!Object.hasOwn(PURSUE_SEND_CONTROL_KEYS, controlKey)) throw invalid('controlKey');
+  if (typeof command.enabled !== 'boolean') throw invalid('enabled');
+  const valueDigest = command.valueDigest ?? null;
+  if (valueDigest !== null && (typeof valueDigest !== 'string' || !digestPattern.test(valueDigest))) {
+    throw invalid('valueDigest');
+  }
+  // Approving wording records the approved digest; readiness compares against it.
+  if (controlKey === 'wording_approval' && command.enabled && valueDigest === null) {
+    throw invalid('valueDigest');
+  }
+  const policyVersion = command.policyVersion ?? null;
+  if (policyVersion !== null) text(policyVersion, 'policyVersion', 120);
+  if (!Number.isSafeInteger(command.expectedRevision) || command.expectedRevision < 0) {
+    throw invalid('expectedRevision');
+  }
+  const reason = command.reason ?? '';
+  if (typeof reason !== 'string' || reason.length > 500) throw invalid('reason');
+  return { controlKey, enabled: command.enabled, valueDigest, policyVersion,
+    expectedRevision: command.expectedRevision, actor: text(command.actor, 'actor', 200),
+    reason, now: instant(command.now) };
+}
+
+export function validateConversationGmailThread(command = {}) {
+  const gmailThreadId = command.gmailThreadId;
+  if (typeof gmailThreadId !== 'string' || !threadIdPattern.test(gmailThreadId)) {
+    throw invalid('gmailThreadId');
+  }
+  return { conversationId: text(command.conversationId, 'conversationId', 240), gmailThreadId,
+    now: instant(command.now) };
+}
+
+/** One connection row in the same shape from both adapters; scopes are an array. */
+export function normalizeGmailConnectionRow(row) {
+  if (!row) return null;
+  const scopes = typeof row.granted_scopes === 'string'
+    ? JSON.parse(row.granted_scopes) : row.granted_scopes;
+  return {
+    id: row.id,
+    email_address: row.email_address,
+    refresh_token_ciphertext: row.refresh_token_ciphertext,
+    granted_scopes: Array.isArray(scopes) ? scopes : [],
+    connected_at: optionalInstant(row.connected_at),
+    connected_by: row.connected_by,
+    revoked_at: optionalInstant(row.revoked_at),
+    revoked_by: row.revoked_by ?? null,
+    history_checkpoint: row.history_checkpoint ?? null,
+    last_token_ok_at: optionalInstant(row.last_token_ok_at),
+    last_error_code: row.last_error_code ?? null,
+  };
+}
+
+export function normalizeSendControlRow(row) {
+  if (!row) {
+    return { enabled: false, valueDigest: null, policyVersion: null, changedAt: null,
+      changedBy: null, revision: 0 };
+  }
+  return {
+    enabled: row.enabled === true || row.enabled === 1,
+    valueDigest: row.value_digest ?? null,
+    policyVersion: row.policy_version ?? null,
+    changedAt: optionalInstant(row.changed_at),
+    changedBy: row.changed_by ?? null,
+    revision: Number(row.revision),
+  };
+}
+
+/** Every control, defaulting to off at revision 0 when it was never set. */
+export function normalizeSendControlRows(rows = []) {
+  const byKey = new Map(rows.map((row) => [row.control_key, row]));
+  return Object.fromEntries(Object.entries(PURSUE_SEND_CONTROL_KEYS)
+    .map(([key, name]) => [name, normalizeSendControlRow(byKey.get(key))]));
+}
+
+export function normalizeOpenGmailConversationRow(row) {
+  return { conversationId: row.conversation_id, gmailThreadId: row.gmail_thread_id,
+    campaignId: row.campaign_id ?? null, recipientFingerprint: row.recipient_fingerprint };
+}
