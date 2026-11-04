@@ -4283,6 +4283,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeGmailReplyMessageRow);
     },
 
+    /** Every conversation with a Gmail reply whose effect is still pending, distinct, uncapped. */
+    async listGmailPendingReplyConversationIds() {
+      const { data, error } = await client.rpc('deal_hunter_gmail_list_pending_reply_conversations_v1');
+      if (error) throw error;
+      if (!Array.isArray(data) || data.some((id) => typeof id !== 'string' || !id)) {
+        throw new Error('Malformed Gmail pending reply conversations result');
+      }
+      return data;
+    },
+
     /** Records a Gmail message once; a pending row is settled by recording it applied. */
     async recordGmailReplyMessage(command = {}) {
       const { data, error } = await client.rpc('deal_hunter_gmail_record_reply_message_v1', {

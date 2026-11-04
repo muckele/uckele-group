@@ -466,6 +466,37 @@ test('the sender sends nothing to a conversation whose held reply cannot be appl
   assert.equal(world.row('deal_hunter_cim_campaign_touches', next.id).state, 'scheduled');
 });
 
+test('the sender holds every conversation with a pending reply, beyond the 200-row page', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805,
+    campaigns: ['a', 'b'].map((suffix) => ({ suffix, dueAt: MONDAY_0800,
+      dueLocal: '2030-10-28T08:00:00' })) });
+  const initials = await fixture.run();
+  assert.equal(initials.sentInitial, 2, JSON.stringify(initials));
+  const threadOf = (suffix) => fixture.row('deal_hunter_broker_conversations',
+    fixture.campaigns[suffix].conversationId).gmail_thread_id;
+  // 201 earlier pending replies on b fill the re-apply page; a's pending reply comes after them.
+  const base = Date.parse(MONDAY_1000);
+  const pending = (suffix, index) => fixture.storage.recordGmailReplyMessage({
+    gmailMessageId: `pending-${suffix}-${index}`, gmailThreadId: threadOf(suffix),
+    conversationId: fixture.campaigns[suffix].conversationId, classification: 'reply',
+    fromFingerprint: null, messageAt: null, applied: false,
+    now: new Date(base + index * 1000).toISOString() });
+  for (let index = 0; index < 201; index += 1) await pending('b', index);
+  await pending('a', 500);
+  assert.equal((await fixture.storage.listPendingGmailReplyMessages({ limit: 200 }))
+    .some((row) => row.conversationId === fixture.campaigns.a.conversationId), false);
+
+  const followUp = fixture.touches(fixture.campaigns.a.campaignId)
+    .find((touch) => touch.kind !== 'initial' && touch.state === 'scheduled');
+  fixture.clock.set(new Date(Date.parse(followUp.due_at) + 5 * MINUTE).toISOString());
+  const attempts = fixture.mailProvider.attempts.length;
+  const sender = await fixture.run();
+  assert.equal(sender.sentFollowUps, 0, JSON.stringify(sender));
+  assert.ok(sender.skipped.gmail_reply_pending >= 1, JSON.stringify(sender));
+  assert.equal(fixture.mailProvider.attempts.length, attempts);
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', followUp.id).state, 'scheduled');
+});
+
 test('our follow-up sent while the history is read is ours, not an owner reply', async (t) => {
   const world = await sentWorld(t);
   const fake = world.mailProvider;

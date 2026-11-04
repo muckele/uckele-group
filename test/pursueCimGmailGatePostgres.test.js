@@ -1059,6 +1059,7 @@ test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-
   const [pending] = await storage.listPendingGmailReplyMessages({ limit: 10 });
   assert.deepEqual([pending.conversationId, pending.classification, pending.applied],
     [seeded.held.conversationId, 'reply', false]);
+  assert.deepEqual(await storage.listGmailPendingReplyConversationIds(), [seeded.held.conversationId]);
   assert.equal((await poll()).pending, 1);
   assert.equal(campaign(seeded.held), 'active-follow-up:-');
   scalar(`update public.deal_hunter_broker_conversations set state = 'open',
@@ -1069,6 +1070,7 @@ test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-
   assert.equal(reopened.pending, 0);
   assert.equal(campaign(seeded.held), 'responded:reply_received');
   assert.deepEqual(await storage.listPendingGmailReplyMessages({ limit: 10 }), []);
+  assert.deepEqual(await storage.listGmailPendingReplyConversationIds(), []);
   // A stop word responds and suppresses the recipient through the existing suppression write.
   inject('stop', {}, 'Please remove me from your list.');
   const stop = await poll();
@@ -1090,4 +1092,20 @@ test('PostgreSQL reply poller: gmail-thread evidence, ours, owner, bounce, auto-
   assert.deepEqual(await storage.listGmailReplyMessages({ gmailMessageIds: [draft.id] }), []);
   assert.equal(scalar(`select count(*) from public.deal_hunter_cim_terminal_events t
     where to_jsonb(t)::text like '%${marker}%';`), '0');
+
+  // Pending conversations are listed distinct and uncapped, beyond any page of pending rows.
+  scalar(`insert into public.deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
+      conversation_id, classification, processed_at, applied)
+    select 'bulk-' || i, 'gmail-thread-poll-owner', '${seeded.owner.conversationId}', 'reply',
+      timestamptz '2030-01-01 00:00:00+00' + i * interval '1 second', false
+    from generate_series(1, 201) as i;
+    insert into public.deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
+      conversation_id, classification, processed_at, applied)
+    values ('bulk-last', 'gmail-thread-poll-auto', '${seeded.auto.conversationId}', 'reply',
+      timestamptz '2030-01-02 00:00:00+00', false);`);
+  assert.equal((await storage.listPendingGmailReplyMessages({ limit: 200 }))
+    .some((row) => row.conversationId === seeded.auto.conversationId), false);
+  assert.deepEqual(await storage.listGmailPendingReplyConversationIds(),
+    [seeded.auto.conversationId, seeded.owner.conversationId].sort());
+  scalar(`delete from public.deal_hunter_gmail_reply_messages where gmail_message_id like 'bulk-%';`);
 });

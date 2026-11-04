@@ -401,6 +401,24 @@ test('gmail reply messages are recorded once with classification, ids and a fing
   await assert.rejects(storage.listPendingGmailReplyMessages({ limit: 0 }), /Invalid limit/);
   assert.deepEqual(await storage.listGmailConversationSentIdentities({
     conversationIds: ['conversation-a'] }), []);
+  assert.deepEqual(await storage.listGmailPendingReplyConversationIds(), []);
   await assert.rejects(storage.listGmailConversationSentIdentities({ conversationIds: 'x' }),
     /Invalid conversationIds/);
+});
+
+test('pending reply conversations are listed distinct and uncapped, beyond any page of pending rows', async (t) => {
+  const { storage, database } = openStorage(t);
+  for (const suffix of ['a', 'b', 'c']) seedConversation(database, suffix);
+  const base = Date.parse(later);
+  const record = (suffix, index, applied = false) => storage.recordGmailReplyMessage({
+    gmailMessageId: `msg-${suffix}-${index}`, gmailThreadId: `gmail-thread-${suffix}`,
+    conversationId: `conversation-${suffix}`, classification: 'reply', fromFingerprint: null,
+    messageAt: null, applied, now: new Date(base + index * 1000).toISOString() });
+  for (let index = 0; index < 201; index += 1) await record('a', index);
+  await record('b', 300);
+  await record('c', 301, true);
+  assert.equal((await storage.listPendingGmailReplyMessages({ limit: 200 }))
+    .some((row) => row.conversationId === 'conversation-b'), false);
+  assert.deepEqual(await storage.listGmailPendingReplyConversationIds(),
+    ['conversation-a', 'conversation-b']);
 });

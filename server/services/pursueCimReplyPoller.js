@@ -183,8 +183,9 @@ export async function readPursueReplyPollerHold({ storage, config, now } = {}) {
  * Applies every recorded Gmail reply whose effect is still pending. The poller runs it first in
  * every poll and the sender runs it after reconciliation and before any send, so a reply held
  * while its conversation was provider-ambiguous is applied before a follow-up can go out once
- * the conversation is reopened. Returns the settled counts and the conversations that still
- * have a pending reply (the sender sends nothing to them in that run).
+ * the conversation is reopened. Returns the settled counts and every conversation that still
+ * has a pending reply, read uncapped after the apply (the sender sends nothing to them in that
+ * run).
  */
 export async function applyPendingPursueCimReplies({ storage, now } = {}) {
   const outcome = { settled: 0, pending: 0, counts: {}, pendingConversationIds: new Set() };
@@ -204,6 +205,13 @@ export async function applyPendingPursueCimReplies({ storage, now } = {}) {
     } else {
       outcome.pending += 1;
       outcome.pendingConversationIds.add(record.conversationId);
+    }
+  }
+  // Every conversation still holding a pending reply, not only those in this page: the sender
+  // sends nothing to any of them, however many pending rows come first.
+  if (typeof storage.listGmailPendingReplyConversationIds === 'function') {
+    for (const conversationId of await storage.listGmailPendingReplyConversationIds()) {
+      outcome.pendingConversationIds.add(conversationId);
     }
   }
   return outcome;

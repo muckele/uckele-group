@@ -24219,6 +24219,23 @@ revoke all on table public.deal_hunter_gmail_reply_messages
   from public, anon, authenticated, service_role;
 grant select on table public.deal_hunter_gmail_reply_messages to service_role;
 
+-- Every conversation with a Gmail reply whose effect is still pending, distinct and uncapped:
+-- the sender sends nothing to them, however many pending rows come before theirs.
+create or replace function public.deal_hunter_gmail_list_pending_reply_conversations_v1()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select coalesce(pg_catalog.jsonb_agg(p.conversation_id order by p.conversation_id), '[]'::jsonb)
+  from (select distinct m.conversation_id from public.deal_hunter_gmail_reply_messages m
+    where not m.applied) p;
+$$;
+revoke all on function public.deal_hunter_gmail_list_pending_reply_conversations_v1()
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_gmail_list_pending_reply_conversations_v1() to service_role;
+
 -- Records a Gmail message once (the first classification wins). A pending row is settled by
 -- recording it again with applied = true; a settled row never returns to pending. 'applied' in
 -- the result is true when a row was written.

@@ -11337,6 +11337,14 @@ ${cimCapacityConsumeTriggerSql}
         `).all(limit).map(normalizeGmailReplyMessageRow);
       },
 
+      /** Every conversation with a Gmail reply whose effect is still pending, distinct, uncapped. */
+      async listGmailPendingReplyConversationIds() {
+        return database.prepare(`
+          SELECT DISTINCT conversation_id FROM deal_hunter_gmail_reply_messages WHERE applied = 0
+          ORDER BY conversation_id
+        `).all().map((row) => row.conversation_id);
+      },
+
       async getCurrentAutoPursueActivation() {
         return database.prepare(`
           SELECT * FROM deal_hunter_auto_pursue_activations WHERE status = 'current' LIMIT 1

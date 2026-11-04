@@ -139,6 +139,7 @@ test('the Gmail send runner migration is mirrored exactly at the end of the fres
   const names = migrationFunctionNames(migration);
   assert.deepEqual(names, [
     'deal_hunter_gmail_list_open_conversations_v1',
+    'deal_hunter_gmail_list_pending_reply_conversations_v1',
     'deal_hunter_gmail_list_sent_identities_v1',
     'deal_hunter_gmail_record_reply_message_v1',
     'deal_hunter_gmail_record_token_check_v1',
