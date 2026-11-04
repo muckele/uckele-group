@@ -395,7 +395,21 @@ function compareManifestDocumentsToDatabase(manifestDocuments, databaseRows) {
   return { errors, documentErrors };
 }
 
-async function copySecureDocuments({ databasePath, documentsDirectory, destination }) {
+// Place a vault document into a bundle as a hardlink, so up to 14 bundles share one inode on the
+// same volume. Any link failure (cross-device, unsupported, link-count limit, permissions) falls
+// back to an independent copy; a partially created destination is removed first.
+const defaultFileOps = { link: fs.link, copyFile: fs.copyFile };
+
+async function placeSecureDocument(sourcePath, copiedPath, fileOps) {
+  try {
+    await fileOps.link(sourcePath, copiedPath);
+  } catch {
+    await fs.rm(copiedPath, { force: true });
+    await fileOps.copyFile(sourcePath, copiedPath);
+  }
+}
+
+async function copySecureDocuments({ databasePath, documentsDirectory, destination, fileOps = defaultFileOps }) {
   const rows = await readSecureDocumentRows(databasePath);
   const manifestDocuments = [];
 
@@ -410,7 +424,7 @@ async function copySecureDocuments({ databasePath, documentsDirectory, destinati
     );
     const copiedPath = path.join(destination, relativePath);
     await fs.mkdir(path.dirname(copiedPath), { recursive: true, mode: 0o700 });
-    await fs.copyFile(sourcePath, copiedPath);
+    await placeSecureDocument(sourcePath, copiedPath, fileOps);
     await fs.chmod(copiedPath, 0o600);
     // The manifest records what was actually copied. A copy that disagrees with its database row
     // is classified by verification as a degraded document, not a reason to discard the backup.
@@ -500,7 +514,12 @@ export async function enforceBackupRetention(config = getConfig(), now = new Dat
   return removed;
 }
 
-export async function createBackupBundle({ storage = getStorage(), config = getConfig(), now = new Date() } = {}) {
+export async function createBackupBundle({
+  storage = getStorage(),
+  config = getConfig(),
+  now = new Date(),
+  fileOps = defaultFileOps,
+} = {}) {
   if (storage.provider !== 'sqlite' || !storage.createApplicationBackup) {
     throw new Error('Application-consistent backup bundles require SQLite storage.');
   }
@@ -522,6 +541,7 @@ export async function createBackupBundle({ storage = getStorage(), config = getC
       databasePath,
       documentsDirectory: config.secureDocuments.storageDir,
       destination: workingPath,
+      fileOps,
     });
     const manifest = {
       version: backupVersion,

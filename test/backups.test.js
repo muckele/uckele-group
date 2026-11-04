@@ -575,12 +575,20 @@ function bundledDocumentPath(backup) {
   return path.join(backup.path, backup.manifest.secureDocuments.files[0].relativePath);
 }
 
+// Replace the bundled file rather than writing through it. Bundled documents are hardlinks of the
+// vault file, so an in-place write would damage the vault copy (and every other bundle) as well.
+function damageBundledDocument(backup, content = 'x'.repeat(Buffer.byteLength(documentContent))) {
+  const bundled = bundledDocumentPath(backup);
+  fs.rmSync(bundled);
+  fs.writeFileSync(bundled, content);
+}
+
 test('a bundle whose stored document no longer matches its checksum is degraded, kept past 24 hours, and not restorable', async (t) => {
   const { root, config, storage } = backupSetup(t, 'ug-backup-degraded-');
   await seedVaultDocument(storage, config);
   const backup = await createBackupBundle({ storage, config });
   assert.deepEqual(backup.documentsDegraded, []);
-  fs.writeFileSync(bundledDocumentPath(backup), 'x'.repeat(Buffer.byteLength(documentContent)));
+  damageBundledDocument(backup);
 
   const result = await verifyBackupBundle(backup.path);
   assert.equal(result.classification, 'degraded');
@@ -652,7 +660,7 @@ test('a document problem alongside a database problem keeps the bundle invalid',
   const { config, storage } = backupSetup(t, 'ug-backup-degraded-mixed-');
   await seedVaultDocument(storage, config);
   const backup = await createBackupBundle({ storage, config });
-  fs.writeFileSync(bundledDocumentPath(backup), 'x'.repeat(Buffer.byteLength(documentContent)));
+  damageBundledDocument(backup);
   fs.appendFileSync(backupDatabasePath(backup), 'tampered');
   const result = await verifyBackupBundle(backup.path);
   assert.equal(result.classification, 'invalid');
@@ -683,7 +691,7 @@ test('a degraded bundle counts toward count retention like a valid one', async (
   const { config, storage } = backupSetup(t, 'ug-backup-degraded-retention-');
   await seedVaultDocument(storage, config);
   const first = await createBackupBundle({ storage, config, now: new Date('2026-07-13T12:00:00.000Z') });
-  fs.writeFileSync(bundledDocumentPath(first), 'x'.repeat(Buffer.byteLength(documentContent)));
+  damageBundledDocument(first);
   const second = await createBackupBundle({ storage, config, now: new Date('2026-07-14T12:00:00.000Z') });
   assert.equal((await verifyBackupBundle(first.path)).classification, 'degraded');
   assert.equal(fs.existsSync(first.path), true, 'two bundles fit within retentionCount 2');
@@ -733,7 +741,7 @@ test('a legacy bundle with a verified database but damaged documents stays legac
   const manifestPath = path.join(backup.path, 'manifest.json');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: 1 }));
-  fs.writeFileSync(bundledDocumentPath(backup), 'x'.repeat(Buffer.byteLength(documentContent)));
+  damageBundledDocument(backup);
   const stale = new Date(Date.now() - 48 * 3600_000);
   fs.utimesSync(backup.path, stale, stale);
 
@@ -745,4 +753,105 @@ test('a legacy bundle with a verified database but damaged documents stays legac
   assert.equal(removed.includes(backup.path), false);
   assert.equal(fs.existsSync(backup.path), true);
   assert.equal((await listBackupBundles(config))[0].state, 'legacy');
+});
+
+test('backup bundles hardlink vault documents instead of copying them', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-hardlink-');
+  const sourceDocument = await seedVaultDocument(storage, config);
+  const first = await createBackupBundle({ storage, config, now: new Date('2026-07-13T12:00:00.000Z') });
+  const second = await createBackupBundle({ storage, config, now: new Date('2026-07-14T12:00:00.000Z') });
+  const vault = fs.statSync(sourceDocument);
+  for (const backup of [first, second]) {
+    assert.equal(fs.statSync(bundledDocumentPath(backup)).ino, vault.ino);
+  }
+  assert.equal(fs.statSync(sourceDocument).nlink, 3);
+  assert.equal(fs.statSync(sourceDocument).mode & 0o777, 0o600);
+});
+
+test('pruning a linked bundle keeps the vault document', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-hardlink-prune-');
+  const sourceDocument = await seedVaultDocument(storage, config);
+  const first = await createBackupBundle({ storage, config, now: new Date('2026-07-13T12:00:00.000Z') });
+  await createBackupBundle({ storage, config, now: new Date('2026-07-14T12:00:00.000Z') });
+  await createBackupBundle({ storage, config, now: new Date('2026-07-15T12:00:00.000Z') });
+  assert.equal(fs.existsSync(first.path), false, 'retentionCount 2 prunes the oldest bundle');
+  assert.equal(fs.readFileSync(sourceDocument, 'utf8'), documentContent);
+  assert.equal(fs.statSync(sourceDocument).nlink, 3);
+});
+
+test('restore from a linked bundle installs independent copies', async (t) => {
+  const { root, config, storage } = backupSetup(t, 'ug-backup-hardlink-restore-');
+  const sourceDocument = await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config });
+  const databasePath = path.join(root, 'restore', 'database.sqlite');
+  const documentsDirectory = path.join(root, 'restore', 'documents');
+  const restore = await restoreBackupBundle(backup.path, { databasePath, documentsDirectory });
+  assert.equal(restore.restoredDocuments, 1);
+  const restoredDatabase = new Database(databasePath, { readonly: true });
+  let restoredFile;
+  try {
+    restoredFile = restoredDatabase.prepare('SELECT storage_path FROM secure_documents WHERE id = ?').get('document-1').storage_path;
+  } finally {
+    restoredDatabase.close();
+  }
+  assert.notEqual(fs.statSync(restoredFile).ino, fs.statSync(sourceDocument).ino);
+  assert.equal(fs.readFileSync(restoredFile, 'utf8'), documentContent);
+});
+
+for (const code of ['EXDEV', 'EPERM', 'ENOTSUP', 'EMLINK']) {
+  test(`any link error falls back to a copy (${code})`, async (t) => {
+    const { config, storage } = backupSetup(t, `ug-backup-link-${code.toLowerCase()}-`);
+    const sourceDocument = await seedVaultDocument(storage, config);
+    const backup = await createBackupBundle({
+      storage,
+      config,
+      fileOps: {
+        link: async () => { throw Object.assign(new Error(code), { code }); },
+        copyFile: fs.promises.copyFile,
+      },
+    });
+    assert.notEqual(fs.statSync(bundledDocumentPath(backup)).ino, fs.statSync(sourceDocument).ino);
+    assert.equal(fs.statSync(sourceDocument).nlink, 1);
+    assert.equal((await verifyBackupBundle(backup.path)).ok, true);
+  });
+}
+
+test('a link that fails after creating a partial file is cleaned up before the copy', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-link-partial-');
+  const sourceDocument = await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({
+    storage,
+    config,
+    fileOps: {
+      link: async (_source, destination) => {
+        fs.writeFileSync(destination, 'partial');
+        throw Object.assign(new Error('EEXIST'), { code: 'EEXIST' });
+      },
+      copyFile: async (source, destination) => {
+        assert.equal(fs.existsSync(destination), false, 'the partial destination is removed first');
+        return fs.promises.copyFile(source, destination);
+      },
+    },
+  });
+  assert.notEqual(fs.statSync(bundledDocumentPath(backup)).ino, fs.statSync(sourceDocument).ino);
+  assert.equal((await verifyBackupBundle(backup.path)).ok, true);
+});
+
+test('with hardlinks, a vault document damaged in place degrades every bundle, keeps them all, and a new backup still succeeds', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-hardlink-damage-');
+  const sourceDocument = await seedVaultDocument(storage, config);
+  const first = await createBackupBundle({ storage, config });
+  const second = await createBackupBundle({ storage, config });
+  fs.writeFileSync(sourceDocument, 'x'.repeat(Buffer.byteLength(documentContent)));
+
+  for (const backup of [first, second]) {
+    const result = await verifyBackupBundle(backup.path);
+    assert.equal(result.classification, 'degraded');
+    assert.deepEqual(result.documentsDegraded, [{ id: 'document-1', reason: 'checksum_mismatch' }]);
+  }
+  const removed = await enforceBackupRetention(config, new Date(Date.now() + 48 * 3600_000));
+  assert.deepEqual(removed.filter((entry) => [first.path, second.path].includes(entry)), []);
+  const third = await createBackupBundle({ storage, config });
+  assert.equal((await verifyBackupBundle(third.path)).databaseVerified, true);
+  assert.equal((await getBackupStatus(config)).status, 'degraded');
 });
