@@ -34,6 +34,7 @@ import { readPursueCimProviderReadiness } from '../../server/services/pursueCimR
 import { runPursueCimSender } from '../../server/services/pursueCimSender.js';
 import { renderPursueCimEmail } from '../../server/services/pursueCimTemplates.js';
 import { changeEmailSendingControl } from '../../server/services/pursueEmailSending.js';
+import { CONTROLLED_CIM_MAILBOX_PROFILE } from '../../server/config.js';
 import { SENDER, SENDER_SETTINGS, gmailConfig } from './pursueCimGmailGateFixture.js';
 
 const RealDate = globalThis.Date;
@@ -104,11 +105,11 @@ const iso = (value) => (value === null || value === undefined ? value : new Real
  * A world on one backend. `createBackend(t)` returns `{ storage, all(sql, ...params),
  * run(sql, ...params) }` with `?` placeholders; it is created after the clock is installed.
  */
-async function createWorld(t, createBackend, { start }) {
+async function createWorld(t, createBackend, { start, config: initialConfig = gmailConfig() }) {
   const clock = installClock(t, start);
   const backend = await createBackend(t);
   const { storage } = backend;
-  let config = gmailConfig();
+  let config = initialConfig;
   const mailProvider = createFakeCimProvider({ now: () => clock.peek(), senderAddress: SENDER });
   const one = async (sql, ...params) => (await backend.all(sql, ...params))[0];
   const world = {
@@ -135,6 +136,7 @@ async function createWorld(t, createBackend, { start }) {
     },
     poll: () => runPursueCimReplyPoll({ storage, mailProvider, now: clock, config }),
     run: backend.run,
+    all: backend.all,
     one,
     count: async (table, where = '1 = 1', ...params) => Number((await one(
       `SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`, ...params)).n),
@@ -639,6 +641,72 @@ async function reconnectKeepsReplies(t, createBackend) {
   assert.equal(world.mailProvider.attempts.length, 1);
 }
 
+const TEST_INBOX = 'owner.test-inbox@example.test';
+
+/**
+ * The owner's controlled test (runbook Part C, step 5): controlled-mailbox-v1 sending through
+ * Gmail with exactly one allowed recipient, the owner's test inbox.
+ */
+function controlledTestConfig() {
+  const base = gmailConfig();
+  return { ...base, dealHunter: { ...base.dealHunter, cimProvider: {
+    enabled: true, profile: CONTROLLED_CIM_MAILBOX_PROFILE, mode: 'controlled-mailbox', provider: 'gmail',
+    gmailSenderAddress: SENDER, resendApiKey: '', resendFromEmail: '', resendReplyTo: '',
+    resendInboundDomain: '', emailWebhookSecret: '', reconciliationApiKey: '',
+    allowedRecipients: [TEST_INBOX] } } };
+}
+
+/**
+ * Runbook step 5 from the Inbox: a dedicated test listing (a Sheet row in a state the app
+ * sends to) whose only broker email is the test inbox → Request SIM → the initial → a
+ * threaded follow-up two business days later → a reply from the test inbox stops it.
+ */
+async function controlledTestFromInbox(t, createBackend) {
+  const world = await createWorld(t, createBackend, { start: START, config: controlledTestConfig() });
+  await ownerTurnsSendingOn(world);
+  const id = await seedDeal(world, { opportunityId: 'opp-controlled-test', name: 'Uckele Test Listing',
+    fitScore: 80, criteriaGroup: 'review', brokerEmail: TEST_INBOX });
+
+  // Request SIM on the test listing: its one broker email is the test inbox, its state is CA.
+  world.clock.set(pacific('2030-01-07', '09:00'));
+  const command = await ownerRequestsSim(world, id);
+  assert.equal(command.enrollment.state, 'campaign-created', JSON.stringify(command.enrollment));
+  let campaign = await world.campaignFor(id);
+  assert.deepEqual([campaign.state, campaign.permission_version], ['initial-pending', 'listing-broker-inquiry-v1']);
+
+  // The next sender run in the window sends the initial, under the controlled test profile.
+  const first = await sendAt(world, pacific('2030-01-07', '09:15'));
+  assert.equal(first.sentInitial, 1, JSON.stringify(first));
+  const [initial] = world.mailProvider.sent;
+  assert.deepEqual([initial.to, initial.from], [TEST_INBOX, { name: SENDER_SETTINGS.name, address: SENDER }]);
+  assert.deepEqual(new Set((await world.all(`SELECT provider_profile FROM deal_hunter_cim_live_provider_authorizations`))
+    .map((row) => row.provider_profile)), new Set([CONTROLLED_CIM_MAILBOX_PROFILE]));
+
+  // Two business days later at 08:00 the follow-up goes out in the same thread.
+  const early = await sendAt(world, pacific('2030-01-08', '16:00'));
+  assert.equal(early.sentFollowUps, 0, JSON.stringify(early));
+  const due = await sendAt(world, pacific('2030-01-09', '08:00'));
+  assert.equal(due.sentFollowUps, 1, JSON.stringify(due));
+  const followUp = world.mailProvider.sent[1];
+  assert.deepEqual([followUp.to, followUp.threadId, followUp.inReplyTo],
+    [TEST_INBOX, initial.threadId, initial.rfcMessageId]);
+
+  // The owner replies from the test inbox; the next reply check stops the campaign.
+  world.clock.set(pacific('2030-01-09', '10:00'));
+  await brokerReplies(world, campaign, { body: 'Test reply from my inbox.',
+    from: `Owner Test <${TEST_INBOX}>` });
+  const poll = await pollAt(world, pacific('2030-01-09', '10:05'));
+  assert.equal(poll.responded, 1, JSON.stringify(poll));
+  campaign = await world.campaignFor(id);
+  assert.deepEqual([campaign.state, campaign.reason_code], ['responded', 'reply_received']);
+  for (const at of [pacific('2030-01-11', '08:00'), pacific('2030-01-15', '08:00')]) {
+    const later = await sendAt(world, at);
+    assert.deepEqual([later.sentInitial, later.sentFollowUps], [0, 0], JSON.stringify(later));
+  }
+  assert.equal(world.mailProvider.sent.length, 2);
+  assert.equal(world.mailProvider.attempts.length, 2);
+}
+
 /** The scenarios by their spec test names, each `(t, createBackend) => Promise`. */
 export const END_TO_END_SCENARIOS = Object.freeze([
   ['90+ deal → auto-Pursue active → initial sent in window → 2 follow-ups → broker reply → campaign responded, no more sends',
@@ -651,4 +719,6 @@ export const END_TO_END_SCENARIOS = Object.freeze([
   ['Live sending off mid-campaign stops the next follow-up; on again resumes it', liveSendingOffAndOn],
   ['a reply that arrives while Gmail is disconnected stops the campaign after reconnect, with no follow-up sent',
     reconnectKeepsReplies],
+  ['controlled Gmail test from the Inbox: a test listing whose only broker email is the test inbox → Request SIM → initial → threaded follow-up → reply stops',
+    controlledTestFromInbox],
 ]);

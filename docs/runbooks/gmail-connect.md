@@ -197,26 +197,53 @@ address (a personal address works).
      than one, nothing is sent.
 2. In the **Email sending** card, click **Turn on Live sending** and confirm.
    - The Live sending part says **Sending setup: controlled test (one allowed recipient)**.
-   - Readiness should say **Ready to send.** If it doesn't, fix what it lists first.
-3. Pick one test listing in the Deal Hunter Inbox. You can use a real listing you don't plan to
-   pursue, or add one for the test.
-   1. Open the listing.
-   2. Under **Broker & Seller**, set **Broker email** to your test inbox and save it.
-   3. Click **Request SIM**.
-4. Wait for the first email.
+   - Readiness should say **Ready to send.** If it doesn't, fix what it lists first. Right after
+     the settings change it may say **Reply checking hasn't run recently**; that clears within
+     5 minutes, once the first reply check has run.
+3. Make a dedicated test listing whose **only** broker email is your test inbox.
+   - Don't reuse a real listing. A listing's contacts are every broker email the app knows for
+     it: from the Sheet, from the CRM, and any you type on the listing. A real listing that
+     already has a broker email would then have two, and the contact rule only emails a listing
+     with exactly one, so the first email would wait.
+   1. Add one row to the SMB Deal Hunter Google Sheet (the Sheet the Deal Hunter Inbox is
+      synced from) for a made-up business:
+      - **Name:** `Uckele Test Listing (do not pursue)`.
+      - **Listing URL:** any page of your own.
+      - **State:** one of `CA`, `NV`, `AZ`, `NY`, `NJ` or `CT`. The app works out the listing's
+        local time from its state; with no state, or another state, the first email waits.
+        Leave **City** empty or use a city in that state.
+      - **Broker Name:** your name. **Broker Email:** your test inbox, and no other email address
+        anywhere in the row. Don't use a shared mailbox like `info@` or `sales@`.
+   2. After the next Sheet sync, find the listing in the Deal Hunter Inbox and open it. Under
+      **Broker & Seller**, your test inbox is the only broker email.
+4. Click **Request SIM** on the test listing.
+   - If **Request SIM** isn't offered, the listing isn't ready yet (for example the sync hasn't
+     picked it up). Wait for the next sync and check again.
+5. Wait for the first email.
    - The sender runs every 15 minutes, and sends only on weekdays between 08:00 and 17:00 in the
      listing's local time.
    - Check your test inbox: the email comes from the sending address, with your signature.
    - **Last runs** in the card shows `1 initial email`.
-5. Wait for the follow-up.
-   - It is due 2 business days later at 08:00 local time.
-   - To avoid the wait, ask your engineer to move that follow-up's due time to now.
+   - In Gmail, open the sent test email (in **Sent**), click **⋮ → Show original**, and note the
+     **Message-ID** line. Check that **From** shows your name and the sending address.
+   - **First email not arriving?** Open the test listing. Its **Pursue CIM canary** card shows
+     the **Campaign state** and, after a dot, why it is waiting. For example:
+     - `Waiting On Eligibility · Contact Permission Missing`, or the Inbox asking you to choose a
+       broker email when you click Request SIM: the listing has more than one broker email. Go
+       back to step 3 and make a listing with only your test inbox.
+     - `Action Required · Timezone Missing` or `Timezone Ambiguous`: its State isn't exactly one
+       of the six above.
+
+     Also check the **Email sending** card's readiness and **Last runs** in Operations.
+6. Wait for the follow-up.
+   - It is due 2 business days later at 08:00 in the listing's local time. There is no way to
+     bring it forward: just wait for it.
    - Check your test inbox: the follow-up arrives **in the same thread** as the first email.
-6. Reply to that thread from your test inbox.
+7. Reply to that thread from your test inbox.
    - Within about 5 minutes, **Last runs** shows the reply check with `1 replies`, and the
      listing's campaign shows as responded.
    - No more follow-ups are sent. You can check again after the next follow-up's due date.
-7. Finish the test and switch to real sending:
+8. Finish the test and switch to real sending:
    1. Click **Turn off Live sending** and confirm.
    2. Change the sending setup to production and remove the test-only settings:
 
