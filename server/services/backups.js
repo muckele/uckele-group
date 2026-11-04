@@ -653,13 +653,14 @@ export async function verifyBackupBundle(bundlePath) {
 
   const documentsDegraded = documentErrors;
   const databaseVerified = errors.length === documentErrors.length;
-  if (errors.length > 0) {
+  // A legacy bundle with a verified database stays legacy (retained, never restorable) even when
+  // its documents are damaged.
+  if (errors.length > 0 && !(databaseVerified && isLegacy)) {
     return {
       ok: false,
       current: false,
       legacy: false,
-      // A legacy bundle is never restorable, so document damage does not soften it to degraded.
-      classification: databaseVerified && !isLegacy ? 'degraded' : 'invalid',
+      classification: databaseVerified ? 'degraded' : 'invalid',
       databaseVerified,
       documentsDegraded,
       errors,
@@ -674,10 +675,11 @@ export async function verifyBackupBundle(bundlePath) {
       legacy: true,
       classification: 'legacy',
       databaseVerified: true,
-      documentsDegraded: [],
+      documentsDegraded,
       errors: [
         'Manifest version 1 is a legacy pre-invariant backup and is not eligible for current restore or repair evidence.',
         ...legacyReasons,
+        ...errors,
       ],
       manifest,
       path: resolvedBundle,
@@ -781,7 +783,9 @@ export async function getBackupStatus(config = getConfig()) {
     ].filter(Boolean).join(' and ');
     return {
       status: 'degraded',
-      message: `A valid application backup is available, but ${issueSummary} backup bundle(s) require attention.`,
+      message: degraded.length > 0
+        ? `${degraded.length} backup bundle(s) have documents that no longer match what was backed up; the database backups are intact. Restore them with --accept-degraded-documents.${issueSummary === `${degraded.length} with mismatched documents` ? '' : ` Bundles needing attention: ${issueSummary}.`}`
+        : `A valid application backup is available, but ${issueSummary} backup bundle(s) require attention.`,
       latest: latestSummary,
       bundleCounts,
       verificationErrors: invalid.flatMap((bundle) => bundle.errors).slice(0, 20),
@@ -836,11 +840,19 @@ export async function restoreBackupBundle(bundlePath, {
     await fs.mkdir(stagedDocuments, { recursive: true, mode: 0o700 });
     await fs.copyFile(path.join(verification.path, verification.manifest.database.relativePath), stagedDatabase);
 
+    // An accepted degraded restore skips a bundled document that is missing or unreadable; its
+    // database row still maps to the target path and is reported in degradedDocuments.
+    const unreadableIds = new Set(verification.ok
+      ? []
+      : verification.documentsDegraded.filter(({ reason }) => reason === 'unreadable').map(({ id }) => id));
+    let installedDocuments = 0;
     for (const document of verification.manifest.secureDocuments.files) {
+      if (unreadableIds.has(document.id)) continue;
       const destination = path.join(stagedDocuments, safeSegment(document.requestId), path.basename(document.relativePath));
       await fs.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
       await fs.copyFile(path.join(verification.path, document.relativePath), destination);
       await fs.chmod(destination, 0o600);
+      installedDocuments += 1;
     }
 
     const restoredDatabase = openBackupDatabase(stagedDatabase, { readonly: false });
@@ -895,7 +907,7 @@ export async function restoreBackupBundle(bundlePath, {
       documentsDirectory: targetDocuments,
       databaseSafetyPath,
       documentsSafetyPath,
-      restoredDocuments: verification.manifest.secureDocuments.count,
+      restoredDocuments: installedDocuments,
       degradedDocuments: verification.ok ? [] : verification.documentsDegraded,
     };
   } finally {
@@ -927,7 +939,12 @@ export async function runClaimedBackup({ storage = getStorage(), config = getCon
     const backup = await createBackupBundle({ storage, config, now });
     const jobRun = await storage.completeScheduledJob(jobKey, {
       status: 'completed',
-      metadata: { dateKey, backupId: backup.manifest.id, documentCount: backup.manifest.secureDocuments.count },
+      metadata: {
+        dateKey,
+        backupId: backup.manifest.id,
+        documentCount: backup.manifest.secureDocuments.count,
+        documentsDegraded: backup.documentsDegraded,
+      },
     });
     return { backup, jobRun };
   } catch (error) {

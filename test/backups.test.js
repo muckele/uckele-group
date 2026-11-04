@@ -596,7 +596,9 @@ test('a bundle whose stored document no longer matches its checksum is degraded,
   const status = await getBackupStatus(config);
   assert.equal(status.status, 'degraded');
   assert.equal(status.bundleCounts.degraded, 1);
-  assert.match(status.message, /1 with mismatched documents/);
+  assert.match(status.message, /1 backup bundle\(s\) have documents that no longer match what was backed up; the database backups are intact\./);
+  assert.match(status.message, /--accept-degraded-documents/);
+  assert.doesNotMatch(status.message, /valid application backup is available/);
   assert.deepEqual(status.documentsDegraded, [{ id: 'document-1', reason: 'checksum_mismatch' }]);
   assert.ok(status.latest);
 
@@ -700,4 +702,47 @@ test('a tampered database is still invalid and is pruned after 24 hours', async 
   fs.utimesSync(backup.path, stale, stale);
   assert.equal((await verifyBackupBundle(backup.path)).classification, 'invalid');
   assert.ok((await enforceBackupRetention(config, new Date())).includes(backup.path));
+});
+
+test('an accepted degraded restore skips an unreadable bundled document and reports it', async (t) => {
+  const { root, config, storage } = backupSetup(t, 'ug-backup-degraded-unreadable-');
+  await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config });
+  fs.rmSync(bundledDocumentPath(backup));
+
+  const databasePath = path.join(root, 'restore', 'database.sqlite');
+  const documentsDirectory = path.join(root, 'restore', 'documents');
+  await assert.rejects(restoreBackupBundle(backup.path, { databasePath, documentsDirectory }), /Backup verification failed/);
+  const restored = await restoreBackupBundle(backup.path, { databasePath, documentsDirectory, acceptDegradedDocuments: true });
+  assert.deepEqual(restored.degradedDocuments, [{ id: 'document-1', reason: 'unreadable' }]);
+  assert.equal(restored.restoredDocuments, 0, 'only documents actually installed are counted');
+  const restoredDatabase = new Database(databasePath, { readonly: true });
+  try {
+    const row = restoredDatabase.prepare('SELECT storage_path FROM secure_documents WHERE id = ?').get('document-1');
+    assert.ok(row.storage_path.startsWith(documentsDirectory));
+    assert.equal(fs.existsSync(row.storage_path), false);
+  } finally {
+    restoredDatabase.close();
+  }
+});
+
+test('a legacy bundle with a verified database but damaged documents stays legacy and survives retention', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-legacy-damaged-docs-');
+  await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config });
+  const manifestPath = path.join(backup.path, 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: 1 }));
+  fs.writeFileSync(bundledDocumentPath(backup), 'x'.repeat(Buffer.byteLength(documentContent)));
+  const stale = new Date(Date.now() - 48 * 3600_000);
+  fs.utimesSync(backup.path, stale, stale);
+
+  const result = await verifyBackupBundle(backup.path);
+  assert.equal(result.classification, 'legacy');
+  assert.equal(result.databaseVerified, true);
+  assert.deepEqual(result.documentsDegraded, [{ id: 'document-1', reason: 'checksum_mismatch' }]);
+  const removed = await enforceBackupRetention(config, new Date(Date.now() + 48 * 3600_000));
+  assert.equal(removed.includes(backup.path), false);
+  assert.equal(fs.existsSync(backup.path), true);
+  assert.equal((await listBackupBundles(config))[0].state, 'legacy');
 });

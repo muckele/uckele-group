@@ -28,7 +28,7 @@ async function main() {
 
   if (command === 'create') {
     const backup = await createBackupBundle({ storage: getStorage(), config });
-    console.log(JSON.stringify({ ok: true, path: backup.path, manifest: backup.manifest }, null, 2));
+    console.log(JSON.stringify({ ok: true, path: backup.path, manifest: backup.manifest, documentsDegraded: backup.documentsDegraded }, null, 2));
     return;
   }
 
