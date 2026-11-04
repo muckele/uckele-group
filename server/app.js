@@ -151,6 +151,11 @@ import {
 } from './services/followUpWorkspace.js';
 import { registerAdminOnboardingRoutes } from './routes/adminOnboarding.js';
 import {
+  buildGmailConnectUrl,
+  completeGmailConnect,
+  disconnectGmail,
+} from './services/gmailConnection.js';
+import {
   createCimRecipientOverride,
   resolveCimIdentityException,
   setCimOutreachPaused,
@@ -548,6 +553,7 @@ function projectSourceAuthorityReconciliation(value) {
 export function createApp({
   dailyDealHunterRunner = runClaimedDailyDealHunterEmail,
   sourceAuthorityRevalidator = revalidateRequiredSourceAuthority,
+  gmailFetcher = (...args) => globalThis.fetch(...args),
 } = {}) {
   const config = getConfig();
   const app = express();
@@ -2483,6 +2489,79 @@ export function createApp({
         actor: session.username,
       });
       response.status(result.status || (result.ok ? 200 : 409)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  // Gmail connect flow (spec §4.2). Admin role only. The callback always redirects back to
+  // Operations with a code; token material never reaches a response, a URL or a log line.
+  const gmailOperationsRedirect = (code) => `/admin/deal-hunter?view=operations&gmail=${code}`;
+  const gmailCallbackErrorCodes = new Set(['gmail_state_invalid', 'gmail_address_mismatch', 'gmail_scope_missing']);
+
+  app.get(
+    '/api/admin/deal-hunter/gmail/connect',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      try {
+        const { url } = buildGmailConnectUrl({ config, actor: session.username || 'admin', now: new Date() });
+        response.redirect(302, url);
+      } catch (error) {
+        console.warn(`[request:${request.id || 'unknown'}] gmail connect unavailable`, { code: 'gmail_connect_failed',
+          cause: String(error?.code || error?.name || 'Error').slice(0, 100) });
+        response.redirect(302, gmailOperationsRedirect('gmail_connect_failed'));
+      }
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/gmail/callback',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      try {
+        await completeGmailConnect({
+          storage: getStorage(),
+          config,
+          code: typeof request.query?.code === 'string' ? request.query.code : '',
+          state: typeof request.query?.state === 'string' ? request.query.state : '',
+          actor: session.username || 'admin',
+          now: new Date(),
+          fetcher: gmailFetcher,
+        });
+        response.redirect(302, gmailOperationsRedirect('connected'));
+      } catch (error) {
+        const code = gmailCallbackErrorCodes.has(error?.code) ? error.code : 'gmail_connect_failed';
+        if (code === 'gmail_connect_failed') {
+          console.warn(`[request:${request.id || 'unknown'}] gmail connect failed`, {
+            code, cause: String(error?.code || error?.name || 'Error').slice(0, 100) });
+        }
+        response.redirect(302, gmailOperationsRedirect(code));
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/gmail/disconnect',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const { revokedAt } = await disconnectGmail({
+        storage: getStorage(),
+        config,
+        actor: session.username || 'admin',
+        now: new Date(),
+        fetcher: gmailFetcher,
+      });
+      response.json({ success: true, revokedAt });
     }),
   );
 

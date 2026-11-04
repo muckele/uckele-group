@@ -400,6 +400,14 @@ export function getConfig() {
       cimProvider: {
         ...cimProvider,
       },
+      // The owner's Gmail mailbox for Pursue sending. All empty until the owner sets them;
+      // tokenKey is a 32-byte base64 AES-256-GCM key for the stored refresh token.
+      gmail: {
+        clientId: process.env.GOOGLE_OAUTH_CLIENT_ID || '',
+        clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET || '',
+        senderAddress: (process.env.DEAL_HUNTER_GMAIL_SENDER_ADDRESS || '').trim(),
+        tokenKey: process.env.DEAL_HUNTER_GMAIL_TOKEN_KEY || '',
+      },
       sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
       // Airtable is retired from Deal Hunter. Keep the public configuration
       // field pinned off so an obsolete deployment variable cannot silently
