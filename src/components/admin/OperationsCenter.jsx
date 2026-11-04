@@ -301,7 +301,7 @@ export default function OperationsCenter({
           <div className="mt-3"><StatusBadge healthy={backupStatus === 'healthy'} warning={['disabled', 'missing', 'stale'].includes(backupStatus)}>{backupStatus}</StatusBadge></div>
           <p className="mt-3 text-sm text-ink/68">{data.backup?.message || 'Backup status unavailable.'}</p>
           {data.backup?.latest?.createdAt ? <p className="mt-1 text-xs text-ink/50">Latest: {formatDate(data.backup.latest.createdAt)} · {data.backup.latest.documentCount} document(s)</p> : null}
-          {data.backup?.bundleCounts ? <p className="mt-2 text-xs text-ink/55">Bundles: {data.backup.bundleCounts.valid || 0} valid · {data.backup.bundleCounts.invalid || 0} invalid · {data.backup.bundleCounts.incomplete || 0} incomplete</p> : null}
+          {data.backup?.bundleCounts ? <p className="mt-2 text-xs text-ink/55">Bundles: {data.backup.bundleCounts.valid || 0} valid{data.backup.bundleCounts.degraded > 0 ? ` · ${data.backup.bundleCounts.degraded} with mismatched documents` : ''} · {data.backup.bundleCounts.invalid || 0} invalid · {data.backup.bundleCounts.incomplete || 0} incomplete</p> : null}
           <PanelError>{data.backup?.error}</PanelError>
         </article>
         </div>

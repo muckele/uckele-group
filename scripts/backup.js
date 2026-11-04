@@ -51,12 +51,13 @@ async function main() {
       databasePath,
       documentsDirectory,
       overwrite: process.argv.includes('--overwrite') || restoringLive,
+      acceptDegradedDocuments: process.argv.includes('--accept-degraded-documents'),
     });
     console.log(JSON.stringify(result, null, 2));
     return;
   }
 
-  throw new Error('Usage: npm run backup:create | npm run backup:verify -- [--bundle PATH] | npm run backup:restore -- [--bundle PATH] [--database PATH] [--documents PATH] [--overwrite] [--confirm-live]');
+  throw new Error('Usage: npm run backup:create | npm run backup:verify -- [--bundle PATH] | npm run backup:restore -- [--bundle PATH] [--database PATH] [--documents PATH] [--overwrite] [--confirm-live] [--accept-degraded-documents]');
 }
 
 main().catch((error) => {

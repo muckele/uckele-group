@@ -356,8 +356,11 @@ function readSecureDocumentRowsFromDatabase(database) {
   `).all();
 }
 
+// Only a stored size that disagrees with the row is a document-level problem; every other
+// field disagreeing means the manifest and database snapshot are inconsistent.
 function compareManifestDocumentsToDatabase(manifestDocuments, databaseRows) {
   const errors = [];
+  const documentErrors = [];
   const rowsById = new Map(databaseRows.map((row) => [String(row.id), row]));
 
   for (const document of manifestDocuments) {
@@ -379,12 +382,17 @@ function compareManifestDocumentsToDatabase(manifestDocuments, databaseRows) {
 
     for (const [field, manifestValue, databaseValue] of comparisons) {
       if (manifestValue !== databaseValue) {
-        errors.push(`Secure document ${document.id} ${field} does not match the database snapshot.`);
+        const message = `Secure document ${document.id} ${field} does not match the database snapshot.`;
+        if (field === 'sizeBytes') {
+          documentErrors.push({ id: document.id, reason: 'database_size_mismatch', message });
+        } else {
+          errors.push(message);
+        }
       }
     }
   }
 
-  return errors;
+  return { errors, documentErrors };
 }
 
 async function copySecureDocuments({ databasePath, documentsDirectory, destination }) {
@@ -402,15 +410,11 @@ async function copySecureDocuments({ databasePath, documentsDirectory, destinati
     );
     const copiedPath = path.join(destination, relativePath);
     await fs.mkdir(path.dirname(copiedPath), { recursive: true, mode: 0o700 });
-    const before = await fs.stat(sourcePath);
     await fs.copyFile(sourcePath, copiedPath);
     await fs.chmod(copiedPath, 0o600);
-    const after = await fs.stat(sourcePath);
+    // The manifest records what was actually copied. A copy that disagrees with its database row
+    // is classified by verification as a degraded document, not a reason to discard the backup.
     const copied = await fs.stat(copiedPath);
-
-    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || copied.size !== Number(row.size_bytes)) {
-      throw new Error(`Secure document ${row.id} changed while the backup was being created.`);
-    }
 
     manifestDocuments.push({
       id: row.id,
@@ -460,8 +464,9 @@ async function inspectBackupDirectory(config) {
       manifest: verification.manifest,
       state: verification.classification === 'legacy'
         ? 'legacy'
-        : verification.ok ? 'valid' : 'invalid',
+        : verification.ok ? 'valid' : verification.classification === 'degraded' ? 'degraded' : 'invalid',
       errors: verification.errors,
+      documentsDegraded: verification.documentsDegraded || [],
       createdAt: Date.parse(verification.manifest?.createdAt || '') || modifiedAt,
       modifiedAt,
     });
@@ -473,7 +478,7 @@ export async function enforceBackupRetention(config = getConfig(), now = new Dat
   const root = config.backup.directory;
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const inspected = await inspectBackupDirectory(config);
-  const bundles = inspected.filter((bundle) => bundle.state === 'valid');
+  const bundles = inspected.filter((bundle) => ['valid', 'degraded'].includes(bundle.state));
   const abandonedCutoff = now.getTime() - abandonedBundleGraceMs;
   const removed = [];
 
@@ -545,13 +550,13 @@ export async function createBackupBundle({ storage = getStorage(), config = getC
     };
     await secureWriteJson(path.join(workingPath, manifestFileName), manifest);
     const verification = await verifyBackupBundle(workingPath);
-    if (!verification.ok) {
+    if (!verification.databaseVerified) {
       throw new Error(`Backup integrity verification failed: ${verification.errors.join(' ')}`);
     }
     await fs.rm(path.join(workingPath, activeMarkerFileName), { force: true });
     await fs.rename(workingPath, finalPath);
     await enforceBackupRetention(config, now);
-    return { path: finalPath, manifest };
+    return { path: finalPath, manifest, documentsDegraded: verification.documentsDegraded };
   } catch (error) {
     await fs.rm(workingPath, { recursive: true, force: true });
     throw error;
@@ -571,6 +576,8 @@ export async function verifyBackupBundle(bundlePath) {
       current: false,
       legacy: false,
       classification: 'invalid',
+      databaseVerified: false,
+      documentsDegraded: [],
       errors: [`Backup manifest could not be loaded: ${error.message}`],
       manifest: null,
       path: resolvedBundle,
@@ -583,6 +590,8 @@ export async function verifyBackupBundle(bundlePath) {
       current: false,
       legacy: false,
       classification: 'invalid',
+      databaseVerified: false,
+      documentsDegraded: [],
       errors,
       manifest,
       path: resolvedBundle,
@@ -590,6 +599,13 @@ export async function verifyBackupBundle(bundlePath) {
   }
   const isLegacy = manifest.version === legacyBackupVersion;
   const legacyReasons = [];
+  // Document-level problems are recorded in both lists: `errors` keeps every message in order,
+  // `documentErrors` marks which of them leave the database itself verified.
+  const documentErrors = [];
+  const addDocumentError = (id, reason, message) => {
+    errors.push(message);
+    documentErrors.push({ id, reason });
+  };
 
   const databasePath = path.resolve(resolvedBundle, manifest.database.relativePath);
   if (!databasePath.startsWith(`${resolvedBundle}${path.sep}`)) {
@@ -606,7 +622,9 @@ export async function verifyBackupBundle(bundlePath) {
         assertSnapshotQuickCheck(database);
         const documentRows = readSecureDocumentRowsFromDatabase(database);
         if (documentRows.length !== manifest.secureDocuments.count) errors.push('Secure-document row count does not match the manifest.');
-        errors.push(...compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows));
+        const comparison = compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows);
+        errors.push(...comparison.errors);
+        for (const { id, reason, message } of comparison.documentErrors) addDocumentError(id, reason, message);
       } finally {
         database.close();
       }
@@ -626,19 +644,24 @@ export async function verifyBackupBundle(bundlePath) {
     }
     try {
       const stat = await fs.stat(filePath);
-      if (stat.size !== document.sizeBytes) errors.push(`Document ${document.id} size does not match.`);
-      if (await sha256File(filePath) !== document.sha256) errors.push(`Document ${document.id} checksum does not match.`);
+      if (stat.size !== document.sizeBytes) addDocumentError(document.id, 'size_mismatch', `Document ${document.id} size does not match.`);
+      if (await sha256File(filePath) !== document.sha256) addDocumentError(document.id, 'checksum_mismatch', `Document ${document.id} checksum does not match.`);
     } catch (error) {
-      errors.push(`Document ${document.id} could not be verified: ${error.message}`);
+      addDocumentError(document.id, 'unreadable', `Document ${document.id} could not be verified: ${error.message}`);
     }
   }
 
+  const documentsDegraded = documentErrors;
+  const databaseVerified = errors.length === documentErrors.length;
   if (errors.length > 0) {
     return {
       ok: false,
       current: false,
       legacy: false,
-      classification: 'invalid',
+      // A legacy bundle is never restorable, so document damage does not soften it to degraded.
+      classification: databaseVerified && !isLegacy ? 'degraded' : 'invalid',
+      databaseVerified,
+      documentsDegraded,
       errors,
       manifest,
       path: resolvedBundle,
@@ -650,6 +673,8 @@ export async function verifyBackupBundle(bundlePath) {
       current: false,
       legacy: true,
       classification: 'legacy',
+      databaseVerified: true,
+      documentsDegraded: [],
       errors: [
         'Manifest version 1 is a legacy pre-invariant backup and is not eligible for current restore or repair evidence.',
         ...legacyReasons,
@@ -663,6 +688,8 @@ export async function verifyBackupBundle(bundlePath) {
     current: true,
     legacy: false,
     classification: 'current',
+    databaseVerified: true,
+    documentsDegraded: [],
     errors: [],
     manifest,
     path: resolvedBundle,
@@ -681,14 +708,24 @@ export async function listBackupBundles(config = getConfig()) {
     }));
 }
 
+function summarizeDegradedDocuments(degradedBundles) {
+  const byId = new Map();
+  for (const { id, reason } of degradedBundles.flatMap((bundle) => bundle.documentsDegraded)) {
+    if (!byId.has(id)) byId.set(id, { id, reason });
+  }
+  return [...byId.values()].slice(0, 20);
+}
+
 export async function getBackupStatus(config = getConfig()) {
   const inspected = await inspectBackupDirectory(config);
   const valid = inspected.filter((bundle) => bundle.state === 'valid');
+  const degraded = inspected.filter((bundle) => bundle.state === 'degraded');
   const legacy = inspected.filter((bundle) => bundle.state === 'legacy');
   const invalid = inspected.filter((bundle) => bundle.state === 'invalid');
   const incomplete = inspected.filter((bundle) => bundle.state === 'incomplete');
   const bundleCounts = {
     valid: valid.length,
+    degraded: degraded.length,
     legacy: legacy.length,
     invalid: invalid.length,
     incomplete: incomplete.length,
@@ -697,7 +734,7 @@ export async function getBackupStatus(config = getConfig()) {
     return { status: 'disabled', message: 'Automated application backups are disabled.', latest: null, bundleCounts };
   }
 
-  const [latest] = valid;
+  const [latest] = inspected.filter((bundle) => ['valid', 'degraded'].includes(bundle.state));
   if (!latest?.manifest) {
     if (invalid.length > 0) {
       return {
@@ -735,9 +772,10 @@ export async function getBackupStatus(config = getConfig()) {
   };
   const ageMs = Date.now() - Date.parse(latest.manifest.createdAt || '');
   const stale = !Number.isFinite(ageMs) || ageMs > 36 * 60 * 60 * 1000;
-  if (legacy.length > 0 || invalid.length > 0 || incomplete.length > 0) {
+  if (degraded.length > 0 || legacy.length > 0 || invalid.length > 0 || incomplete.length > 0) {
     const issueSummary = [
       legacy.length > 0 ? `${legacy.length} legacy` : '',
+      degraded.length > 0 ? `${degraded.length} with mismatched documents` : '',
       invalid.length > 0 ? `${invalid.length} invalid` : '',
       incomplete.length > 0 ? `${incomplete.length} incomplete` : '',
     ].filter(Boolean).join(' and ');
@@ -747,6 +785,7 @@ export async function getBackupStatus(config = getConfig()) {
       latest: latestSummary,
       bundleCounts,
       verificationErrors: invalid.flatMap((bundle) => bundle.errors).slice(0, 20),
+      documentsDegraded: summarizeDegradedDocuments(degraded),
     };
   }
   return {
@@ -780,9 +819,11 @@ export async function restoreBackupBundle(bundlePath, {
   databasePath,
   documentsDirectory,
   overwrite = false,
+  acceptDegradedDocuments = false,
 } = {}) {
   const verification = await verifyBackupBundle(bundlePath);
-  if (!verification.ok) throw new Error(`Backup verification failed: ${verification.errors.join(' ')}`);
+  const restorable = verification.ok || (acceptDegradedDocuments && verification.classification === 'degraded');
+  if (!restorable) throw new Error(`Backup verification failed: ${verification.errors.join(' ')}`);
 
   const targetDatabase = path.resolve(databasePath);
   const targetDocuments = path.resolve(documentsDirectory);
@@ -855,6 +896,7 @@ export async function restoreBackupBundle(bundlePath, {
       databaseSafetyPath,
       documentsSafetyPath,
       restoredDocuments: verification.manifest.secureDocuments.count,
+      degradedDocuments: verification.ok ? [] : verification.documentsDegraded,
     };
   } finally {
     await fs.rm(stageRoot, { recursive: true, force: true });
