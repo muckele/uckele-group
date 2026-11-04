@@ -333,7 +333,7 @@ async function autoPursueReplyStops(t, createBackend) {
   const [initial] = world.mailProvider.sent;
   const initialCopy = expectedEmail(world, { kind: 'initial', name: 'Acme Plumbing' });
   assert.deepEqual([initial.from, initial.to, initial.subject, initial.text],
-    [SENDER, BROKER_EMAIL, initialCopy.subject, initialCopy.text]);
+    [{ name: SENDER_SETTINGS.name, address: SENDER }, BROKER_EMAIL, initialCopy.subject, initialCopy.text]);
   campaign = await world.campaignFor(id);
   assert.equal(campaign.state, 'active-follow-up');
   assert.equal((await world.conversation(campaign.conversation_id)).gmail_thread_id, initial.threadId);

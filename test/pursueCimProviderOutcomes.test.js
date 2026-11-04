@@ -435,7 +435,7 @@ test('gmail accepted outcome finalizes the touch with provider gmail and stores 
   const [sent] = mailProvider.sent;
   assert.equal(sent.rfcMessageId, `<${gate.transmission.id}@uckele.example.test>`);
   assert.equal(sent.to, BROKER);
-  assert.equal(sent.from, SENDER);
+  assert.deepEqual(sent.from, { name: 'Mathew Uckele', address: SENDER });
   assert.equal(sent.inReplyTo, null);
   const transmission = row(database, 'deal_hunter_cim_transmissions', gate.transmission.id);
   assert.deepEqual({ state: transmission.state, provider: transmission.provider,

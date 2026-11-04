@@ -540,7 +540,7 @@ async function recordTrackedEmailDelivery(message, result) {
 // Pursue CIM through the owner's Gmail mailbox (spec 2026-11-03 §4.3, §5.6, §5.7). Runs only
 // after the CIM boundary entered the provider seam. The provider never throws for a provider
 // outcome; anything thrown is treated as an ambiguous outcome to reconcile through findSent.
-async function sendViaGmailCim(message, { mailProvider, onProviderAttempt } = {}) {
+async function sendViaGmailCim(message, { mailProvider, onProviderAttempt, fromName = '' } = {}) {
   // The seam was entered: from here every path is a provider outcome the touch is finalized,
   // released or reconciled under, never a silent provider-pending.
   onProviderAttempt?.();
@@ -550,12 +550,15 @@ async function sendViaGmailCim(message, { mailProvider, onProviderAttempt } = {}
       errorCategory: 'gmail_thread_missing', definitiveFailure: true,
       error: 'A follow-up needs the conversation Gmail thread and the initial Message-ID.' };
   }
+  // The owner's name (DEAL_HUNTER_SENDER_NAME) is the From display name; the address is the
+  // stored one. The header writer strips or encodes anything unsafe in the name.
+  const displayName = String(fromName ?? '').trim();
   let sent;
   try {
     sent = await mailProvider.send({
       transmissionId: message.transmissionId,
       to: normalizeRecipients(message.to)[0],
-      from: message.from,
+      from: displayName ? { name: displayName, address: message.from } : message.from,
       subject: message.subject,
       text: message.text,
       html: message.html,
@@ -719,6 +722,7 @@ async function sendMessage(message, {
         // anything else keeps the previous fallthrough to the console provider.
         result = cimClassification.protected && typeof cimMailProvider?.send === 'function'
           ? await sendViaGmailCim(message, { mailProvider: cimMailProvider,
+            fromName: config?.dealHunter?.sender?.name,
             onProviderAttempt: () => { providerAttempted = true; } })
           : await sendViaConsole(message);
         break;

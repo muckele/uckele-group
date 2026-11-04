@@ -813,3 +813,13 @@ test('follow-ups, not initial emails, are held while reply checking is off or ha
   assert.equal(sent.sentFollowUps, 1, JSON.stringify(sent));
   assert.equal(fixture.mailProvider.sent.length, 2);
 });
+
+test('Gmail sends carry the owner name from DEAL_HUNTER_SENDER_NAME as the From display name', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, campaigns: [due('a')] });
+  await sendInitial(fixture);
+  const [initial] = fixture.mailProvider.sent;
+  assert.deepEqual(initial.from, { name: 'Mathew Uckele', address: 'owner@uckele.example.test' });
+  const { messages } = await fixture.mailProvider.listThreadChanges({ checkpoint: '0',
+    threadIds: [initial.threadId] });
+  assert.equal(messages[0].headers.from, '"Mathew Uckele" <owner@uckele.example.test>');
+});

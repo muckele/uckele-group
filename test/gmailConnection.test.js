@@ -147,7 +147,8 @@ test('callback rejects reused, expired, and forged state with gmail_state_invali
   const [payload, signature] = fresh.split('.');
   const otherKeyState = buildGmailConnectUrl({ config: makeConfig(), actor: 'admin', now: at }).state;
   const forged = [
-    `${payload}.${signature.slice(0, -2)}AA`,
+    // The last signature character flipped to one guaranteed to differ.
+    `${payload}.${signature.slice(0, -1)}${signature.endsWith('A') ? 'B' : 'A'}`,
     `${Buffer.from(JSON.stringify({ nonce: 'x', actor: 'admin', issuedAt: at })).toString('base64url')}.${signature}`,
     otherKeyState,
     'garbage',
@@ -234,6 +235,25 @@ test('invalid_grant on refresh throws gmail_token_invalid and records the failed
   const empty = openStorage(t);
   await assert.rejects(getGmailAccessToken({ storage: empty, config, now: at, fetcher: google.fetcher }),
     (error) => error.code === 'gmail_not_connected');
+});
+
+test('invalid_client and unauthorized_client on refresh are gmail_token_invalid, not a transient failure', async (t) => {
+  for (const refreshError of ['invalid_client', 'unauthorized_client']) {
+    const storage = openStorage(t);
+    const config = makeConfig();
+    await connect(storage, config, fakeGoogle());
+    const google = fakeGoogle({ refreshError });
+    await assert.rejects(getGmailAccessToken({ storage, config, now: at, fetcher: google.fetcher }),
+      (error) => error.code === 'gmail_token_invalid' && error.message === 'gmail_token_invalid', refreshError);
+    assert.equal((await storage.getGmailConnection()).last_error_code, 'gmail_token_invalid', refreshError);
+  }
+  // Any other refusal stays the transient refresh failure.
+  const storage = openStorage(t);
+  const config = makeConfig();
+  await connect(storage, config, fakeGoogle());
+  await assert.rejects(getGmailAccessToken({ storage, config, now: at,
+    fetcher: fakeGoogle({ refreshError: 'temporarily_unavailable' }).fetcher }),
+  (error) => error.code === 'gmail_token_refresh_failed');
 });
 
 test('disconnect revokes at Google best-effort and still revokes locally when Google errors', async (t) => {

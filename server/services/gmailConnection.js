@@ -17,6 +17,9 @@ const PROFILE_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/profile';
 const STATE_TTL_MS = 10 * 60 * 1000;
 const STATE_CLOCK_SKEW_MS = 60 * 1000;
 const FORM_HEADERS = Object.freeze({ 'Content-Type': 'application/x-www-form-urlencoded' });
+// Token refusals that only the owner can fix (reconnect, or correct the OAuth client):
+// a revoked or expired grant, or a client Google no longer accepts for this token.
+const TOKEN_INVALID_ERRORS = new Set(['invalid_grant', 'invalid_client', 'unauthorized_client']);
 
 // Single-use state nonces, kept in memory: a restart only forces the owner to click again.
 const pendingStateNonces = new Map();
@@ -213,7 +216,7 @@ export async function getGmailAccessToken({ storage, config, now = new Date(), f
       grant_type: 'refresh_token',
     }).toString(),
   }, config, 'gmail_token_refresh_failed');
-  if (result.body?.error === 'invalid_grant') {
+  if (TOKEN_INVALID_ERRORS.has(result.body?.error)) {
     await storage.recordGmailTokenCheck({ ok: false, errorCode: 'gmail_token_invalid', now: at });
     throw gmailError('gmail_token_invalid');
   }
