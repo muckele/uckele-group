@@ -40,11 +40,14 @@ function expiryDerivation(value) {
   return value;
 }
 
-function nextKind(kind) {
+/** The kind of the touch that follows a touch of `kind`, or '' for an unknown kind. */
+export function nextCimTouchKind(kind) {
   return ({ initial: 'follow-up-1', 'follow-up-1': 'follow-up-2',
     'follow-up-2': 'follow-up-3', 'follow-up-3': 'weekday-follow-up',
     'weekday-follow-up': 'weekday-follow-up' })[kind] ?? '';
 }
+
+const nextKind = nextCimTouchKind;
 
 function assertCurrentTouch(touch) {
   const expectedOrdinal = { initial: 0, 'follow-up-1': 1, 'follow-up-2': 2,

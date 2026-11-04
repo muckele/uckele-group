@@ -23119,3 +23119,476 @@ revoke all on function public.pursue_cim_list_due_initial_touches_v1(timestamptz
   from public, anon, authenticated;
 grant execute on function public.pursue_cim_list_due_initial_touches_v1(timestamptz, integer)
   to service_role;
+
+-- Due follow-up touches (spec 2026-11-03 §5.2): scheduled, non-initial touches that are due,
+-- of open conversations whose campaign is in active-follow-up and not past its expiry, while
+-- the fl04c-followup chain is current and active. Claimed touches are never listed. Each row
+-- carries the touch's next preparation generation, so a touch Gmail never accepted is
+-- prepared again as a new transmission. Mirrors listDueCimFollowUpTouches in SQLite.
+create or replace function public.pursue_cim_list_due_followup_touches_v1(
+  p_now timestamptz, p_limit integer default 25
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  v_activation_id text;
+begin
+  if p_now is null or p_limit is null or p_limit not between 1 and 100 then
+    raise exception 'Invalid Pursue CIM due selection';
+  end if;
+  select a.id into v_activation_id from public.deal_hunter_cim_capability_activations a
+    where a.id = public.pursue_cim_current_activation_v1('fl04c-followup', p_now)
+      and a.mode = 'active';
+  if v_activation_id is null then
+    return '[]'::jsonb;
+  end if;
+  return coalesce((
+    select pg_catalog.jsonb_agg(pg_catalog.to_jsonb(due) order by due.due_at, due.touch_id)
+    from (
+      select t.id as touch_id, t.campaign_id, t.opportunity_id, t.kind, t.ordinal,
+        t.state, t.due_at, t.due_local as "dueLocal", t.row_version, t.claim_expires_at,
+        c.conversation_id, c.terminal_revision as campaign_terminal_revision,
+        v.terminal_revision as conversation_terminal_revision,
+        c.crm_submission_id, c.recipient_fingerprint,
+        c.recipient_fingerprint as campaign_recipient_fingerprint,
+        v.recipient_fingerprint as conversation_recipient_fingerprint,
+        v.recipient_address, c.local_expiry_at as "campaignExpiryAt",
+        v_activation_id as activation_id,
+        (select coalesce(max(tr.preparation_generation), 0) + 1
+          from public.deal_hunter_cim_transmission_touches as m
+          join public.deal_hunter_cim_transmissions as tr on tr.id = m.transmission_id
+          where m.touch_id = t.id) as preparation_generation
+      from public.deal_hunter_cim_campaign_touches as t
+      join public.deal_hunter_cim_campaigns as c on c.id = t.campaign_id
+      join public.deal_hunter_broker_conversations as v on v.id = c.conversation_id
+      where t.kind <> 'initial' and t.logical_slot <> 'initial' and t.ordinal >= 1
+        and c.policy_version = 'deal-hunter-cim-autopilot-v1'
+        and c.state = 'active-follow-up' and v.state = 'open'
+        and t.opportunity_id = c.opportunity_id
+        and t.state = 'scheduled' and t.transmission_id is null
+        and t.due_at <= p_now
+        and c.local_expiry_at is not null and c.local_expiry_at > p_now
+        and t.timezone_revision = c.timezone_revision
+      order by t.due_at, t.id
+      limit p_limit
+    ) as due
+  ), '[]'::jsonb);
+end;
+$$;
+
+revoke all on function public.pursue_cim_list_due_followup_touches_v1(timestamptz, integer)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_list_due_followup_touches_v1(timestamptz, integer)
+  to service_role;
+
+-- The durable authority a follow-up is prepared under: touch, campaign, conversation,
+-- opportunity, CRM owner, timezone, the current fl04c-followup activation, the campaign's
+-- accepted initial transmission (what the follow-up replies to) and the stop signals held in
+-- durable records. Null when the touch does not exist. Mirrors readCimFollowUpAuthority.
+create or replace function public.pursue_cim_read_followup_authority_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  v_now timestamptz := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_touch public.deal_hunter_cim_campaign_touches%rowtype;
+  v_campaign public.deal_hunter_cim_campaigns%rowtype;
+  v_conversation public.deal_hunter_broker_conversations%rowtype;
+  v_activation_id text;
+  v_address text;
+begin
+  select * into v_touch from public.deal_hunter_cim_campaign_touches
+    where id = public.pursue_cim_required_text_v1(p_command, 'touchId', 240);
+  if not found then
+    return null;
+  end if;
+  select * into v_campaign from public.deal_hunter_cim_campaigns where id = v_touch.campaign_id;
+  select * into v_conversation from public.deal_hunter_broker_conversations
+    where id = v_campaign.conversation_id;
+  v_activation_id := public.pursue_cim_current_activation_v1('fl04c-followup', v_now);
+  v_address := coalesce(v_conversation.recipient_address, '');
+  return pg_catalog.jsonb_build_object(
+    'touch', pg_catalog.to_jsonb(v_touch),
+    'campaign', case when v_campaign.id is null then null else pg_catalog.to_jsonb(v_campaign) end,
+    'conversation', case when v_conversation.id is null then null
+      else pg_catalog.to_jsonb(v_conversation) end,
+    'opportunity', (select pg_catalog.to_jsonb(o) from public.deal_hunter_opportunities o
+      where o.opportunity_id = v_touch.opportunity_id),
+    'crmOwnership', (select pg_catalog.jsonb_build_object('revision', r.revision,
+        'submission_id', r.submission_id)
+      from public.deal_hunter_crm_ownership_revisions r
+      where r.opportunity_id = v_touch.opportunity_id order by r.revision desc limit 1),
+    'crmSubmission', (select pg_catalog.jsonb_build_object('id', s.id,
+        'deal_hunter_opportunity_id', s.deal_hunter_opportunity_id, 'archived_at', s.archived_at)
+      from public.contact_submissions s where s.id = v_campaign.crm_submission_id),
+    'timezone', (select pg_catalog.to_jsonb(z) from public.deal_hunter_opportunity_timezone_revisions z
+      where z.opportunity_id = v_touch.opportunity_id and z.revision = v_campaign.timezone_revision),
+    'activation', (select pg_catalog.to_jsonb(a) from public.deal_hunter_cim_capability_activations a
+      where a.id = v_activation_id),
+    'initial', (select pg_catalog.jsonb_build_object('transmissionId', tr.id,
+        'fromAddress', tr.from_address, 'subject', comm.subject)
+      from public.deal_hunter_cim_campaign_touches it
+      join public.deal_hunter_cim_transmission_touches m
+        on m.touch_id = it.id and m.cancelled_at is null
+      join public.deal_hunter_cim_transmissions tr
+        on tr.id = m.transmission_id and tr.state = 'accepted'
+      join public.crm_communications comm on comm.id = tr.communication_id
+      where it.campaign_id = v_campaign.id and it.kind = 'initial'
+      order by tr.preparation_generation desc, tr.id limit 1),
+    'signals', pg_catalog.jsonb_build_object(
+      'replyReceived', exists(select 1 from public.crm_communications
+        where direction = 'inbound' and (thread_key = v_conversation.rfc_thread_key
+          or submission_id = v_campaign.crm_submission_id)),
+      'suppressed', exists(select 1 from public.email_suppressions
+          where normalized_email = pg_catalog.lower(v_address) and lifted_at is null)
+        or exists(select 1 from public.email_events
+          where pg_catalog.lower(recipient_email) = pg_catalog.lower(v_address)
+            and event_type in ('unsubscribe','unsubscribed','opt_out')),
+      'unsafeDelivery', exists(select 1 from public.email_events
+        where pg_catalog.lower(recipient_email) = pg_catalog.lower(v_address)
+          and event_type in ('complained','complaint','bounced','hard_bounce')),
+      'providerPending', exists(select 1 from public.deal_hunter_cim_transmissions
+        where conversation_id = v_conversation.id and state = 'provider-pending'),
+      'providerAmbiguous', coalesce(v_campaign.state = 'provider-ambiguous', false)
+        or coalesce(v_conversation.state = 'provider-ambiguous', false)
+        or exists(select 1 from public.deal_hunter_cim_transmissions
+          where conversation_id = v_conversation.id and state = 'ambiguous')));
+end;
+$$;
+
+revoke all on function public.pursue_cim_read_followup_authority_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_read_followup_authority_v1(jsonb) to service_role;
+
+-- A follow-up released after Gmail refused it before acceptance is prepared again under the
+-- touch's next preparation generation, and its released transmission's consumed reservation
+-- no longer holds a daily or per-recipient slot (the transmission never reached the
+-- provider). These redefine the bodies from 20261015120000 with only those changes.
+create or replace function public.pursue_cim_prepare_reserved_followup_v1(p_command jsonb)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_touch public.deal_hunter_cim_campaign_touches%rowtype;
+  v_campaign public.deal_hunter_cim_campaigns%rowtype;
+  v_conversation public.deal_hunter_broker_conversations%rowtype;
+  v_activation public.deal_hunter_cim_capability_activations%rowtype;
+  v_reservation public.deal_hunter_cim_capacity_reservations%rowtype;
+  v_current public.deal_hunter_cim_transmissions%rowtype;
+  v_prepared jsonb;
+  v_touch_id text;
+  v_activation_id text;
+  v_claim_digest text;
+  v_claim_owner text;
+  v_fingerprint text;
+  v_address_digest text;
+  v_capacity_date date := (v_now at time zone 'America/Los_Angeles')::date;
+  v_next_midnight timestamptz;
+  v_expires_at timestamptz;
+  v_recipient_expires timestamptz := v_now + interval '24 hours';
+  v_count bigint;
+  v_id text;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(17499,48146);
+  if pg_catalog.jsonb_typeof(p_command->'touchIds') <> 'array'
+    or pg_catalog.jsonb_array_length(p_command->'touchIds') <> 1 then
+    raise exception 'Invalid follow-up reservation membership';
+  end if;
+  v_touch_id := public.pursue_cim_required_text_v1(
+    pg_catalog.jsonb_build_object('value',p_command->'touchIds'->>0),'value',240);
+  v_activation_id := public.pursue_cim_required_text_v1(p_command,'activationId',240);
+  v_claim_digest := public.pursue_cim_required_text_v1(p_command,'claimTokenDigest',64);
+  v_claim_owner := public.pursue_cim_required_text_v1(p_command,'claimOwner',200);
+  v_fingerprint := public.pursue_cim_required_text_v1(p_command,'recipientFingerprint',64);
+  if v_claim_digest !~ '^[0-9a-f]{64}$' or v_fingerprint !~ '^[0-9a-f]{64}$' then
+    raise exception 'Invalid follow-up reservation digest';
+  end if;
+  update public.deal_hunter_cim_capacity_reservations set state='expired',
+    expired_at=v_now, row_version=row_version+1 where state='reserved' and expires_at <= v_now;
+  select * into v_touch from public.deal_hunter_cim_campaign_touches
+    where id=v_touch_id for update;
+  if not found then return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+    'capacityDeferred',false,'payloadConflict',false,'terminal',true,
+    'blockedReason','terminal_authority_changed','transmission',null,'reservation',null); end if;
+  select * into v_campaign from public.deal_hunter_cim_campaigns
+    where id=v_touch.campaign_id for update;
+  select * into v_conversation from public.deal_hunter_broker_conversations
+    where id=v_campaign.conversation_id for update;
+  select * into v_activation from public.deal_hunter_cim_capability_activations
+    where id=public.pursue_cim_current_activation_v1('fl04c-followup',v_now) for update;
+  if v_activation.id is distinct from v_activation_id or v_activation.mode <> 'active'
+    or v_touch.kind='initial' or v_campaign.state <> 'active-follow-up'
+    or v_touch.opportunity_id <> v_campaign.opportunity_id
+    or v_conversation.state <> 'open'
+    or v_campaign.recipient_fingerprint <> v_fingerprint
+    or v_conversation.recipient_fingerprint <> v_fingerprint
+    or v_conversation.recipient_address <> p_command->'toAddresses'->>0
+    or v_campaign.terminal_revision <> (p_command->>'expectedCampaignTerminalRevision')::bigint
+    or v_conversation.terminal_revision <> (p_command->>'expectedConversationTerminalRevision')::bigint
+    or v_touch.state <> 'claimed' or v_touch.claim_token_digest <> v_claim_digest
+    or v_touch.claim_owner <> v_claim_owner or v_touch.claim_expires_at is null
+    or v_touch.claim_expires_at <= v_now
+    or (v_campaign.local_expiry_at is not null and v_campaign.local_expiry_at <= v_now)
+  then return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+    'capacityDeferred',false,'payloadConflict',false,'terminal',true,
+    'blockedReason','recipient_authority_changed','transmission',null,'reservation',null); end if;
+  if v_touch.claim_expires_at > v_now+interval '5 minutes' then
+    return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+      'capacityDeferred',false,'payloadConflict',false,'terminal',true,
+      'blockedReason','claim_expiry_invalid','transmission',null,'reservation',null);
+  end if;
+  if exists(select 1 from public.email_suppressions where normalized_email=pg_catalog.lower(v_conversation.recipient_address)
+      and lifted_at is null)
+    or exists(select 1 from public.email_events
+      where pg_catalog.lower(recipient_email)=pg_catalog.lower(v_conversation.recipient_address)
+        and event_type in ('complained','complaint','bounced','hard_bounce',
+          'unsubscribe','unsubscribed','opt_out'))
+  then return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+    'capacityDeferred',false,'payloadConflict',false,'terminal',true,
+    'blockedReason','recipient_suppressed','transmission',null,'reservation',null); end if;
+  if exists(select 1 from public.crm_communications where direction='inbound'
+      and (thread_key=v_conversation.rfc_thread_key or submission_id=v_campaign.crm_submission_id))
+  then return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+    'capacityDeferred',false,'payloadConflict',false,'terminal',true,
+    'blockedReason','reply_received','transmission',null,'reservation',null); end if;
+  select * into v_reservation from public.deal_hunter_cim_capacity_reservations
+    where touch_id=v_touch.id and state='reserved';
+  if found then
+    select * into v_current from public.deal_hunter_cim_transmissions
+      where id=v_reservation.transmission_id for update;
+    if public.pursue_cim_required_revision_v1(p_command,'preparationGeneration')
+      <> v_current.preparation_generation then
+      return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+        'capacityDeferred',false,'payloadConflict',true,'terminal',false,
+        'blockedReason','payload_conflict','transmission',pg_catalog.to_jsonb(v_current),
+        'reservation',pg_catalog.to_jsonb(v_reservation));
+    end if;
+    v_prepared := public.pursue_cim_prepare_transmission_v1(
+      p_command || pg_catalog.jsonb_build_object('now',pg_catalog.to_char(
+        v_now at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+        'preparationGeneration',public.pursue_cim_required_revision_v1(
+          p_command,'preparationGeneration')));
+    return v_prepared || pg_catalog.jsonb_build_object('capacityDeferred',false,
+      'blockedReason',case when coalesce((v_prepared->>'existing')::boolean,false)
+        then null else 'payload_conflict' end,
+      'reservation',pg_catalog.to_jsonb(v_reservation));
+  end if;
+  select tr.* into v_current from public.deal_hunter_cim_transmission_touches m
+    join public.deal_hunter_cim_transmissions tr on tr.id=m.transmission_id
+    where m.touch_id=v_touch.id and m.cancelled_at is null for update of tr;
+  if found then return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+    'capacityDeferred',false,'payloadConflict',false,'terminal',true,
+    'blockedReason','reservation_renewal_required','transmission',pg_catalog.to_jsonb(v_current),
+    'reservation',null); end if;
+  if public.pursue_cim_required_revision_v1(p_command,'preparationGeneration') <> (
+      select coalesce(max(tr.preparation_generation),0)+1
+      from public.deal_hunter_cim_transmission_touches m
+      join public.deal_hunter_cim_transmissions tr on tr.id=m.transmission_id
+      where m.touch_id=v_touch.id) then
+    return pg_catalog.jsonb_build_object('prepared',false,'existing',false,
+      'capacityDeferred',false,'payloadConflict',true,'terminal',false,
+      'blockedReason','preparation_generation_invalid','transmission',null,'reservation',null);
+  end if;
+  v_address_digest := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+    pg_catalog.lower(pg_catalog.btrim(v_conversation.recipient_address)),'UTF8')),'hex');
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
+    'cim-capacity-daily:'||v_capacity_date::text,0));
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(
+    'cim-capacity-recipient:'||v_address_digest,0));
+  select count(*) into v_count from public.deal_hunter_cim_capacity_reservations
+    where capacity_date=v_capacity_date and (state='consumed' or (state='reserved' and expires_at>v_now))
+      and not exists(select 1 from public.deal_hunter_cim_transmissions held
+        where held.id=deal_hunter_cim_capacity_reservations.transmission_id
+          and held.state='cancelled-before-provider');
+  if v_activation.daily_cap is null or v_activation.daily_cap < 1 or v_count >= v_activation.daily_cap then
+    return pg_catalog.jsonb_build_object('prepared',false,'existing',false,'capacityDeferred',true,
+      'payloadConflict',false,'terminal',false,'blockedReason','daily_capacity','transmission',null,'reservation',null);
+  end if;
+  select count(*) into v_count from public.deal_hunter_cim_capacity_reservations
+    where recipient_address_digest=v_address_digest and recipient_window_expires_at>v_now
+      and state in ('reserved','consumed')
+      and not exists(select 1 from public.deal_hunter_cim_transmissions held
+        where held.id=deal_hunter_cim_capacity_reservations.transmission_id
+          and held.state='cancelled-before-provider');
+  if v_activation.recipient_cap is null or v_activation.recipient_cap < 1
+    or v_count >= v_activation.recipient_cap then
+    return pg_catalog.jsonb_build_object('prepared',false,'existing',false,'capacityDeferred',true,
+      'payloadConflict',false,'terminal',false,'blockedReason','recipient_capacity','transmission',null,'reservation',null);
+  end if;
+  if exists(select 1 from public.deal_hunter_cim_capacity_reservations
+      where campaign_id=v_campaign.id and state='reserved') then
+    return pg_catalog.jsonb_build_object('prepared',false,'existing',false,'capacityDeferred',true,
+      'payloadConflict',false,'terminal',false,'blockedReason','campaign_capacity','transmission',null,'reservation',null);
+  end if;
+  v_prepared := public.pursue_cim_prepare_transmission_v1(
+    p_command || pg_catalog.jsonb_build_object('now',pg_catalog.to_char(
+      v_now at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+  if coalesce((v_prepared->>'prepared')::boolean,false) is not true then
+    return v_prepared || pg_catalog.jsonb_build_object('capacityDeferred',false,
+      'blockedReason',case when coalesce((v_prepared->>'terminal')::boolean,false)
+        then 'terminal_authority_changed' else null end,'reservation',null);
+  end if;
+  v_next_midnight := ((v_capacity_date+1)::timestamp at time zone 'America/Los_Angeles');
+  v_expires_at := least(v_touch.claim_expires_at,v_next_midnight);
+  v_id := public.pursue_cim_digest_v1(pg_catalog.to_jsonb('cim-follow-up-capacity:v1'::text),
+    v_prepared->'transmission'->'id',pg_catalog.to_jsonb(v_claim_digest),
+    pg_catalog.to_jsonb(v_capacity_date::text));
+  insert into public.deal_hunter_cim_capacity_reservations(id,activation_id,transmission_id,
+    touch_id,campaign_id,conversation_id,recipient_fingerprint,recipient_address_digest,
+    capacity_date,claim_token_digest,state,reserved_at,expires_at,recipient_window_expires_at)
+  values(v_id,v_activation.id,v_prepared->'transmission'->>'id',v_touch.id,v_campaign.id,
+    v_conversation.id,v_fingerprint,v_address_digest,v_capacity_date,v_claim_digest,
+    'reserved',v_now,v_expires_at,v_recipient_expires) returning * into v_reservation;
+  return v_prepared || pg_catalog.jsonb_build_object('capacityDeferred',false,
+    'blockedReason',null,'reservation',pg_catalog.to_jsonb(v_reservation));
+end;
+$$;
+
+create or replace function public.pursue_cim_renew_reserved_followup_v1(p_command jsonb)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_now timestamptz := pg_catalog.clock_timestamp();
+  v_transmission public.deal_hunter_cim_transmissions%rowtype;
+  v_touch public.deal_hunter_cim_campaign_touches%rowtype;
+  v_campaign public.deal_hunter_cim_campaigns%rowtype;
+  v_conversation public.deal_hunter_broker_conversations%rowtype;
+  v_activation public.deal_hunter_cim_capability_activations%rowtype;
+  v_prior public.deal_hunter_cim_capacity_reservations%rowtype;
+  v_reservation public.deal_hunter_cim_capacity_reservations%rowtype;
+  v_capacity_date date := (v_now at time zone 'America/Los_Angeles')::date;
+  v_claim_digest text := public.pursue_cim_required_text_v1(p_command,'claimTokenDigest',64);
+  v_fingerprint text := public.pursue_cim_required_text_v1(p_command,'recipientFingerprint',64);
+  v_claim_expires timestamptz := public.pursue_cim_required_instant_v1(p_command,'claimExpiresAt');
+  v_claim_owner text := public.pursue_cim_required_text_v1(p_command,'claimOwner',200);
+  v_address_digest text; v_id text; v_count bigint; v_changed bigint;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(17499,48146);
+  if v_claim_digest !~ '^[0-9a-f]{64}$' or v_fingerprint !~ '^[0-9a-f]{64}$' then
+    raise exception 'Invalid follow-up renewal digest';
+  end if;
+  update public.deal_hunter_cim_capacity_reservations set state='expired',expired_at=v_now,
+    row_version=row_version+1 where state='reserved' and expires_at<=v_now;
+  select * into v_transmission from public.deal_hunter_cim_transmissions
+    where id=p_command->>'transmissionId' for update;
+  select * into v_touch from public.deal_hunter_cim_campaign_touches
+    where id=p_command->>'touchId' for update;
+  select * into v_campaign from public.deal_hunter_cim_campaigns where id=v_touch.campaign_id for update;
+  select * into v_conversation from public.deal_hunter_broker_conversations
+    where id=v_campaign.conversation_id for update;
+  select * into v_activation from public.deal_hunter_cim_capability_activations
+    where id=public.pursue_cim_current_activation_v1('fl04c-followup',v_now) for update;
+  v_address_digest := pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(
+    pg_catalog.lower(pg_catalog.btrim(v_conversation.recipient_address)),'UTF8')),'hex');
+  v_id := public.pursue_cim_digest_v1(pg_catalog.to_jsonb('cim-follow-up-capacity:v1'::text),
+    pg_catalog.to_jsonb(v_transmission.id),pg_catalog.to_jsonb(v_claim_digest),
+    pg_catalog.to_jsonb(v_capacity_date::text));
+  select * into v_reservation from public.deal_hunter_cim_capacity_reservations where id=v_id;
+  if found then
+    if v_transmission.id is null or v_transmission.state <> 'prepared'
+      or v_transmission.invocation_authority_count <> 0 or v_touch.id is null
+      or v_touch.transmission_id <> v_transmission.id or v_touch.state <> 'claimed'
+      or v_touch.opportunity_id <> v_campaign.opportunity_id
+      or v_touch.claim_token_digest <> v_claim_digest or v_touch.claim_owner <> v_claim_owner
+      or v_touch.claim_expires_at <> v_claim_expires or v_touch.claim_expires_at <= v_now
+      or v_campaign.state <> 'active-follow-up' or v_campaign.local_expiry_at <= v_now
+      or v_conversation.state <> 'open' or v_activation.id is distinct from p_command->>'activationId'
+      or v_campaign.recipient_fingerprint <> v_fingerprint
+      or v_conversation.recipient_fingerprint <> v_fingerprint
+      or v_reservation.state <> 'reserved' or v_reservation.expires_at <= v_now
+      or v_reservation.activation_id <> v_activation.id
+      or v_reservation.transmission_id <> v_transmission.id
+      or v_reservation.touch_id <> v_touch.id or v_reservation.campaign_id <> v_campaign.id
+      or v_reservation.conversation_id <> v_conversation.id
+      or v_reservation.recipient_fingerprint <> v_fingerprint
+      or v_reservation.recipient_address_digest <> v_address_digest
+      or v_reservation.claim_token_digest <> v_claim_digest
+    then return pg_catalog.jsonb_build_object('renewed',false,'existing',false,
+      'capacityDeferred',false,'terminal',true,'blockedReason','renewal_authority_changed',
+      'transmission',pg_catalog.to_jsonb(v_transmission),
+      'reservation',pg_catalog.to_jsonb(v_reservation)); end if;
+    return pg_catalog.jsonb_build_object('renewed',false,'existing',true,
+      'capacityDeferred',false,'terminal',false,'blockedReason',null,
+      'transmission',pg_catalog.to_jsonb(v_transmission),
+      'reservation',pg_catalog.to_jsonb(v_reservation));
+  end if;
+  select * into v_prior from public.deal_hunter_cim_capacity_reservations
+    where transmission_id=v_transmission.id order by reserved_at desc,id desc limit 1;
+  if v_transmission.id is null or v_transmission.state <> 'prepared'
+    or v_transmission.invocation_authority_count <> 0 or v_touch.id is null
+    or v_touch.transmission_id <> v_transmission.id or v_touch.row_version <> (p_command->>'expectedRowVersion')::bigint
+    or v_touch.opportunity_id <> v_campaign.opportunity_id
+    or v_touch.state <> 'claimed' or v_touch.claim_expires_at > v_now
+    or v_prior.id is null or v_prior.state <> 'expired'
+    or v_activation.id is distinct from p_command->>'activationId'
+    or v_campaign.state <> 'active-follow-up' or v_conversation.state <> 'open'
+    or v_campaign.local_expiry_at <= v_now
+    or v_campaign.recipient_fingerprint <> v_fingerprint
+    or v_conversation.recipient_fingerprint <> v_fingerprint
+    or v_prior.activation_id <> v_activation.id or v_prior.touch_id <> v_touch.id
+    or v_prior.campaign_id <> v_campaign.id or v_prior.conversation_id <> v_conversation.id
+    or v_prior.recipient_fingerprint <> v_fingerprint
+    or v_prior.recipient_address_digest <> v_address_digest
+    or v_claim_expires <= v_now or v_claim_expires > v_now+interval '5 minutes'
+  then return pg_catalog.jsonb_build_object('renewed',false,'existing',false,'capacityDeferred',false,
+    'terminal',true,'blockedReason','renewal_authority_changed',
+    'transmission',pg_catalog.to_jsonb(v_transmission),'reservation',null); end if;
+  if v_activation.daily_cap is null or v_activation.daily_cap < 1
+    or v_activation.recipient_cap is null or v_activation.recipient_cap < 1
+  then return pg_catalog.jsonb_build_object('renewed',false,'existing',false,
+    'capacityDeferred',false,'terminal',true,'blockedReason','renewal_authority_changed',
+    'transmission',pg_catalog.to_jsonb(v_transmission),'reservation',null); end if;
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('cim-capacity-daily:'||v_capacity_date::text,0));
+  perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('cim-capacity-recipient:'||v_address_digest,0));
+  select count(*) into v_count from public.deal_hunter_cim_capacity_reservations
+    where capacity_date=v_capacity_date and (state='consumed' or (state='reserved' and expires_at>v_now))
+      and not exists(select 1 from public.deal_hunter_cim_transmissions held
+        where held.id=deal_hunter_cim_capacity_reservations.transmission_id
+          and held.state='cancelled-before-provider');
+  if v_count >= v_activation.daily_cap then return pg_catalog.jsonb_build_object('renewed',false,
+    'existing',false,'capacityDeferred',true,'terminal',false,'blockedReason','daily_capacity',
+    'transmission',pg_catalog.to_jsonb(v_transmission),'reservation',null); end if;
+  select count(*) into v_count from public.deal_hunter_cim_capacity_reservations
+    where recipient_address_digest=v_address_digest and recipient_window_expires_at>v_now
+      and state in ('reserved','consumed')
+      and not exists(select 1 from public.deal_hunter_cim_transmissions held
+        where held.id=deal_hunter_cim_capacity_reservations.transmission_id
+          and held.state='cancelled-before-provider');
+  if v_count >= v_activation.recipient_cap then return pg_catalog.jsonb_build_object('renewed',false,
+    'existing',false,'capacityDeferred',true,'terminal',false,'blockedReason','recipient_capacity',
+    'transmission',pg_catalog.to_jsonb(v_transmission),'reservation',null); end if;
+  if exists(select 1 from public.deal_hunter_cim_capacity_reservations
+      where campaign_id=v_campaign.id and state='reserved') then
+    return pg_catalog.jsonb_build_object('renewed',false,'existing',false,
+      'capacityDeferred',true,'terminal',false,'blockedReason','campaign_capacity',
+      'transmission',pg_catalog.to_jsonb(v_transmission),'reservation',null);
+  end if;
+  update public.deal_hunter_cim_campaign_touches set claim_token_digest=v_claim_digest,
+    claim_owner=v_claim_owner,claimed_at=v_now, claim_expires_at=v_claim_expires,
+    row_version=row_version+1,updated_at=v_now where id=v_touch.id
+      and row_version=(p_command->>'expectedRowVersion')::bigint
+      and transmission_id=v_transmission.id and state='claimed';
+  get diagnostics v_changed = row_count;
+  if v_changed <> 1 then raise exception 'Follow-up renewal lost touch authority'; end if;
+  insert into public.deal_hunter_cim_capacity_reservations(id,activation_id,transmission_id,touch_id,
+    campaign_id,conversation_id,recipient_fingerprint,recipient_address_digest,capacity_date,
+    claim_token_digest,state,reserved_at,expires_at,recipient_window_expires_at)
+  values(v_id,v_activation.id,v_transmission.id,v_touch.id,v_campaign.id,v_conversation.id,
+    v_fingerprint,v_address_digest,v_capacity_date,v_claim_digest,'reserved',v_now,
+    least(v_claim_expires,((v_capacity_date+1)::timestamp at time zone 'America/Los_Angeles')),
+    v_now+interval '24 hours') returning * into v_reservation;
+  return pg_catalog.jsonb_build_object('renewed',true,'existing',false,'capacityDeferred',false,
+    'terminal',false,'blockedReason',null,'transmission',pg_catalog.to_jsonb(v_transmission),
+    'reservation',pg_catalog.to_jsonb(v_reservation));
+end;
+$$;
+
+revoke all on function public.pursue_cim_prepare_reserved_followup_v1(jsonb) from public,anon,authenticated;
+revoke all on function public.pursue_cim_renew_reserved_followup_v1(jsonb) from public,anon,authenticated;
+grant execute on function public.pursue_cim_prepare_reserved_followup_v1(jsonb) to service_role;
+grant execute on function public.pursue_cim_renew_reserved_followup_v1(jsonb) to service_role;

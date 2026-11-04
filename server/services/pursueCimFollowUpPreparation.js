@@ -50,6 +50,14 @@ function authorityBlock(authority, candidate, at) {
   return null;
 }
 
+// A follow-up released after Gmail refused it before acceptance is listed with the next
+// generation and prepared again as a new transmission; every other follow-up is generation 1.
+// Storage refuses any generation other than the touch's next one.
+function preparationGeneration(candidate) {
+  const generation = Number(candidate?.preparation_generation ?? 1);
+  return Number.isSafeInteger(generation) && generation >= 1 ? generation : 1;
+}
+
 export async function runCimFollowUpPreparation({ storage, candidate, now, clock,
   actor = 'pursue-cim-follow-up-preparer', claimTokenDigest, loadAuthority,
   buildPayload } = {}) {
@@ -100,7 +108,7 @@ export async function runCimFollowUpPreparation({ storage, candidate, now, clock
     touchIds: [candidate.touch_id], claimTokenDigest,
     expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),
     expectedConversationTerminalRevision: Number(candidate.conversation_terminal_revision),
-    ...message, preparationGeneration: 1, actor,
+    ...message, preparationGeneration: preparationGeneration(candidate), actor,
   });
   return {
     prepared: prepared.prepared === true,

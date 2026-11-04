@@ -149,10 +149,14 @@ test('the Gmail send runner migration is mirrored exactly at the end of the fres
     'pursue_cim_authorize_provider_pending_p7a',
     'pursue_cim_claim_due_touch_v1',
     'pursue_cim_finalize_transmission_p7a',
+    'pursue_cim_list_due_followup_touches_v1',
     'pursue_cim_list_due_initial_touches_v1',
     'pursue_cim_materialize_campaign_v1',
     'pursue_cim_materialize_campaign_v2',
+    'pursue_cim_prepare_reserved_followup_v1',
+    'pursue_cim_read_followup_authority_v1',
     'pursue_cim_reconcile_transmission_p7a',
+    'pursue_cim_renew_reserved_followup_v1',
     'pursue_cim_resolve_inbound_v1',
   ]);
   for (const name of names) {

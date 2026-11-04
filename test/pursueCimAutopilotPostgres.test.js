@@ -58,6 +58,10 @@ const fl04cCapacityMigrationPath = path.join(root,
   'supabase/migrations/20261015120000_pursue_cim_followup_capacity.sql');
 const cadenceV3MigrationPath = path.join(root,
   'supabase/migrations/20261102140000_pursue_cim_cadence_v3.sql');
+// The Gmail send runner migration adds pursue_cim_list_due_followup_touches_v1 and
+// pursue_cim_read_followup_authority_v1, so the P1C upgrade database replays it last.
+const gmailSendRunnersMigrationPath = path.join(root,
+  'supabase/migrations/20261103120000_gmail_send_runners.sql');
 // Migrations between the FL04C capacity and cadence v3 files. The best-first deal list one
 // adds pursue_cim_record_auto_pursue_decision_v1, so the P1C upgrade database replays them
 // in order to match the fresh schema's function inventory.
@@ -120,12 +124,14 @@ const expectedP1cFunctions = [
   'pursue_cim_finalize_with_cadence_v1',
   'pursue_cim_issue_live_authorization_v1',
   'pursue_cim_json_stringify_v1',
+  'pursue_cim_list_due_followup_touches_v1',
   'pursue_cim_list_due_initial_touches_v1',
   'pursue_cim_materialize_campaign_v1',
   'pursue_cim_prepare_reserved_followup_v1',
   'pursue_cim_prepare_transmission_v1',
   'pursue_cim_read_cadence_context_v1',
   'pursue_cim_read_final_gate_context_v1',
+  'pursue_cim_read_followup_authority_v1',
   'pursue_cim_read_import_outreach_counters_v1',
   'pursue_cim_read_operations_snapshot_v1',
   'pursue_cim_read_projection_v1',
@@ -1134,6 +1140,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     psql(container, 'pursue_cim_upgrade', fs.readFileSync(migrationFile, 'utf8'));
   }
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(cadenceV3MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(gmailSendRunnersMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',

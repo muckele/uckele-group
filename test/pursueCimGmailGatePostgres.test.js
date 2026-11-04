@@ -9,6 +9,11 @@ import { fileURLToPath } from 'node:url';
 import { calculateCampaignExpiry } from '../server/services/cimCampaignPolicy.js';
 import { CONTACT_POLICY_VERSION, contactPolicyDigest } from '../server/services/pursueCimContactPolicy.js';
 import { authorizePreparedCimTransmission } from '../server/services/pursueCimFinalGate.js';
+import {
+  buildPursueFollowUpPayload,
+  isFinalPursueFollowUp,
+  loadPursueFollowUpAuthority,
+} from '../server/services/pursueCimFollowUpHooks.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
@@ -213,15 +218,14 @@ async function prepareGate({ container, database, storage, suffix, followUp = fa
       ready: true, reasons: [], signatureComplete: true, evidenceRevision: `readiness-${suffix}`,
       generatedAt: now, expiresAt: new Date(Date.parse(now) + 60_000).toISOString() }),
     ...overrides });
-  return { ids, transmission: prepared.transmission, capability, writerPath, gate };
+  return { ids, transmission: prepared.transmission, capability, writerPath, gate,
+    recipientFingerprint, message };
 }
 
-test('PostgreSQL final gate accepts the contact rule basis and single-member follow-ups, and releases unsent Gmail work', {
-  skip: integrationEnabled ? false : 'set DEAL_HUNTER_POSTGRES_INTEGRATION=1 for disposable PostgreSQL integration',
-  timeout: 240_000,
-}, async (t) => {
+/** A disposable postgres:16 with the fresh schema, the Gmail activation chain and no pause. */
+async function startPostgres(t, prefix, database) {
   run(dockerCommand, ['image', 'inspect', 'postgres:16']);
-  const container = `uckele-gmail-gate-${process.pid}-${randomUUID().slice(0, 8)}`;
+  const container = `${prefix}-${process.pid}-${randomUUID().slice(0, 8)}`;
   let started = false;
   t.after(() => {
     if (started) run(dockerCommand, ['rm', '-f', container]);
@@ -238,7 +242,6 @@ test('PostgreSQL final gate accepts the contact rule basis and single-member fol
     if (attempt === 99) throw new Error('Disposable PostgreSQL did not become ready.');
     Atomics.wait(signal, 0, 0, 100);
   }
-  const database = 'gmail_gate';
   psql(container, 'postgres', `
     create role anon nologin;
     create role authenticated nologin;
@@ -270,6 +273,15 @@ test('PostgreSQL final gate accepts the contact rule basis and single-member fol
       accepted_generation, accepted_run_id, accepted_digest, accepted_at, projection_state)
       values ('sheet-0', 1, 1, 'source-run', '${fill('c')}', '${seededAt}', 'accepted');
   `);
+  return { container, storage };
+}
+
+test('PostgreSQL final gate accepts the contact rule basis and single-member follow-ups, and releases unsent Gmail work', {
+  skip: integrationEnabled ? false : 'set DEAL_HUNTER_POSTGRES_INTEGRATION=1 for disposable PostgreSQL integration',
+  timeout: 240_000,
+}, async (t) => {
+  const database = 'gmail_gate';
+  const { container, storage } = await startPostgres(t, 'uckele-gmail-gate', database);
   let ruleRevision = 0;
   const setRule = async (enabled, policyVersion = CONTACT_POLICY_VERSION) => {
     ruleRevision = (await storage.setPursueSendControl({ controlKey: 'contact_rule', enabled,
@@ -365,4 +377,183 @@ test('PostgreSQL final gate accepts the contact rule basis and single-member fol
     assert.equal(scalar(`select state from public.deal_hunter_cim_transmissions
       where id = '${followUp.transmission.id}';`), 'prepared', name);
   }
+});
+
+test('PostgreSQL lists due follow-ups and prepares a released follow-up again under generation 2', {
+  skip: integrationEnabled ? false : 'set DEAL_HUNTER_POSTGRES_INTEGRATION=1 for disposable PostgreSQL integration',
+  timeout: 240_000,
+}, async (t) => {
+  const database = 'gmail_follow_ups';
+  const { container, storage } = await startPostgres(t, 'uckele-gmail-follow-ups', database);
+  const scalar = (sql) => psql(container, database, sql);
+  const wallNow = () => new Date().toISOString();
+  const fingerprintFor = (suffix) => sha256(stableCanonicalJson({ opportunityId: `opp-gmail-${suffix}`,
+    emailHash: sha256(BROKER), provenanceFingerprint: fill('9'),
+    contactAuthorityRevision: fill('b') }));
+  const seed = (suffix, followUp = true) => seedCampaign(container, database, suffix,
+    fingerprintFor(suffix), { followUp, basis: 'activation' });
+  const memberAuthority = async ({ opportunityId }) => ({ opportunityId,
+    recipientOptions: [{ email: BROKER, displayName: 'Jordan Lee', firstName: 'Jordan',
+      provenanceFingerprint: fill('9'), permissionProvenanceFingerprint: fill('a'),
+      contactAuthorityRevision: fill('b') }],
+    materialsState: { materialsReceived: false, advancedBeyondBrokerOutreach: false,
+      evidenceCodes: [] }, preparationBlockers: [], suppression: null });
+
+  // Listing: only the due, scheduled follow-up of an active campaign.
+  const due = seed('due');
+  seed('initial', false);
+  const claimed = seed('claimed');
+  assert.equal((await storage.claimDueCimTouch({ touchId: claimed.touchId, expectedRowVersion: 1,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    claimTokenDigest: fill('c'), claimOwner: 'another-worker',
+    claimExpiresAt: new Date(Date.now() + 4 * 60_000).toISOString(), now: wallNow() })).claimed, true);
+  const cancelled = seed('cancelled');
+  const responded = seed('responded');
+  const later = seed('later');
+  psql(container, database, `
+    update public.deal_hunter_cim_campaign_touches set state = 'cancelled-before-provider'
+      where id = '${cancelled.touchId}';
+    update public.deal_hunter_cim_campaigns set state = 'responded' where id = '${responded.campaignId}';
+    update public.deal_hunter_broker_conversations set state = 'responded'
+      where id = '${responded.conversationId}';
+    update public.deal_hunter_cim_campaign_touches set due_at = now() + interval '2 days'
+      where id = '${later.touchId}';
+  `);
+  const listed = await storage.listDueCimFollowUpTouches({ now: wallNow() });
+  assert.deepEqual(listed.map((candidate) => candidate.touch_id), [due.touchId]);
+  const [candidate] = listed;
+  assert.deepEqual(Object.keys(candidate).sort(), ['activation_id', 'campaignExpiryAt',
+    'campaign_id', 'campaign_recipient_fingerprint', 'campaign_terminal_revision',
+    'claim_expires_at', 'conversation_id', 'conversation_recipient_fingerprint',
+    'conversation_terminal_revision', 'crm_submission_id', 'dueLocal', 'due_at', 'kind',
+    'opportunity_id', 'ordinal', 'preparation_generation', 'recipient_address',
+    'recipient_fingerprint', 'row_version', 'state', 'touch_id']);
+  assert.deepEqual({ kind: candidate.kind, ordinal: candidate.ordinal, state: candidate.state,
+    dueLocal: candidate.dueLocal, generation: candidate.preparation_generation,
+    activation: candidate.activation_id, recipient: candidate.recipient_address,
+    fingerprint: candidate.recipient_fingerprint, rowVersion: candidate.row_version,
+    campaignRevision: candidate.campaign_terminal_revision },
+  { kind: 'follow-up-1', ordinal: 1, state: 'scheduled', dueLocal: '2026-09-29T08:00:00-07:00',
+    generation: 1, activation: 'gmail-fl04c-followup', recipient: BROKER,
+    fingerprint: fingerprintFor('due'), rowVersion: 1, campaignRevision: 0 });
+  assert.equal(Date.parse(candidate.campaignExpiryAt), Date.parse(scalar(`select local_expiry_at
+    from public.deal_hunter_cim_campaigns where id = '${due.campaignId}';`)));
+  assert.equal((await storage.listDueCimFollowUpTouches({
+    now: new Date(Date.now() + 3 * 86_400_000).toISOString(), limit: 1 })).length, 1);
+  await assert.rejects(storage.listDueCimFollowUpTouches({ now: wallNow(), limit: 101 }),
+    /due selection/);
+
+  // The production authority loader reads the same durable authority as SQLite.
+  const authority = await loadPursueFollowUpAuthority({ candidate, storage, now: wallNow(),
+    loadMemberAuthority: memberAuthority });
+  assert.deepEqual({ touch: authority.touch.id, campaign: authority.campaign.id,
+    conversation: authority.conversation.id, opportunity: authority.opportunity.opportunity_id,
+    submission: authority.crmSubmission.id, owner: authority.crmOwnership.submission_id,
+    activation: authority.activation.id, timezone: authority.timezone.iana_timezone,
+    recipient: authority.recipient, initial: authority.initial, terminal: authority.terminal },
+  { touch: due.touchId, campaign: due.campaignId, conversation: due.conversationId,
+    opportunity: due.opportunityId, submission: due.submissionId, owner: due.submissionId,
+    activation: 'gmail-fl04c-followup', timezone: 'America/Los_Angeles',
+    recipient: { address: BROKER, fingerprint: fingerprintFor('due'), firstName: 'Jordan',
+      displayName: 'Jordan Lee' },
+    initial: null,
+    terminal: { replyReceived: false, materialsReceived: false, advancedDiligence: false,
+      suppressed: false, unsafeDelivery: false, providerPending: false, providerAmbiguous: false } });
+  // The cadence reads the PostgreSQL rows as they come back (jsonb derivation, +00:00 instants).
+  assert.equal(isFinalPursueFollowUp({ authority, now: wallNow() }), false);
+  assert.equal(isFinalPursueFollowUp({ authority: { ...authority, campaign: { ...authority.campaign,
+    local_expiry_at: new Date(Date.now() + 86_400_000).toISOString() } }, now: wallNow() }), true);
+  await assert.rejects(buildPursueFollowUpPayload({ candidate, authority, storage, now: wallNow(),
+    config: { isProduction: false, dealHunter: { cimProvider: { enabled: true,
+      profile: GMAIL_PROFILE, mode: 'production-gmail', provider: 'gmail',
+      gmailSenderAddress: SENDER } } } }), /pursue_follow_up_initial_unavailable/);
+  assert.equal(await loadPursueFollowUpAuthority({ candidate: { touch_id: 'missing' }, storage,
+    now: wallNow(), loadMemberAuthority: memberAuthority }), null);
+
+  // A follow-up Gmail never accepted is released, listed under generation 2, prepared again
+  // although only one follow-up per day and per recipient is allowed, renewed after its lease
+  // lapses, and authorized once.
+  const released = await prepareGate({ container, database, storage, suffix: 'released',
+    followUp: true });
+  psql(container, database, `update public.deal_hunter_cim_capability_activations
+    set daily_cap = 1, recipient_cap = 1 where id = 'gmail-fl04c-followup';`);
+  const gate = await released.gate();
+  assert.equal(gate.authorized, true, JSON.stringify(gate));
+  const minute = (offset) => new Date(Date.parse(GATE_NOW) + offset * 60_000).toISOString();
+  const seam = await storage.enterCimProviderSeam({ transmissionId: released.transmission.id,
+    authorizationId: 'authorization-released', writerPath: released.writerPath,
+    providerProfile: GMAIL_PROFILE, capability: released.capability,
+    payloadDigest: released.transmission.payload_digest,
+    boundaryNonceDigest: sha256(gate.boundaryNonce),
+    expectedRowVersion: Number(gate.transmission.row_version), actor: 'pursue-cim-sender',
+    now: minute(1) });
+  assert.equal(seam.entered, true, JSON.stringify(seam));
+  const release = await storage.releaseCimProviderPendingUnsent({
+    transmissionId: released.transmission.id, payloadDigest: released.transmission.payload_digest,
+    expectedRowVersion: Number(gate.transmission.row_version) + 1, provider: 'gmail',
+    providerResultCode: 'provider_quota', actor: 'pursue-cim-sender', now: minute(2) });
+  assert.equal(release.applied, true, JSON.stringify(release));
+  assert.equal(scalar(`select state from public.deal_hunter_cim_capacity_reservations
+    where transmission_id = '${released.transmission.id}';`), 'consumed');
+  const again = (await storage.listDueCimFollowUpTouches({ now: wallNow() }))
+    .find((item) => item.touch_id === released.ids.touchId);
+  assert.equal(again?.preparation_generation, 2, JSON.stringify(again));
+  const claim = await storage.claimDueCimTouch({ touchId: released.ids.touchId,
+    expectedRowVersion: Number(again.row_version), expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest: fill('d'), claimOwner: 'gmail-worker',
+    claimExpiresAt: new Date(Date.now() + 4 * 60_000).toISOString(), now: wallNow() });
+  assert.equal(claim.claimed, true, JSON.stringify(claim));
+  const command = (preparationGeneration) => ({ activationId: 'gmail-fl04c-followup',
+    claimOwner: 'gmail-worker', recipientFingerprint: released.recipientFingerprint,
+    touchIds: [released.ids.touchId], claimTokenDigest: fill('d'),
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    ...released.message, bodyText: 'Synthetic follow-up, second generation',
+    preparationGeneration, actor: 'gmail-worker' });
+  for (const generation of [1, 3]) {
+    const refused = await storage.prepareReservedCimFollowUp(command(generation));
+    assert.deepEqual({ prepared: refused.prepared, blockedReason: refused.blockedReason },
+      { prepared: false, blockedReason: 'preparation_generation_invalid' }, `generation ${generation}`);
+  }
+  const reprepared = await storage.prepareReservedCimFollowUp(command(2));
+  assert.equal(reprepared.prepared, true, JSON.stringify(reprepared));
+  assert.equal(Number(reprepared.transmission.preparation_generation), 2);
+  assert.notEqual(reprepared.transmission.id, released.transmission.id);
+  assert.equal(reprepared.reservation.state, 'reserved');
+  assert.equal((await storage.prepareReservedCimFollowUp(command(2))).existing, true);
+
+  psql(container, database, `
+    update public.deal_hunter_cim_capacity_reservations set state = 'expired',
+      expired_at = now() - interval '1 second', row_version = row_version + 1
+      where id = '${reprepared.reservation.id}';
+    update public.deal_hunter_cim_campaign_touches set claim_expires_at = now() - interval '1 second'
+      where id = '${released.ids.touchId}';
+  `);
+  const renewed = await storage.renewReservedCimFollowUp({
+    transmissionId: reprepared.transmission.id, touchId: released.ids.touchId,
+    activationId: 'gmail-fl04c-followup', recipientFingerprint: released.recipientFingerprint,
+    expectedRowVersion: Number(scalar(`select row_version from public.deal_hunter_cim_campaign_touches
+      where id = '${released.ids.touchId}';`)), claimTokenDigest: fill('e'), claimOwner: 'gmail-worker',
+    claimExpiresAt: new Date(Date.now() + 4 * 60_000).toISOString(), actor: 'gmail-worker' });
+  assert.equal(renewed.renewed, true, JSON.stringify(renewed));
+  assert.equal(renewed.transmission.id, reprepared.transmission.id);
+
+  const issued = await storage.issueCimLiveProviderAuthorization({ id: 'authorization-generation-2',
+    activationId: 'gmail-fl04c-followup', capability: 'fl04c-followup',
+    writerPath: 'pursue-cim-follow-up', transmissionId: reprepared.transmission.id,
+    payloadDigest: reprepared.transmission.payload_digest,
+    recipientAuthorityDigest: released.recipientFingerprint, providerProfile: GMAIL_PROFILE,
+    expiresAt: '2026-09-29T17:00:00.000Z', actor: 'fixture-owner', reason: 'generation 2',
+    now: minute(3) });
+  assert.equal(issued.issued, true, JSON.stringify(issued));
+  const second = await released.gate({ transmissionId: reprepared.transmission.id,
+    authorizationId: 'authorization-generation-2', now: minute(4) });
+  assert.equal(second.authorized, true, JSON.stringify(second));
+  assert.equal(scalar(`select string_agg(t.preparation_generation || ':' || t.state, ','
+      order by t.preparation_generation)
+    from public.deal_hunter_cim_transmissions t
+    join public.deal_hunter_cim_transmission_touches m on m.transmission_id = t.id
+    where m.touch_id = '${released.ids.touchId}';`), '1:cancelled-before-provider,2:provider-pending');
+  assert.equal(scalar(`select string_agg(state, ',' order by reserved_at, id)
+    from public.deal_hunter_cim_capacity_reservations
+    where transmission_id = '${reprepared.transmission.id}';`), 'expired,consumed');
 });

@@ -53,7 +53,28 @@ function temporaryPath(t, prefix) {
   return path.join(directory, 'storage.sqlite');
 }
 
-async function seedActivationChain(storage, providerProfile) {
+/** The broker contact option the fixture campaigns are enrolled for. */
+export const FIXTURE_RECIPIENT = Object.freeze({ email: BROKER, displayName: 'Jordan Lee',
+  firstName: 'Jordan', provenanceFingerprint: fill('9'), permissionProvenanceFingerprint: fill('a'),
+  contactAuthorityRevision: fill('b') });
+
+/** The recipient fingerprint a fixture campaign for `opportunityId` carries. */
+export function fixtureRecipientFingerprint(opportunityId) {
+  return sha256(stableCanonicalJson({ opportunityId, emailHash: sha256(FIXTURE_RECIPIENT.email),
+    provenanceFingerprint: FIXTURE_RECIPIENT.provenanceFingerprint,
+    contactAuthorityRevision: FIXTURE_RECIPIENT.contactAuthorityRevision }));
+}
+
+/** Broker-materials authority for a fixture opportunity: the recipient, nothing received. */
+export function fixtureMemberAuthority(opportunityId) {
+  return { opportunityId, recipientOptions: [{ ...FIXTURE_RECIPIENT }],
+    materialsState: { materialsReceived: false, advancedBeyondBrokerOutreach: false,
+      evidenceCodes: [] }, preparationBlockers: [], suppression: null, terminalReason: '',
+    existingRequest: null, opportunityClaim: null, currentDispositionState: 'pursued',
+    pursued: true };
+}
+
+export async function seedActivationChain(storage, providerProfile = GMAIL_PROFILE) {
   let parentId = null;
   for (const capability of ['fl04a-safety', 'fl04b-enrollment', 'fl04b-initial', 'fl04c-followup']) {
     const id = `gmail-${capability}`;
@@ -90,7 +111,7 @@ export async function setSendControl(storage, controlKey, enabled, extra = {}) {
     expectedRevision: controls[name].revision, actor: 'fixture-owner', now: seededAt });
 }
 
-function seedCampaign(database, suffix, recipientFingerprint, { followUp, now }) {
+export function seedCampaign(database, suffix, recipientFingerprint, { followUp, now }) {
   const opportunityId = `opp-gmail-${suffix}`;
   const ids = { opportunityId, decisionId: `decision-${suffix}`, enrollmentId: `enrollment-${suffix}`,
     conversationId: `conversation-${suffix}`, campaignId: `campaign-${suffix}`,
@@ -186,13 +207,8 @@ export async function createGmailGateFixture(t, suffix, { kind = 'initial', basi
   t.after(() => storage.close());
   const database = new Database(sqlitePath);
   t.after(() => database.close());
-  const recipient = { email: BROKER, displayName: 'Jordan Lee', firstName: 'Jordan',
-    provenanceFingerprint: fill('9'), permissionProvenanceFingerprint: fill('a'),
-    contactAuthorityRevision: fill('b') };
   const opportunityId = `opp-gmail-${suffix}`;
-  const recipientFingerprint = sha256(stableCanonicalJson({ opportunityId,
-    emailHash: sha256(recipient.email), provenanceFingerprint: recipient.provenanceFingerprint,
-    contactAuthorityRevision: recipient.contactAuthorityRevision }));
+  const recipientFingerprint = fixtureRecipientFingerprint(opportunityId);
   const realNow = new Date().toISOString();
   const ids = seedCampaign(database, suffix, recipientFingerprint, { followUp, now: realNow });
   await seedActivationChain(storage, GMAIL_PROFILE);
@@ -253,11 +269,7 @@ export async function createGmailGateFixture(t, suffix, { kind = 'initial', basi
   if (!issued.issued) throw new Error(`fixture authorization failed: ${JSON.stringify(issued)}`);
   const mailProvider = createFakeCimProvider({ now: GATE_NOW, senderAddress: SENDER });
   const config = gmailConfig();
-  const loadMemberAuthority = async () => ({ opportunityId, recipientOptions: [recipient],
-    materialsState: { materialsReceived: false, advancedBeyondBrokerOutreach: false,
-      evidenceCodes: [] }, preparationBlockers: [], suppression: null, terminalReason: '',
-    existingRequest: null, opportunityClaim: null, currentDispositionState: 'pursued',
-    pursued: true });
+  const loadMemberAuthority = async () => fixtureMemberAuthority(opportunityId);
   const readCurrentAuthority = async () => ({ opportunityId, blocked: false, blockers: [],
     opportunity: database.prepare('SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?')
       .get(opportunityId),
@@ -276,5 +288,5 @@ export async function createGmailGateFixture(t, suffix, { kind = 'initial', basi
     readCurrentAuthority, readProviderReadiness, configOverride: config, ...overrides });
   return { storage, database, ids, transmission, authorization: issued.authorization,
     capability, writerPath, recipientFingerprint, mailProvider, config, gate,
-    reservation: prepared.reservation ?? null };
+    loadMemberAuthority, reservation: prepared.reservation ?? null };
 }

@@ -295,6 +295,23 @@ function currentActivationChain(database, capability, now) {
     ? activation : null;
 }
 
+// A consumed follow-up reservation holds its daily and per-recipient slot only while its
+// transmission may have reached the provider. A transmission released because Gmail refused
+// it before acceptance (quota) or nothing reached Gmail is cancelled-before-provider: its
+// reservation stays consumed as evidence, but the slot is free for the touch's next generation.
+const CAPACITY_SLOT_HELD = `NOT EXISTS (SELECT 1 FROM deal_hunter_cim_transmissions AS held
+  WHERE held.id = r.transmission_id AND held.state = 'cancelled-before-provider')`;
+
+// 1 + the highest generation any transmission of this touch was prepared under.
+function nextPreparationGeneration(database, touchId) {
+  return database.prepare(`
+    SELECT COALESCE(MAX(tr.preparation_generation), 0) + 1 AS generation
+    FROM deal_hunter_cim_transmission_touches AS m
+    JOIN deal_hunter_cim_transmissions AS tr ON tr.id = m.transmission_id
+    WHERE m.touch_id = ?
+  `).get(touchId).generation;
+}
+
 const campaignTransitions = Object.freeze({
   queued: ['waiting-on-eligibility', 'initial-pending', 'action-required', 'stopped'],
   'waiting-on-eligibility': ['queued', 'initial-pending', 'action-required', 'stopped'],
@@ -1902,21 +1919,26 @@ export function createPursueCimSqliteTransitions(database, {
           WHERE m.touch_id=? AND m.cancelled_at IS NULL LIMIT 1`).get(touchId);
         if (priorTransmission) return outcome({ terminal: true,
           blockedReason: 'reservation_renewal_required' }, priorTransmission);
-        if (command.preparationGeneration !== 1) return outcome({ payloadConflict: true,
-          blockedReason: 'preparation_generation_invalid' });
+        // A follow-up released after Gmail refused it before acceptance is prepared again as
+        // a new transmission under the next generation; any other generation is refused.
+        if (command.preparationGeneration !== nextPreparationGeneration(database, touchId)) {
+          return outcome({ payloadConflict: true, blockedReason: 'preparation_generation_invalid' });
+        }
         const window = cimFollowUpCapacityWindow(now);
         const addressDigest = sha256(conversation.recipient_address.trim().toLowerCase());
         const dailyCount = database.prepare(`SELECT COUNT(*) AS count
-          FROM deal_hunter_cim_capacity_reservations WHERE capacity_date=? AND
-          (state='consumed' OR (state='reserved' AND expires_at>?))`)
+          FROM deal_hunter_cim_capacity_reservations r WHERE r.capacity_date=? AND
+          (r.state='consumed' OR (r.state='reserved' AND r.expires_at>?))
+          AND ${CAPACITY_SLOT_HELD}`)
           .get(window.capacityDate, now).count;
         if (!Number.isSafeInteger(activation.daily_cap) || activation.daily_cap < 1
           || dailyCount >= activation.daily_cap) {
           return outcome({ capacityDeferred: true, blockedReason: 'daily_capacity' });
         }
         const recipientCount = database.prepare(`SELECT COUNT(*) AS count
-          FROM deal_hunter_cim_capacity_reservations WHERE recipient_address_digest=?
-          AND recipient_window_expires_at>? AND state IN ('reserved','consumed')`)
+          FROM deal_hunter_cim_capacity_reservations r WHERE r.recipient_address_digest=?
+          AND r.recipient_window_expires_at>? AND r.state IN ('reserved','consumed')
+          AND ${CAPACITY_SLOT_HELD}`)
           .get(addressDigest, now).count;
         if (!Number.isSafeInteger(activation.recipient_cap) || activation.recipient_cap < 1
           || recipientCount >= activation.recipient_cap) {
@@ -2043,14 +2065,16 @@ export function createPursueCimSqliteTransitions(database, {
           return outcome({ terminal: true, blockedReason: 'renewal_authority_changed' }, transmission);
         }
         const dailyCount = database.prepare(`SELECT COUNT(*) AS count
-          FROM deal_hunter_cim_capacity_reservations WHERE capacity_date=? AND
-          (state='consumed' OR (state='reserved' AND expires_at>?))`)
+          FROM deal_hunter_cim_capacity_reservations r WHERE r.capacity_date=? AND
+          (r.state='consumed' OR (r.state='reserved' AND r.expires_at>?))
+          AND ${CAPACITY_SLOT_HELD}`)
           .get(window.capacityDate, now).count;
         if (dailyCount >= activation.daily_cap) return outcome({ capacityDeferred: true,
           blockedReason: 'daily_capacity' }, transmission);
         const recipientCount = database.prepare(`SELECT COUNT(*) AS count
-          FROM deal_hunter_cim_capacity_reservations WHERE recipient_address_digest=?
-          AND recipient_window_expires_at>? AND state IN ('reserved','consumed')`)
+          FROM deal_hunter_cim_capacity_reservations r WHERE r.recipient_address_digest=?
+          AND r.recipient_window_expires_at>? AND r.state IN ('reserved','consumed')
+          AND ${CAPACITY_SLOT_HELD}`)
           .get(addressDigest, now).count;
         if (recipientCount >= activation.recipient_cap) return outcome({ capacityDeferred: true,
           blockedReason: 'recipient_capacity' }, transmission);
@@ -3174,6 +3198,108 @@ export function createPursueCimSqliteTransitions(database, {
         ORDER BY t.due_at, t.id
         LIMIT ?
       `).all(at, at, at, limit);
+    },
+    /**
+     * Scheduled follow-up touches that are due, of open conversations whose campaign is in
+     * active-follow-up and not past its expiry, while the fl04c-followup chain is current and
+     * active. Claimed touches are never listed (a lapsed claim is renewed, not re-listed).
+     */
+    async listDueCimFollowUpTouches({ now, limit = 25 } = {}) {
+      const at = canonicalInstant(now);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid due touch limit');
+      }
+      const activation = currentActivationChain(database, 'fl04c-followup', at);
+      if (!activation || activation.mode !== 'active') return [];
+      return database.prepare(`
+        SELECT t.id AS touch_id, t.campaign_id, t.opportunity_id, t.kind, t.ordinal,
+          t.state, t.due_at, t.due_local AS dueLocal, t.row_version, t.claim_expires_at,
+          c.conversation_id, c.terminal_revision AS campaign_terminal_revision,
+          v.terminal_revision AS conversation_terminal_revision,
+          c.crm_submission_id, c.recipient_fingerprint,
+          c.recipient_fingerprint AS campaign_recipient_fingerprint,
+          v.recipient_fingerprint AS conversation_recipient_fingerprint,
+          v.recipient_address, c.local_expiry_at AS campaignExpiryAt,
+          ? AS activation_id,
+          (SELECT COALESCE(MAX(tr.preparation_generation), 0) + 1
+            FROM deal_hunter_cim_transmission_touches AS m
+            JOIN deal_hunter_cim_transmissions AS tr ON tr.id = m.transmission_id
+            WHERE m.touch_id = t.id) AS preparation_generation
+        FROM deal_hunter_cim_campaign_touches AS t
+        JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
+        JOIN deal_hunter_broker_conversations AS v ON v.id = c.conversation_id
+        WHERE t.kind <> 'initial' AND t.logical_slot <> 'initial' AND t.ordinal >= 1
+          AND c.policy_version = 'deal-hunter-cim-autopilot-v1'
+          AND c.state = 'active-follow-up' AND v.state = 'open'
+          AND t.opportunity_id = c.opportunity_id
+          AND t.state = 'scheduled' AND t.transmission_id IS NULL
+          AND t.due_at <= ? AND c.local_expiry_at IS NOT NULL AND c.local_expiry_at > ?
+          AND t.timezone_revision = c.timezone_revision
+        ORDER BY t.due_at, t.id
+        LIMIT ?
+      `).all(activation.id, at, at, limit);
+    },
+    /**
+     * The durable authority a follow-up is prepared under: its touch, campaign, conversation,
+     * opportunity, CRM owner, timezone, the current fl04c-followup activation, the campaign's
+     * accepted initial transmission (what the follow-up replies to) and the stop signals held
+     * in durable records. Null when the touch does not exist.
+     */
+    async readCimFollowUpAuthority({ touchId, now } = {}) {
+      const id = requiredText(touchId, 'touchId');
+      const at = canonicalInstant(now);
+      const touch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+        WHERE id = ?`).get(id);
+      if (!touch) return null;
+      const campaign = database.prepare('SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?')
+        .get(touch.campaign_id) ?? null;
+      const conversation = campaign ? database.prepare(`SELECT *
+        FROM deal_hunter_broker_conversations WHERE id = ?`).get(campaign.conversation_id) ?? null
+        : null;
+      const opportunity = database.prepare(`SELECT * FROM deal_hunter_opportunities
+        WHERE opportunity_id = ?`).get(touch.opportunity_id) ?? null;
+      const crmOwnership = database.prepare(`SELECT revision, submission_id
+        FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = ?
+        ORDER BY revision DESC LIMIT 1`).get(touch.opportunity_id) ?? null;
+      const crmSubmission = campaign?.crm_submission_id ? database.prepare(`SELECT id,
+          deal_hunter_opportunity_id, archived_at
+        FROM contact_submissions WHERE id = ?`).get(campaign.crm_submission_id) ?? null : null;
+      const timezone = campaign ? database.prepare(`SELECT *
+        FROM deal_hunter_opportunity_timezone_revisions WHERE opportunity_id = ? AND revision = ?`)
+        .get(touch.opportunity_id, campaign.timezone_revision) ?? null : null;
+      const activation = currentActivationChain(database, 'fl04c-followup', at);
+      const initial = campaign ? database.prepare(`
+        SELECT tr.id AS transmissionId, tr.from_address AS fromAddress, comm.subject AS subject
+        FROM deal_hunter_cim_campaign_touches AS it
+        JOIN deal_hunter_cim_transmission_touches AS m
+          ON m.touch_id = it.id AND m.cancelled_at IS NULL
+        JOIN deal_hunter_cim_transmissions AS tr
+          ON tr.id = m.transmission_id AND tr.state = 'accepted'
+        JOIN crm_communications AS comm ON comm.id = tr.communication_id
+        WHERE it.campaign_id = ? AND it.kind = 'initial'
+        ORDER BY tr.preparation_generation DESC, tr.id LIMIT 1
+      `).get(campaign.id) ?? null : null;
+      const address = conversation?.recipient_address ?? '';
+      const exists = (sql, ...values) => Boolean(database.prepare(sql).get(...values));
+      const signals = {
+        replyReceived: Boolean(conversation && campaign) && exists(`SELECT 1 FROM crm_communications
+          WHERE direction = 'inbound' AND (thread_key = ? OR submission_id = ?) LIMIT 1`,
+        conversation?.rfc_thread_key ?? '', campaign?.crm_submission_id ?? ''),
+        suppressed: exists(`SELECT 1 FROM email_suppressions WHERE normalized_email = lower(?)
+          AND lifted_at IS NULL LIMIT 1`, address)
+          || exists(`SELECT 1 FROM email_events WHERE lower(recipient_email) = lower(?)
+            AND event_type IN ('unsubscribe','unsubscribed','opt_out') LIMIT 1`, address),
+        unsafeDelivery: exists(`SELECT 1 FROM email_events WHERE lower(recipient_email) = lower(?)
+          AND event_type IN ('complained','complaint','bounced','hard_bounce') LIMIT 1`, address),
+        providerPending: Boolean(conversation) && exists(`SELECT 1 FROM deal_hunter_cim_transmissions
+          WHERE conversation_id = ? AND state = 'provider-pending' LIMIT 1`, conversation?.id ?? ''),
+        providerAmbiguous: campaign?.state === 'provider-ambiguous'
+          || conversation?.state === 'provider-ambiguous'
+          || (Boolean(conversation) && exists(`SELECT 1 FROM deal_hunter_cim_transmissions
+            WHERE conversation_id = ? AND state = 'ambiguous' LIMIT 1`, conversation?.id ?? '')),
+      };
+      return { touch, campaign, conversation, opportunity, crmOwnership, crmSubmission, timezone,
+        activation, initial, signals };
     },
     async recordCimCapabilityActivation(command) {
       const id = requiredText(command.id, 'id');
