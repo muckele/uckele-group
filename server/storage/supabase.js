@@ -1,7 +1,8 @@
 import { normalizeCurrentUnlinkedRestore } from '../services/currentUnlinkedRestore.js';
 import {
   normalizeGmailConnectionRow, normalizeOpenGmailConversationRow, normalizeSendControlRow,
-  normalizeSendControlRows, sendControlConflictError, validateConversationGmailThread,
+  normalizeSendControlRows, sendControlConflictError, validateCimProviderRelease,
+  validateConversationGmailThread,
   validateGmailCheckpointUpdate, validateGmailTokenCheck, validateRevokeGmailConnection,
   validateSaveGmailConnection, validateSetPursueSendControl,
 } from './gmailSendStorageContract.js';
@@ -1684,6 +1685,23 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizePursueCimRpcResult(data,
         ['applied', 'existing', 'conflict'], ['transmission', 'nextTouch'],
         { requiredRows: { transmission: ['applied', 'existing'] } });
+    },
+
+    /** Ruling D: a quota-refused or never-attempted Gmail send returns its touches to scheduled. */
+    async releaseCimProviderPendingUnsent(command) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_release_unsent_v1', {
+        p_command: validateCimProviderRelease(command),
+      });
+      if (error) throw error;
+      const result = normalizePursueCimRpcResult(data, ['applied', 'replay', 'conflict'],
+        ['transmission'], { requiredRows: { transmission: ['applied', 'replay'] },
+          extraFields: ['touches'] });
+      if (!Array.isArray(result.touches)
+        || result.touches.some((touch) => !touch || typeof touch.id !== 'string')) {
+        throw new Error('Malformed Pursue CIM provider release result');
+      }
+      return { ...result, touches: result.touches.map((touch) => ({ ...touch,
+        row_version: Number(touch.row_version) })) };
     },
 
     async reconcileCimTransmission(command) {

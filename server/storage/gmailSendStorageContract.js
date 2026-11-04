@@ -9,6 +9,14 @@ export const PURSUE_SEND_CONTROL_KEYS = Object.freeze({
   wording_approval: 'wordingApproval',
 });
 
+// Codes a provider-pending transmission may be released under (Ruling D): Gmail refused it
+// before acceptance (quota) or nothing reached Gmail (a not-attempted outcome, Ruling E).
+export const CIM_PROVIDER_RELEASE_CODES = Object.freeze(['provider_quota', 'gmail_token_invalid',
+  'gmail_token_refresh_failed', 'gmail_not_connected', 'gmail_access_denied']);
+// The membership cancellation reason a release records; it is the only cancelled membership
+// that does not block the touch from being claimed again.
+export const CIM_PROVIDER_RELEASE_CANCELLATION = 'provider-unsent-release';
+
 export const SEND_CONTROL_AUDIT_EVENT = 'send-control-changed';
 export const SEND_CONTROL_AUDIT_SOURCE = 'pursue-send-controls';
 
@@ -166,4 +174,27 @@ export function normalizeSendControlRows(rows = []) {
 export function normalizeOpenGmailConversationRow(row) {
   return { conversationId: row.conversation_id, gmailThreadId: row.gmail_thread_id,
     campaignId: row.campaign_id ?? null, recipientFingerprint: row.recipient_fingerprint };
+}
+
+export function validateCimProviderRelease(command = {}) {
+  const payloadDigest = command.payloadDigest;
+  if (typeof payloadDigest !== 'string' || !digestPattern.test(payloadDigest)) {
+    throw invalid('payloadDigest');
+  }
+  if (!Number.isSafeInteger(command.expectedRowVersion) || command.expectedRowVersion < 0) {
+    throw invalid('expectedRowVersion');
+  }
+  if (command.provider !== 'gmail') throw invalid('provider');
+  if (!CIM_PROVIDER_RELEASE_CODES.includes(command.providerResultCode)) {
+    throw invalid('providerResultCode');
+  }
+  return {
+    transmissionId: text(command.transmissionId, 'transmissionId', 240),
+    payloadDigest,
+    expectedRowVersion: command.expectedRowVersion,
+    provider: 'gmail',
+    providerResultCode: command.providerResultCode,
+    actor: text(command.actor, 'actor', 200),
+    now: instant(command.now),
+  };
 }

@@ -1,4 +1,5 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { isContactRuleCampaign } from './pursueCimContactPolicy.js';
 
 const terminalCampaignStates = new Set([
   'responded', 'materials-received', 'stopped', 'expired',
@@ -266,7 +267,9 @@ export async function getPursueCimReleaseReport({ storage, opportunityId,
       mode: boundedText(activation.mode, 40),
       status: boundedText(activation.status, 40),
       expiresAt: boundedText(activation.expires_at, 80),
-      matchesCampaign: Boolean(campaign && activation.id === campaign.permission_version),
+      // A rule-based campaign's authority is the contact rule (Ruling H), not an activation.
+      matchesCampaign: Boolean(campaign && (activation.id === campaign.permission_version
+        || isContactRuleCampaign(campaign))),
     } : null,
     pause: {
       paused: Boolean(pause?.paused),

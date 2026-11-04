@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 
 import {
+  cimProviderUsesGmail,
   getCimProviderDeliveryConfig,
   getConfig,
   validateCimProviderProfileBinding,
@@ -16,6 +17,8 @@ import {
   buildP10bControlledMailboxTestEmail,
   requiresP10bControlledMailboxTemplate,
 } from './pursueCimControlledMailboxTemplate.js';
+import { PURSUE_INITIAL_PAYLOAD_VERSION } from './pursueCimFinalGate.js';
+import { renderPursueCimEmail } from './pursueCimTemplates.js';
 
 const leaseMilliseconds = 5 * 60 * 1000;
 
@@ -26,7 +29,55 @@ function recipientFingerprint(opportunityId, recipient) {
     contactAuthorityRevision: recipient.contactAuthorityRevision }));
 }
 
+function validatedPayload(payload, config) {
+  const profileBinding = validateCimProviderProfileBinding(config, {
+    providerProfile: config.dealHunter?.cimProvider?.profile,
+    fromAddress: payload.fromAddress,
+    toAddresses: payload.toAddresses,
+    ccAddresses: payload.ccAddresses,
+    bccAddresses: payload.bccAddresses,
+    replyToAddress: payload.replyToAddress,
+  });
+  if (!profileBinding.ok) {
+    throw new Error(`CIM provider profile invalid: ${profileBinding.blockers.join(',')}`);
+  }
+  return payload;
+}
+
+// The owner's Gmail mailbox sends the Pursue initial template (spec §8.2). Replies come back to
+// the same mailbox, so Reply-To is the sender itself.
+function gmailProposal(candidate, authority, recipient, config) {
+  const fromAddress = String(getCimProviderDeliveryConfig(config).delivery?.gmailSenderAddress
+    || '').trim();
+  if (!fromAddress || !recipient.email) throw new Error('CIM sender or recipient unavailable');
+  const rendered = renderPursueCimEmail({
+    kind: 'initial',
+    deal: {
+      name: authority.opportunity?.canonical_name || authority.score?.name || '',
+      brokerName: recipient.firstName || recipient.displayName || '',
+    },
+    sender: config.dealHunter?.sender,
+  });
+  const tags = normalizeResendTags([
+    { name: 'cim_conversation_id', value: candidate.conversation_id },
+    { name: 'cim_touch_id', value: candidate.touch_id },
+    { name: 'cim_template', value: rendered.templateVersion },
+  ]).map(({ name, value }) => `${name}=${value}`);
+  if (tags.some((tag) => tag.length > 120)) throw new Error('CIM tag exceeds storage bound');
+  return validatedPayload({
+    payloadVersion: PURSUE_INITIAL_PAYLOAD_VERSION,
+    fromAddress,
+    toAddresses: [recipient.email], ccAddresses: [], bccAddresses: [],
+    replyToAddress: fromAddress,
+    subject: rendered.subject,
+    bodyText: rendered.text,
+    bodyHtmlSanitized: rendered.html,
+    tags,
+  }, config);
+}
+
 function proposal(candidate, authority, recipient, config) {
+  if (cimProviderUsesGmail(config)) return gmailProposal(candidate, authority, recipient, config);
   const deliveryConfig = getCimProviderDeliveryConfig(config);
   const fromAddress = deliveryConfig.delivery.resendFromEmail
     || deliveryConfig.delivery.fallbackRecipient;
@@ -76,18 +127,14 @@ function proposal(candidate, authority, recipient, config) {
     bodyHtmlSanitized: message.html,
     tags,
   };
-  const profileBinding = validateCimProviderProfileBinding(config, {
-    providerProfile: config.dealHunter?.cimProvider?.profile,
-    fromAddress: payload.fromAddress,
-    toAddresses: payload.toAddresses,
-    ccAddresses: payload.ccAddresses,
-    bccAddresses: payload.bccAddresses,
-    replyToAddress: payload.replyToAddress,
-  });
-  if (!profileBinding.ok) {
-    throw new Error(`CIM provider profile invalid: ${profileBinding.blockers.join(',')}`);
-  }
-  return payload;
+  return validatedPayload(payload, config);
+}
+
+// A touch released after Gmail refused it before acceptance (quota, or nothing reached
+// Gmail) is prepared again under the next generation; every other touch is generation 1.
+function preparationGeneration(candidate) {
+  const generation = Number(candidate?.preparation_generation ?? 1);
+  return Number.isSafeInteger(generation) && generation >= 1 ? generation : 1;
 }
 
 export async function runDueCimInitialPreparations({ storage, now, clock, limit = 25,
@@ -144,7 +191,8 @@ export async function runDueCimInitialPreparations({ storage, now, clock, limit 
         touchIds: [candidate.touch_id], claimTokenDigest,
         expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),
         expectedConversationTerminalRevision: Number(candidate.conversation_terminal_revision),
-        preparationGeneration: 1, ...payload, actor, now: instant().toISOString(),
+        preparationGeneration: preparationGeneration(candidate), ...payload, actor,
+        now: instant().toISOString(),
       });
       outcomes.push({ touchId: candidate.touch_id, prepared: result.prepared,
         existing: result.existing, payloadConflict: result.payloadConflict,

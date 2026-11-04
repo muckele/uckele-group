@@ -347,3 +347,59 @@ test('P10A controlled inbound requires the durable alias in the selected mailbox
   assert.equal(resolves, 1);
   assert.equal(terminalCalls, 1);
 });
+
+test('production-gmail-v1 resolves to the Gmail provider and binds sends to the owner mailbox', () => {
+  const profile = configModule.resolveCimProviderProfile({
+    DEAL_HUNTER_CIM_PROVIDER_ENABLED: 'true',
+    DEAL_HUNTER_CIM_PROVIDER_PROFILE: 'production-gmail-v1',
+    DEAL_HUNTER_GMAIL_SENDER_ADDRESS: ' Owner@Uckele.test ',
+    RESEND_API_KEY: 'production-resend-key',
+  });
+  assert.deepEqual({ enabled: profile.enabled, profile: profile.profile, mode: profile.mode,
+    provider: profile.provider, sender: profile.gmailSenderAddress,
+    resendApiKey: profile.resendApiKey, reconciliationApiKey: profile.reconciliationApiKey },
+  { enabled: true, profile: 'production-gmail-v1', mode: 'production-gmail', provider: 'gmail',
+    sender: 'Owner@Uckele.test', resendApiKey: '', reconciliationApiKey: '' });
+  const config = { delivery: { provider: 'resend', resendApiKey: 'production-resend-key' },
+    dealHunter: { cimProvider: profile } };
+  assert.equal(configModule.cimProviderUsesGmail(config), true);
+  assert.equal(configModule.getCimProviderDeliveryConfig(config).delivery.provider, 'gmail');
+  assert.equal(configModule.getCimProviderDeliveryConfig(config).delivery.resendApiKey, '');
+  assert.deepEqual(configModule.getCimProviderReconciliationConfig(config),
+    { providerProfile: 'production-gmail-v1', provider: 'gmail', apiKey: '' });
+  const bind = (overrides) => configModule.validateCimProviderProfileBinding(config, {
+    providerProfile: 'production-gmail-v1', fromAddress: 'owner@uckele.test',
+    toAddresses: ['broker@example.test'], ccAddresses: [], bccAddresses: [],
+    replyToAddress: 'owner@uckele.test', ...overrides });
+  assert.deepEqual(bind({}), { ok: true, blockers: [] });
+  assert.deepEqual(bind({ fromAddress: 'someone@uckele.test' }).blockers, ['mailbox_sender_mismatch']);
+  assert.deepEqual(bind({ replyToAddress: 'replies@elsewhere.test' }).blockers,
+    ['mailbox_reply_domain_mismatch']);
+  assert.deepEqual(bind({ providerProfile: 'production-resend-v1' }).blockers, ['profile_mismatch']);
+});
+
+test('controlled-mailbox-v1 can send through Gmail to its single allowed recipient', () => {
+  const profile = configModule.resolveCimProviderProfile({
+    DEAL_HUNTER_CIM_PROVIDER_ENABLED: 'true',
+    DEAL_HUNTER_CIM_PROVIDER_PROFILE: mailboxProfile,
+    DEAL_HUNTER_CIM_MAILBOX_PROVIDER: 'gmail',
+    DEAL_HUNTER_GMAIL_SENDER_ADDRESS: 'owner@uckele.test',
+    DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS: 'owner-controlled@example.test',
+    DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY: 'ignored-under-gmail',
+  });
+  assert.equal(profile.provider, 'gmail');
+  assert.equal(profile.resendApiKey, '');
+  const config = { delivery: { provider: 'resend' }, dealHunter: { cimProvider: profile } };
+  assert.equal(configModule.cimProviderUsesGmail(config), true);
+  const bind = (overrides) => configModule.validateCimProviderProfileBinding(config, {
+    providerProfile: mailboxProfile, fromAddress: 'owner@uckele.test',
+    toAddresses: ['owner-controlled@example.test'], ccAddresses: [], bccAddresses: [],
+    replyToAddress: 'owner@uckele.test', ...overrides });
+  assert.deepEqual(bind({}), { ok: true, blockers: [] });
+  assert.deepEqual(bind({ toAddresses: ['broker@example.test'] }).blockers,
+    ['mailbox_recipient_mismatch']);
+  assert.deepEqual(bind({ fromAddress: 'other@uckele.test' }).blockers, ['mailbox_sender_mismatch']);
+  // Without the provider switch the controlled mailbox stays on Resend, unchanged.
+  assert.equal(configModule.resolveCimProviderProfile(mailboxEnvironment()).provider, 'resend');
+  assert.equal(configModule.cimProviderUsesGmail(mailboxConfig()), false);
+});

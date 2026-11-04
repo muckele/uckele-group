@@ -5,7 +5,15 @@ import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
 import { deriveAcceptedCimCadence } from '../services/pursueCimCadence.js';
 import { cimFollowUpCapacityWindow } from '../services/pursueCimFollowUpCapacity.js';
-import { CONTACT_POLICY_VERSION, contactPolicyDigest } from '../services/pursueCimContactPolicy.js';
+import {
+  CONTACT_POLICY_VERSION,
+  contactPolicyDigest,
+  isContactRuleCampaign,
+} from '../services/pursueCimContactPolicy.js';
+import {
+  CIM_PROVIDER_RELEASE_CANCELLATION,
+  validateCimProviderRelease,
+} from './gmailSendStorageContract.js';
 
 const cimWriterCapabilities = new Map([
   ['pursue-cim-initial', 'fl04b-initial'],
@@ -263,6 +271,13 @@ function contactRuleBasisCurrent(database, command) {
   if (!control || control.enabled !== 1 || control.policy_version !== CONTACT_POLICY_VERSION) return false;
   const policyDigest = contactPolicyDigest();
   return command.permissionDigest === policyDigest && command.policyHash === policyDigest;
+}
+
+/** True while the standing contact rule is on under its current policy version (Ruling H). */
+function contactRuleControlOn(database) {
+  const control = database.prepare(`SELECT enabled, policy_version FROM deal_hunter_pursue_send_controls
+    WHERE control_key = 'contact_rule'`).get();
+  return control?.enabled === 1 && control.policy_version === CONTACT_POLICY_VERSION;
 }
 
 function currentActivationChain(database, capability, now) {
@@ -937,6 +952,85 @@ export function createPursueCimSqliteTransitions(database, {
         `).get(transmissionId), nextTouch);
       }).immediate();
     },
+    /**
+     * Returns a provider-pending transmission's touches to scheduled after Gmail refused the
+     * message before acceptance (quota) or nothing reached Gmail (Ruling D). Only for a
+     * transmission whose seam was entered and that has no provider outcome. The transmission
+     * is retained as cancelled-before-provider with the provider and code; its memberships are
+     * released so the touch can be claimed and prepared again under the next generation. No
+     * terminal event is written and no campaign or conversation changes state.
+     */
+    async releaseCimProviderPendingUnsent(command) {
+      const { transmissionId, payloadDigest, expectedRowVersion, providerResultCode, actor,
+        now } = validateCimProviderRelease(command);
+      const outcome = (flags, transmission = null, touches = []) => ({ applied: false,
+        replay: false, conflict: false, ...flags, transmission, touches });
+      return database.transaction(() => {
+        const transmission = database.prepare('SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?')
+          .get(transmissionId);
+        if (!transmission || transmission.payload_digest !== payloadDigest) {
+          return outcome({ conflict: true }, transmission ?? null);
+        }
+        if (transmission.state === 'cancelled-before-provider') {
+          const replay = transmission.provider === 'gmail'
+            && transmission.provider_result_code === providerResultCode
+            && transmission.provider_seam_entered_at !== null;
+          return outcome({ replay, conflict: !replay }, transmission);
+        }
+        if (transmission.state !== 'provider-pending' || transmission.row_version !== expectedRowVersion
+          || transmission.invocation_authority_count !== 1 || !transmission.provider_seam_entered_at
+          || transmission.provider || transmission.provider_message_id
+          || transmission.provider_result_code) return outcome({ conflict: true }, transmission);
+        const members = database.prepare(`
+          SELECT t.* FROM deal_hunter_cim_transmission_touches m
+          JOIN deal_hunter_cim_campaign_touches t ON t.id = m.touch_id
+          WHERE m.transmission_id = ? AND m.cancelled_at IS NULL ORDER BY t.id
+        `).all(transmissionId);
+        if (!members.length || members.some((member) => member.state !== 'provider-pending'
+          || member.transmission_id !== transmissionId)) {
+          return outcome({ conflict: true }, transmission);
+        }
+        database.prepare(`
+          UPDATE deal_hunter_cim_transmissions SET state = 'cancelled-before-provider',
+            provider = 'gmail', provider_result_code = ?, row_version = row_version + 1,
+            updated_at = ?
+          WHERE id = ? AND state = 'provider-pending' AND row_version = ?
+        `).run(providerResultCode, now, transmissionId, expectedRowVersion);
+        for (const member of members) {
+          database.prepare(`
+            UPDATE deal_hunter_cim_transmission_touches SET cancelled_at = ?, cancellation_reason = ?
+            WHERE transmission_id = ? AND touch_id = ? AND cancelled_at IS NULL
+          `).run(now, CIM_PROVIDER_RELEASE_CANCELLATION, transmissionId, member.id);
+          database.prepare(`
+            UPDATE deal_hunter_cim_campaign_touches SET state = 'scheduled', transmission_id = NULL,
+              claim_token_digest = NULL, claim_owner = NULL, claimed_at = NULL,
+              claim_expires_at = NULL, row_version = row_version + 1, updated_at = ?
+            WHERE id = ? AND state = 'provider-pending' AND transmission_id = ? AND row_version = ?
+          `).run(now, member.id, transmissionId, member.row_version);
+          appendAudit(database, { eventType: 'touch-released',
+            authorityId: `${member.id}:${member.row_version + 1}`,
+            opportunityId: member.opportunity_id, campaignId: member.campaign_id,
+            touchId: member.id, transmissionId, priorState: 'provider-pending',
+            nextState: 'scheduled', reasonCode: providerResultCode, actor, occurredAt: now });
+        }
+        database.prepare(`
+          UPDATE crm_communications SET provider = 'gmail', delivery_state = 'not-attempted',
+            delivery_state_at = ?, updated_at = ? WHERE id = ?
+        `).run(now, now, transmission.communication_id);
+        database.prepare(`
+          UPDATE crm_email_outbox SET provider = 'gmail', state = 'cancelled',
+            last_error_category = ?, updated_at = ? WHERE id = ?
+        `).run(providerResultCode, now, transmission.outbox_id);
+        appendAudit(database, { eventType: 'transmission-released', authorityId: transmissionId,
+          conversationId: transmission.conversation_id, transmissionId,
+          priorState: 'provider-pending', nextState: 'cancelled-before-provider',
+          reasonCode: providerResultCode, payloadDigest, actor, occurredAt: now });
+        return outcome({ applied: true },
+          database.prepare('SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?').get(transmissionId),
+          members.map((member) => database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+            WHERE id = ?`).get(member.id)));
+      }).immediate();
+    },
     async readCimFinalGateContext(command) {
       const transmissionId = requiredText(command.transmissionId, 'transmissionId');
       const authorizationId = requiredText(command.authorizationId, 'authorizationId');
@@ -1251,10 +1345,20 @@ export function createPursueCimSqliteTransitions(database, {
         const activation = currentActivationChain(database, authorization.capability, now);
         if (!activation || activation.id !== authorization.activation_id
           || activation.provider_profile !== providerProfile) return blocked('capability_inactive');
-        if (authorization.capability !== 'fl04b-initial'
+        if (!['fl04b-initial', 'fl04c-followup'].includes(authorization.capability)
           || authoritySnapshot.activation?.id !== activation.id
           || authoritySnapshot.activation?.policy_hash !== activation.policy_hash
           || authoritySnapshot.activation?.config_hash !== activation.config_hash) {
+          return blocked('capability_inactive');
+        }
+        // A follow-up is one single-member transmission under fl04c-followup. Its permission
+        // basis is checked against the fl04b-initial activation in its chain, exactly as an
+        // initial's is checked against its own fl04b-initial activation.
+        const followUp = authorization.capability === 'fl04c-followup';
+        const permissionActivation = followUp
+          ? currentActivationChain(database, 'fl04b-initial', now) : activation;
+        if (!permissionActivation || (followUp
+          && permissionActivation.id !== activation.prerequisite_activation_id)) {
           return blocked('capability_inactive');
         }
         const conversation = database.prepare(`
@@ -1302,10 +1406,12 @@ export function createPursueCimSqliteTransitions(database, {
           || authoritySnapshot.transmission?.memberDigest !== transmission.member_digest) {
           return blocked('membership_changed');
         }
-        if (members.some((member) => member.state !== 'claimed'
+        if ((followUp && members.length !== 1) || members.some((member) => member.state !== 'claimed'
           || member.claim_token_digest !== claimTokenDigest
           || member.transmission_id !== transmissionId
-          || member.kind !== 'initial' || member.logical_slot !== 'initial' || member.ordinal !== 0
+          || (followUp
+            ? member.kind === 'initial' || member.logical_slot === 'initial' || member.ordinal < 1
+            : member.kind !== 'initial' || member.logical_slot !== 'initial' || member.ordinal !== 0)
           || !member.claim_expires_at
           || Date.parse(member.claim_expires_at) <= Date.parse(now)
           || Date.parse(member.due_at) > Date.parse(now))) return blocked('lifecycle_conflict');
@@ -1318,13 +1424,16 @@ export function createPursueCimSqliteTransitions(database, {
           const campaign = database.prepare(`
             SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?
           `).get(member.campaign_id);
-          if (campaign?.permission_version !== activation.prerequisite_activation_id
+          const ruleBasis = isContactRuleCampaign(campaign);
+          if ((!ruleBasis
+            && campaign?.permission_version !== permissionActivation.prerequisite_activation_id)
             || expectedMember?.campaign?.permission_version !== campaign?.permission_version) {
             return blocked('unknown_policy_version');
           }
           if (!expectedMember || !campaign || campaign.generation !== 1
             || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'
-            || campaign.state !== 'initial-pending' || campaign.terminal_reason
+            || campaign.state !== (followUp ? 'active-follow-up' : 'initial-pending')
+            || campaign.terminal_reason
             || campaign.conversation_id !== transmission.conversation_id
             || campaign.crm_submission_id !== expectedMember.campaign?.crm_submission_id
             || campaign.row_version !== expectedMember.campaign?.row_version
@@ -1340,9 +1449,12 @@ export function createPursueCimSqliteTransitions(database, {
             || campaign.recipient_fingerprint !== authorization.recipient_authority_digest) {
             return blocked('recipient_authority_changed');
           }
-          if (activation.permission_basis_digest !== campaign.permission_digest
-            || activation.permission_revision !== campaign.permission_revision
-            || activation.cohort_digest !== campaign.permission_scope
+          // Ruling H: a rule-based campaign sends only while the rule is on; off pauses it
+          // without a terminal event, and on again resumes it.
+          if (ruleBasis && !contactRuleControlOn(database)) return blocked('contact_rule_off');
+          if ((!ruleBasis && (permissionActivation.permission_basis_digest !== campaign.permission_digest
+            || permissionActivation.permission_revision !== campaign.permission_revision
+            || permissionActivation.cohort_digest !== campaign.permission_scope))
             || expectedMember.campaign?.permission_digest !== campaign.permission_digest
             || expectedMember.campaign?.permission_revision !== campaign.permission_revision
             || expectedMember.campaign?.permission_scope !== campaign.permission_scope) {
@@ -1507,7 +1619,7 @@ export function createPursueCimSqliteTransitions(database, {
           || communication.delivery_state !== 'not-attempted'
           || communication.direction !== 'outbound' || communication.channel !== 'email'
           || communication.source !== 'pursue-cim-autopilot'
-          || communication.kind !== 'cim-initial'
+          || communication.kind !== (followUp ? 'cim-follow-up' : 'cim-initial')
           || communication.thread_key !== conversation.rfc_thread_key
           || communication.from_address !== transmission.from_address
           || communication.to_addresses !== transmission.to_addresses
@@ -1560,6 +1672,12 @@ export function createPursueCimSqliteTransitions(database, {
           payloadVersion: transmission.payload_version,
         });
         if (payloadDigest !== transmission.payload_digest) return blocked('payload_changed');
+        if (followUp && !database.prepare(`SELECT 1 FROM deal_hunter_cim_capacity_reservations
+          WHERE transmission_id = ? AND touch_id = ? AND state = 'reserved'
+            AND claim_token_digest = ? AND expires_at > ? LIMIT 1`)
+          .get(transmissionId, members[0].id, claimTokenDigest, now)) {
+          return blocked('capacity_reservation_invalid');
+        }
         const transmissionChanged = database.prepare(`
           UPDATE deal_hunter_cim_transmissions SET state = 'provider-pending',
             release_state = 'authorized', final_gate_authority_digest = ?,
@@ -2986,8 +3104,12 @@ export function createPursueCimSqliteTransitions(database, {
           return result({ staleAuthority: true }, touch);
         }
         if (touch.transmission_id) return result({ conflict: true }, touch);
+        // A membership released because Gmail never accepted the message does not block a
+        // new claim; any other retained membership does.
         if (database.prepare(`SELECT 1 FROM deal_hunter_cim_transmission_touches
-          WHERE touch_id = ? LIMIT 1`).get(touchId)) {
+          WHERE touch_id = ? AND (cancelled_at IS NULL OR cancellation_reason IS NULL
+            OR cancellation_reason <> ?) LIMIT 1`)
+          .get(touchId, CIM_PROVIDER_RELEASE_CANCELLATION)) {
           return result({ conflict: true }, touch);
         }
         if (touch.state === 'claimed' && touch.claim_token_digest === claimTokenDigest
@@ -3032,7 +3154,11 @@ export function createPursueCimSqliteTransitions(database, {
           v.terminal_revision AS conversation_terminal_revision,
           c.crm_submission_id, c.recipient_fingerprint AS campaign_recipient_fingerprint,
           v.recipient_fingerprint AS conversation_recipient_fingerprint,
-          v.recipient_address
+          v.recipient_address,
+          (SELECT COALESCE(MAX(tr.preparation_generation), 0) + 1
+            FROM deal_hunter_cim_transmission_touches AS m
+            JOIN deal_hunter_cim_transmissions AS tr ON tr.id = m.transmission_id
+            WHERE m.touch_id = t.id) AS preparation_generation
         FROM deal_hunter_cim_campaign_touches AS t
         JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
         JOIN deal_hunter_broker_conversations AS v ON v.id = c.conversation_id
