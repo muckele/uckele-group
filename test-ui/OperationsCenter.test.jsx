@@ -94,7 +94,19 @@ describe('Operations Center partial failures', () => {
       backup: { status: 'degraded', bundleCounts: { valid: 1, degraded: 2, invalid: 0, incomplete: 0 } },
     }} />);
     expect(screen.getByText('Bundles: 1 valid · 2 with mismatched documents · 0 invalid · 0 incomplete')).toBeVisible();
+    expect(screen.queryByText(/ · mismatched:/)).toBeNull();
     unmount();
+
+    const listed = render(<OperationsCenter data={{
+      scheduler: { runs: [] }, sources: {}, audit: {}, cleanup: {}, storage: {},
+      backup: {
+        status: 'degraded',
+        bundleCounts: { valid: 1, degraded: 1, invalid: 0, incomplete: 0 },
+        documentsDegraded: [{ id: 'document-1', reason: 'checksum_mismatch' }, { id: 'document-2', reason: 'unreadable' }],
+      },
+    }} />);
+    expect(screen.getByText('Bundles: 1 valid · 1 with mismatched documents · 0 invalid · 0 incomplete · mismatched: document-1, document-2')).toBeVisible();
+    listed.unmount();
 
     render(<OperationsCenter data={{
       scheduler: { runs: [] }, sources: {}, audit: {}, cleanup: {}, storage: {},

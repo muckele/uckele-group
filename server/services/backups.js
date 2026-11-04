@@ -404,6 +404,7 @@ async function placeSecureDocument(sourcePath, copiedPath, fileOps) {
   try {
     await fileOps.link(sourcePath, copiedPath);
   } catch {
+    // Any link error falls back to a copy; a real source problem (missing file) resurfaces from copyFile.
     await fs.rm(copiedPath, { force: true });
     await fileOps.copyFile(sourcePath, copiedPath);
   }
@@ -801,15 +802,19 @@ export async function getBackupStatus(config = getConfig()) {
       invalid.length > 0 ? `${invalid.length} invalid` : '',
       incomplete.length > 0 ? `${incomplete.length} incomplete` : '',
     ].filter(Boolean).join(' and ');
+    const documentsDegraded = summarizeDegradedDocuments(degraded);
+    const documentIds = documentsDegraded.map(({ id }) => id);
+    const attentionTail = issueSummary === `${degraded.length} with mismatched documents` ? '' : ` Bundles needing attention: ${issueSummary}.`;
+    const staleTail = stale ? ' The latest application backup is older than 36 hours.' : '';
     return {
       status: 'degraded',
       message: degraded.length > 0
-        ? `${degraded.length} backup bundle(s) have documents that no longer match what was backed up; the database backups are intact. Restore them with --accept-degraded-documents.${issueSummary === `${degraded.length} with mismatched documents` ? '' : ` Bundles needing attention: ${issueSummary}.`}`
-        : `A valid application backup is available, but ${issueSummary} backup bundle(s) require attention.`,
+        ? `${degraded.length} backup ${degraded.length === 1 ? 'bundle holds' : 'bundles hold'} documents that changed after they were backed up (${documentIds.length === 1 ? 'id' : 'ids'}: ${documentIds.join(', ')}). Their database backups are intact and kept. Check the live vault file and recover it from a Fly volume snapshot. Use --accept-degraded-documents only if you must restore the database from one of these bundles.${attentionTail}${staleTail}`
+        : `A valid application backup is available, but ${issueSummary} backup bundle(s) require attention.${staleTail}`,
       latest: latestSummary,
       bundleCounts,
       verificationErrors: invalid.flatMap((bundle) => bundle.errors).slice(0, 20),
-      documentsDegraded: summarizeDegradedDocuments(degraded),
+      documentsDegraded,
     };
   }
   return {

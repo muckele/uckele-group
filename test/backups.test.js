@@ -604,8 +604,7 @@ test('a bundle whose stored document no longer matches its checksum is degraded,
   const status = await getBackupStatus(config);
   assert.equal(status.status, 'degraded');
   assert.equal(status.bundleCounts.degraded, 1);
-  assert.match(status.message, /1 backup bundle\(s\) have documents that no longer match what was backed up; the database backups are intact\./);
-  assert.match(status.message, /--accept-degraded-documents/);
+  assert.match(status.message, /^1 backup bundle holds documents that changed after they were backed up \(id: document-1\)\. Their database backups are intact and kept\. Check the live vault file and recover it from a Fly volume snapshot\. Use --accept-degraded-documents only if you must restore the database from one of these bundles\.$/);
   assert.doesNotMatch(status.message, /valid application backup is available/);
   assert.deepEqual(status.documentsDegraded, [{ id: 'document-1', reason: 'checksum_mismatch' }]);
   assert.ok(status.latest);
@@ -630,7 +629,7 @@ test('a bundled document that differs in size or cannot be read is degraded with
   const backup = await createBackupBundle({ storage, config });
   const bundled = bundledDocumentPath(backup);
 
-  fs.appendFileSync(bundled, 'extra');
+  damageBundledDocument(backup, `${documentContent}extra`);
   assert.deepEqual((await verifyBackupBundle(backup.path)).documentsDegraded, [
     { id: 'document-1', reason: 'size_mismatch' },
     { id: 'document-1', reason: 'checksum_mismatch' },
@@ -854,4 +853,28 @@ test('with hardlinks, a vault document damaged in place degrades every bundle, k
   const third = await createBackupBundle({ storage, config });
   assert.equal((await verifyBackupBundle(third.path)).databaseVerified, true);
   assert.equal((await getBackupStatus(config)).status, 'degraded');
+});
+
+test('the degraded status message adds the other bundle problems and the staleness warning', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-degraded-message-');
+  await seedVaultDocument(storage, config);
+  const first = await createBackupBundle({ storage, config });
+  const second = await createBackupBundle({ storage, config });
+  damageBundledDocument(first);
+  fs.appendFileSync(backupDatabasePath(second), 'tampered');
+
+  const mixed = await getBackupStatus(config);
+  assert.equal(mixed.status, 'degraded');
+  assert.match(mixed.message, / Bundles needing attention: 1 with mismatched documents and 1 invalid\.$/);
+  assert.doesNotMatch(mixed.message, /older than 36 hours/);
+});
+
+test('a degraded status still names a stopped backup scheduler', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-degraded-stale-');
+  await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config, now: new Date(Date.now() - 48 * 3600_000) });
+  damageBundledDocument(backup);
+  const status = await getBackupStatus(config);
+  assert.equal(status.status, 'degraded');
+  assert.match(status.message, /\(id: document-1\)\..* The latest application backup is older than 36 hours\.$/);
 });
