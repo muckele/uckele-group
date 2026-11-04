@@ -2,11 +2,20 @@
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
 import { cleanup, render, screen, within } from '@testing-library/react';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import OperationsCenter from '../src/components/admin/OperationsCenter.jsx';
 import EmailReadinessPanel from '../src/components/admin/EmailReadinessPanel.jsx';
 
-afterEach(cleanup);
+// The Email sending card loads its own status; keep that request pending so these tests stay
+// about the Operations data they pass in.
+beforeEach(() => {
+  vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe('Operations Center partial failures', () => {
   test.each([
@@ -69,6 +78,14 @@ describe('Operations Center partial failures', () => {
     expect(container.querySelector('[data-admin-tour="operations-readiness"]')).toBeInTheDocument();
     expect(container.querySelector('[data-admin-tour="operations-history"]')).toBeInTheDocument();
     expect(container.querySelector('[data-admin-tour="operations-storage"]')).toBeInTheDocument();
+  });
+
+  test('renders the Email sending card and links to it', () => {
+    render(<OperationsCenter data={{ scheduler: { runs: [] }, sources: {}, audit: {}, cleanup: {}, storage: {}, backup: {} }} />);
+
+    expect(screen.getByRole('heading', { name: 'Email sending' })).toBeVisible();
+    expect(screen.getByRole('link', { name: 'Email sending' })).toHaveAttribute('href', '#email-sending-heading');
+    expect(fetch).toHaveBeenCalledWith('/api/admin/deal-hunter/email-sending', expect.objectContaining({ credentials: 'same-origin' }));
   });
 
   test('shows configured, evidence, effective, activation, every gate, and zero-send/live summaries without granting viewer controls', () => {

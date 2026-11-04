@@ -156,6 +156,11 @@ import {
   disconnectGmail,
 } from './services/gmailConnection.js';
 import {
+  changeEmailSendingControl,
+  getEmailSendingStatus,
+  parseEmailSendingControlRequest,
+} from './services/pursueEmailSending.js';
+import {
   createCimRecipientOverride,
   resolveCimIdentityException,
   setCimOutreachPaused,
@@ -2562,6 +2567,64 @@ export function createApp({
         fetcher: gmailFetcher,
       });
       response.json({ success: true, revokedAt });
+    }),
+  );
+
+  // Operations "Email sending" card (spec §9). Viewers read status without the wording preview;
+  // only the admin role changes a control. Token material is never part of either response.
+  app.get(
+    '/api/admin/deal-hunter/email-sending',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const emailSending = await getEmailSendingStatus({
+        storage: getStorage(),
+        config,
+        now: new Date(),
+        fetcher: gmailFetcher,
+        includePreview: session.role === 'admin',
+      });
+      response.json({ success: true, emailSending });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/email-sending/controls',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      if (session.role !== 'admin') {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const command = parseEmailSendingControlRequest(request.body);
+      if (!command.ok) {
+        response.status(command.status).json({ success: false, code: command.code, error: command.error });
+        return;
+      }
+      const result = await changeEmailSendingControl({
+        storage: getStorage(),
+        config,
+        command,
+        actor: session.username || 'admin',
+        now: new Date(),
+      });
+      if (!result.ok) {
+        if (result.code === 'live_sending_sync_failed') {
+          console.error(`[request:${request.id || 'unknown'}] live sending capability sync failed`,
+            { code: result.code });
+        }
+        response.status(result.status).json({ success: false, code: result.code, error: result.error,
+          ...(result.control ? { control: result.control } : {}) });
+        return;
+      }
+      response.json({ success: true, control: result.control });
     }),
   );
 

@@ -1,0 +1,186 @@
+// The Operations "Email sending" card (spec 2026-11-03 §9): one status read and one audited
+// control write behind GET/POST /api/admin/deal-hunter/email-sending.
+//
+// The status never carries token material: the Gmail part is projected from four connection
+// fields, and Job history rows are reduced to their status, instants, counts and codes.
+import { PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE } from '../config.js';
+import { createGmailCimProvider } from './gmailCimProvider.js';
+import { CONTACT_POLICY_VERSION, contactPolicyDigest } from './pursueCimContactPolicy.js';
+import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
+import { PURSUE_CIM_REPLY_POLLER_JOB_NAME } from './pursueCimReplyPollerScheduler.js';
+import { PURSUE_CIM_SENDER_JOB_NAME } from './pursueCimSenderScheduler.js';
+import {
+  pursueCimWordingDigest,
+  renderPursueCimWordingPreview,
+  senderSignatureComplete,
+} from './pursueCimTemplates.js';
+import { PURSUE_GMAIL_CAPABILITY_POLICY, syncPursueGmailCapabilities } from './pursueGmailCapabilities.js';
+
+export const EMAIL_SENDING_CONTROL_KEYS = Object.freeze(['live_sending', 'contact_rule', 'wording_approval']);
+
+const CODE = /^[a-z][a-z0-9_]{0,79}$/;
+const SENDER_COUNTS = ['sentInitial', 'sentFollowUps', 'expired', 'reconciled', 'released', 'failed', 'ambiguous'];
+const POLLER_COUNTS = ['processed', 'responded', 'ownerReplied', 'bounced', 'autoReplies', 'stopped', 'pending',
+  'failed'];
+
+function codeOrNull(value) {
+  return typeof value === 'string' && CODE.test(value) ? value : null;
+}
+
+function instantOrNull(value) {
+  const parsed = Date.parse(value ?? '');
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function controlView(control = {}) {
+  return {
+    enabled: control.enabled === true,
+    policyVersion: control.policyVersion ?? null,
+    changedAt: control.changedAt ?? null,
+    changedBy: control.changedBy ?? null,
+    revision: Number(control.revision) || 0,
+  };
+}
+
+/** A Job history row reduced to what the card shows: never keys, claim tokens or free text. */
+function projectRun(row, countNames) {
+  if (!row) return null;
+  const metadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+    ? row.metadata : {};
+  const counts = Object.fromEntries(countNames.map((name) => [name,
+    Math.max(0, Math.trunc(Number(metadata[name]) || 0))]));
+  const notReadyReasons = Array.isArray(metadata.notReadyReasons)
+    ? metadata.notReadyReasons.map(codeOrNull).filter(Boolean) : [];
+  return {
+    status: codeOrNull(String(row.status ?? '').replace(/-/g, '_')) ?? 'unknown',
+    updatedAt: instantOrNull(row.updated_at),
+    completedAt: instantOrNull(row.completed_at),
+    counts,
+    stoppedFor: codeOrNull(metadata.stoppedFor),
+    notReadyReasons,
+    error: codeOrNull(row.last_error) ?? codeOrNull(metadata.error),
+  };
+}
+
+async function latestRun(storage, jobName, countNames) {
+  if (typeof storage?.listScheduledJobs !== 'function') return null;
+  const [row] = await storage.listScheduledJobs({ limit: 1, jobName });
+  return projectRun(row && row.job_name === jobName ? row : null, countNames);
+}
+
+/**
+ * Reads the card's status. `includePreview` adds the rendered wording (administrators only).
+ * Readiness may refresh the Gmail token through `fetcher` when the last check is stale.
+ */
+export async function getEmailSendingStatus({ storage, config, now = new Date(), fetcher, includePreview = false }) {
+  const sender = config?.dealHunter?.sender ?? {};
+  const [connection, controls] = await Promise.all([storage.getGmailConnection(), storage.getPursueSendControls()]);
+  const readiness = await readPursueCimProviderReadiness({
+    storage,
+    config,
+    now,
+    providerProfile: PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE,
+    mailProvider: createGmailCimProvider({ storage, config, now, ...(fetcher ? { fetcher } : {}) }),
+  });
+  // Readiness may have just refreshed the token; show the connection as it is now.
+  const gmailRow = connection ? (await storage.getGmailConnection()) ?? connection : null;
+  const wordingApproval = controls.wordingApproval ?? {};
+  const approved = wordingApproval.enabled === true;
+  const [senderRun, replyPoller] = await Promise.all([
+    latestRun(storage, PURSUE_CIM_SENDER_JOB_NAME, SENDER_COUNTS),
+    latestRun(storage, PURSUE_CIM_REPLY_POLLER_JOB_NAME, POLLER_COUNTS),
+  ]);
+  return {
+    gmail: {
+      connected: Boolean(gmailRow),
+      emailAddress: gmailRow?.email_address ?? null,
+      lastTokenOkAt: gmailRow?.last_token_ok_at ?? null,
+      lastErrorCode: codeOrNull(gmailRow?.last_error_code),
+    },
+    wording: {
+      approvedDigest: approved ? wordingApproval.valueDigest ?? null : null,
+      currentDigest: pursueCimWordingDigest(sender),
+      approvedAt: approved ? wordingApproval.changedAt ?? null : null,
+      approvedBy: approved ? wordingApproval.changedBy ?? null : null,
+      revision: Number(wordingApproval.revision) || 0,
+      signatureComplete: senderSignatureComplete(sender),
+      ...(includePreview ? { preview: renderPursueCimWordingPreview(sender) } : {}),
+    },
+    contactRule: controlView(controls.contactRule),
+    liveSending: controlView(controls.liveSending),
+    readiness: { ready: readiness.ready === true, reasons: [...readiness.reasons] },
+    lastRuns: { sender: senderRun, replyPoller },
+  };
+}
+
+function refusal(status, code, error) {
+  return { ok: false, status, code, error };
+}
+
+/** Validates a control change request body. Returns the command or a 400 refusal. */
+export function parseEmailSendingControlRequest(body) {
+  const value = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  if (!EMAIL_SENDING_CONTROL_KEYS.includes(value.controlKey)) {
+    return refusal(400, 'invalid_control', 'Choose live_sending, contact_rule or wording_approval.');
+  }
+  if (typeof value.enabled !== 'boolean') return refusal(400, 'invalid_control', 'enabled must be true or false.');
+  if (!Number.isSafeInteger(value.expectedRevision) || value.expectedRevision < 0) {
+    return refusal(400, 'invalid_control', 'expectedRevision must be the revision you loaded.');
+  }
+  const reason = value.reason ?? '';
+  if (typeof reason !== 'string' || reason.length > 500) {
+    return refusal(400, 'invalid_control', 'reason must be text of at most 500 characters.');
+  }
+  return { ok: true, controlKey: value.controlKey, enabled: value.enabled,
+    expectedRevision: value.expectedRevision, reason: reason.trim() };
+}
+
+/**
+ * Applies one owner control change. The wording digest is always the server's current digest
+ * (any client value is ignored). Live sending syncs the Gmail capability chain after the write
+ * (on: record it; off: withdraw it and release prepared sends). A failed sync leaves the
+ * control written and returns `live_sending_sync_failed`. Both outcomes are safe (a partial
+ * chain stops the sender with capability_inactive; off is gated by readiness), and the sync is
+ * idempotent, so repeating the same change at the new revision ("Try again") repairs it.
+ */
+export async function changeEmailSendingControl({ storage, config, command, actor, now = new Date() }) {
+  const at = new Date(now).toISOString();
+  const sender = config?.dealHunter?.sender ?? {};
+  const write = { controlKey: command.controlKey, enabled: command.enabled,
+    expectedRevision: command.expectedRevision, actor, reason: command.reason, now: at,
+    valueDigest: null, policyVersion: null };
+  if (command.controlKey === 'wording_approval' && command.enabled) {
+    if (!senderSignatureComplete(sender)) {
+      return refusal(409, 'signature_incomplete',
+        'Your name, title, phone, or mailing address is missing from settings.');
+    }
+    write.valueDigest = pursueCimWordingDigest(sender);
+  }
+  if (command.controlKey === 'contact_rule') {
+    write.policyVersion = CONTACT_POLICY_VERSION;
+    write.valueDigest = contactPolicyDigest();
+  }
+  if (command.controlKey === 'live_sending') write.policyVersion = PURSUE_GMAIL_CAPABILITY_POLICY;
+
+  let control;
+  try {
+    control = await storage.setPursueSendControl(write);
+  } catch (error) {
+    if (error?.code === 'send_control_conflict') {
+      return refusal(409, 'send_control_conflict',
+        'This setting changed since the card loaded. Review the latest state and try again.');
+    }
+    throw error;
+  }
+  if (command.controlKey === 'live_sending') {
+    try {
+      await syncPursueGmailCapabilities({ storage, enabled: command.enabled, actor, now: at });
+    } catch {
+      return { ...refusal(500, 'live_sending_sync_failed', command.enabled
+        ? 'Live sending was saved as on, but its sending permissions were not fully recorded, so nothing will send yet. Use Try again to finish.'
+        : 'Live sending is off, so nothing will send. Some sending permissions were not withdrawn yet. Use Try again to finish.'),
+      control: controlView(control) };
+    }
+  }
+  return { ok: true, status: 200, control: controlView(control) };
+}

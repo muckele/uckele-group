@@ -359,6 +359,23 @@ async function installFixture(page, options = {}) {
       await fulfillJson(route, state, queueResponse(state));
       return;
     }
+    // The Email sending card on Operations reads its status; viewers get no wording preview.
+    if (method === 'GET' && url.pathname === '/api/admin/deal-hunter/email-sending') {
+      const off = { enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0 };
+      await fulfillJson(route, state, {
+        success: true,
+        emailSending: {
+          gmail: { connected: false, emailAddress: null, lastTokenOkAt: null, lastErrorCode: null },
+          wording: { approvedDigest: null, currentDigest: 'a'.repeat(64), approvedAt: null, approvedBy: null, revision: 0,
+            signatureComplete: true, ...(state.role === 'admin' ? { preview: [] } : {}) },
+          contactRule: off,
+          liveSending: off,
+          readiness: { ready: false, reasons: ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off'] },
+          lastRuns: { sender: null, replyPoller: null },
+        },
+      });
+      return;
+    }
     if (method === 'GET' && detailMatch) {
       const row = state.rows.find((item) => item.opportunityId === decodeURIComponent(detailMatch[1]));
       await fulfillJson(route, state, row ? detailResponse(row) : { success: false, error: 'Not found.' }, row ? 200 : 404);

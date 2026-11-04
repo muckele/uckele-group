@@ -530,6 +530,30 @@ describe('Dashboard Deal Hunter communications integration', () => {
     });
   });
 
+  test('shows the Email sending card and the Gmail connect result where the connect callback lands', async () => {
+    const fallbackFetch = createDealHunterFetch();
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      if (String(input) === '/api/admin/deal-hunter/email-sending') {
+        return jsonResponse({ success: true, emailSending: {
+          gmail: { connected: true, emailAddress: 'owner@uckele.test', lastTokenOkAt: '2026-11-03T17:00:00.000Z', lastErrorCode: null },
+          wording: { approvedDigest: null, currentDigest: 'a'.repeat(64), approvedAt: null, approvedBy: null, revision: 0, signatureComplete: true, preview: [] },
+          contactRule: { enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0 },
+          liveSending: { enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0 },
+          readiness: { ready: false, reasons: ['wording_not_approved', 'contact_rule_off', 'live_sending_off'] },
+          lastRuns: { sender: null, replyPoller: null },
+        } });
+      }
+      return fallbackFetch(input, options);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/deal-hunter?view=operations&gmail=connected');
+
+    const card = await screen.findByRole('region', { name: 'Email sending' });
+    expect(within(card).getByText('Gmail is connected.')).toBeVisible();
+    expect(await within(card).findByText('owner@uckele.test')).toBeVisible();
+  });
+
   test('keeps durable CIM history visible to viewers without loading the admin-only inbox or rendering writes', async () => {
     const fetchMock = createDealHunterFetch('viewer');
     vi.stubGlobal('fetch', fetchMock);

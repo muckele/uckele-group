@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import EmailReadinessPanel from './EmailReadinessPanel';
+import EmailSendingCard from './EmailSendingCard';
 
 function formatDate(value) {
   if (!value) return 'Not recorded';
@@ -191,6 +192,7 @@ export default function OperationsCenter({
         <div className="mt-2 flex gap-2 overflow-x-auto pb-1">
           {[
             ...(data.email ? [['#email-readiness-heading', 'Email']] : []),
+            ['#email-sending-heading', 'Email sending'],
             ['#daily-digest-heading', 'Daily Digest'],
             ['#cim-automation-heading', 'Automation'],
             ['#communication-ingestion-heading', 'Communications'],
@@ -207,6 +209,7 @@ export default function OperationsCenter({
         </div>
       </nav>
       <EmailReadinessPanel data={data.email} onSendTest={readOnly ? undefined : onSendEmailTest} testSending={emailTestSending} />
+      <EmailSendingCard readOnly={readOnly} />
       <section className="panel p-5 sm:p-7" aria-labelledby="cim-automation-heading">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">CIM outreach</p><h3 className="mt-2 text-xl font-semibold text-ink" id="cim-automation-heading">Guarded Stage 2 rollout</h3><p className="mt-2 text-sm text-ink/65">Configured Stage {cimAutomation.configuredStage || 1} · evidence Stage {cimAutomation.evidenceStage || 1} · effective Stage {cimAutomation.effectiveStage || 1} · activation {cimAutomation.activationMode || 'off'}</p><p className="mt-1 text-sm font-semibold text-ink">Automatic transmission: {cimAutomation.automaticTransmissionAllowed ? 'ALLOWED under the current durable activation' : 'BLOCKED'}</p></div>

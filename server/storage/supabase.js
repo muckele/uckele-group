@@ -5793,10 +5793,12 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeScheduledJobRow(data);
     },
 
-    async listScheduledJobs({ limit = 100 } = {}) {
-      const { data, error } = await client
+    async listScheduledJobs({ limit = 100, jobName = '' } = {}) {
+      let query = client
         .from('scheduled_job_runs')
-        .select('*')
+        .select('*');
+      if (jobName) query = query.eq('job_name', String(jobName));
+      const { data, error } = await query
         .order('updated_at', { ascending: false })
         .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
       if (error) throw error;

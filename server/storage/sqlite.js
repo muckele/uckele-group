@@ -15610,10 +15610,17 @@ ${cimCapacityConsumeTriggerSql}
       return normalizeScheduledJobRow(run);
     },
 
-    async listScheduledJobs({ limit = 100 } = {}) {
+    async listScheduledJobs({ limit = 100, jobName = '' } = {}) {
+      const bounded = Math.max(1, Math.min(Number(limit) || 100, 500));
+      if (jobName) {
+        return database
+          .prepare('SELECT * FROM scheduled_job_runs WHERE job_name = ? ORDER BY updated_at DESC LIMIT ?')
+          .all(String(jobName), bounded)
+          .map(normalizeScheduledJobRow);
+      }
       return database
         .prepare('SELECT * FROM scheduled_job_runs ORDER BY updated_at DESC LIMIT ?')
-        .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
+        .all(bounded)
         .map(normalizeScheduledJobRow);
     },
 

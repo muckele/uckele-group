@@ -1569,6 +1569,28 @@ async function installPhase1OperationsFixture(page) {
     await fulfillPhase1Json(route, { success: true, rows: [], total: 0, page: 1, pageSize: 25 });
   });
 
+  // The Email sending card on the Operations view reads its status once.
+  await page.route('**/api/admin/deal-hunter/email-sending', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() !== 'GET' || url.search) {
+      await rejectPhase1Request(route, state, 'Unexpected Email sending request.');
+      return;
+    }
+    const off = { enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0 };
+    await fulfillPhase1Json(route, {
+      success: true,
+      emailSending: {
+        gmail: { connected: false, emailAddress: null, lastTokenOkAt: null, lastErrorCode: null },
+        wording: { approvedDigest: null, currentDigest: 'a'.repeat(64), approvedAt: null, approvedBy: null, revision: 0, signatureComplete: true, preview: [] },
+        contactRule: off,
+        liveSending: off,
+        readiness: { ready: false, reasons: ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off'] },
+        lastRuns: { sender: null, replyPoller: null },
+      },
+    });
+  });
+
   return state;
 }
 
@@ -2002,6 +2024,64 @@ test('an authenticated administrator can reach the Operations Center', async ({ 
   await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible();
 });
 
+test('Email sending card shows readiness and gates Live sending behind confirmation', async ({ page }) => {
+  await mockAuthenticatedAdmin(page);
+  const control = (overrides = {}) => ({ enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0, ...overrides });
+  let liveSending = control({ revision: 2 });
+  const controlPosts = [];
+  await page.route('**/api/admin/deal-hunter/email-sending', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      status: 200,
+      body: JSON.stringify({
+        success: true,
+        emailSending: {
+          gmail: { connected: true, emailAddress: 'owner@uckele.test', lastTokenOkAt: '2026-11-03T17:00:00.000Z', lastErrorCode: null },
+          wording: {
+            approvedDigest: 'a'.repeat(64), currentDigest: 'a'.repeat(64), approvedAt: '2026-11-03T16:00:00.000Z',
+            approvedBy: 'phase16-admin', revision: 1, signatureComplete: true,
+            preview: [{ variant: 'initial', subject: 'Inquiry about Sample Business', text: 'Hi Jordan,\n\nInitial body' }],
+          },
+          contactRule: control({ enabled: true, policyVersion: 'listing-broker-inquiry-v1', revision: 1 }),
+          liveSending,
+          readiness: liveSending.enabled ? { ready: true, reasons: [] } : { ready: false, reasons: ['live_sending_off'] },
+          lastRuns: { sender: null, replyPoller: null },
+        },
+      }),
+    });
+  });
+  await page.route('**/api/admin/deal-hunter/email-sending/controls', async (route) => {
+    const body = route.request().postDataJSON();
+    controlPosts.push(body);
+    liveSending = control({ enabled: body.enabled, changedAt: '2026-11-03T18:00:00.000Z', changedBy: 'phase16-admin',
+      revision: body.expectedRevision + 1 });
+    await route.fulfill({ contentType: 'application/json', status: 200, body: JSON.stringify({ success: true, control: liveSending }) });
+  });
+
+  await page.goto('/admin/operations');
+  const card = page.getByRole('region', { name: 'Email sending' });
+  await expect(card.getByText('owner@uckele.test')).toBeVisible();
+  await expect(card.getByText('Live sending is off.')).toBeVisible();
+
+  const turnOn = card.getByRole('button', { name: 'Turn on Live sending' });
+  await turnOn.click();
+  const dialog = page.getByRole('dialog', { name: 'Turn on Live sending?' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(turnOn).toBeFocused();
+  expect(controlPosts).toHaveLength(0);
+
+  await turnOn.click();
+  await dialog.getByLabel('Reason (optional)').fill('Controlled test passed');
+  await dialog.getByRole('button', { name: 'Turn on Live sending' }).click();
+  await expect(dialog).toBeHidden();
+  expect(controlPosts).toEqual([{ controlKey: 'live_sending', enabled: true, expectedRevision: 2, reason: 'Controlled test passed' }]);
+  await expect(card.getByText('Ready to send.')).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Turn off Live sending' })).toBeVisible();
+});
+
 test('the follow-up queue renders a full server page and its mobile dialog is keyboard-safe', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await mockAuthenticatedAdmin(page);
@@ -2058,6 +2138,7 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
     'GET /api/admin/communications/unassigned?page=1&pageSize=25',
     'GET /api/admin/acquisition-command-center',
+    'GET /api/admin/deal-hunter/email-sending',
   ].sort();
   await expect.poll(() => state.apiRequests.length).toBe(expectedOperationsApiRequests.length);
   expect(state.apiRequests.map(phase1RequestSignature).sort()).toEqual(expectedOperationsApiRequests);
@@ -2238,6 +2319,7 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
     'GET /api/admin/communications/unassigned?page=1&pageSize=25',
     'GET /api/admin/acquisition-command-center',
+    'GET /api/admin/deal-hunter/email-sending',
     'POST /api/admin/deal-hunter/deal-os-import',
     'GET /api/admin/acquisition-command-center',
     'POST /api/admin/deal-hunter/crm-reconciliation/preview',
