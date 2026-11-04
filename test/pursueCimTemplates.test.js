@@ -20,10 +20,11 @@ const sender = {
 const sampleDeal = { name: 'Sample Plumbing Co.', brokerName: 'Jordan Lee' };
 
 // Copied from docs/superpowers/specs/2026-11-03-gmail-send-runners-design.md section 8.2,
-// with the sample deal and the test sender filled in.
+// with the sample deal and the test sender filled in. A business name that already ends in a
+// period is not followed by the template's own period ("Co." once, never "Co..").
 const INITIAL_FIXTURE = `Hi Jordan,
 
-I am reaching out regarding Sample Plumbing Co.. Based on the information available, it looks like the type of durable service business I would like to evaluate further.
+I am reaching out regarding Sample Plumbing Co. Based on the information available, it looks like the type of durable service business I would like to evaluate further.
 
 By way of background, I am an operator and small business buyer focused on acquiring a cash-flowing service business with repeat or recurring demand, a strong local reputation, and a transition path where the team and customers are protected.
 
@@ -42,11 +43,11 @@ If you would rather I not reach out about future listings, just reply "stop".
 1 Example Way, Portland, OR 97201`;
 
 const FOLLOW_UP_FIXTURES = {
-  A: 'I wanted to follow up on my note below about Sample Plumbing Co.. If it is still available, I would appreciate the CIM or teaser, or the next step in your NDA process.',
-  B: 'Checking in on Sample Plumbing Co.. I am an active buyer with SBA financing lined up and can review materials quickly. If an NDA is the first step, I am happy to sign it.',
-  C: 'Following up on Sample Plumbing Co.. If the timing is not right, or it is already under LOI, a quick note is completely fine and I will close the loop.',
-  D: 'Circling back on Sample Plumbing Co.. If there is a better contact for buyer inquiries on this listing, I would be grateful if you could point me to them.',
-  Final: 'This is my last note on Sample Plumbing Co.. If it is still available, I would welcome the CIM or the NDA process. If not, no reply is needed. Thank you for your time.',
+  A: 'I wanted to follow up on my note below about Sample Plumbing Co. If it is still available, I would appreciate the CIM or teaser, or the next step in your NDA process.',
+  B: 'Checking in on Sample Plumbing Co. I am an active buyer with SBA financing lined up and can review materials quickly. If an NDA is the first step, I am happy to sign it.',
+  C: 'Following up on Sample Plumbing Co. If the timing is not right, or it is already under LOI, a quick note is completely fine and I will close the loop.',
+  D: 'Circling back on Sample Plumbing Co. If there is a better contact for buyer inquiries on this listing, I would be grateful if you could point me to them.',
+  Final: 'This is my last note on Sample Plumbing Co. If it is still available, I would welcome the CIM or the NDA process. If not, no reply is needed. Thank you for your time.',
 };
 
 const SIGNATURE_AND_FOOTER = `Best,
@@ -136,6 +137,32 @@ test('digest changes when any template or signature field changes and not when t
   // Rendering other deals does not alter it either.
   renderPursueCimEmail({ kind: 'initial', deal: { name: 'Other Co', brokerName: 'Sam' }, sender });
   assert.equal(pursueCimWordingDigest(sender), base);
+});
+
+test('a business name ending in a period keeps one period before the template period, and the digest is unchanged', () => {
+  // The digest of the approved wording for this sender, before this rendering rule existed.
+  assert.equal(pursueCimWordingDigest(sender),
+    '954041f74bf8232698404ef90f9c02999e1a0e7a02c52f4024c923d37d3699c0');
+  const emails = [renderPursueCimEmail({ kind: 'initial', deal: sampleDeal, sender }),
+    ...[1, 2, 3, 4].map((followUpNumber) => renderPursueCimEmail({ kind: 'follow-up', followUpNumber,
+      deal: sampleDeal, sender })),
+    renderPursueCimEmail({ kind: 'follow-up', followUpNumber: 5, isFinal: true, deal: sampleDeal, sender })];
+  for (const email of emails) {
+    assert.doesNotMatch(email.text, /Co\.\./, email.variant);
+    assert.doesNotMatch(email.html, /Co\.\./, email.variant);
+    assert.match(email.text, /Sample Plumbing Co\. /, email.variant);
+  }
+  assert.equal(emails[0].subject, 'CIM / NDA request for Sample Plumbing Co.');
+  for (const item of renderPursueCimWordingPreview(sender)) assert.doesNotMatch(item.text, /Co\.\./);
+
+  // Only one period is dropped, and only before the template's period.
+  const plain = renderPursueCimEmail({ kind: 'initial', deal: { name: 'Acme Plumbing', brokerName: 'Sam' }, sender });
+  assert.match(plain.text, /regarding Acme Plumbing\. Based on/);
+  const dots = renderPursueCimEmail({ kind: 'follow-up', followUpNumber: 1,
+    deal: { name: 'Acme Inc...', brokerName: 'Sam' }, sender });
+  assert.match(dots.text, /about Acme Inc\.\.\. If it is still available/);
+  assert.equal(pursueCimWordingDigest(sender),
+    '954041f74bf8232698404ef90f9c02999e1a0e7a02c52f4024c923d37d3699c0');
 });
 
 test('senderSignatureComplete is false when name, title, phone, or postal is blank', () => {

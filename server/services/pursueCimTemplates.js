@@ -53,12 +53,20 @@ function oneLine(value) {
 
 // Replace {placeholders} in a template. Literal template text and values both pass through
 // `escape`, so the HTML body never contains an unescaped interpolated value.
+// Where the template puts a period right after {business}, one trailing period of the business
+// name is dropped ("Sample Plumbing Co." + "." reads "Co." once). This is a rendering rule only:
+// the template strings, and so the wording digest, do not change.
 function fill(template, values, escape) {
-  return template
-    .split(/(\{[A-Za-z]+\})/)
-    .map((part) => {
+  const parts = template.split(/(\{[A-Za-z]+\})/);
+  return parts
+    .map((part, index) => {
       const match = /^\{([A-Za-z]+)\}$/.exec(part);
-      return escape(match ? (values[match[1]] ?? '') : part);
+      if (!match) return escape(part);
+      let value = String(values[match[1]] ?? '');
+      if (match[1] === 'business' && String(parts[index + 1] ?? '').startsWith('.') && value.endsWith('.')) {
+        value = value.slice(0, -1);
+      }
+      return escape(value);
     })
     .join('');
 }
