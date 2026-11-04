@@ -1062,6 +1062,81 @@ function crmSubmissionReversalReceiptMatches(relation, receipt) {
   );
 }
 
+// A follow-up's reservation is consumed when its transmission goes provider-pending. The
+// recipient window never shrinks (the lifecycle trigger forbids it), so it is the later of the
+// reserved window and one day from consumption. Recreated at startup so existing databases
+// pick up the latest definition.
+const cimCapacityConsumeTriggerSql = `
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_consume
+      BEFORE UPDATE OF state ON deal_hunter_cim_transmissions
+      WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'provider-pending'
+        AND EXISTS (
+          SELECT 1 FROM deal_hunter_cim_transmission_touches m
+          JOIN deal_hunter_cim_campaign_touches t ON t.id=m.touch_id
+          WHERE m.transmission_id=NEW.id AND m.cancelled_at IS NULL AND t.kind <> 'initial'
+        )
+      BEGIN
+        SELECT CASE WHEN (
+          SELECT COUNT(*) FROM deal_hunter_cim_capacity_reservations r
+          JOIN deal_hunter_cim_campaign_touches t ON t.id=r.touch_id
+          JOIN deal_hunter_cim_campaigns c ON c.id=r.campaign_id
+          JOIN deal_hunter_broker_conversations v ON v.id=r.conversation_id
+          JOIN deal_hunter_cim_capability_activations a ON a.id=r.activation_id
+          JOIN deal_hunter_cim_capability_activations initial
+            ON initial.id=a.prerequisite_activation_id
+          JOIN deal_hunter_cim_capability_activations enrollment
+            ON enrollment.id=initial.prerequisite_activation_id
+          JOIN deal_hunter_cim_capability_activations safety
+            ON safety.id=enrollment.prerequisite_activation_id
+          WHERE r.transmission_id=NEW.id AND r.state='reserved'
+            AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND t.transmission_id=NEW.id AND t.state='claimed'
+            AND t.claim_token_digest=r.claim_token_digest
+            AND t.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND c.id=t.campaign_id AND c.state='active-follow-up'
+            AND c.local_expiry_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            AND c.recipient_fingerprint=r.recipient_fingerprint
+            AND v.id=NEW.conversation_id AND v.state='open'
+            AND v.recipient_fingerprint=r.recipient_fingerprint
+            AND v.recipient_address=json_extract(NEW.to_addresses,'$[0]')
+            AND a.capability='fl04c-followup' AND a.status='current' AND a.mode='active'
+            AND (a.expires_at IS NULL OR a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND a.prerequisite_evidence_id IS NOT NULL
+            AND a.prerequisite_evidence_hash IS NOT NULL
+            AND initial.capability='fl04b-initial' AND initial.status='current'
+            AND initial.mode NOT IN ('off','shadow')
+            AND (initial.expires_at IS NULL
+              OR initial.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND initial.prerequisite_evidence_id IS NOT NULL
+            AND initial.prerequisite_evidence_hash IS NOT NULL
+            AND enrollment.capability='fl04b-enrollment' AND enrollment.status='current'
+            AND enrollment.mode NOT IN ('off','shadow')
+            AND (enrollment.expires_at IS NULL
+              OR enrollment.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            AND enrollment.prerequisite_evidence_id IS NOT NULL
+            AND enrollment.prerequisite_evidence_hash IS NOT NULL
+            AND safety.capability='fl04a-safety' AND safety.status='current'
+            AND safety.mode NOT IN ('off','shadow')
+            AND (safety.expires_at IS NULL
+              OR safety.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        ) <> 1 THEN RAISE(ABORT, 'follow-up capacity authority unavailable') END;
+        UPDATE deal_hunter_cim_capacity_reservations SET state = 'consumed',
+          consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+          recipient_window_expires_at = MAX(recipient_window_expires_at,
+            strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day')),
+          row_version = row_version + 1
+        WHERE transmission_id = NEW.id AND state = 'reserved'
+          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now');
+      END;
+`;
+
+function migrateCimCapacityConsumeTrigger(database) {
+  database.transaction(() => {
+    database.exec('DROP TRIGGER IF EXISTS trg_deal_hunter_cim_capacity_consume');
+    database.exec(cimCapacityConsumeTriggerSql);
+  }).immediate();
+}
+
 function migrateCrmSubmissionReversalTrigger(database) {
   database.transaction(() => {
     database.exec('DROP TRIGGER IF EXISTS trg_crm_submission_supersessions_reverse_only');
@@ -4961,66 +5036,7 @@ export function createSqliteStorage(config, options = {}) {
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_no_delete
       BEFORE DELETE ON deal_hunter_cim_capacity_reservations
       BEGIN SELECT RAISE(ABORT, 'capacity reservation evidence is retained'); END;
-      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_consume
-      BEFORE UPDATE OF state ON deal_hunter_cim_transmissions
-      WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'provider-pending'
-        AND EXISTS (
-          SELECT 1 FROM deal_hunter_cim_transmission_touches m
-          JOIN deal_hunter_cim_campaign_touches t ON t.id=m.touch_id
-          WHERE m.transmission_id=NEW.id AND m.cancelled_at IS NULL AND t.kind <> 'initial'
-        )
-      BEGIN
-        SELECT CASE WHEN (
-          SELECT COUNT(*) FROM deal_hunter_cim_capacity_reservations r
-          JOIN deal_hunter_cim_campaign_touches t ON t.id=r.touch_id
-          JOIN deal_hunter_cim_campaigns c ON c.id=r.campaign_id
-          JOIN deal_hunter_broker_conversations v ON v.id=r.conversation_id
-          JOIN deal_hunter_cim_capability_activations a ON a.id=r.activation_id
-          JOIN deal_hunter_cim_capability_activations initial
-            ON initial.id=a.prerequisite_activation_id
-          JOIN deal_hunter_cim_capability_activations enrollment
-            ON enrollment.id=initial.prerequisite_activation_id
-          JOIN deal_hunter_cim_capability_activations safety
-            ON safety.id=enrollment.prerequisite_activation_id
-          WHERE r.transmission_id=NEW.id AND r.state='reserved'
-            AND r.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            AND t.transmission_id=NEW.id AND t.state='claimed'
-            AND t.claim_token_digest=r.claim_token_digest
-            AND t.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            AND c.id=t.campaign_id AND c.state='active-follow-up'
-            AND c.local_expiry_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-            AND c.recipient_fingerprint=r.recipient_fingerprint
-            AND v.id=NEW.conversation_id AND v.state='open'
-            AND v.recipient_fingerprint=r.recipient_fingerprint
-            AND v.recipient_address=json_extract(NEW.to_addresses,'$[0]')
-            AND a.capability='fl04c-followup' AND a.status='current' AND a.mode='active'
-            AND (a.expires_at IS NULL OR a.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            AND a.prerequisite_evidence_id IS NOT NULL
-            AND a.prerequisite_evidence_hash IS NOT NULL
-            AND initial.capability='fl04b-initial' AND initial.status='current'
-            AND initial.mode NOT IN ('off','shadow')
-            AND (initial.expires_at IS NULL
-              OR initial.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            AND initial.prerequisite_evidence_id IS NOT NULL
-            AND initial.prerequisite_evidence_hash IS NOT NULL
-            AND enrollment.capability='fl04b-enrollment' AND enrollment.status='current'
-            AND enrollment.mode NOT IN ('off','shadow')
-            AND (enrollment.expires_at IS NULL
-              OR enrollment.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            AND enrollment.prerequisite_evidence_id IS NOT NULL
-            AND enrollment.prerequisite_evidence_hash IS NOT NULL
-            AND safety.capability='fl04a-safety' AND safety.status='current'
-            AND safety.mode NOT IN ('off','shadow')
-            AND (safety.expires_at IS NULL
-              OR safety.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        ) <> 1 THEN RAISE(ABORT, 'follow-up capacity authority unavailable') END;
-        UPDATE deal_hunter_cim_capacity_reservations SET state = 'consumed',
-          consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-          recipient_window_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 day'),
-          row_version = row_version + 1
-        WHERE transmission_id = NEW.id AND state = 'reserved'
-          AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now');
-      END;
+${cimCapacityConsumeTriggerSql}
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_capacity_release
       AFTER UPDATE OF state ON deal_hunter_cim_transmissions
       WHEN OLD.state IN ('prepared', 'final-gate-blocked') AND NEW.state = 'cancelled-before-provider'
@@ -5769,6 +5785,7 @@ export function createSqliteStorage(config, options = {}) {
 	  `);
 
   migrateCrmSubmissionReversalTrigger(database);
+  migrateCimCapacityConsumeTrigger(database);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
   ensureColumn(database, 'contact_submissions', 'priority', "TEXT NOT NULL DEFAULT 'normal'");

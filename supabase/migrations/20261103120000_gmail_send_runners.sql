@@ -2589,3 +2589,342 @@ revoke all on function public.pursue_cim_prepare_reserved_followup_v1(jsonb) fro
 revoke all on function public.pursue_cim_renew_reserved_followup_v1(jsonb) from public,anon,authenticated;
 grant execute on function public.pursue_cim_prepare_reserved_followup_v1(jsonb) to service_role;
 grant execute on function public.pursue_cim_renew_reserved_followup_v1(jsonb) to service_role;
+
+-- Task 8: the scheduled Pursue sender (spec 2026-11-03 §5, Ruling L).
+--
+-- A follow-up touch whose claimer died before preparing it (claimed, claim lapsed, no
+-- transmission) is listed again, so claimDueCimTouch can take it over. A lapsed claim that holds
+-- a prepared transmission is renewed instead (pursue_cim_renew_reserved_followup_v1). This
+-- redefines the body above with only the claim clause and its comment changed.
+create or replace function public.pursue_cim_list_due_followup_touches_v1(
+  p_now timestamptz, p_limit integer default 25
+)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  v_activation_id text;
+begin
+  if p_now is null or p_limit is null or p_limit not between 1 and 100 then
+    raise exception 'Invalid Pursue CIM due selection';
+  end if;
+  select a.id into v_activation_id from public.deal_hunter_cim_capability_activations a
+    where a.id = public.pursue_cim_current_activation_v1('fl04c-followup', p_now)
+      and a.mode = 'active';
+  if v_activation_id is null then
+    return '[]'::jsonb;
+  end if;
+  return coalesce((
+    select pg_catalog.jsonb_agg(pg_catalog.to_jsonb(due) order by due.due_at, due.touch_id)
+    from (
+      select t.id as touch_id, t.campaign_id, t.opportunity_id, t.kind, t.ordinal,
+        t.state, t.due_at, t.due_local as "dueLocal", t.row_version, t.claim_expires_at,
+        c.conversation_id, c.terminal_revision as campaign_terminal_revision,
+        v.terminal_revision as conversation_terminal_revision,
+        c.crm_submission_id, c.recipient_fingerprint,
+        c.recipient_fingerprint as campaign_recipient_fingerprint,
+        v.recipient_fingerprint as conversation_recipient_fingerprint,
+        v.recipient_address, c.local_expiry_at as "campaignExpiryAt",
+        v_activation_id as activation_id,
+        (select coalesce(max(tr.preparation_generation), 0) + 1
+          from public.deal_hunter_cim_transmission_touches as m
+          join public.deal_hunter_cim_transmissions as tr on tr.id = m.transmission_id
+          where m.touch_id = t.id) as preparation_generation
+      from public.deal_hunter_cim_campaign_touches as t
+      join public.deal_hunter_cim_campaigns as c on c.id = t.campaign_id
+      join public.deal_hunter_broker_conversations as v on v.id = c.conversation_id
+      where t.kind <> 'initial' and t.logical_slot <> 'initial' and t.ordinal >= 1
+        and c.policy_version = 'deal-hunter-cim-autopilot-v1'
+        and c.state = 'active-follow-up' and v.state = 'open'
+        and t.opportunity_id = c.opportunity_id
+        and t.transmission_id is null
+        and (t.state = 'scheduled' or (t.state = 'claimed'
+          and t.claim_expires_at is not null and t.claim_expires_at <= p_now))
+        and t.due_at <= p_now
+        and c.local_expiry_at is not null and c.local_expiry_at > p_now
+        and t.timezone_revision = c.timezone_revision
+      order by t.due_at, t.id
+      limit p_limit
+    ) as due
+  ), '[]'::jsonb);
+end;
+$$;
+
+revoke all on function public.pursue_cim_list_due_followup_touches_v1(timestamptz, integer)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_list_due_followup_touches_v1(timestamptz, integer)
+  to service_role;
+
+-- An expired live authorization that was never used can no longer authorize anything, so it
+-- no longer blocks a new one for the same transmission: once the new issue is otherwise valid,
+-- the expired one is retired (withdrawn_at, audit authorization-expired). A transmission whose
+-- gate refused it (central pause, outside the window) can then be authorized again after its
+-- claim is renewed. Redefines the body from 20260925120000 with only that change.
+create or replace function public.pursue_cim_issue_live_authorization_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_id text;
+  v_activation_id text;
+  v_capability text;
+  v_writer_path text;
+  v_transmission_id text;
+  v_payload_digest text;
+  v_recipient_digest text;
+  v_provider_profile text;
+  v_actor text;
+  v_reason text;
+  v_now timestamptz;
+  v_expires timestamptz;
+  v_existing public.deal_hunter_cim_live_provider_authorizations%rowtype;
+  v_current public.deal_hunter_cim_live_provider_authorizations%rowtype;
+  v_activation public.deal_hunter_cim_capability_activations%rowtype;
+  v_transmission public.deal_hunter_cim_transmissions%rowtype;
+  v_member record;
+  v_count integer := 0;
+  v_replay boolean;
+  v_retire boolean := false;
+begin
+  v_id := public.pursue_cim_required_text_v1(p_command, 'id', 240);
+  v_activation_id := public.pursue_cim_required_text_v1(p_command, 'activationId', 240);
+  v_capability := public.pursue_cim_required_text_v1(p_command, 'capability', 40);
+  v_writer_path := public.pursue_cim_required_text_v1(p_command, 'writerPath', 240);
+  v_transmission_id := public.pursue_cim_required_text_v1(p_command, 'transmissionId', 240);
+  v_payload_digest := public.pursue_cim_required_text_v1(p_command, 'payloadDigest', 64);
+  v_recipient_digest := public.pursue_cim_required_text_v1(
+    p_command, 'recipientAuthorityDigest', 64);
+  v_provider_profile := public.pursue_cim_required_text_v1(p_command, 'providerProfile', 120);
+  v_actor := public.pursue_cim_required_text_v1(p_command, 'actor', 200);
+  v_reason := public.pursue_cim_required_text_v1(p_command, 'reason', 1000);
+  if v_payload_digest !~ '^[0-9a-f]{64}$'
+    or v_recipient_digest !~ '^[0-9a-f]{64}$'
+    or p_command ->> 'now' is null or p_command ->> 'expiresAt' is null
+  then
+    raise exception 'Invalid Pursue CIM live authorization command';
+  end if;
+  v_now := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_expires := public.pursue_cim_required_instant_v1(p_command, 'expiresAt');
+  if v_expires <= v_now then
+    raise exception 'Pursue CIM authorization already expired';
+  end if;
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended('pursue-cim:authorization-id:' || v_id, 0));
+  select * into v_existing from public.deal_hunter_cim_live_provider_authorizations
+    where id = v_id for update;
+  if found then
+    v_replay := v_existing.activation_id = v_activation_id
+      and v_existing.capability = v_capability
+      and v_existing.writer_path = v_writer_path
+      and v_existing.transmission_id = v_transmission_id
+      and v_existing.payload_digest = v_payload_digest
+      and v_existing.recipient_authority_digest = v_recipient_digest
+      and v_existing.provider_profile = v_provider_profile
+      and v_existing.expires_at = v_expires;
+    return pg_catalog.jsonb_build_object('issued', false, 'replay', v_replay,
+      'conflict', not v_replay, 'blockedReason', null,
+      'authorization', pg_catalog.to_jsonb(v_existing));
+  end if;
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      'pursue-cim:authorization-current:' || v_transmission_id || ':' || v_writer_path, 0));
+  select * into v_current from public.deal_hunter_cim_live_provider_authorizations
+    where transmission_id = v_transmission_id and writer_path = v_writer_path
+      and consumed_at is null and withdrawn_at is null for update;
+  if found then
+    if v_current.expires_at > v_now then
+      return pg_catalog.jsonb_build_object('issued', false, 'replay', false,
+        'conflict', false, 'blockedReason', 'authorization_exists',
+        'authorization', pg_catalog.to_jsonb(v_current));
+    end if;
+    v_retire := true;
+  end if;
+  select * into v_activation from public.deal_hunter_cim_capability_activations
+    where id = v_activation_id for share;
+  if public.pursue_cim_current_activation_v1(v_capability, v_now) is distinct from v_activation_id
+    or v_activation.provider_profile is distinct from v_provider_profile
+  then
+    return pg_catalog.jsonb_build_object('issued', false, 'replay', false,
+      'conflict', false, 'blockedReason', 'capability_inactive', 'authorization', null);
+  end if;
+  select * into v_transmission from public.deal_hunter_cim_transmissions
+    where id = v_transmission_id for update;
+  if not found or v_transmission.state <> 'prepared'
+    or v_transmission.payload_digest <> v_payload_digest
+  then
+    return pg_catalog.jsonb_build_object('issued', false, 'replay', false,
+      'conflict', false, 'blockedReason', 'transmission_invalid', 'authorization', null);
+  end if;
+  for v_member in
+    select c.recipient_fingerprint, t.kind
+    from public.deal_hunter_cim_transmission_touches as m
+    join public.deal_hunter_cim_campaigns as c on c.id = m.campaign_id
+    join public.deal_hunter_cim_campaign_touches as t on t.id = m.touch_id
+    where m.transmission_id = v_transmission_id and m.cancelled_at is null
+    order by m.touch_id for share of m,c,t
+  loop
+    v_count := v_count + 1;
+    if v_member.recipient_fingerprint <> v_recipient_digest
+      or (v_member.kind = 'initial' and v_capability <> 'fl04b-initial')
+      or (v_member.kind <> 'initial' and v_capability = 'fl04b-initial')
+    then
+      return pg_catalog.jsonb_build_object('issued', false, 'replay', false,
+        'conflict', false, 'blockedReason', 'recipient_authority_changed',
+        'authorization', null);
+    end if;
+  end loop;
+  if v_count = 0 then
+    return pg_catalog.jsonb_build_object('issued', false, 'replay', false,
+      'conflict', false, 'blockedReason', 'recipient_authority_changed',
+      'authorization', null);
+  end if;
+  if v_retire then
+    update public.deal_hunter_cim_live_provider_authorizations set withdrawn_at = v_now
+      where id = v_current.id and consumed_at is null and withdrawn_at is null;
+    insert into public.deal_hunter_cim_audit_events
+      (id, event_type, transmission_id, activation_id, authorization_id,
+       prior_state, next_state, reason_code, actor, source, occurred_at, metadata)
+    values (public.pursue_cim_digest_v1(
+        pg_catalog.to_jsonb('cim-audit:v1'::text),
+        pg_catalog.to_jsonb('authorization-expired'::text),
+        pg_catalog.to_jsonb(v_current.id)),
+      'authorization-expired', v_transmission_id, v_current.activation_id, v_current.id,
+      'issued', 'withdrawn', 'authorization_expired', v_actor, 'sqlite-transition', v_now,
+      '{}'::jsonb);
+  end if;
+  insert into public.deal_hunter_cim_live_provider_authorizations
+    (id, activation_id, capability, writer_path, transmission_id,
+     payload_digest, recipient_authority_digest, provider_profile,
+     maximum_calls, issued_at, expires_at, actor, reason)
+  values (v_id, v_activation_id, v_capability, v_writer_path, v_transmission_id,
+    v_payload_digest, v_recipient_digest, v_provider_profile, 1,
+    v_now, v_expires, v_actor, v_reason)
+  returning * into v_existing;
+  insert into public.deal_hunter_cim_audit_events
+    (id, event_type, transmission_id, activation_id, authorization_id,
+     next_state, payload_digest, actor, source, occurred_at, metadata)
+  values (public.pursue_cim_digest_v1(
+      pg_catalog.to_jsonb('cim-audit:v1'::text),
+      pg_catalog.to_jsonb('live-authorization-issued'::text),
+      pg_catalog.to_jsonb(v_id)),
+    'live-authorization-issued', v_transmission_id, v_activation_id,
+    v_id, 'issued', v_payload_digest, v_actor, 'sqlite-transition', v_now, '{}'::jsonb);
+  return pg_catalog.jsonb_build_object('issued', true, 'replay', false,
+    'conflict', false, 'blockedReason', null, 'authorization', pg_catalog.to_jsonb(v_existing));
+end;
+$$;
+
+revoke all on function public.pursue_cim_issue_live_authorization_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.pursue_cim_issue_live_authorization_v1(jsonb)
+  to service_role;
+
+-- Renews the lapsed claim of an initial touch that holds a prepared, never-authorized
+-- transmission, keeping that transmission (Ruling L). The new claim is at most five minutes
+-- long; replaying the same renewal returns existing. Mirrors renewLapsedCimInitialClaim in
+-- SQLite. Named outside the pursue_cim_%_v1 inventory, like the Gmail release helper.
+create or replace function public.deal_hunter_pursue_renew_initial_claim_v1(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_touch_id text := public.pursue_cim_required_text_v1(p_command, 'touchId', 240);
+  v_transmission_id text := public.pursue_cim_required_text_v1(p_command, 'transmissionId', 240);
+  v_expected_row bigint := public.pursue_cim_required_revision_v1(p_command, 'expectedRowVersion');
+  v_claim_digest text := public.pursue_cim_required_text_v1(p_command, 'claimTokenDigest', 64);
+  v_claim_owner text := public.pursue_cim_required_text_v1(p_command, 'claimOwner', 200);
+  v_claim_expires timestamptz := public.pursue_cim_required_instant_v1(p_command, 'claimExpiresAt');
+  v_actor text := public.pursue_cim_required_text_v1(p_command, 'actor', 200);
+  v_now timestamptz := public.pursue_cim_required_instant_v1(p_command, 'now');
+  v_touch public.deal_hunter_cim_campaign_touches%rowtype;
+  v_transmission public.deal_hunter_cim_transmissions%rowtype;
+  v_campaign public.deal_hunter_cim_campaigns%rowtype;
+  v_conversation public.deal_hunter_broker_conversations%rowtype;
+  v_unchanged boolean;
+  v_changed bigint;
+begin
+  if v_claim_digest !~ '^[0-9a-f]{64}$' then
+    raise exception 'Invalid claim token digest';
+  end if;
+  perform pg_catalog.pg_advisory_xact_lock(17499,48146);
+  select * into v_touch from public.deal_hunter_cim_campaign_touches
+    where id = v_touch_id for update;
+  select * into v_transmission from public.deal_hunter_cim_transmissions
+    where id = v_transmission_id for update;
+  select * into v_campaign from public.deal_hunter_cim_campaigns
+    where id = v_touch.campaign_id for update;
+  select * into v_conversation from public.deal_hunter_broker_conversations
+    where id = v_campaign.conversation_id for update;
+  v_unchanged := coalesce(v_touch.id is not null and v_transmission.id is not null
+    and v_campaign.id is not null and v_conversation.id is not null
+    and exists(select 1 from public.deal_hunter_cim_transmission_touches m
+      where m.touch_id = v_touch.id and m.transmission_id = v_transmission.id
+        and m.cancelled_at is null)
+    and v_touch.kind = 'initial' and v_touch.logical_slot = 'initial' and v_touch.ordinal = 0
+    and v_touch.state = 'claimed' and v_touch.transmission_id = v_transmission.id
+    and v_touch.opportunity_id = v_campaign.opportunity_id
+    and v_touch.timezone_revision = v_campaign.timezone_revision
+    and v_transmission.state = 'prepared' and v_transmission.invocation_authority_count = 0
+    and v_transmission.provider_seam_entered_at is null
+    and v_transmission.boundary_nonce_digest is null
+    and v_transmission.conversation_id = v_conversation.id
+    and v_campaign.state = 'initial-pending' and v_campaign.generation = 1
+    and v_campaign.policy_version = 'deal-hunter-cim-autopilot-v1'
+    and v_conversation.state = 'open'
+    and (v_campaign.local_expiry_at is null or v_campaign.local_expiry_at > v_now)
+    and public.pursue_cim_current_activation_v1('fl04b-initial', v_now) is not null, false);
+  if v_unchanged and v_touch.claim_token_digest = v_claim_digest
+    and v_touch.claim_owner = v_claim_owner and v_touch.claim_expires_at = v_claim_expires
+    and v_touch.claim_expires_at > v_now
+  then
+    return pg_catalog.jsonb_build_object('renewed', false, 'existing', true, 'terminal', false,
+      'blockedReason', null, 'transmission', pg_catalog.to_jsonb(v_transmission),
+      'touch', pg_catalog.to_jsonb(v_touch));
+  end if;
+  if not v_unchanged or v_touch.row_version <> v_expected_row
+    or v_touch.claim_expires_at is null or v_touch.claim_expires_at > v_now
+    or v_claim_expires <= v_now or v_claim_expires > v_now + interval '5 minutes'
+  then
+    return pg_catalog.jsonb_build_object('renewed', false, 'existing', false, 'terminal', true,
+      'blockedReason', 'renewal_authority_changed',
+      'transmission', case when v_transmission.id is null then null
+        else pg_catalog.to_jsonb(v_transmission) end,
+      'touch', case when v_touch.id is null then null else pg_catalog.to_jsonb(v_touch) end);
+  end if;
+  update public.deal_hunter_cim_campaign_touches set claim_token_digest = v_claim_digest,
+    claim_owner = v_claim_owner, claimed_at = v_now, claim_expires_at = v_claim_expires,
+    row_version = row_version + 1, updated_at = v_now
+    where id = v_touch.id and row_version = v_expected_row
+      and transmission_id = v_transmission.id and state = 'claimed';
+  get diagnostics v_changed = row_count;
+  if v_changed <> 1 then
+    raise exception 'Initial claim renewal lost touch authority';
+  end if;
+  insert into public.deal_hunter_cim_audit_events
+    (id, event_type, opportunity_id, campaign_id, conversation_id, touch_id, transmission_id,
+     prior_state, next_state, reason_code, actor, source, occurred_at, metadata)
+  values (public.pursue_cim_digest_v1(
+      pg_catalog.to_jsonb('cim-audit:v1'::text),
+      pg_catalog.to_jsonb('touch-claim-renewed'::text),
+      pg_catalog.to_jsonb(v_touch.id || ':' || (v_expected_row + 1)::text)),
+    'touch-claim-renewed', v_touch.opportunity_id, v_campaign.id, v_conversation.id,
+    v_touch.id, v_transmission.id, 'claimed', 'claimed', 'lapsed_claim', v_actor,
+    'sqlite-transition', v_now, '{}'::jsonb);
+  select * into v_touch from public.deal_hunter_cim_campaign_touches where id = v_touch.id;
+  return pg_catalog.jsonb_build_object('renewed', true, 'existing', false, 'terminal', false,
+    'blockedReason', null, 'transmission', pg_catalog.to_jsonb(v_transmission),
+    'touch', pg_catalog.to_jsonb(v_touch));
+end;
+$$;
+
+revoke all on function public.deal_hunter_pursue_renew_initial_claim_v1(jsonb)
+  from public, anon, authenticated;
+grant execute on function public.deal_hunter_pursue_renew_initial_claim_v1(jsonb)
+  to service_role;

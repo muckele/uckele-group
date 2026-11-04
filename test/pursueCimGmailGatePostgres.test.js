@@ -15,6 +15,8 @@ import {
   loadPursueFollowUpAuthority,
 } from '../server/services/pursueCimFollowUpHooks.js';
 import { runCimFollowUpPreparation } from '../server/services/pursueCimFollowUpPreparation.js';
+import { reconcileUnrecordedPursueSends, sweepExpiredPursueCampaigns } from '../server/services/pursueCimSender.js';
+import { syncPursueGmailCapabilities } from '../server/services/pursueGmailCapabilities.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
@@ -63,11 +65,62 @@ function serviceRoleClient(container, database) {
         return { data: null, error };
       }
     },
+    // A small PostgREST stand-in: select with eq/in/is/not-is-null/lte filters, order, limit
+    // and single-row reads, run as service_role.
     from(table) {
-      const select = async () => ({ data: JSON.parse(sql(`select coalesce(jsonb_agg(to_jsonb(t)),
-        '[]'::jsonb)::text from public.${table} t;`)), error: null });
-      const builder = { select() { return builder; },
-        then(resolve, reject) { return select().then(resolve, reject); } };
+      const where = [];
+      const orders = [];
+      let columns = '*';
+      let limit = null;
+      let single = '';
+      const value = (item) => (item === null ? 'null' : `$v$${String(item)}$v$`);
+      const column = (name) => {
+        if (!/^[a-z_][a-z0-9_]*$/.test(name)) throw new Error(`unsupported column ${name}`);
+        return `t.${name}`;
+      };
+      const read = async () => {
+        const filter = where.length ? `where ${where.join(' and ')}` : '';
+        const order = orders.length ? `order by ${orders.join(', ')}` : '';
+        const rows = JSON.parse(sql(`select coalesce(jsonb_agg(to_jsonb(q) - '__ord'
+          order by q.__ord), '[]'::jsonb)::text from (select t.*, row_number() over
+          (${order}) as __ord from public.${table} t ${filter}
+          ${order} ${limit === null ? '' : `limit ${limit}`}) q;`));
+        const wanted = columns === '*' ? null : columns.split(',').map((name) => name.trim());
+        const projected = wanted ? rows.map((row) => Object.fromEntries(wanted
+          .map((name) => [name, row[name]]))) : rows;
+        if (!single) return { data: projected, error: null };
+        if (single === 'single' && projected.length !== 1) {
+          return { data: null, error: new Error('expected one row') };
+        }
+        return { data: projected[0] ?? null, error: null };
+      };
+      const builder = {
+        select(list = '*') { columns = list; return builder; },
+        eq(name, item) { where.push(`${column(name)} = ${value(item)}`); return builder; },
+        in(name, items) {
+          where.push(items.length ? `${column(name)} in (${items.map(value).join(', ')})` : 'false');
+          return builder;
+        },
+        is(name, item) {
+          if (item !== null) throw new Error('unsupported is filter');
+          where.push(`${column(name)} is null`);
+          return builder;
+        },
+        not(name, operator, item) {
+          if (operator !== 'is' || item !== null) throw new Error('unsupported not filter');
+          where.push(`${column(name)} is not null`);
+          return builder;
+        },
+        lte(name, item) { where.push(`${column(name)} <= ${value(item)}`); return builder; },
+        order(name, { ascending = true } = {}) {
+          orders.push(`${column(name)} ${ascending ? 'asc' : 'desc'}`);
+          return builder;
+        },
+        limit(count) { limit = Number(count); return builder; },
+        maybeSingle() { single = 'maybe'; return builder; },
+        single() { single = 'single'; return builder; },
+        then(resolve, reject) { return read().then(resolve, reject); },
+      };
       return builder;
     },
   };
@@ -579,4 +632,227 @@ test('PostgreSQL lists due follow-ups and prepares a released follow-up again un
   assert.equal(scalar(`select string_agg(state, ',' order by reserved_at, id)
     from public.deal_hunter_cim_capacity_reservations
     where transmission_id = '${reprepared.transmission.id}';`), 'expired,consumed');
+});
+
+test('PostgreSQL sender storage: expiry sweep, lapsed claims, expired authorizations, waiting enrollments and the Live sending chain', {
+  skip: integrationEnabled ? false : 'set DEAL_HUNTER_POSTGRES_INTEGRATION=1 for disposable PostgreSQL integration',
+  timeout: 240_000,
+}, async (t) => {
+  const database = 'pursue_sender';
+  const { container, storage } = await startPostgres(t, 'uckele-pursue-sender', database);
+  const scalar = (sql) => psql(container, database, sql);
+  const realNow = Date.now();
+  const iso = (ms) => new Date(ms).toISOString();
+  const recipientFingerprint = (suffix) => sha256(stableCanonicalJson({
+    opportunityId: `opp-gmail-${suffix}`, emailHash: sha256(BROKER),
+    provenanceFingerprint: fill('9'), contactAuthorityRevision: fill('b') }));
+  await storage.setPursueSendControl({ controlKey: 'contact_rule', enabled: true,
+    policyVersion: CONTACT_POLICY_VERSION, expectedRevision: 0, actor: 'owner',
+    reason: 'sender test', now: seededAt });
+
+  // Day-28 expiry: the sweep expires the campaign and cancels its scheduled touch, once.
+  const expiring = seedCampaign(container, database, 'expiring', recipientFingerprint('expiring'),
+    { followUp: true, basis: 'rule' });
+  const expiry = Date.parse(scalar(`select to_jsonb(local_expiry_at) #>> '{}'
+    from public.deal_hunter_cim_campaigns where id = '${expiring.campaignId}';`));
+  assert.deepEqual(await storage.listExpiredCimCampaigns({ now: iso(expiry - 60_000) }), []);
+  const [listed] = await storage.listExpiredCimCampaigns({ now: iso(expiry + 60_000) });
+  assert.deepEqual(Object.keys(listed).sort(), ['conversation_id', 'id', 'local_expiry_at',
+    'opportunity_id', 'row_version', 'state', 'terminal_revision']);
+  assert.equal(listed.id, expiring.campaignId);
+  assert.equal(listed.row_version, 1);
+  assert.equal(await sweepExpiredPursueCampaigns({ storage, now: iso(expiry + 60_000) }), 1);
+  assert.equal(scalar(`select state || ':' || reason_code from public.deal_hunter_cim_campaigns
+    where id = '${expiring.campaignId}';`), 'expired:campaign_expired');
+  assert.equal(scalar(`select state || ':' || terminal_reason
+    from public.deal_hunter_cim_campaign_touches where id = '${expiring.touchId}';`),
+  'cancelled-before-provider:campaign_expired');
+  assert.equal(await sweepExpiredPursueCampaigns({ storage, now: iso(expiry + 120_000) }), 0);
+
+  // A follow-up whose claimer died before preparing is listed again (Ruling L).
+  const lapsedFollowUp = seedCampaign(container, database, 'lapsed-follow-up',
+    recipientFingerprint('lapsed-follow-up'), { followUp: true, basis: 'rule' });
+  const claimed = await storage.claimDueCimTouch({ touchId: lapsedFollowUp.touchId,
+    expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest: fill('d'),
+    claimOwner: 'crashed-worker', claimExpiresAt: iso(realNow + 60_000), now: iso(realNow) });
+  assert.equal(claimed.claimed, true, JSON.stringify(claimed));
+  assert.deepEqual((await storage.listDueCimFollowUpTouches({ now: iso(realNow + 30_000) }))
+    .map((row) => row.touch_id), []);
+  const relisted = await storage.listDueCimFollowUpTouches({ now: iso(realNow + 120_000) });
+  assert.deepEqual(relisted.map((row) => [row.touch_id, row.state]),
+    [[lapsedFollowUp.touchId, 'claimed']]);
+
+  // An initial prepared under a claim that then lapsed: listed, renewed, sent through a new
+  // authorization once the expired one is retired.
+  const initial = seedCampaign(container, database, 'lapsed-initial',
+    recipientFingerprint('lapsed-initial'), { followUp: false, basis: 'rule' });
+  const t0 = Date.parse('2026-09-29T15:30:00.000Z');
+  const at = (minutes) => iso(t0 + minutes * 60_000);
+  assert.equal((await storage.claimDueCimTouch({ touchId: initial.touchId, expectedRowVersion: 1,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    claimTokenDigest: fill('e'), claimOwner: 'crashed-worker', claimExpiresAt: at(4),
+    now: at(0) })).claimed, true);
+  const prepared = await storage.prepareCimTransmission({ touchIds: [initial.touchId],
+    claimTokenDigest: fill('e'), expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, preparationGeneration: 1,
+    payloadVersion: 'deal-hunter-cim-pursue-initial-v2', fromAddress: SENDER,
+    toAddresses: [BROKER], ccAddresses: [], bccAddresses: [], replyToAddress: SENDER,
+    subject: 'CIM / NDA request for Acme Plumbing', bodyText: 'Synthetic body',
+    bodyHtmlSanitized: '<p>Synthetic body</p>', tags: [`cim_touch_id=${initial.touchId}`],
+    actor: 'crashed-worker', now: at(1) });
+  assert.equal(prepared.prepared, true, JSON.stringify(prepared));
+  const transmission = prepared.transmission;
+  assert.deepEqual(await storage.listLapsedCimPreparedTouches({ now: at(3) }), []);
+  const [lapsed] = await storage.listLapsedCimPreparedTouches({ now: at(10) });
+  assert.deepEqual(Object.keys(lapsed).sort(), ['campaign_id', 'campaign_state',
+    'claim_expires_at', 'conversation_id', 'kind', 'opportunity_id', 'preparation_generation',
+    'recipient_fingerprint', 'row_version', 'touch_id', 'transmission_id']);
+  assert.equal(lapsed.touch_id, initial.touchId);
+  assert.equal(lapsed.transmission_id, transmission.id);
+  assert.equal(lapsed.kind, 'initial');
+  assert.equal(lapsed.preparation_generation, 1);
+  const renewal = { touchId: initial.touchId, transmissionId: transmission.id,
+    expectedRowVersion: lapsed.row_version, claimTokenDigest: fill('f'),
+    claimOwner: 'pursue-cim-sender', claimExpiresAt: at(14), actor: 'pursue-cim-sender',
+    now: at(10) };
+  const tooLong = await storage.renewLapsedCimInitialClaim({ ...renewal, claimExpiresAt: at(16) });
+  assert.equal(tooLong.blockedReason, 'renewal_authority_changed');
+  const renewed = await storage.renewLapsedCimInitialClaim(renewal);
+  assert.equal(renewed.renewed, true, JSON.stringify(renewed));
+  assert.equal(renewed.transmission.id, transmission.id);
+  assert.equal(renewed.touch.claim_token_digest, fill('f'));
+  assert.equal(renewed.touch.row_version, lapsed.row_version + 1);
+  assert.equal((await storage.renewLapsedCimInitialClaim(renewal)).existing, true);
+  assert.equal((await storage.renewLapsedCimInitialClaim({ ...renewal, claimTokenDigest: fill('0'),
+    expectedRowVersion: lapsed.row_version + 1, now: at(11) })).terminal, true);
+  assert.equal(scalar(`select count(*) from public.deal_hunter_cim_audit_events
+    where event_type = 'touch-claim-renewed';`), '1');
+
+  const issue = (id, now, expiresAt) => storage.issueCimLiveProviderAuthorization({ id,
+    activationId: 'gmail-fl04b-initial', capability: 'fl04b-initial',
+    writerPath: 'pursue-cim-initial', transmissionId: transmission.id,
+    payloadDigest: transmission.payload_digest,
+    recipientAuthorityDigest: recipientFingerprint('lapsed-initial'),
+    providerProfile: GMAIL_PROFILE, expiresAt, actor: 'pursue-cim-sender',
+    reason: 'sender test', now });
+  assert.equal((await issue('authorization-first', at(11), at(13))).issued, true);
+  const blocked = await issue('authorization-early', at(12), at(20));
+  assert.equal(blocked.blockedReason, 'authorization_exists');
+  assert.equal(blocked.authorization.id, 'authorization-first');
+  const reissued = await issue('authorization-second', at(13), at(20));
+  assert.equal(reissued.issued, true, JSON.stringify(reissued));
+  assert.equal(scalar(`select (withdrawn_at is not null and consumed_at is null)::text
+    from public.deal_hunter_cim_live_provider_authorizations where id = 'authorization-first';`),
+  'true');
+  assert.equal(scalar(`select count(*) from public.deal_hunter_cim_audit_events
+    where event_type = 'authorization-expired' and authorization_id = 'authorization-first';`), '1');
+
+  // A send whose provider seam was entered and that recorded no outcome.
+  const pending = await prepareGate({ container, database, storage, suffix: 'pending',
+    basis: 'rule' });
+  const gate = await pending.gate();
+  assert.equal(gate.authorized, true, JSON.stringify(gate));
+  const seam = await storage.enterCimProviderSeam({ transmissionId: pending.transmission.id,
+    authorizationId: 'authorization-pending', writerPath: pending.writerPath,
+    providerProfile: GMAIL_PROFILE, capability: pending.capability,
+    payloadDigest: pending.transmission.payload_digest,
+    boundaryNonceDigest: sha256(gate.boundaryNonce),
+    expectedRowVersion: Number(gate.transmission.row_version), actor: 'pursue-cim-sender',
+    now: GATE_NOW });
+  assert.equal(seam.entered, true, JSON.stringify(seam));
+  assert.deepEqual(await storage.listCimProviderPendingTransmissions({
+    enteredBefore: iso(Date.parse(GATE_NOW) - 60_000) }), []);
+  const [unrecorded] = await storage.listCimProviderPendingTransmissions({
+    enteredBefore: iso(Date.parse(GATE_NOW) + 10 * 60_000) });
+  assert.equal(unrecorded.id, pending.transmission.id);
+  assert.equal(unrecorded.state, 'provider-pending');
+  assert.equal(unrecorded.invocation_authority_count, 1);
+  assert.equal(typeof unrecorded.row_version, 'number');
+  // Gmail has no such message: finalized ambiguous for the owner, never sent again.
+  const notFound = { async findSent() { return { found: false }; } };
+  const reconcileConfig = { isProduction: false, dealHunter: { cimProvider: { enabled: true,
+    profile: GMAIL_PROFILE, mode: 'production-gmail', provider: 'gmail',
+    gmailSenderAddress: SENDER } } };
+  const tooSoon = await reconcileUnrecordedPursueSends({ storage, mailProvider: notFound,
+    providerProfile: GMAIL_PROFILE, now: iso(Date.parse(GATE_NOW) + 5 * 60_000),
+    config: reconcileConfig });
+  assert.deepEqual(tooSoon, { reconciled: 0, ambiguous: 0, skipped: {} });
+  const ambiguous = await reconcileUnrecordedPursueSends({ storage, mailProvider: notFound,
+    providerProfile: GMAIL_PROFILE, now: iso(Date.parse(GATE_NOW) + 15 * 60_000),
+    config: reconcileConfig });
+  assert.deepEqual(ambiguous, { reconciled: 0, ambiguous: 1, skipped: {} });
+  assert.equal(scalar(`select state || ':' || provider || ':' || provider_result_code
+    from public.deal_hunter_cim_transmissions where id = '${pending.transmission.id}';`),
+  'ambiguous:gmail:gmail_send_unrecorded');
+  assert.equal(scalar(`select state from public.deal_hunter_cim_campaigns
+    where id = '${pending.ids.campaignId}';`), 'provider-ambiguous');
+  // Gmail has it: reconciled as accepted, its thread stored and the follow-up scheduled.
+  const delivered = await prepareGate({ container, database, storage, suffix: 'delivered',
+    basis: 'rule' });
+  const deliveredGate = await delivered.gate({ now: iso(Date.parse(GATE_NOW) + 1000) });
+  assert.equal(deliveredGate.authorized, true, JSON.stringify(deliveredGate));
+  assert.equal((await storage.enterCimProviderSeam({ transmissionId: delivered.transmission.id,
+    authorizationId: 'authorization-delivered', writerPath: delivered.writerPath,
+    providerProfile: GMAIL_PROFILE, capability: delivered.capability,
+    payloadDigest: delivered.transmission.payload_digest,
+    boundaryNonceDigest: sha256(deliveredGate.boundaryNonce),
+    expectedRowVersion: Number(deliveredGate.transmission.row_version),
+    actor: 'pursue-cim-sender', now: iso(Date.parse(GATE_NOW) + 1000) })).entered, true);
+  const found = { async findSent() { return { found: true, messageId: 'gmail-message-1',
+    threadId: 'gmail-thread-delivered' }; } };
+  const accepted = await reconcileUnrecordedPursueSends({ storage, mailProvider: found,
+    providerProfile: GMAIL_PROFILE, now: iso(Date.parse(GATE_NOW) + 15 * 60_000),
+    config: reconcileConfig });
+  assert.deepEqual(accepted, { reconciled: 1, ambiguous: 0, skipped: {} });
+  assert.equal(scalar(`select state || ':' || provider_message_id
+    from public.deal_hunter_cim_transmissions where id = '${delivered.transmission.id}';`),
+  'accepted:gmail-message-1');
+  assert.equal(scalar(`select gmail_thread_id from public.deal_hunter_broker_conversations
+    where id = '${delivered.ids.conversationId}';`), 'gmail-thread-delivered');
+  assert.equal(scalar(`select state || ':' || kind from public.deal_hunter_cim_campaign_touches
+    where campaign_id = '${delivered.ids.campaignId}' and kind <> 'initial';`),
+  'scheduled:follow-up-1');
+
+  // Waiting enrollments are listed with their decisions.
+  scalar(`
+    insert into public.deal_hunter_opportunities (opportunity_id, created_at, updated_at,
+      canonical_name, identity_version, discovery_state) values ('opp-waiting', '${seededAt}',
+      '${seededAt}', 'Waiting Co', 'cim-identity-v1', 'known_prospective');
+    insert into public.deal_hunter_owner_decision_events (id, idempotency_key, request_digest,
+      opportunity_id, action, actor, expected_discovery_revision, expected_material_revision,
+      observed_discovery_revision, observed_material_revision, policy_version, created_at)
+      values ('decision-waiting', 'idem-waiting', '${fill('a')}', 'opp-waiting', 'pursue',
+        'fixture-owner', 0, 0, 0, 0, 'owner-decision-v1', '${seededAt}');
+    insert into public.deal_hunter_pursuit_enrollments (id, decision_event_id, opportunity_id,
+      state, reason_code, authority_digest, created_at, updated_at, row_version)
+      values ('enrollment-waiting', 'decision-waiting', 'opp-waiting', 'waiting-on-eligibility',
+        'contact_permission_missing', '${fill('b')}', '${seededAt}', '${seededAt}', 2);
+  `);
+  const waiting = await storage.listWaitingPursuitEnrollments({ limit: 10 });
+  assert.deepEqual(waiting.map(({ enrollment, decision }) => [enrollment.id, decision?.id,
+    enrollment.row_version]), [['enrollment-waiting', 'decision-waiting', 2]]);
+
+  // Live sending: an intact production-gmail-v1 chain is kept; off withdraws it; on records it.
+  const now = iso(realNow);
+  assert.equal((await syncPursueGmailCapabilities({ storage, enabled: true, actor: 'owner',
+    now })).applied, false);
+  const off = await syncPursueGmailCapabilities({ storage, enabled: false, actor: 'owner', now });
+  assert.deepEqual(off.withdrawn.sort(), ['gmail-fl04a-safety', 'gmail-fl04b-enrollment',
+    'gmail-fl04b-initial', 'gmail-fl04c-followup']);
+  assert.deepEqual(await storage.listCurrentCimCapabilityActivations(), []);
+  assert.equal(scalar(`select coalesce(public.pursue_cim_current_activation_v1('fl04c-followup',
+    now()), 'none');`), 'none');
+  const on = await syncPursueGmailCapabilities({ storage, enabled: true, actor: 'owner',
+    now: iso(realNow + 1000) });
+  assert.equal(on.applied, true);
+  const current = await storage.listCurrentCimCapabilityActivations();
+  assert.deepEqual(current.map((row) => [row.capability, row.provider_profile, row.mode]), [
+    ['fl04a-safety', GMAIL_PROFILE, 'active'], ['fl04b-enrollment', GMAIL_PROFILE, 'active'],
+    ['fl04b-initial', GMAIL_PROFILE, 'active'], ['fl04c-followup', GMAIL_PROFILE, 'active']]);
+  assert.equal(scalar(`select public.pursue_cim_current_activation_v1('fl04c-followup', now());`),
+    on.activations['fl04c-followup'].id);
+  assert.equal(scalar(`select count(*) from public.deal_hunter_cim_audit_events
+    where event_type in ('capability-activation', 'capability-withdrawn')
+      and actor = 'owner';`), '8');
 });

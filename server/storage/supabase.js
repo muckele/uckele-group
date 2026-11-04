@@ -121,6 +121,31 @@ const pursueCimJsonTextColumns = new Set([
   'to_addresses', 'cc_addresses', 'bcc_addresses', 'expiry_derivation',
 ]);
 
+function pursueCimNumericRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  const result = { ...row };
+  for (const [key, value] of Object.entries(row)) {
+    if (pursueCimNumericColumns.has(key) && typeof value === 'string' && /^-?\d+$/.test(value)) {
+      result[key] = Number(value);
+    }
+  }
+  return result;
+}
+
+function pursueCimSelectionLimit(limit, maximum, name) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > maximum) {
+    throw new Error(`Invalid ${name} limit`);
+  }
+  return limit;
+}
+
+function pursueCimSelectionInstant(value, name) {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`Invalid ${name} instant`);
+  }
+  return new Date(value).toISOString();
+}
+
 function normalizePursueCimRpcResult(data, booleanFields, rowFields = [], {
   requiredRows = {}, extraFields = [], requireOutcome = false,
 } = {}) {
@@ -1361,6 +1386,119 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) throw error;
       if (!Array.isArray(data)) throw new Error('Malformed Pursue CIM due selection');
       return data;
+    },
+
+    async listCurrentCimCapabilityActivations() {
+      const { data, error } = await client.from('deal_hunter_cim_capability_activations')
+        .select('*').eq('status', 'current').order('capability').order('id');
+      if (error) throw error;
+      return (data ?? []).map(pursueCimNumericRow);
+    },
+
+    async listExpiredCimCampaigns({ now, limit = 100 } = {}) {
+      const at = pursueCimSelectionInstant(now, 'expired campaign');
+      pursueCimSelectionLimit(limit, 500, 'expired campaign');
+      const { data, error } = await client.from('deal_hunter_cim_campaigns')
+        .select('id, opportunity_id, conversation_id, state, terminal_revision, row_version, local_expiry_at')
+        .in('state', ['initial-pending', 'active-follow-up'])
+        .not('local_expiry_at', 'is', null).lte('local_expiry_at', at)
+        .order('local_expiry_at').order('id').limit(limit);
+      if (error) throw error;
+      return (data ?? []).map(pursueCimNumericRow);
+    },
+
+    async listCimProviderPendingTransmissions({ enteredBefore, limit = 50 } = {}) {
+      const before = pursueCimSelectionInstant(enteredBefore, 'provider-pending');
+      pursueCimSelectionLimit(limit, 100, 'provider-pending');
+      const { data, error } = await client.from('deal_hunter_cim_transmissions')
+        .select('*').eq('state', 'provider-pending')
+        .not('provider_seam_entered_at', 'is', null).lte('provider_seam_entered_at', before)
+        .is('provider_message_id', null)
+        .order('provider_seam_entered_at').order('id').limit(limit);
+      if (error) throw error;
+      return (data ?? []).map(pursueCimNumericRow);
+    },
+
+    // Mirrors the SQLite join with bounded reads; every condition is re-checked atomically by
+    // the renewal transition, so a row that changes in between is refused there.
+    async listLapsedCimPreparedTouches({ now, limit = 25 } = {}) {
+      const at = pursueCimSelectionInstant(now, 'lapsed touch');
+      pursueCimSelectionLimit(limit, 100, 'lapsed touch');
+      const { data: touches, error } = await client.from('deal_hunter_cim_campaign_touches')
+        .select('*').eq('state', 'claimed').not('transmission_id', 'is', null)
+        .not('claim_expires_at', 'is', null).lte('claim_expires_at', at)
+        .order('claim_expires_at').order('id').limit(500);
+      if (error) throw error;
+      if (!touches?.length) return [];
+      const byId = async (table, ids) => {
+        const unique = [...new Set(ids)];
+        const { data, error: readError } = await client.from(table).select('*').in('id', unique);
+        if (readError) throw readError;
+        return new Map((data ?? []).map((row) => [row.id, pursueCimNumericRow(row)]));
+      };
+      const transmissions = await byId('deal_hunter_cim_transmissions',
+        touches.map((touch) => touch.transmission_id));
+      const campaigns = await byId('deal_hunter_cim_campaigns',
+        touches.map((touch) => touch.campaign_id));
+      const conversations = await byId('deal_hunter_broker_conversations',
+        [...campaigns.values()].map((campaign) => campaign.conversation_id));
+      const { data: memberships, error: membershipError } = await client
+        .from('deal_hunter_cim_transmission_touches').select('touch_id, transmission_id')
+        .in('touch_id', touches.map((touch) => touch.id)).is('cancelled_at', null);
+      if (membershipError) throw membershipError;
+      const live = new Set((memberships ?? []).map((row) => `${row.touch_id}|${row.transmission_id}`));
+      const atMs = Date.parse(at);
+      return touches.map(pursueCimNumericRow).filter((touch) => {
+        const transmission = transmissions.get(touch.transmission_id);
+        const campaign = campaigns.get(touch.campaign_id);
+        const conversation = campaign && conversations.get(campaign.conversation_id);
+        return transmission && campaign && conversation
+          && live.has(`${touch.id}|${touch.transmission_id}`)
+          && transmission.state === 'prepared' && transmission.invocation_authority_count === 0
+          && !transmission.provider_seam_entered_at
+          && ['initial-pending', 'active-follow-up'].includes(campaign.state)
+          && conversation.state === 'open'
+          && (!campaign.local_expiry_at || Date.parse(campaign.local_expiry_at) > atMs)
+          && touch.opportunity_id === campaign.opportunity_id
+          && touch.timezone_revision === campaign.timezone_revision;
+      }).slice(0, limit).map((touch) => {
+        const campaign = campaigns.get(touch.campaign_id);
+        return { touch_id: touch.id, kind: touch.kind, campaign_id: touch.campaign_id,
+          opportunity_id: touch.opportunity_id, row_version: touch.row_version,
+          claim_expires_at: touch.claim_expires_at, transmission_id: touch.transmission_id,
+          preparation_generation: transmissions.get(touch.transmission_id).preparation_generation,
+          conversation_id: campaign.conversation_id,
+          recipient_fingerprint: campaign.recipient_fingerprint, campaign_state: campaign.state };
+      });
+    },
+
+    async renewLapsedCimInitialClaim(command) {
+      const { data, error } = await client.rpc('deal_hunter_pursue_renew_initial_claim_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (![null, 'renewal_authority_changed'].includes(data?.blockedReason ?? null)) {
+        throw new Error('Malformed Pursue CIM initial renewal result');
+      }
+      return normalizePursueCimRpcResult(data, ['renewed', 'existing', 'terminal'],
+        ['transmission', 'touch'], { requiredRows: { transmission: ['renewed', 'existing'],
+          touch: ['renewed', 'existing'] }, extraFields: ['blockedReason'] });
+    },
+
+    async listWaitingPursuitEnrollments({ limit = 100 } = {}) {
+      pursueCimSelectionLimit(limit, 500, 'waiting enrollment');
+      const { data: enrollments, error } = await client.from('deal_hunter_pursuit_enrollments')
+        .select('*').eq('state', 'waiting-on-eligibility')
+        .order('updated_at').order('id').limit(limit);
+      if (error) throw error;
+      if (!enrollments?.length) return [];
+      const { data: decisions, error: decisionError } = await client
+        .from('deal_hunter_owner_decision_events').select('*')
+        .in('id', [...new Set(enrollments.map((row) => row.decision_event_id))]);
+      if (decisionError) throw decisionError;
+      const byId = new Map((decisions ?? []).map((row) => [row.id, pursueCimNumericRow(row)]));
+      return enrollments.map((row) => ({ enrollment: pursueCimNumericRow(row),
+        decision: byId.get(row.decision_event_id) ?? null }));
     },
 
     async readCimFollowUpAuthority({ touchId, now } = {}) {

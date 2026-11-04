@@ -137,6 +137,72 @@ function preparationGeneration(candidate) {
   return Number.isSafeInteger(generation) && generation >= 1 ? generation : 1;
 }
 
+/**
+ * Claims and prepares one due initial touch from `listDueCimInitialTouches`. Returns the
+ * outcome `runDueCimInitialPreparations` reports, plus the prepared `transmission` (or null).
+ */
+export async function prepareDueCimInitialTouch({ storage, candidate, now, clock,
+  actor = 'pursue-cim-initial-preparer', loadAuthority = loadBrokerMaterialsAuthority,
+  configOverride } = {}) {
+  if (!storage?.claimDueCimTouch || !storage?.prepareCimTransmission) {
+    throw new Error('CIM storage transitions unavailable');
+  }
+  const instant = () => {
+    const at = new Date(clock ? clock() : now ?? new Date());
+    if (!Number.isFinite(at.getTime())) throw new Error('Invalid CIM preparation instant');
+    return at;
+  };
+  if (candidate?.kind !== 'initial') throw new Error('Non-initial CIM touch reached Package 5');
+  const config = configOverride || getConfig();
+  const rawClaimToken = randomBytes(32).toString('hex');
+  const claimTokenDigest = createHash('sha256').update(rawClaimToken).digest('hex');
+  const claimAt = instant();
+  const claim = await storage.claimDueCimTouch({
+    touchId: candidate.touch_id,
+    expectedRowVersion: Number(candidate.row_version),
+    expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),
+    expectedConversationTerminalRevision: Number(candidate.conversation_terminal_revision),
+    claimTokenDigest, claimOwner: actor,
+    claimExpiresAt: new Date(claimAt.getTime() + leaseMilliseconds).toISOString(),
+    now: claimAt.toISOString(),
+  });
+  if (!claim.claimed || claim.touch?.kind !== 'initial') {
+    return { touchId: candidate.touch_id, claimed: false,
+      staleAuthority: claim.staleAuthority, terminal: claim.terminal,
+      conflict: claim.conflict, prepared: false, transmission: null };
+  }
+  try {
+    const authority = await loadAuthority({ opportunityId: candidate.opportunity_id,
+      storage, now: instant() });
+    const recipients = authority.recipientOptions?.filter((item) =>
+      item.email === candidate.recipient_address) || [];
+    const recipient = recipients.length === 1 ? recipients[0] : null;
+    const fingerprint = recipient && recipientFingerprint(candidate.opportunity_id, recipient);
+    if (authority.submission?.id !== candidate.crm_submission_id
+      || authority.preparationBlockers?.length || !recipient
+      || !fingerprint || fingerprint !== candidate.campaign_recipient_fingerprint
+      || fingerprint !== candidate.conversation_recipient_fingerprint) {
+      return { touchId: candidate.touch_id, claimed: true,
+        prepared: false, staleAuthority: true, transmission: null };
+    }
+    const payload = proposal(candidate, authority, recipient, config);
+    const result = await storage.prepareCimTransmission({
+      touchIds: [candidate.touch_id], claimTokenDigest,
+      expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),
+      expectedConversationTerminalRevision: Number(candidate.conversation_terminal_revision),
+      preparationGeneration: preparationGeneration(candidate), ...payload, actor,
+      now: instant().toISOString(),
+    });
+    return { touchId: candidate.touch_id, prepared: result.prepared,
+      existing: result.existing, payloadConflict: result.payloadConflict,
+      terminal: result.terminal, transmissionId: result.transmission?.id ?? null,
+      transmission: result.transmission ?? null };
+  } catch (error) {
+    return { touchId: candidate.touch_id, claimed: true,
+      prepared: false, constructionFailed: true, reason: error.message, transmission: null };
+  }
+}
+
 export async function runDueCimInitialPreparations({ storage, now, clock, limit = 25,
   actor = 'pursue-cim-initial-preparer', loadAuthority = loadBrokerMaterialsAuthority,
   configOverride } = {}) {
@@ -153,54 +219,9 @@ export async function runDueCimInitialPreparations({ storage, now, clock, limit 
   const outcomes = [];
   for (const candidate of candidates) {
     if (candidate.kind !== 'initial') throw new Error('Non-initial CIM touch reached Package 5');
-    const rawClaimToken = randomBytes(32).toString('hex');
-    const claimTokenDigest = createHash('sha256').update(rawClaimToken).digest('hex');
-    const claimAt = instant();
-    const claim = await storage.claimDueCimTouch({
-      touchId: candidate.touch_id,
-      expectedRowVersion: Number(candidate.row_version),
-      expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),
-      expectedConversationTerminalRevision: Number(candidate.conversation_terminal_revision),
-      claimTokenDigest, claimOwner: actor,
-      claimExpiresAt: new Date(claimAt.getTime() + leaseMilliseconds).toISOString(),
-      now: claimAt.toISOString(),
-    });
-    if (!claim.claimed || claim.touch?.kind !== 'initial') {
-      outcomes.push({ touchId: candidate.touch_id, claimed: false,
-        staleAuthority: claim.staleAuthority, terminal: claim.terminal,
-        conflict: claim.conflict, prepared: false });
-      continue;
-    }
-    try {
-      const authority = await loadAuthority({ opportunityId: candidate.opportunity_id,
-        storage, now: instant() });
-      const recipients = authority.recipientOptions?.filter((item) =>
-        item.email === candidate.recipient_address) || [];
-      const recipient = recipients.length === 1 ? recipients[0] : null;
-      const fingerprint = recipient && recipientFingerprint(candidate.opportunity_id, recipient);
-      if (authority.submission?.id !== candidate.crm_submission_id
-        || authority.preparationBlockers?.length || !recipient
-        || !fingerprint || fingerprint !== candidate.campaign_recipient_fingerprint
-        || fingerprint !== candidate.conversation_recipient_fingerprint) {
-        outcomes.push({ touchId: candidate.touch_id, claimed: true,
-          prepared: false, staleAuthority: true });
-        continue;
-      }
-      const payload = proposal(candidate, authority, recipient, config);
-      const result = await storage.prepareCimTransmission({
-        touchIds: [candidate.touch_id], claimTokenDigest,
-        expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),
-        expectedConversationTerminalRevision: Number(candidate.conversation_terminal_revision),
-        preparationGeneration: preparationGeneration(candidate), ...payload, actor,
-        now: instant().toISOString(),
-      });
-      outcomes.push({ touchId: candidate.touch_id, prepared: result.prepared,
-        existing: result.existing, payloadConflict: result.payloadConflict,
-        terminal: result.terminal, transmissionId: result.transmission?.id ?? null });
-    } catch (error) {
-      outcomes.push({ touchId: candidate.touch_id, claimed: true,
-        prepared: false, constructionFailed: true, reason: error.message });
-    }
+    const { transmission: _transmission, ...outcome } = await prepareDueCimInitialTouch({ storage, candidate,
+      clock: instant, actor, loadAuthority, configOverride: config });
+    outcomes.push(outcome);
   }
   return outcomes;
 }

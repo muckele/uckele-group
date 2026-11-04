@@ -7,6 +7,7 @@
 import { getStorage } from '../storage/index.js';
 import { runAutoPursue } from './autoPursue.js';
 import { refreshOpportunityScores } from './dealHunterScoreStore.js';
+import { reevaluateWaitingPursuitEnrollments } from './pursueCimSender.js';
 
 const sheetErrorMaxLength = 300;
 
@@ -80,6 +81,7 @@ export async function runDealHunterSheetSync({
   triggeredBy = 'scheduler',
   refresh = refreshOpportunityScores,
   autoPursue = runAutoPursue,
+  reevaluate = reevaluateWaitingPursuitEnrollments,
   clock = () => Date.now(),
 } = {}) {
   const startedAt = clock();
@@ -147,6 +149,19 @@ export async function runDealHunterSheetSync({
     };
   } catch (error) {
     result.autoPursue = { error: boundedError(error) || 'Automatic Pursue threw.' };
+  }
+
+  // Fresh sheets can make a waiting enrollment eligible under the current contact rule and
+  // contact options (spec 2026-11-03 §5.5). A failure here never fails the sync.
+  try {
+    const counts = await reevaluate({ storage, now });
+    result.waitingEnrollments = {
+      enrolled: Math.max(0, Math.trunc(Number(counts?.enrolled) || 0)),
+      stillWaiting: Math.max(0, Math.trunc(Number(counts?.stillWaiting) || 0)),
+      actionRequired: Math.max(0, Math.trunc(Number(counts?.actionRequired) || 0)),
+    };
+  } catch (error) {
+    result.waitingEnrollments = { error: boundedError(error) || 'Re-evaluation threw.' };
   }
   return result;
 }

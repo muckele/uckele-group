@@ -202,7 +202,7 @@ test('lists only due scheduled follow-up touches of active campaigns', async (t)
   assert.deepEqual(await storage.listDueCimFollowUpTouches({ now }), []);
 });
 
-test('excludes initial, claimed, cancelled, and terminal-campaign touches', async (t) => {
+test('excludes initial, live-claimed, cancelled, and terminal-campaign touches; lists a lapsed claim', async (t) => {
   const { storage, database, seed } = await listingStore(t);
   const due = seed('due');
   seed('initial', { followUp: false });
@@ -235,8 +235,13 @@ test('excludes initial, claimed, cancelled, and terminal-campaign touches', asyn
     database.prepare('UPDATE deal_hunter_broker_conversations SET state = ? WHERE id = ?')
       .run(conversationState, ids.conversationId);
   }
-  assert.deepEqual((await storage.listDueCimFollowUpTouches({ now: wallNow() }))
-    .map((candidate) => candidate.touch_id), [due.touchId]);
+  // A lapsed claim with no transmission is listed again (Ruling L): its claimer died before
+  // preparing, and claimDueCimTouch takes it over.
+  const listed = await storage.listDueCimFollowUpTouches({ now: wallNow() });
+  assert.deepEqual(listed.map((candidate) => candidate.touch_id),
+    [due.touchId, lapsedClaim.touchId]);
+  assert.equal(listed[1].state, 'claimed');
+  assert.equal(listed[1].preparation_generation, 1);
 });
 
 test('payload marks the last follow-up before expiry as Final', async (t) => {

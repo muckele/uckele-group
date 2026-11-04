@@ -547,6 +547,11 @@ export function getConfig() {
         retryUntil: '12:00',
         checkIntervalMs: 60_000,
       },
+      // The 15-minute Pursue sender (spec 2026-11-03 §5.1). Ships off.
+      pursueSender: {
+        enabled: process.env.DEAL_HUNTER_PURSUE_SENDER_ENABLED === 'true',
+        intervalMinutes: 15,
+      },
       cimFollowUp: {
         enabled: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED, false),
         checkIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS, 1000 * 60 * 60),

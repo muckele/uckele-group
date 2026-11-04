@@ -1784,7 +1784,11 @@ export function createPursueCimSqliteTransitions(database, {
           WHERE transmission_id = ? AND writer_path = ?
             AND consumed_at IS NULL AND withdrawn_at IS NULL
         `).get(transmissionId, writerPath);
-        if (current) return outcome({ blockedReason: 'authorization_exists' }, current);
+        // An expired authorization that was never used can no longer authorize anything; it
+        // is retired below (once this issue is otherwise valid) instead of blocking forever.
+        if (current && Date.parse(current.expires_at) > Date.parse(now)) {
+          return outcome({ blockedReason: 'authorization_exists' }, current);
+        }
         const activation = currentActivationChain(database, capability, now);
         if (!activation || activation.id !== activationId
           || activation.provider_profile !== providerProfile) {
@@ -1809,6 +1813,15 @@ export function createPursueCimSqliteTransitions(database, {
           || (member.kind === 'initial' && capability !== 'fl04b-initial')
           || (member.kind !== 'initial' && capability === 'fl04b-initial'))) {
           return outcome({ blockedReason: 'recipient_authority_changed' });
+        }
+        if (current) {
+          database.prepare(`UPDATE deal_hunter_cim_live_provider_authorizations
+            SET withdrawn_at = ? WHERE id = ? AND consumed_at IS NULL AND withdrawn_at IS NULL`)
+            .run(now, current.id);
+          appendAudit(database, { eventType: 'authorization-expired', authorityId: current.id,
+            transmissionId, activationId: current.activation_id, authorizationId: current.id,
+            priorState: 'issued', nextState: 'withdrawn', reasonCode: 'authorization_expired',
+            actor, occurredAt: now });
         }
         database.prepare(`
           INSERT INTO deal_hunter_cim_live_provider_authorizations (
@@ -3200,9 +3213,11 @@ export function createPursueCimSqliteTransitions(database, {
       `).all(at, at, at, limit);
     },
     /**
-     * Scheduled follow-up touches that are due, of open conversations whose campaign is in
+     * Follow-up touches that are due, of open conversations whose campaign is in
      * active-follow-up and not past its expiry, while the fl04c-followup chain is current and
-     * active. Claimed touches are never listed (a lapsed claim is renewed, not re-listed).
+     * active. A touch is listed while scheduled, or claimed under a lapsed claim with no
+     * transmission (its claimer died before preparing; Ruling L). A lapsed claim that holds a
+     * prepared transmission is renewed instead (listLapsedCimPreparedTouches).
      */
     async listDueCimFollowUpTouches({ now, limit = 25 } = {}) {
       const at = canonicalInstant(now);
@@ -3232,12 +3247,14 @@ export function createPursueCimSqliteTransitions(database, {
           AND c.policy_version = 'deal-hunter-cim-autopilot-v1'
           AND c.state = 'active-follow-up' AND v.state = 'open'
           AND t.opportunity_id = c.opportunity_id
-          AND t.state = 'scheduled' AND t.transmission_id IS NULL
+          AND t.transmission_id IS NULL
+          AND (t.state = 'scheduled' OR (t.state = 'claimed'
+            AND t.claim_expires_at IS NOT NULL AND t.claim_expires_at <= ?))
           AND t.due_at <= ? AND c.local_expiry_at IS NOT NULL AND c.local_expiry_at > ?
           AND t.timezone_revision = c.timezone_revision
         ORDER BY t.due_at, t.id
         LIMIT ?
-      `).all(activation.id, at, at, limit);
+      `).all(activation.id, at, at, at, limit);
     },
     /**
      * The durable authority a follow-up is prepared under: its touch, campaign, conversation,
@@ -3300,6 +3317,161 @@ export function createPursueCimSqliteTransitions(database, {
       };
       return { touch, campaign, conversation, opportunity, crmOwnership, crmSubmission, timezone,
         activation, initial, signals };
+    },
+    /** The current capability activations, at most one per capability. */
+    async listCurrentCimCapabilityActivations() {
+      return database.prepare(`SELECT * FROM deal_hunter_cim_capability_activations
+        WHERE status = 'current' ORDER BY capability, id`).all();
+    },
+    /**
+     * Campaigns still initial-pending or in active-follow-up whose local expiry has passed:
+     * the day-28 expiry sweep's work (spec §5.4).
+     */
+    async listExpiredCimCampaigns({ now, limit = 100 } = {}) {
+      const at = canonicalInstant(now);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+        throw new Error('Invalid expired campaign limit');
+      }
+      return database.prepare(`
+        SELECT id, opportunity_id, conversation_id, state, terminal_revision, row_version,
+          local_expiry_at
+        FROM deal_hunter_cim_campaigns
+        WHERE state IN ('initial-pending', 'active-follow-up')
+          AND local_expiry_at IS NOT NULL AND local_expiry_at <= ?
+        ORDER BY local_expiry_at, id
+        LIMIT ?
+      `).all(at, limit);
+    },
+    /**
+     * Provider-pending transmissions whose provider seam was entered at or before
+     * `enteredBefore` and that still have no provider outcome: a send that may or may not have
+     * reached the provider before its process stopped (Review Focus 3).
+     */
+    async listCimProviderPendingTransmissions({ enteredBefore, limit = 50 } = {}) {
+      const before = canonicalInstant(enteredBefore);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid provider-pending limit');
+      }
+      return database.prepare(`
+        SELECT * FROM deal_hunter_cim_transmissions
+        WHERE state = 'provider-pending' AND provider_seam_entered_at IS NOT NULL
+          AND provider_seam_entered_at <= ? AND provider_message_id IS NULL
+        ORDER BY provider_seam_entered_at, id
+        LIMIT ?
+      `).all(before, limit);
+    },
+    /**
+     * Touches whose claim lapsed while they held a prepared transmission that never reached the
+     * final gate's provider-pending step (Ruling L): an initial is renewed with
+     * renewLapsedCimInitialClaim, a follow-up with renewReservedCimFollowUp. A transmission that
+     * is provider-pending, ambiguous or accepted is never listed.
+     */
+    async listLapsedCimPreparedTouches({ now, limit = 25 } = {}) {
+      const at = canonicalInstant(now);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid lapsed touch limit');
+      }
+      return database.prepare(`
+        SELECT t.id AS touch_id, t.kind, t.campaign_id, t.opportunity_id, t.row_version,
+          t.claim_expires_at, t.transmission_id, tr.preparation_generation,
+          c.conversation_id, c.recipient_fingerprint, c.state AS campaign_state
+        FROM deal_hunter_cim_campaign_touches AS t
+        JOIN deal_hunter_cim_transmission_touches AS m
+          ON m.touch_id = t.id AND m.transmission_id = t.transmission_id AND m.cancelled_at IS NULL
+        JOIN deal_hunter_cim_transmissions AS tr ON tr.id = t.transmission_id
+        JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
+        JOIN deal_hunter_broker_conversations AS v ON v.id = c.conversation_id
+        WHERE t.state = 'claimed' AND t.claim_expires_at IS NOT NULL AND t.claim_expires_at <= ?
+          AND tr.state = 'prepared' AND tr.invocation_authority_count = 0
+          AND tr.provider_seam_entered_at IS NULL
+          AND c.state IN ('initial-pending', 'active-follow-up') AND v.state = 'open'
+          AND (c.local_expiry_at IS NULL OR c.local_expiry_at > ?)
+          AND t.opportunity_id = c.opportunity_id
+          AND t.timezone_revision = c.timezone_revision
+        ORDER BY t.claim_expires_at, t.id
+        LIMIT ?
+      `).all(at, at, limit);
+    },
+    /**
+     * Renews the lapsed claim of an initial touch that holds a prepared, never-authorized
+     * transmission, keeping that transmission (Ruling L). The new claim is at most five minutes
+     * long. Replaying the same renewal returns `existing`.
+     */
+    async renewLapsedCimInitialClaim(command) {
+      const touchId = requiredText(command.touchId, 'touchId');
+      const transmissionId = requiredText(command.transmissionId, 'transmissionId');
+      const expectedRowVersion = requiredRevision(command.expectedRowVersion, 'expectedRowVersion');
+      const claimTokenDigest = requiredText(command.claimTokenDigest, 'claimTokenDigest', 64);
+      if (!/^[0-9a-f]{64}$/.test(claimTokenDigest)) throw new Error('Invalid claim token digest');
+      const claimOwner = requiredText(command.claimOwner, 'claimOwner', 200);
+      const claimExpiresAt = canonicalInstant(command.claimExpiresAt);
+      const actor = requiredText(command.actor, 'actor', 200);
+      const now = canonicalInstant(command.now);
+      const outcome = (flags = {}, transmission = null, touch = null) => ({ renewed: false,
+        existing: false, terminal: false, blockedReason: null, ...flags, transmission, touch });
+      return database.transaction(() => {
+        const touch = database.prepare('SELECT * FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+          .get(touchId);
+        const transmission = database.prepare('SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?')
+          .get(transmissionId);
+        const campaign = touch && database.prepare('SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?')
+          .get(touch.campaign_id);
+        const conversation = campaign && database.prepare(`SELECT *
+          FROM deal_hunter_broker_conversations WHERE id = ?`).get(campaign.conversation_id);
+        const membership = touch && database.prepare(`SELECT 1
+          FROM deal_hunter_cim_transmission_touches WHERE touch_id = ? AND transmission_id = ?
+            AND cancelled_at IS NULL`).get(touchId, transmissionId);
+        const unchanged = Boolean(touch && transmission && campaign && conversation && membership)
+          && touch.kind === 'initial' && touch.logical_slot === 'initial' && touch.ordinal === 0
+          && touch.state === 'claimed' && touch.transmission_id === transmission.id
+          && touch.opportunity_id === campaign.opportunity_id
+          && touch.timezone_revision === campaign.timezone_revision
+          && transmission.state === 'prepared' && transmission.invocation_authority_count === 0
+          && !transmission.provider_seam_entered_at && !transmission.boundary_nonce_digest
+          && transmission.conversation_id === conversation.id
+          && campaign.state === 'initial-pending' && campaign.generation === 1
+          && campaign.policy_version === 'deal-hunter-cim-autopilot-v1'
+          && conversation.state === 'open'
+          && (!campaign.local_expiry_at || campaign.local_expiry_at > now)
+          && Boolean(currentActivationChain(database, 'fl04b-initial', now));
+        if (unchanged && touch.claim_token_digest === claimTokenDigest
+          && touch.claim_owner === claimOwner && touch.claim_expires_at === claimExpiresAt
+          && touch.claim_expires_at > now) {
+          return outcome({ existing: true }, transmission, touch);
+        }
+        if (!unchanged || touch.row_version !== expectedRowVersion
+          || !touch.claim_expires_at || touch.claim_expires_at > now
+          || claimExpiresAt <= now
+          || Date.parse(claimExpiresAt) > Date.parse(now) + 5 * 60 * 1000) {
+          return outcome({ terminal: true, blockedReason: 'renewal_authority_changed' },
+            transmission ?? null, touch ?? null);
+        }
+        const updated = database.prepare(`UPDATE deal_hunter_cim_campaign_touches SET
+          claim_token_digest = ?, claim_owner = ?, claimed_at = ?, claim_expires_at = ?,
+          row_version = row_version + 1, updated_at = ?
+          WHERE id = ? AND row_version = ? AND transmission_id = ? AND state = 'claimed'`)
+          .run(claimTokenDigest, claimOwner, now, claimExpiresAt, now, touchId,
+            expectedRowVersion, transmissionId);
+        if (updated.changes !== 1) throw new Error('Initial claim renewal lost touch authority');
+        appendAudit(database, { eventType: 'touch-claim-renewed',
+          authorityId: `${touchId}:${expectedRowVersion + 1}`, opportunityId: touch.opportunity_id,
+          campaignId: campaign.id, conversationId: conversation.id, touchId, transmissionId,
+          priorState: 'claimed', nextState: 'claimed', reasonCode: 'lapsed_claim', actor,
+          occurredAt: now });
+        return outcome({ renewed: true }, transmission, database.prepare(`SELECT *
+          FROM deal_hunter_cim_campaign_touches WHERE id = ?`).get(touchId));
+      }).immediate();
+    },
+    /** Waiting enrollments and their decisions, for re-evaluation after a Sheet sync (§5.5). */
+    async listWaitingPursuitEnrollments({ limit = 100 } = {}) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
+        throw new Error('Invalid waiting enrollment limit');
+      }
+      const enrollments = database.prepare(`SELECT * FROM deal_hunter_pursuit_enrollments
+        WHERE state = 'waiting-on-eligibility' ORDER BY updated_at, id LIMIT ?`).all(limit);
+      return enrollments.map((enrollment) => ({ enrollment,
+        decision: database.prepare(`SELECT * FROM deal_hunter_owner_decision_events WHERE id = ?`)
+          .get(enrollment.decision_event_id) ?? null }));
     },
     async recordCimCapabilityActivation(command) {
       const id = requiredText(command.id, 'id');
