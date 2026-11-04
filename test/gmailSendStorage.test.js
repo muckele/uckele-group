@@ -152,10 +152,49 @@ test('checkpoint compare-and-set rejects a stale expected value', async (t) => {
   await assert.rejects(storage.updateGmailHistoryCheckpoint({ expected: '1500', next: 'x', now: later }),
     /historyCheckpoint/);
 
-  await storage.saveGmailConnection(connection({ historyCheckpoint: null, now: later }));
+  // A different mailbox starts from its own checkpoint (here none).
+  await storage.saveGmailConnection(connection({ emailAddress: 'other@uckele.test', historyCheckpoint: null,
+    now: later }));
   assert.equal((await storage.getGmailConnection()).history_checkpoint, null);
   assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: null, next: '42', now: later }), true);
   assert.equal((await storage.getGmailConnection()).history_checkpoint, '42');
+});
+
+test('reconnecting the same mailbox carries the previous checkpoint forward (Ruling U)', async (t) => {
+  const { storage } = openStorage(t);
+  const t1 = '2026-11-03T17:00:00.000Z';
+  const t2 = '2026-11-03T18:00:00.000Z';
+  const t3 = '2026-11-03T19:00:00.000Z';
+  const t4 = '2026-11-03T20:00:00.000Z';
+  await storage.saveGmailConnection(connection({ historyCheckpoint: '1000' }));
+  assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '1000', next: '1500', now: later }), true);
+
+  // Reconnect while connected: the same address (any case) keeps the poller's checkpoint, not
+  // Google's current historyId, so nothing that arrived since the last poll is skipped.
+  const again = await storage.saveGmailConnection(connection({ emailAddress: 'Owner@Uckele.TEST',
+    historyCheckpoint: '9000', now: later }));
+  assert.equal(again.history_checkpoint, '1500');
+  assert.equal(again.email_address, 'Owner@Uckele.TEST');
+
+  // Disconnect, then reconnect the same mailbox: the revoked row's checkpoint carries forward.
+  await storage.revokeGmailConnection({ revokedBy: 'owner', now: t1 });
+  const back = await storage.saveGmailConnection(connection({ historyCheckpoint: '9100', now: t1 }));
+  assert.equal(back.history_checkpoint, '1500');
+
+  // A different mailbox starts from its own checkpoint, and so does the next switch back.
+  const other = await storage.saveGmailConnection(connection({ emailAddress: 'other@uckele.test',
+    historyCheckpoint: '9200', now: t2 }));
+  assert.equal(other.history_checkpoint, '9200');
+  const switched = await storage.saveGmailConnection(connection({ historyCheckpoint: '9300', now: t3 }));
+  assert.equal(switched.history_checkpoint, '9300');
+
+  // A previous checkpoint of none carries forward as none (the poller then reads whole threads).
+  assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '9300', next: '9400', now: t3 }), true);
+  await storage.saveGmailConnection(connection({ emailAddress: 'other@uckele.test', historyCheckpoint: null,
+    now: t3 }));
+  const none = await storage.saveGmailConnection(connection({ emailAddress: 'other@uckele.test',
+    historyCheckpoint: '9500', now: t4 }));
+  assert.equal(none.history_checkpoint, null);
 });
 
 test('send control set is revisioned, audited, and rejects a stale revision with send_control_conflict', async (t) => {

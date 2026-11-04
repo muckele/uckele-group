@@ -25,6 +25,7 @@ import { AUTO_PURSUE_CONFIRMATIONS, runAutoPursue, setAutoPursueMode } from '../
 import { setCimOutreachPaused } from '../../server/services/cimOpportunityIdentity.js';
 import { recordAcquisitionOwnerCommand } from '../../server/services/dealHunterTriage.js';
 import { createFakeCimProvider } from '../../server/services/fakeCimProvider.js';
+import { buildGmailConnectUrl, completeGmailConnect, disconnectGmail } from '../../server/services/gmailConnection.js';
 import { runPursueCimReplyPoll } from '../../server/services/pursueCimReplyPoller.js';
 import { readPursueCimProviderReadiness } from '../../server/services/pursueCimReadiness.js';
 import { runPursueCimSender } from '../../server/services/pursueCimSender.js';
@@ -547,6 +548,75 @@ async function liveSendingOffAndOn(t, createBackend) {
   assert.deepEqual(await world.scheduled(campaign), [['follow-up-3', pacific('2030-01-15', '08:00')]]);
 }
 
+/**
+ * Google's OAuth endpoints for the owner's Connect Gmail and Disconnect clicks: the token
+ * exchange grants both scopes and the profile reports the fake mailbox's current historyId,
+ * as Google's profile does.
+ */
+function fakeGoogle(world) {
+  return async (url) => {
+    let body = {};
+    if (url.startsWith('https://oauth2.googleapis.com/token')) {
+      body = { access_token: 'e2e-access', refresh_token: 'e2e-refresh', scope: SCOPES.join(' ') };
+    } else if (url.endsWith('/users/me/profile')) {
+      const { nextCheckpoint } = await world.mailProvider.listThreadChanges({ checkpoint: '0', threadIds: [] });
+      body = { emailAddress: SENDER, historyId: nextCheckpoint };
+    }
+    return { ok: true, json: async () => body };
+  };
+}
+
+function connectConfig(world) {
+  const config = world.config;
+  return { ...config, dealHunter: { ...config.dealHunter,
+    gmail: { ...config.dealHunter.gmail, tokenKey: Buffer.alloc(32, 7).toString('base64') } } };
+}
+
+/** A broker reply that arrives while Gmail is disconnected is applied after the owner reconnects. */
+async function reconnectKeepsReplies(t, createBackend) {
+  const world = await createWorld(t, createBackend, { start: START });
+  const campaign = await autoPursuedAndSent(world);
+  const config = connectConfig(world);
+  const fetcher = fakeGoogle(world);
+
+  // The owner clicks Disconnect; the mailbox reads as not connected until they reconnect.
+  world.clock.set(pacific('2030-01-07', '10:00'));
+  await disconnectGmail({ storage: world.storage, config, actor: OWNER, now: world.clock.peek(), fetcher });
+  world.mailProvider.setReadinessReasons(['gmail_not_connected']);
+
+  // The broker replies during the gap; the poller cannot read the mailbox.
+  world.clock.set(pacific('2030-01-07', '11:00'));
+  await brokerReplies(world, campaign, { body: 'Happy to help. NDA attached.' });
+  const gap = await pollAt(world, pacific('2030-01-07', '11:05'));
+  assert.equal(gap.stoppedFor, 'gmail_not_connected', JSON.stringify(gap));
+
+  // Follow-up 1 falls due while disconnected: nothing is sent.
+  const due = await sendAt(world, pacific('2030-01-09', '08:00'));
+  assert.equal(due.stoppedFor, 'not_ready', JSON.stringify(due));
+  assert.equal(world.mailProvider.sent.length, 1);
+
+  // The owner reconnects the same mailbox. Google's current historyId is already past the reply.
+  world.clock.set(pacific('2030-01-09', '09:00'));
+  const { state } = buildGmailConnectUrl({ config, actor: OWNER, now: world.clock.peek() });
+  await completeGmailConnect({ storage: world.storage, config, code: 'e2e-code', state, actor: OWNER,
+    now: world.clock.peek(), fetcher });
+  world.mailProvider.setReadinessReasons([]);
+  assert.deepEqual((await world.readiness()).reasons, []);
+
+  // The next poll still reads the reply and stops the campaign before any follow-up.
+  const poll = await pollAt(world, pacific('2030-01-09', '09:05'));
+  assert.equal(poll.responded, 1, JSON.stringify(poll));
+  const stopped = await world.campaignFor('opp-auto');
+  assert.deepEqual([stopped.state, stopped.reason_code], ['responded', 'reply_received']);
+  assert.deepEqual(await world.scheduled(stopped), []);
+  for (const at of [pacific('2030-01-09', '09:10'), pacific('2030-01-11', '08:00')]) {
+    const later = await sendAt(world, at);
+    assert.deepEqual([later.sentInitial, later.sentFollowUps], [0, 0], JSON.stringify(later));
+  }
+  assert.equal(world.mailProvider.sent.length, 1);
+  assert.equal(world.mailProvider.attempts.length, 1);
+}
+
 /** The scenarios by their spec test names, each `(t, createBackend) => Promise`. */
 export const END_TO_END_SCENARIOS = Object.freeze([
   ['90+ deal → auto-Pursue active → initial sent in window → 2 follow-ups → broker reply → campaign responded, no more sends',
@@ -557,4 +627,6 @@ export const END_TO_END_SCENARIOS = Object.freeze([
     stopSuppressesBroker],
   ['wording change after approval pauses sending until re-approved', wordingChangePauses],
   ['Live sending off mid-campaign stops the next follow-up; on again resumes it', liveSendingOffAndOn],
+  ['a reply that arrives while Gmail is disconnected stops the campaign after reconnect, with no follow-up sent',
+    reconnectKeepsReplies],
 ]);

@@ -279,6 +279,8 @@ test('PostgreSQL Gmail connection, send controls, threads and gmail provider out
     const second = await storage.saveGmailConnection(connection({ historyCheckpoint: '2000',
       connectedBy: 'owner-again', now: later }));
     assert.notEqual(second.id, first.id);
+    // Reconnecting the same mailbox keeps the previous reply checkpoint (Ruling U).
+    assert.equal(second.history_checkpoint, '1000');
     assert.deepEqual(await storage.getGmailConnection(), second);
     assert.equal(psql(container, database, `select string_agg(id || ':' || coalesce(revoked_by, '-'), ','
       order by connected_at) from public.deal_hunter_gmail_connections;`),
@@ -293,9 +295,9 @@ test('PostgreSQL Gmail connection, send controls, threads and gmail provider out
     /uq_deal_hunter_gmail_connections_active/);
 
     // checkpoint compare-and-set rejects a stale expected value
-    assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '1999', next: '2500', now: later }), false);
-    assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '2000', next: '2500', now: later }), true);
-    assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '2000', next: '2600', now: later }), false);
+    assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '999', next: '2500', now: later }), false);
+    assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '1000', next: '2500', now: later }), true);
+    assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '1000', next: '2600', now: later }), false);
     assert.equal((await storage.getGmailConnection()).history_checkpoint, '2500');
 
     // revoke clears the active connection
@@ -312,6 +314,24 @@ test('PostgreSQL Gmail connection, send controls, threads and gmail provider out
     assert.equal(await storage.revokeGmailConnection({ revokedBy: 'owner', now: later }), null);
     assert.equal(await storage.recordGmailTokenCheck({ ok: true, now: later }), null);
     assert.equal(await storage.updateGmailHistoryCheckpoint({ expected: '2500', next: '2700', now: later }), false);
+
+    // reconnecting the same mailbox carries the previous checkpoint forward (Ruling U)
+    const reconnectAt = (hour) => `2026-11-03T${hour}:00:00.000Z`;
+    const back = await storage.saveGmailConnection(connection({ emailAddress: 'Owner@Uckele.TEST',
+      historyCheckpoint: '9100', now: reconnectAt(18) }));
+    assert.deepEqual([back.email_address, back.history_checkpoint], ['Owner@Uckele.TEST', '2500']);
+    const other = await storage.saveGmailConnection(connection({ emailAddress: 'other@uckele.test',
+      historyCheckpoint: null, now: reconnectAt(19) }));
+    assert.equal(other.history_checkpoint, null);
+    const otherAgain = await storage.saveGmailConnection(connection({ emailAddress: 'other@uckele.test',
+      historyCheckpoint: '9200', now: reconnectAt(20) }));
+    assert.equal(otherAgain.history_checkpoint, null, 'a previous checkpoint of none carries as none');
+    const switched = await storage.saveGmailConnection(connection({ historyCheckpoint: '9300',
+      now: reconnectAt(21) }));
+    assert.equal(switched.history_checkpoint, '9300');
+    assert.equal((await storage.revokeGmailConnection({ revokedBy: 'owner', now: reconnectAt(22) })).id,
+      switched.id);
+    assert.equal(await storage.getGmailConnection(), null);
 
     // send control set is revisioned, audited, and rejects a stale revision with send_control_conflict
     const off = { enabled: false, valueDigest: null, policyVersion: null, changedAt: null,

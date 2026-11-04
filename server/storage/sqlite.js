@@ -11123,11 +11123,23 @@ ${cimCapacityConsumeTriggerSql}
         `).get());
       },
 
-      /** Stores a new active connection, revoking any prior active row in the same transaction. */
+      /**
+       * Stores a new active connection, revoking any prior active row in the same transaction.
+       * Reconnecting the previous connection's mailbox (same address, any case) keeps that
+       * connection's reply checkpoint instead of Google's current historyId, so a reply that
+       * arrived while it was disconnected is still read (Ruling U).
+       */
       async saveGmailConnection(command = {}) {
         const connection = validateSaveGmailConnection(command);
         const id = randomUUID();
         return database.transaction(() => {
+          const previous = database.prepare(`
+            SELECT email_address, history_checkpoint FROM deal_hunter_gmail_connections
+            ORDER BY (revoked_at IS NULL) DESC, connected_at DESC, revoked_at DESC, id DESC LIMIT 1
+          `).get();
+          const historyCheckpoint = previous && String(previous.email_address).trim().toLowerCase()
+            === connection.emailAddress.trim().toLowerCase()
+            ? previous.history_checkpoint ?? null : connection.historyCheckpoint;
           database.prepare(`
             UPDATE deal_hunter_gmail_connections SET revoked_at = ?, revoked_by = ?
             WHERE revoked_at IS NULL
@@ -11139,7 +11151,7 @@ ${cimCapacityConsumeTriggerSql}
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
           `).run(id, connection.emailAddress, connection.refreshTokenCiphertext,
             JSON.stringify(connection.grantedScopes), connection.now, connection.connectedBy,
-            connection.historyCheckpoint);
+            historyCheckpoint);
           return normalizeGmailConnectionRow(database.prepare(`
             SELECT * FROM deal_hunter_gmail_connections WHERE id = ?
           `).get(id));

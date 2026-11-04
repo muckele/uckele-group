@@ -21063,6 +21063,9 @@ create index if not exists idx_deal_hunter_broker_conversations_gmail_thread
 
 -- Stores a new active connection and revokes any prior active row in one transaction.
 -- The instant check takes the CIM writer lock, so connection writes are serialized.
+-- Reconnecting the previous connection's mailbox (same address, any case) keeps that
+-- connection's reply checkpoint instead of Google's current historyId, so a reply that arrived
+-- while it was disconnected is still read (Ruling U).
 create or replace function public.deal_hunter_gmail_save_connection_v1(p_command jsonb)
 returns jsonb
 language plpgsql
@@ -21076,6 +21079,7 @@ declare
   v_ciphertext text := public.pursue_cim_required_text_v1(p_command, 'refreshTokenCiphertext', 8192);
   v_connected_by text := public.pursue_cim_required_text_v1(p_command, 'connectedBy', 200);
   v_checkpoint text := p_command ->> 'historyCheckpoint';
+  v_previous public.deal_hunter_gmail_connections%rowtype;
   v_row public.deal_hunter_gmail_connections%rowtype;
 begin
   if pg_catalog.jsonb_typeof(p_command -> 'grantedScopes') is distinct from 'array'
@@ -21089,6 +21093,14 @@ begin
     or (v_checkpoint is not null and v_checkpoint !~ '^[0-9]{1,30}$')
   then
     raise exception 'Invalid Gmail connection';
+  end if;
+  select * into v_previous from public.deal_hunter_gmail_connections
+    order by (revoked_at is null) desc, connected_at desc, revoked_at desc nulls last, id desc
+    limit 1
+    for update;
+  if found and pg_catalog.lower(pg_catalog.btrim(v_previous.email_address))
+    = pg_catalog.lower(pg_catalog.btrim(v_email)) then
+    v_checkpoint := v_previous.history_checkpoint;
   end if;
   update public.deal_hunter_gmail_connections
     set revoked_at = v_now, revoked_by = v_connected_by
