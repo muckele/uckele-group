@@ -835,6 +835,33 @@ test('GET /api/admin/deal-hunter/pursuing', async (t) => {
       assert.deepEqual(vaultLitter(), []);
     });
 
+    await t.test('no address for the synthetic request is 409 no_crm_record before the body, with no file and no cleanup job', async () => {
+      const { receivePursuitSimUpload } = await import('../server/services/pursuedDealsSimUpload.js');
+      const config = getConfig();
+      // The CRM record has no email, Gmail is not connected, and no sender address is configured.
+      const noAddress = storageWith(storage, {
+        getSubmission: async (id) => ({ ...(await storage.getSubmission(id)), email: '' }),
+        getGmailConnection: async () => null,
+      });
+      const noSender = { ...config, dealHunter: { ...config.dealHunter,
+        gmail: { ...config.dealHunter.gmail, senderAddress: '' } } };
+      let bodyRead = false;
+      const request = new Readable({ read() { bodyRead = true; this.push(pdfBytes); this.push(null); } });
+      const documents = documentCount();
+      const events = simEvents();
+      const jobs = database.prepare('SELECT COUNT(*) AS n FROM secure_document_cleanup_jobs').get().n;
+      const result = await receivePursuitSimUpload({ storage: noAddress, config: noSender, request,
+        opportunityId: 'opp-sim', actor: 'admin', role: 'admin',
+        headers: { idempotencyKey: randomUUID(), fileName: 'No-address.pdf', contentLength: pdfBytes.length,
+          acknowledgedReplyId: null },
+        diskStats: async () => ({ bavail: 2 ** 30, bsize: 4096 }) });
+      assert.deepEqual([result.status, result.body], [409, { success: false, code: 'no_crm_record',
+        error: 'This deal has no CRM record yet, so a SIM can\'t be stored.' }]);
+      assert.equal(bodyRead, false);
+      assert.equal(database.prepare('SELECT COUNT(*) AS n FROM secure_document_cleanup_jobs').get().n, jobs);
+      assert.deepEqual([documentCount(), simEvents(), vaultLitter()], [documents, events, []]);
+    });
+
     await t.test('an upload during a backup leaves both consistent', async () => {
       world.clock.set(new Date(Date.now() + 60_000).toISOString());
       const backup = createBackupBundle({ storage, config: getConfig() });

@@ -150,7 +150,8 @@ function diskReserveBytes(config) {
   return Math.max(MIN_FREE_BYTES_AFTER_UPLOAD, 2 * databaseBytes);
 }
 
-// The synthetic request's address: the CRM record's, else the owner's mailbox.
+// The synthetic request's address: the CRM record's, else the owner's mailbox; '' when there is
+// neither, which the caller refuses before reading the body.
 async function requestEmailFor({ storage, config, submissionId }) {
   const submission = await storage.getSubmission(submissionId);
   if (submission?.email) return String(submission.email);
@@ -216,7 +217,9 @@ export async function receivePursuitSimUpload({ storage, config, request, opport
     if (error instanceof CrmSubmissionSupersededError) return simUploadRefusal('crm_superseded');
     throw error;
   }
+  // The synthetic request needs an address; without one the intake could never commit.
   const email = await requestEmailFor({ storage, config, submissionId });
+  if (!email) return simUploadRefusal('no_crm_record');
 
   const storageDir = path.resolve(config.secureDocuments.storageDir);
   await fsp.mkdir(storageDir, { recursive: true, mode: 0o700 });
