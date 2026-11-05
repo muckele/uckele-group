@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
+import { findCanonicalOpportunityMergeApprovalForException } from '../repairs/canonicalOpportunityMerge.js';
 import { matchDealNarrative } from './dealHunterSemanticMatcher.js';
 import { getStorage } from '../storage/index.js';
 import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
@@ -40,6 +41,7 @@ import {
   evaluateCimRecipientPolicy,
   getCimOutreachPauseStatus,
   logicalCimTouchesForRecipient,
+  identityExceptionAliasOwners,
   recordCimSafetyMetric,
   resolveDealHunterOpportunity,
   resolveDealHunterOpportunityReadOnly,
@@ -7986,6 +7988,7 @@ async function buildDailyDealReview({
     assertCimOutreachAllowed({ storage }),
     storage.listDealHunterIdentityExceptions?.({ statuses: ['open'], limit: 100 }) || [],
   ]);
+  const identityExceptionOwners = await identityExceptionAliasOwners(identityExceptions, storage);
   const baseScoredDeals = attachCimRequestStatus(
     attachDealHunterDispositions(scoredDealsWithHistory, dispositions),
     cimRequests,
@@ -8115,6 +8118,18 @@ async function buildDailyDealReview({
       reason: item.reason,
       evidenceVersion: item.evidence_version,
       comparisons: item.metadata?.comparisons || [],
+      // Two deals own this listing's aliases right now (the same live check the resolve route
+      // uses): link and keep-distinct both refuse, and only the reviewed merge can resolve it.
+      mergeRequired: (identityExceptionOwners.get(item.id) || []).length > 1,
+      ...(() => {
+        const merge = findCanonicalOpportunityMergeApprovalForException(item.id);
+        return {
+          mergeIncident: merge?.incident || '',
+          mergeSurvivorId: merge?.survivorId || '',
+          mergeSupersededId: merge?.supersededId || '',
+          mergeReason: merge?.approvedResolutionReason || '',
+        };
+      })(),
     })),
   };
 

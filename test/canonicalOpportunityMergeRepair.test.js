@@ -802,6 +802,11 @@ test('Garage dry run accepts and inventories the exact production-shaped preserv
   assert.deepEqual(first.plan.resolutionSafety.aliasDerivedExpectedOwnerIds, [garageSupersededId, garageSurvivorId]);
   assert.equal(second.planChecksum, first.planChecksum);
   assert.deepEqual(second.plan.preservedIncidentState, first.plan.preservedIncidentState);
+  assert.deepEqual(Object.keys(first.plan).sort(), [...historicalPlanKeys, 'preservedIncidentState'].sort());
+  assert.deepEqual(Object.keys(first.plan.preservedIncidentState).sort(), [
+    'historicalIdentityEvidence', 'opportunityScores', 'scoreEvidence', 'sourceObservations',
+  ]);
+  assert.deepEqual(Object.keys(first.plan.authorityGrantingOperationalState), ['stage2Activations']);
 });
 
 test('Garage apply moves one alias and preserves observations, scores, evidence, history, and forbidden tables byte-for-byte', async (t) => {
@@ -860,6 +865,7 @@ test('Garage apply moves one alias and preserves observations, scores, evidence,
   assert.deepEqual(identityException.candidate_opportunity_ids, []);
   assert.equal(identityException.metadata.canonicalOpportunityMerge.survivorId, garageSurvivorId);
   assert.equal(identityException.metadata.canonicalOpportunityMerge.supersededId, garageSupersededId);
+  assert.equal(Object.hasOwn(identityException.metadata, 'resolvedOpportunityId'), false);
   const manifests = (await fixture.storage.listDealHunterCimRepairManifests({ limit: 100 }))
     .filter(({ mode }) => mode === CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE);
   assert.equal(manifests.length, 1);
@@ -2677,6 +2683,13 @@ test('standalone apply verifies backup evidence before writable storage startup'
   assert.deepEqual(fs.readdirSync(directory).sort(), beforeFiles);
 });
 
+const historicalPlanKeys = [
+  'actor', 'aliasMoves', 'approvalSchema', 'approvalTuple', 'authorityGrantingOperationalState',
+  'dependentState', 'globalAliasOwnership', 'identityException', 'manifest', 'mutation',
+  'observedAliases', 'opportunities', 'planSchema', 'preservedOperationalState', 'reason',
+  'relationshipInventory', 'repairType', 'resolutionSafety',
+];
+
 test('dry run returns the exact deterministic plan and writes nothing', async (t) => {
   const { storage } = repairStorage(t);
   await seedApprovedRepair(storage);
@@ -2711,6 +2724,10 @@ test('dry run returns the exact deterministic plan and writes nothing', async (t
     supersededId,
   ]);
   assert.equal(Object.values(first.plan.dependentState.counts).every((count) => count === 0), true);
+  // Historical approvals keep their reviewed plan shape: no pair-scoped preservation or authority keys.
+  assert.deepEqual(Object.keys(first.plan).sort(), historicalPlanKeys);
+  assert.deepEqual(Object.keys(first.plan.authorityGrantingOperationalState), ['stage2Activations']);
+  assert.equal(first.changes.deletes, 0);
   assert.deepEqual(await repairState(storage), before);
 });
 
@@ -3192,7 +3209,7 @@ test('relationship inventory checksum is deterministic over the complete presenc
   const second = canonicalOpportunityMergeRelationshipInventorySummary();
   assert.deepEqual(first, second);
   assert.equal(first.entryCount, 328);
-  assert.equal(first.checksum, 'e7f5fdee7462f1c5a65fe6e667b09aa93936f81a89731ffdadb79b83bcc2af1d');
+  assert.equal(first.checksum, '024ae57efda4abe6f53c341601f76f13b6177cd4a485ed45fc5dcf87dcb0d4a8');
   assert.equal(
     first.checksum,
     createHash('sha256')

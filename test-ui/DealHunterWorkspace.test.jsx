@@ -212,6 +212,66 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     );
   });
 
+  test('routes a listing owned by two deals to the merge instead of offering buttons that fail', () => {
+    const onResolveIdentityException = vi.fn();
+    const crossListed = {
+      id: '0cfa01f1-exception',
+      observedName: 'Precision Carbon & Graphite Manufacturer',
+      observedRecipient: 'broker@example.test',
+      candidateOpportunityIds: [],
+      reason: 'conflicting-canonical-aliases',
+      evidenceVersion: 'cim-opportunity-v1',
+      comparisons: [],
+      mergeRequired: true,
+      mergeIncident: 'precision-carbon-2026-11-02',
+      mergeSurvivorId: 'opp_8cc53064-survivor',
+      mergeSupersededId: 'opp_910e6860-duplicate',
+      mergeReason: 'Owner confirmed these are the same business.',
+    };
+    const unprepared = {
+      ...crossListed,
+      id: 'legal-tech-exception',
+      observedName: 'Established Legal Tech Firm',
+      mergeIncident: '',
+      mergeSurvivorId: '',
+      mergeSupersededId: '',
+    };
+    const ambiguous = {
+      ...crossListed,
+      id: 'ambiguous-exception',
+      observedName: 'Recurring HVAC Services',
+      candidateOpportunityIds: ['opp_existing'],
+      reason: 'ambiguous-similarity',
+      mergeRequired: false,
+      mergeIncident: '',
+      mergeSurvivorId: '',
+      mergeSupersededId: '',
+    };
+    render(
+      <DealHunterWorkspace
+        feedback={{ error: '', message: '' }}
+        onResolveIdentityException={onResolveIdentityException}
+        onReview={vi.fn()}
+        review={{ ...reviewWithDeal({ eligible: false }), identityExceptions: [crossListed, unprepared, ambiguous] }}
+      />,
+    );
+
+    const panel = screen.getByRole('region', { name: 'CIM identity exceptions' });
+    const [carbon, legal, hvac] = within(panel).getAllByRole('group');
+    expect(carbon).toHaveTextContent('Precision Carbon & Graphite Manufacturer');
+    expect(carbon).toHaveTextContent('Same business on two deals — needs a merge');
+    expect(carbon).toHaveTextContent(/Link and Keep distinct can.t fix this/);
+    expect(carbon).toHaveTextContent('It keeps opp_8cc53064-survivor and retires opp_910e6860-duplicate');
+    expect(carbon).toHaveTextContent('A reviewed merge is ready: precision-carbon-2026-11-02');
+    expect(carbon).toHaveTextContent("npm run cim:canonical-merge -- --incident precision-carbon-2026-11-02 --actor '<your name>' --reason 'Owner confirmed these are the same business.'");
+    expect(within(carbon).queryByRole('button')).not.toBeInTheDocument();
+    expect(legal).toHaveTextContent('No merge has been prepared for this listing yet');
+    expect(within(legal).queryByRole('button')).not.toBeInTheDocument();
+    expect(within(hvac).getByRole('button', { name: /Link to opp_existing/ })).toBeEnabled();
+    expect(within(hvac).getByRole('button', { name: 'Keep distinct' })).toBeEnabled();
+    expect(onResolveIdentityException).not.toHaveBeenCalled();
+  });
+
   test('shows post-import counts and only enables explicit CRM sync for eligible reviewed deals', () => {
     const onSyncHighFits = vi.fn();
     const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });

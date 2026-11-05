@@ -1,6 +1,8 @@
 import path from 'node:path';
 import {
   CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
+  assertApprovedResolutionReason,
+  describeCanonicalOpportunityMergeChanges,
   getCanonicalOpportunityMergeApproval,
 } from '../repairs/canonicalOpportunityMerge.js';
 import { verifyBackupBundle } from './backups.js';
@@ -98,6 +100,7 @@ export async function runCanonicalOpportunityMergeRepair({
   const normalizedReason = normalizedText(reason, 1000);
   if (!normalizedActor) throw new Error('Canonical opportunity merge requires an accountable actor.');
   if (normalizedReason.length < 20) throw new Error('Canonical opportunity merge requires a specific human reason.');
+  assertApprovedResolutionReason(approval, normalizedReason);
   if (apply) {
     const requiredConfirmation = approval.confirmation || CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION;
     if (confirmation !== requiredConfirmation) {
@@ -170,6 +173,13 @@ export async function runCanonicalOpportunityMergeRepair({
       survivorId: approval.survivorId,
       supersededId: approval.supersededId,
     },
+    ...(inspected?.alreadyApplied ? {} : {
+      changes: describeCanonicalOpportunityMergeChanges({
+        plan: inspected.plan,
+        planChecksum: inspected.planChecksum,
+        manifestId: inspected.manifestId,
+      }),
+    }),
     ...inspected,
   };
 }

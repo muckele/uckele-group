@@ -9,6 +9,7 @@ import {
   buildCimOpportunityAliases,
   createCimRecipientOverride,
   getCimIdentityOperationsStatus,
+  identityExceptionAliasOwners,
   resolveDealHunterOpportunity,
   resolveCimIdentityException,
 } from '../server/services/cimOpportunityIdentity.js';
@@ -1738,4 +1739,90 @@ test('a previously created CIM override stops granting authority after its oppor
     recipientEmail: 'broker@example.test',
     nowIso: '2026-08-27T11:30:00.000Z',
   }), null);
+});
+
+for (const action of ['keep-distinct', 'link']) {
+  test(`manual ${action} on aliases owned by two deals routes the owner to the merge without mutating`, async (t) => {
+    const storage = sqliteStorage(t);
+    await seedOpportunity(storage, { opportunityId: 'opp-first-listing' });
+    await seedOpportunity(storage, { opportunityId: 'opp-second-listing' });
+    await seedAlias(storage, { aliasKey: 'listing-id:costar:2561135', opportunityId: 'opp-first-listing' });
+    await seedAlias(storage, { aliasKey: 'listing-id:dealstream:/d/carbon', opportunityId: 'opp-second-listing' });
+    const identityException = await storage.upsertDealHunterIdentityException({
+      id: `exception-two-owner-${action}`,
+      created_at: '2026-11-02T15:00:40.000Z',
+      updated_at: '2026-11-02T15:00:40.000Z',
+      status: 'open',
+      observed_deal_key: 'cross-listed-observation',
+      observed_name: 'Precision Carbon & Graphite Manufacturer',
+      observed_recipient: 'broker@example.test',
+      candidate_opportunity_ids: ['opp-first-listing', 'opp-second-listing'],
+      reason: 'conflicting-canonical-aliases',
+      evidence_version: 'cim-opportunity-v1',
+      resolved_at: null,
+      resolved_by: null,
+      resolution_reason: null,
+      metadata: { aliases: ['listing-id:costar:2561135', 'listing-id:dealstream:/d/carbon'] },
+    });
+    const opportunitiesBefore = await storage.listDealHunterOpportunities({ limit: 10 });
+
+    const result = await resolveCimIdentityException({
+      exceptionId: identityException.id,
+      action,
+      opportunityId: action === 'link' ? 'opp-first-listing' : '',
+      confirmed: true,
+      reason: 'Owner tried to resolve the cross-listed business from the review.',
+      actor: 'manual-two-owner-test',
+      storage,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 409);
+    assert.equal(result.code, 'IDENTITY_EXCEPTION_REQUIRES_MERGE');
+    assert.match(result.error, /two different deals/);
+    assert.match(result.error, /merge/i);
+    assert.deepEqual(result.aliasOwnerIds, ['opp-first-listing', 'opp-second-listing']);
+    assert.equal(result.mergeIncident, '');
+    assert.deepEqual(await storage.listDealHunterOpportunities({ limit: 10 }), opportunitiesBefore);
+    assert.deepEqual(
+      (await storage.listDealHunterIdentityExceptions({ limit: 10 })).find(({ id }) => id === identityException.id),
+      identityException,
+    );
+  });
+}
+
+test('a conflicting-aliases exception whose aliases now have one owner keeps its normal resolution path', async (t) => {
+  const storage = sqliteStorage(t);
+  await seedOpportunity(storage, { opportunityId: 'opp-single-owner' });
+  await seedAlias(storage, { aliasKey: 'listing-id:costar:777', opportunityId: 'opp-single-owner' });
+  const identityException = await storage.upsertDealHunterIdentityException({
+    id: 'exception-single-owner',
+    created_at: '2026-11-02T15:00:40.000Z',
+    updated_at: '2026-11-02T15:00:40.000Z',
+    status: 'open',
+    observed_deal_key: 'single-owner-observation',
+    observed_name: 'Single Owner Co',
+    observed_recipient: 'broker@example.test',
+    candidate_opportunity_ids: [],
+    reason: 'conflicting-canonical-aliases',
+    evidence_version: 'cim-opportunity-v1',
+    resolved_at: null,
+    resolved_by: null,
+    resolution_reason: null,
+    metadata: { aliases: ['listing-id:costar:777', 'listing-id:dealstream:/d/unowned'] },
+  });
+  const owners = await identityExceptionAliasOwners([identityException], storage);
+  assert.deepEqual(owners.get(identityException.id), ['opp-single-owner']);
+
+  const result = await resolveCimIdentityException({
+    exceptionId: identityException.id,
+    action: 'link',
+    opportunityId: 'opp-single-owner',
+    confirmed: true,
+    reason: 'Only one deal owns these aliases now; link the listing to it.',
+    actor: 'manual-single-owner-test',
+    storage,
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.code, undefined);
 });

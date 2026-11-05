@@ -19,9 +19,11 @@ The September 11 Garage Door approval is selected only with `--incident garage-d
 - superseded duplicate: `opp_a8289b2f-4be2-4a34-81d1-21b046b2f615`
 - alias move: only `fingerprint-v1:a4088c416937e7a58de28ca885e22500be3234a556d7a808281bf4c4ddc50454`
 
+The November 2 Precision Carbon approval is selected only with `--incident precision-carbon-2026-11-02`; it does not accept tuple overrides. Its full runbook is in [Precision Carbon incident (pair-scoped)](#precision-carbon-incident-pair-scoped) below.
+
 The command refuses every other incident or tuple. Each checked-in descriptor fixes the complete expected alias keys, values, and owners; the Garage approval also fixes every deterministic alias row ID. A missing, added, changed, duplicated, or third-party-owned alias refuses both dry run and apply.
 
-The Garage approval is the sole exception to the historical zero-dependency precondition. It permits exactly 49 loser observations, 168 survivor observations, 45 colliding observation keys, one survivor score, 12 survivor score-evidence rows, and three matching seen-history rows. The plan records full-row deterministic digests for each preserved owner set and for seen history. Those rows remain attached to their existing owners and receive no writes. All CRM, CIM, operator-fact, disposition, communication, email, source-health, and scheduled-job relationship categories remain exact-zero blockers.
+The Garage approval was the first exception to the historical zero-dependency precondition; the pair-scoped Precision Carbon approval below is the second. It permits exactly 49 loser observations, 168 survivor observations, 45 colliding observation keys, one survivor score, 12 survivor score-evidence rows, and three matching seen-history rows. The plan records full-row deterministic digests for each preserved owner set and for seen history. Those rows remain attached to their existing owners and receive no writes. All CRM, CIM, operator-fact, disposition, communication, email, source-health, and scheduled-job relationship categories remain exact-zero blockers.
 
 This tool is SQLite-only. It refuses every other active storage provider before backup verification or repair execution. The service requires explicitly supplied storage and never starts ordinary application storage implicitly. Do not adapt this command to a remote provider during an incident.
 
@@ -71,7 +73,7 @@ Stop if the approved evidence is incomplete or the intended decision differs in 
 
 ### Production-derived legacy relationship schema contract
 
-The v1 relationship inventory contains 231 entries. Its reviewed classification counts are 91 blocking entity dependencies, 51 relationships redundant through a scanned parent, 54 preserved global/recipient operational fields, and 35 explicit exclusions. Enforcement counts are 186 material scanner paths, 10 independent gates, 11 approval preconditions, and 24 explicit exclusions. The current inventory checksum is `64e4e3376bca92e17a33f9f7ac5b1ccdd0f5954478d3eaf54f546723e52a404e`.
+The v1 relationship inventory contains 328 entries. Its reviewed classification counts are 166 blocking entity dependencies, 68 relationships redundant through a scanned parent, 54 preserved global/recipient operational fields, and 40 explicit exclusions. Enforcement counts are 278 material scanner paths, 10 independent gates, 12 approval preconditions, and 28 explicit exclusions. The current inventory checksum is `024ae57efda4abe6f53c341601f76f13b6177cd4a485ed45fc5dcf87dcb0d4a8`.
 
 Historical SQLite installations can retain three relationship-bearing tables that a fresh current schema does not create. Their seven relationship-like columns use the same inventory and enforcement machinery as every current-schema entry:
 
@@ -263,3 +265,113 @@ Stop and escalate for independent investigation if any of these occurs:
 - post-apply resolver, manifest, or final-state audit fails.
 
 Do not repair those conditions by weakening this tool, editing production state by hand, or adding generic reparenting during the incident.
+
+## Precision Carbon incident (pair-scoped)
+
+Identity exception `0cfa01f1fb4666903281f0c8d2b2da00027b307446a266c5adba7e0192343f56` (`conflicting-canonical-aliases`, opened 2026-11-02): "Precision Carbon & Graphite Manufacturer" is listed on BizBuySell (Alameda, CA, listing 2561135) and DealStream (Hayward, CA). The app created one deal per listing on 2026-10-31. Since 2026-11-02 the Sheet presents both listings as one row, and that row's aliases belong to both deals. The owner confirmed it is one business.
+
+### Survivor rule
+
+The checked-in descriptor keeps the earliest-created deal and retires the later one:
+
+- **Kept:** `opp_8cc53064-bf61-4d2f-9862-2694c2773e0e` (BizBuySell, created 15:00:32.916Z).
+- **Retired:** `opp_910e6860-deea-4e3d-bcf2-20c6e0a0fc92` (DealStream, 15:00:38.304Z).
+
+Neither deal has owner review, Pursue, CIM campaign, CRM, or operator state that would favor the later row. Keeping the earliest row keeps the deal's first-discovery time, discovery evidence, and digest history continuous. Here it is also the deal that holds the broker recipient, the BizBuySell listing id, and the fingerprint alias; the DealStream deal has no recipient. The rule is recorded as `survivorRule: 'earliest-created'` in the descriptor and re-checked against both deals' `created_at` on every run.
+
+The descriptor values come from the owner-approved read-only production capture of 2026-11-05:
+
+- exact ids, plus 5 survivor aliases and 4 duplicate aliases with deterministic ids;
+- per-deal identity facts;
+- 1 score per deal, with 12 and 13 evidence rows;
+- 22 and 17 source observations;
+- 5 bound freshness rows per deal, plus 40 deferred rows at capture time;
+- 2 pending safety events, 2 audit rows, and 1 baseline CRM revision per deal;
+- zero global sending authority;
+- an exception candidate list of `[]`, the same shape Garage had.
+
+The two listings were written up separately, so recipient, description, and location equality are not required. Each deal's facts are pinned exactly instead, and a recipient appearing on the duplicate later refuses.
+
+### What is different about this approval
+
+The descriptor declares `dependentPolicy: 'pair-scoped-preservation-v1'`. The HVAC and Garage approvals are unchanged and keep their historical behavior.
+
+- **Pursue CIM authority is scanned for this pair only.** Historical approvals refuse on any row anywhere in the Pursue CIM tables. That is no longer workable now that Pursue runs for other deals. This approval refuses on every row tied to the pair, whether directly or through its campaigns, conversations, and transmissions. That covers decisions, enrollments, timezone revisions, stage events, campaigns, touches, transmissions, reservations, terminal events, live authorizations, Gmail reply messages, and claims (`opportunityClaims`, `recipientClaims`).
+- **Global sending authority still refuses.** Dry run and apply stop if any of these exist:
+  - a current CIM capability activation in a mode other than off or shadow;
+  - an unexpired, unconsumed, unwithdrawn live-provider authorization;
+  - a current automatic-Pursue activation in a mode other than off or shadow;
+  - the `live_sending` send control switched on.
+
+  The plan records these as `authorityGrantingOperationalState.pursueCimAuthority`, and every count must be zero.
+- **Preserved in place, never written.** Each category is pinned by exact count per deal plus a full-row SHA-256 digest:
+  - both score rows and their score evidence (1 score and 12–13 evidence rows per deal);
+  - pending, unconsumed, outcome-free CIM safety events;
+  - their `safety-emitted` audit rows that carry no campaign, conversation, touch, transmission, activation, or authorization link;
+  - the null-owner revision-1 CRM ownership baselines;
+  - source observations, seen history, and freshness evidence.
+
+  Any other safety, audit, or ownership row for the pair refuses: consumed or non-pending safety events, transition audit rows, and nonbaseline ownership revisions. Audit rows also count as the pair's when their campaign, conversation, touch, transmission, or authorization belongs to the pair, or when their metadata names either deal.
+
+  Safety events are *payload*-immutable. The CIM safety consumer can later set their status, for example to no-op. A status change between dry run and apply changes the digest, and apply refuses. The superseded deal's score row is safe to leave. Every Inbox, triage, digest, disposition, and current-score read joins `deal_hunter_opportunities.status = 'active'`, and the next eligibility reconciliation clears its `current_triage_eligible` flag.
+- **Some preservation-only counts are pinned by the reviewed plan.** Three counts are pinned in the reviewed plan, not in source: deferred freshness evidence, the source-observation collision count, and seen history. These rows are never written, and the plan pins them by digest. Every blocking category stays an exact count in source.
+- **Deferred freshness evidence is pinned by the reviewed plan.** While the exception is open, every daily Sheet run defers this business's freshness evidence to the exception: the rows have a null current deal and carry the exception id. That count therefore grows daily, and the descriptor leaves it to the plan (`unboundCount: null`). The dry-run plan records the exact count and digest. The plan checksum binds apply to that review, and apply re-reads both inside its transaction. **A daily Sheet run between dry run and apply makes the checksum stale, and apply refuses.** In that case, rerun the dry run and have the owner review it again.
+- **Checked-in guard rails.** At module load, every descriptor passes a structural check:
+  - a plan-pinned `null` count is allowed only on a pair-scoped approval, and only for the three preservation-only counts above;
+  - a pair-scoped approval must pin every preserved category, carry its own confirmation and a shell-safe approved reason, and record its survivor rule;
+  - the survivor rule is re-checked against both deals' `created_at` on every dry run and apply.
+- **Exact resolution reason.** The exception is resolved with the owner-approved reason checked into the descriptor (`approvedResolutionReason`). Any other `--reason` refuses. For pair-scoped approvals only, the resolution also writes `resolvedOpportunityId: <survivor>`, the same key a manual link writes. That gives the merge the same freshness semantics as a link: if a listing's earliest accepted evidence was deferred to this exception, the next accepted Sheet run binds that first discovery to the survivor. Both Precision Carbon listings were accepted before the exception opened, so their deferred rows simply stay attached to the resolved exception as history. A test covers this on the production-shaped fixture.
+- **The dry run prints every change.** Output field `changes.writes` lists every write the apply would make:
+  - the alias owner reassignments, with alias keys;
+  - the duplicate's status change from `active` to `superseded`;
+  - the exception resolution, with actor, reason, and `resolvedOpportunityId`;
+  - the manifest insert.
+
+  `changes.deletes` is `0`. `changes.unchanged.preservedWithoutWrites` lists each preserved category's per-deal counts.
+
+### Production runbook
+
+Every step that touches production needs the owner's explicit OK, asked for one step at a time. The pull request does not authorize any of them. Run commands on the `uckele-group` Fly app with Node 22.
+
+1. **Deploy** the reviewed release (owner OK).
+2. **Dry run** (read-only, owner OK). It copies a stable WAL snapshot to a private temporary directory and inspects only the copy. Run it after the day's 15:00Z Sheet run has finished:
+
+   ```bash
+   fly ssh console -a uckele-group -C "cd /app && npm run cim:canonical-merge -- --incident precision-carbon-2026-11-02 --actor '<owner name or email>' --reason 'Owner confirmed the BizBuySell (Alameda, CA, listing 2561135) and DealStream (Hayward, CA) Precision Carbon & Graphite Manufacturer listings are the same business listed on two sites; keep the earliest-created deal and retire the duplicate.'"
+   ```
+
+   The owner reviews `changes`, `planChecksum`, `plan.dependentState.counts`, `plan.preservedIncidentState`, and `plan.authorityGrantingOperationalState`. Any refusal or drift is a stop. Never edit the descriptor during the window.
+
+   The capture did not measure three counts, so the plan sets them and the owner checks each:
+   - `plan.preservedIncidentState.historicalIdentityEvidence`: the count and record ids, expected 0 or a few seen-history rows for these two listing URLs;
+   - `plan.preservedIncidentState.sourceObservations.collisionCount`;
+   - `plan.preservedIncidentState.freshnessEvidence.unbound.count`: 40 on 2026-11-05, plus 10 for each daily Sheet run since.
+
+   An unexpected value is a stop.
+3. **Pause CIM outreach** with the existing operations control (owner OK) and confirm the persisted pause.
+4. **Snapshot the volume** `vol_rnzyd1xde6oqq0kr` (owner OK) with `fly volumes snapshots create vol_rnzyd1xde6oqq0kr -a uckele-group`. Then create and verify the application backup the apply requires:
+
+   ```bash
+   fly ssh console -a uckele-group -C "cd /app && npm run backup:create"
+   fly ssh console -a uckele-group -C "cd /app && npm run backup:verify -- --bundle '<absolute-bundle-path>'"
+   ```
+
+5. **Apply** (owner OK, before the next 15:00Z Sheet run). Use the same actor and reason, the exact reviewed checksum, and the verified bundle path:
+
+   ```bash
+   fly ssh console -a uckele-group -C "cd /app && npm run cim:canonical-merge -- --incident precision-carbon-2026-11-02 --actor '<same actor>' --reason '<same approved reason>' --apply --expected-plan-checksum '<reviewed checksum>' --backup '<absolute-bundle-path>' --confirm 'MERGE opp_910e6860-deea-4e3d-bcf2-20c6e0a0fc92 INTO opp_8cc53064-bf61-4d2f-9862-2694c2773e0e FOR EXCEPTION 0cfa01f1fb4666903281f0c8d2b2da00027b307446a266c5adba7e0192343f56'"
+   ```
+
+   The exact confirmation phrase is:
+
+   ```text
+   MERGE opp_910e6860-deea-4e3d-bcf2-20c6e0a0fc92 INTO opp_8cc53064-bf61-4d2f-9862-2694c2773e0e FOR EXCEPTION 0cfa01f1fb4666903281f0c8d2b2da00027b307446a266c5adba7e0192343f56
+   ```
+6. **Post-apply check.** Immediately, and before the next Sheet run, rerun the step 2 dry run. This check only works inside that window. The next Sheet run writes new evidence for the survivor, and a later safety-consumer run marks the pending events no-op. Either changes the preserved rows, after which a replay correctly refuses to call itself idempotent. It must report `alreadyApplied: true` with no writes. In Deal Hunter's review, the Precision Carbon identity exception is gone, and only the survivor appears after the next scoring run.
+7. **Unpause outreach** only as a separate owner decision.
+
+If the dry run refuses because of authority that can send email, the owner decides whether to switch that authority off for the window. The merge tool never changes those switches.
+
+### Review UI
+
+Deal Hunter's identity-exception panel marks a `conflicting-canonical-aliases` exception as **Same business on two deals — needs a merge**. It shows no Link or Keep distinct buttons, because the resolve route refuses both while two deals own the listing's aliases. The route returns `409` with `code: 'IDENTITY_EXCEPTION_REQUIRES_MERGE'`, and no identity change is applied. The panel decides this from live alias ownership, with the same two-or-more-owners check the route uses, not from the stored reason. A `conflicting-canonical-aliases` exception whose aliases now have one owner or none keeps its normal buttons. When a checked-in descriptor covers the exception, the panel names the incident, shows which deal is kept and which is retired, and prints the full read-only dry-run command, including the approved reason. Otherwise it says no merge has been prepared yet. The app deliberately has no one-click merge button. The merge needs a reviewed dry run, a verified backup, and paused outreach, and none of that belongs behind a web button.
