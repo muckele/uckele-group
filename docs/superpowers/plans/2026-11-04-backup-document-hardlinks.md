@@ -265,8 +265,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   Gated Postgres is not affected; backups are SQLite-only (`backups.js:499-501`).
 
   The PR body states the rollout steps (spec §11 steps 1–2):
-  1. Measure `/data` first, with `df -h /data` and `du -sh /data/backups /data/secure-documents /data/uckele-group.sqlite`.
+  1. Measure `/data` first, with `df -h /data` and `du -sh /data/secure-documents /data/backups /data/uckele-group.sqlite` (`du` attributes shared inodes to the first path listed).
   2. Extend the volume if free space is under 1.5 GiB.
   3. After the deploy, run one backup and confirm `stat -c %h` on a vault file is greater than 1.
+  4. Before deploying, record `bundleCounts.legacy` from Operations — legacy v1 bundles are never pruned and stay full copies.
 
   Old copied bundles age out over the next 14 days.

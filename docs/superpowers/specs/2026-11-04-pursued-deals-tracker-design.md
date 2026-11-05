@@ -333,7 +333,7 @@ The daily backup copies every vault document into each bundle with `fs.copyFile`
   - deletion goes through trash staging, which unlinks only the vault's own name;
   - pruning a bundle (`backups.js:484-491`) unlinks only that bundle's name;
   - restore copies out of the bundle (`:801`);
-  - the size and mtime checks (`:407-412`) still hold;
+  - vault files are write-once at unique paths and the database row is committed after the write, so a file changing mid-backup is not reachable; if a copied file ever disagrees with its row, the bundle is degraded rather than failing or being deleted;
   - the `chmod 0600` (`:407`) lands on an inode that is already 0600.
 - *What we give up:* 14 days of independent document copies become one shared copy. If a vault file is damaged in place, every bundle's copy is damaged too. Recovery then depends on Fly volume snapshots (14-day retention), which were also the only protection against losing the volume.
 - *Effect:* a document then costs about 1×. This helps the existing broker upload path as well.
@@ -460,7 +460,8 @@ Run on Node 22, outside the Bash sandbox, because the UI suite hangs inside it.
 
 Steps:
 1. **Disk check, before deploying.**
-   - Run `fly ssh console -C "df -h /data"` and `du -sh /data/backups /data/secure-documents /data/uckele-group.sqlite`.
+   - Run `fly ssh console -C "df -h /data"` and `du -sh /data/secure-documents /data/backups /data/uckele-group.sqlite`.
+   - `du` attributes a shared inode to the first path listed, so listing the vault first shows documents at their true size and the bundles as only their database snapshots.
    - If free space is under 1.5 GiB, extend the volume first, for example `fly volumes extend <id> -s 8`.
    - Record the numbers in the PR.
 2. **Merge and deploy PR A, then PR B.** After PR A, run one backup and confirm a vault file's link count (`stat -c %h`) is greater than 1. For PR B, SQLite creates the table at boot. Supabase applies `20261105120000_pursuing_tracker.sql` first.
