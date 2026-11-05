@@ -287,12 +287,18 @@ test('fold: sort key is instant, then system before owner, then id', () => {
   assert.equal(byId.latestEventId, 'b');
 });
 
-test('fold: latestEventId is the last event by (createdAt, id), not the predecessor chain', () => {
-  const projection = foldPursuitStage(makeBundle({ events: [
+test('fold: latestEventId is the chain tip, even when created_at is not monotonic along the chain', () => {
+  // genesis -> z (10:00) -> m (09:00): m is the tip although z has the later created_at.
+  const chain = foldPursuitStage(makeBundle({ events: [
     ownerEvent('z', at('10:00'), { previousEventId: 'genesis' }),
-    ownerEvent('a', at('10:00'), { previousEventId: 'genesis' }),
     ownerEvent('m', at('09:00'), { previousEventId: 'z' })] }));
-  assert.equal(projection.latestEventId, 'z');
+  assert.equal(chain.latestEventId, 'm');
+  // Several unreferenced events: the tie-break is (createdAt, id).
+  const forked = foldPursuitStage(makeBundle({ events: [
+    ownerEvent('b', at('10:00'), { previousEventId: 'genesis' }),
+    ownerEvent('a', at('10:00'), { previousEventId: 'genesis' })] }));
+  assert.equal(forked.latestEventId, 'b');
+  assert.equal(foldPursuitStage(makeBundle()).latestEventId, 'genesis');
 });
 
 test('fold: a reply processed late with an older message_at still needs action', () => {

@@ -63,9 +63,14 @@ export function buildGmailThreadUrl({ threadId, address } = {}) {
   return `https://mail.google.com/mail/?authuser=${encodeURIComponent(address)}#all/${threadId}`;
 }
 
+// The chain tip, as storage computes it: among all events, those no other event names as its
+// predecessor, then the last by (createdAt, id). `created_at` is caller-supplied, so it is not
+// monotonic along the chain and cannot pick the tip on its own.
 function latestEventIdOf(events) {
+  const named = new Set(events.map((event) => event.previousEventId));
   let latest = null;
   for (const event of events) {
+    if (named.has(event.id)) continue;
     if (!latest || time(event.createdAt) > time(latest.createdAt)
       || (time(event.createdAt) === time(latest.createdAt) && compareText(event.id, latest.id) > 0)) {
       latest = event;
