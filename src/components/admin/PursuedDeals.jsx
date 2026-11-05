@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import PursuitReplyTypeControl from './PursuitReplyTypeControl.jsx';
 import {
-  PursuedDealsApiError, REFRESH_COPY, SAVE_FAILED_COPY, UPLOAD_INTERRUPTED_COPY, acknowledgeReply, createIdempotencyKeys,
+  PursuedDealsApiError, REFRESH_COPY, SAVE_FAILED_COPY, SIM_UPLOADED_COPY, SIM_UPLOADED_STOPPED_COPY,
+  UPLOAD_CHECKING_COPY, UPLOAD_INTERRUPTED_COPY, acknowledgeReply, createIdempotencyKeys,
   loadPursuedDeals, moveStage, stopSimRequests, uploadErrorCopy, uploadPursuedSim,
 } from './pursuedDealsApi.js';
 
@@ -103,9 +104,9 @@ function PursuedRow({ row, readOnly, onRowChange, onReload }) {
         keys.forget(row.opportunityId, signature);
         outcome = describe.api(failure);
       } else {
-        outcome = describe.network(describe.retried);
+        outcome = await describe.network();
       }
-      if (outcome.text) setMessage({ tone: 'error', text: outcome.text });
+      setMessage(outcome.text ? { tone: outcome.tone || 'error', text: outcome.text } : null);
       if (outcome.reload) onReload();
       return null;
     } finally {
@@ -150,18 +151,29 @@ function PursuedRow({ row, readOnly, onRowChange, onReload }) {
   async function upload(file) {
     const acknowledgedReplyId = attention?.replyId;
     const signature = JSON.stringify(['sim', file.name, file.size, file.lastModified, acknowledgedReplyId ?? null]);
+    const knownDocuments = new Set((row.simDocuments || []).map((document) => document.id));
     const result = await runWrite(signature,
       (idempotencyKey) => uploadPursuedSim({ opportunityId: row.opportunityId, file, idempotencyKey, acknowledgedReplyId }), {
         api: (failure) => ({ text: uploadErrorCopy(failure), reload: false }),
-        // A retry of an upload that may already have committed: the server can answer a replay and
-        // reset the connection, so look at the row instead of reporting a failure.
-        network: (retried) => (retried ? { text: '', reload: true } : { text: UPLOAD_INTERRUPTED_COPY, reload: false }),
-        retried: keysRef.current.has(row.opportunityId, signature),
+        // No answer came back, so the upload may or may not have committed. Read the deal again: a
+        // SIM that was not there when the owner started means it landed. If not, say so every time
+        // and keep the key, so the next attempt is a safe retry that replays if it did commit.
+        network: async () => {
+          setMessage({ tone: 'ok', text: UPLOAD_CHECKING_COPY });
+          const rows = await onReload();
+          const fresh = rows?.find((candidate) => candidate.opportunityId === row.opportunityId);
+          if (fresh?.simDocuments?.some((document) => !knownDocuments.has(document.id))) {
+            keysRef.current.forget(row.opportunityId, signature);
+            setUploadOpen(false);
+            return { text: SIM_UPLOADED_COPY, tone: 'ok' };
+          }
+          return { text: UPLOAD_INTERRUPTED_COPY };
+        },
       });
     if (!result) return;
     if (result.row) onRowChange(result.row);
     setUploadOpen(false);
-    setMessage({ tone: 'ok', text: result.stoppedFollowUps ? 'SIM uploaded. Follow-ups for this deal have stopped.' : 'SIM uploaded.' });
+    setMessage({ tone: 'ok', text: result.stoppedFollowUps ? SIM_UPLOADED_STOPPED_COPY : SIM_UPLOADED_COPY });
   }
 
   function handleRecorded({ kind, replyType, row: nextRow }) {
@@ -256,6 +268,7 @@ export default function PursuedDeals({ readOnly = false }) {
   const filterRef = useRef(null);
 
   // `requested` null is the first look: Needs your action if anything needs it, else All.
+  // Resolves to the rows read, or null when the read failed or was superseded.
   const load = useCallback(async (requested) => {
     generationRef.current += 1;
     const generation = generationRef.current;
@@ -269,12 +282,14 @@ export default function PursuedDeals({ readOnly = false }) {
         stage = ALL;
         result = await loadPursuedDeals(ALL);
       }
-      if (generation !== generationRef.current) return;
+      if (generation !== generationRef.current) return null;
       filterRef.current = stage;
       setFilter(stage);
       setData({ rows: result.rows || [], counts: result.counts, truncated: Boolean(result.truncated) });
+      return result.rows || [];
     } catch {
       if (generation === generationRef.current) setLoadFailed(true);
+      return null;
     } finally {
       if (generation === generationRef.current) setLoading(false);
     }

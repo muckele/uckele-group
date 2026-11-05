@@ -8,6 +8,9 @@ const SIM_PDF_MIME = 'application/pdf';
 export const REFRESH_COPY = 'This deal changed in another tab. We refreshed it — check the stage and try again.';
 export const SAVE_FAILED_COPY = 'That change couldn\'t be saved. Try again.';
 export const UPLOAD_INTERRUPTED_COPY = 'The upload was interrupted. Try again.';
+export const SIM_UPLOADED_COPY = 'SIM uploaded.';
+export const SIM_UPLOADED_STOPPED_COPY = 'SIM uploaded. Follow-ups for this deal have stopped.';
+export const UPLOAD_CHECKING_COPY = 'Checking whether the upload finished…';
 export const NOT_A_PDF_NAME_COPY = 'Only PDF files can be uploaded as a SIM.';
 
 // Spec §7.5: the owner-facing text for each upload refusal, keyed by the server's error code.

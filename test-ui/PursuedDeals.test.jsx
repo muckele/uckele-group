@@ -479,15 +479,31 @@ describe('Upload SIM', () => {
     expect(postsTo(fetchMock, '/sim')).toHaveLength(0);
   });
 
-  test('a retried upload that hits a network error reloads the row instead of failing hard', async () => {
-    let attempts = 0;
+  test('a network error whose reload shows the new SIM closes the panel with SIM uploaded.', async () => {
+    let posted = false;
+    const landed = dealRow({ latestEventId: 'evt-2',
+      simDocuments: [{ id: 'doc-1', name: 'sim.pdf', sizeBytes: 8, uploadedAt: '2026-11-04T12:00:00.000Z' }] });
+    const fetchMock = stubFetch({
+      [`GET ${LIST}`]: () => jsonResponse(page([posted ? landed : dealRow()], { needsAction: 0 })),
+      'POST /api/admin/deal-hunter/pursuing/opp-1/sim': () => {
+        posted = true; // The server committed, then the connection dropped.
+        throw new TypeError('Failed to fetch');
+      },
+    });
+    renderTab();
+
+    fireEvent.change(await openUpload(), { target: { files: [pdf()] } });
+    expect(await screen.findByText('SIM uploaded.')).toBeVisible();
+    expect(screen.queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+    expect(screen.queryByText('The upload was interrupted. Try again.')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /sim\.pdf/ })).toBeVisible();
+    expect(postsTo(fetchMock, '/sim')).toHaveLength(1);
+  });
+
+  test('a network error with no new SIM shows the interrupted copy on every attempt, under one key', async () => {
     const fetchMock = stubFetch({
       [`GET ${LIST}`]: () => jsonResponse(page([dealRow()], { needsAction: 0 })),
-      'POST /api/admin/deal-hunter/pursuing/opp-1/sim': () => {
-        attempts += 1;
-        if (attempts <= 2) throw new TypeError('Failed to fetch');
-        return jsonResponse({ success: true, row: dealRow() });
-      },
+      'POST /api/admin/deal-hunter/pursuing/opp-1/sim': () => { throw new TypeError('Failed to fetch'); },
     });
     renderTab();
 
@@ -495,12 +511,19 @@ describe('Upload SIM', () => {
     const file = pdf();
     fireEvent.change(input, { target: { files: [file] } });
     expect(await screen.findByText('The upload was interrupted. Try again.')).toBeVisible();
-    const firstKey = postsTo(fetchMock, '/sim')[0][1].headers['X-Idempotency-Key'];
 
     fireEvent.change(screen.getByLabelText('SIM file for Acme Plumbing'), { target: { files: [file] } });
-    await waitFor(() => expect(listCalls(fetchMock).length).toBeGreaterThan(2));
-    expect(postsTo(fetchMock, '/sim')[1][1].headers['X-Idempotency-Key']).toBe(firstKey);
-    expect(screen.queryByText('The upload was interrupted. Try again.')).not.toBeInTheDocument();
+    await waitFor(() => expect(postsTo(fetchMock, '/sim')).toHaveLength(2));
+    await waitFor(() => expect(screen.queryByText('Checking whether the upload finished…')).not.toBeInTheDocument());
+    expect(screen.getByText('The upload was interrupted. Try again.')).toBeVisible();
+    expect(screen.getByLabelText('SIM file for Acme Plumbing')).toBeVisible();
+
+    fireEvent.change(screen.getByLabelText('SIM file for Acme Plumbing'), { target: { files: [file] } });
+    await waitFor(() => expect(postsTo(fetchMock, '/sim')).toHaveLength(3));
+    expect(await screen.findByText('The upload was interrupted. Try again.')).toBeVisible();
+    const keys = postsTo(fetchMock, '/sim').map(([, options]) => options.headers['X-Idempotency-Key']);
+    expect(keys[0]).toMatch(UUID);
+    expect(new Set(keys).size).toBe(1);
   });
 });
 
