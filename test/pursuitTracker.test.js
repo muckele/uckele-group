@@ -301,6 +301,65 @@ test('fold: latestEventId is the chain tip, even when created_at is not monotoni
   assert.equal(foldPursuitStage(makeBundle()).latestEventId, 'genesis');
 });
 
+test('fold: owner events fold in chain order, not created_at order', () => {
+  // genesis -> e1 (stage-move to broker-replied, ...002Z) -> e2 (sim-intake, ...001Z): e2 came last.
+  const projection = foldPursuitStage(makeBundle({ events: [
+    ownerEvent('e1', '2026-11-02T10:00:00.002Z', { previousEventId: 'genesis', kind: 'stage-move',
+      stage: 'broker-replied' }),
+    ownerEvent('e2', '2026-11-02T10:00:00.001Z', { previousEventId: 'e1', kind: 'sim-intake',
+      fromStage: 'broker-replied', stage: 'cim-received', secureDocumentId: 'doc-1' })] }));
+  assert.equal(projection.stage, 'cim-received');
+  assert.equal(projection.stageSource, 'owner');
+  assert.equal(projection.stageSince, '2026-11-02T10:00:00.002Z');
+  assert.equal(projection.latestEventId, 'e2');
+});
+
+test('fold: a backward clock step across three owner events keeps chain order; evidence keeps its own instant', () => {
+  // genesis -> e1 (10:00) -> e2 (09:00) -> e3 (09:30). e2 and e3 fold at 10:00, after e1 and in
+  // that order; the reply at 09:15 folds at 09:15, before all three.
+  const projection = foldPursuitStage(makeBundle({
+    replies: [reply('R1', at('09:15'))],
+    events: [
+      ownerEvent('e3', at('09:30'), { previousEventId: 'e2', kind: 'stage-move', fromStage: 'loi-candidate',
+        stage: 'financial-review' }),
+      ownerEvent('e1', at('10:00'), { previousEventId: 'genesis', kind: 'stage-move', stage: 'nda-sent' }),
+      ownerEvent('e2', at('09:00'), { previousEventId: 'e1', kind: 'stage-move', fromStage: 'nda-sent',
+        stage: 'loi-candidate' }),
+    ],
+  }));
+  assert.equal(projection.stage, 'financial-review');
+  assert.equal(projection.stageSource, 'owner');
+  assert.equal(projection.stageSince, at('10:00'));
+  assert.equal(projection.latestEventId, 'e3');
+
+  // A document at 09:45 is evidence on its own instant, so the owner's later moves still win.
+  const withDocument = foldPursuitStage(makeBundle({
+    documents: [document('doc-1', at('09:45'))],
+    events: [
+      ownerEvent('e1', at('10:00'), { previousEventId: 'genesis', kind: 'stage-move', stage: 'nda-sent' }),
+      ownerEvent('e2', at('09:00'), { previousEventId: 'e1', kind: 'stage-move', fromStage: 'nda-sent',
+        stage: 'broker-replied' }),
+    ],
+  }));
+  assert.equal(withDocument.stage, 'broker-replied');
+});
+
+test('fold: the pre-pursue cutoff uses the effective instant along the chain', () => {
+  // Second pursue at 08:00. e1 (09:00) is after it; e2 chained after e1 carries a 07:00 created_at
+  // from a clock step, but its effective instant is 09:00, so it is kept.
+  const projection = foldPursuitStage(makeBundle({
+    decisions: [{ id: 'd1', action: 'pursue', createdAt: T0 }, { id: 'd2', action: 'watch', createdAt: at('06:00') },
+      { id: 'd3', action: 'pursue', createdAt: at('08:00') }],
+    events: [
+      ownerEvent('e1', at('09:00'), { previousEventId: 'genesis', kind: 'stage-move', stage: 'nda-sent' }),
+      ownerEvent('e2', at('07:00'), { previousEventId: 'e1', kind: 'stage-move', fromStage: 'nda-sent',
+        stage: 'loi-candidate' }),
+    ],
+  }));
+  assert.equal(projection.stage, 'loi-candidate');
+  assert.equal(projection.stageSince, at('09:00'));
+});
+
 test('fold: a reply processed late with an older message_at still needs action', () => {
   const projection = foldPursuitStage(makeBundle({
     replies: [reply('R1', at('10:00'), 'reply', at('09:50')), reply('R0', at('10:05'), 'reply', at('09:00'))],

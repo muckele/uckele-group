@@ -79,6 +79,38 @@ function latestEventIdOf(events) {
   return latest ? latest.id : PURSUIT_GENESIS;
 }
 
+// Owner events in chain order, each with its effective instant. The chain is walked from
+// 'genesis' through each event's predecessor (storage keeps it linear). `created_at` is
+// caller-supplied and may step backward along the chain, so an event's effective instant is the
+// later of its own and its predecessor's. Events the walk cannot reach (no predecessor recorded,
+// or a fork storage never writes) follow in (createdAt, id) order.
+function ownerEventsInChainOrder(events) {
+  const successors = new Map();
+  for (const event of events) {
+    const list = successors.get(event.previousEventId) ?? [];
+    list.push(event);
+    successors.set(event.previousEventId, list);
+  }
+  const ordered = [];
+  const reached = new Set();
+  for (let next = successors.get(PURSUIT_GENESIS); next?.length === 1 && !reached.has(next[0].id);
+    next = successors.get(next[0].id)) {
+    reached.add(next[0].id);
+    ordered.push(next[0]);
+  }
+  ordered.push(...events.filter((event) => !reached.has(event.id))
+    .sort((a, b) => (time(a.createdAt) - time(b.createdAt)) || compareText(a.id, b.id)));
+
+  let floor = -Infinity;
+  return ordered.map((event, position) => {
+    const own = time(event.createdAt);
+    if (Number.isNaN(own)) return { event, at: own, instant: event.createdAt, position };
+    const at = Math.max(own, floor);
+    floor = at;
+    return { event, at, instant: at === own ? event.createdAt : new Date(at).toISOString(), position };
+  });
+}
+
 // (processedAt, gmailMessageId) ordering for attention and acknowledgement.
 function compareReplyPoints(aAt, aId, bAt, bId) {
   return (time(aAt) - time(bAt)) || compareText(aId, bId);
@@ -130,12 +162,15 @@ export function foldPursuitStage(bundle) {
     items.push({ at, instant: new Date(at).toISOString(), owner: 0, id,
       apply: (state, instant) => forward(state, stage, instant) });
   }
-  const ownerEvents = events.filter((event) => time(event.createdAt) >= startAt);
-  for (const event of ownerEvents) {
-    items.push({ at: time(event.createdAt), instant: event.createdAt, owner: 1, id: event.id,
-      apply: (state, instant) => applyOwnerEvent(state, event, instant) });
+  // Owner events fold on their effective instants; among themselves, in chain order.
+  const ownerEntries = ownerEventsInChainOrder(events).filter((entry) => entry.at >= startAt);
+  for (const { event, at, instant, position } of ownerEntries) {
+    items.push({ at, instant, owner: 1, id: event.id, position,
+      apply: (state, applyAt) => applyOwnerEvent(state, event, applyAt) });
   }
-  items.sort((a, b) => (a.at - b.at) || (a.owner - b.owner) || compareText(a.id, b.id));
+  items.sort((a, b) => (a.at - b.at) || (a.owner - b.owner)
+    || (a.owner ? a.position - b.position : compareText(a.id, b.id)));
+  const ownerEvents = ownerEntries.map((entry) => entry.event);
 
   const state = { stage: 'cim-requested', stageSince: pursue.createdAt, stageSource: 'evidence' };
   for (const item of items) item.apply(state, item.instant);
