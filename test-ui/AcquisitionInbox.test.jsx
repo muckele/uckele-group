@@ -3252,7 +3252,7 @@ describe('Broker replies in Needs Your Action', () => {
       const url = String(input);
       if (options.method === 'POST' && url.startsWith(PURSUING)) {
         const handler = writes[url.slice(PURSUING.length)];
-        return handler ? handler(JSON.parse(options.body)) : jsonResponse({ success: false, error: 'Unexpected' }, { ok: false, status: 404 });
+        return handler ? handler(typeof options.body === 'string' ? JSON.parse(options.body) : options.body) : jsonResponse({ success: false, error: 'Unexpected' }, { ok: false, status: 404 });
       }
       if (url.startsWith(PURSUING)) return typeof pursuing === 'function' ? pursuing(url) : pursuing;
       if (url.includes('/auto-pursue')) return jsonResponse({ error: 'nope' }, { ok: false, status: 503 });
@@ -3303,19 +3303,77 @@ describe('Broker replies in Needs Your Action', () => {
     expect(within(block).getByText('Acme Plumbing')).toBeVisible();
   });
 
-  test('recording SIM received points to the Pursued deals tab instead of opening an upload', async () => {
-    const after = pursuedRow({ stage: 'cim-received', stageLabel: 'SIM received', latestEventId: 'evt-2', needsAction: null });
-    stubInboxWithPursuing({
-      pursuing: jsonResponse(pursuingPage([pursuedRow()])),
-      writes: { '/pursued-1/reply-type': () => jsonResponse({ success: true, row: after }) },
-    });
-    renderInbox({ initialView: 'inbox' });
+  describe('SIM received opens the upload panel', () => {
+    const simReceivedRow = () => pursuedRow({ stage: 'cim-received', stageLabel: 'SIM received', latestEventId: 'evt-2', needsAction: null });
+    const pdf = (name = 'sim.pdf') => new File(['%PDF-1.4'], name, { type: 'application/pdf' });
 
-    const block = await screen.findByRole('list', { name: 'Broker replies' });
-    fireEvent.click(within(block).getByRole('button', { name: 'SIM received' }));
-    expect(await within(block).findByText(/^Recorded: SIM received\./)).toBeVisible();
-    expect(within(block).getByRole('link', { name: 'Upload the SIM in Pursued deals →' })).toHaveAttribute('href', '/admin/deal-hunter?view=pursued');
-    expect(screen.queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+    test('recording SIM received opens the upload panel with the input focused; Upload later closes it', async () => {
+      stubInboxWithPursuing({
+        pursuing: jsonResponse(pursuingPage([pursuedRow()])),
+        writes: { '/pursued-1/reply-type': () => jsonResponse({ success: true, row: simReceivedRow() }) },
+      });
+      renderInbox({ initialView: 'inbox' });
+
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      fireEvent.click(within(block).getByRole('button', { name: 'SIM received' }));
+      const input = await within(block).findByLabelText('SIM file for Acme Plumbing');
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(within(block).getByText(/^Recorded: SIM received\./)).toBeVisible();
+      expect(within(block).queryByRole('link', { name: /Upload the SIM/ })).not.toBeInTheDocument();
+
+      fireEvent.click(within(block).getByRole('button', { name: 'Upload later' }));
+      expect(within(block).queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+    });
+
+    test('an upload from the block posts to the SIM route like the tab and shows the upload-OK copy', async () => {
+      const uploaded = { ...simReceivedRow(), simDocuments: [{ id: 'doc-1', name: 'sim.pdf', sizeBytes: 8, uploadedAt: '2026-11-04T12:00:00.000Z' }] };
+      const fetchMock = stubInboxWithPursuing({
+        pursuing: jsonResponse(pursuingPage([pursuedRow()])),
+        writes: {
+          '/pursued-1/reply-type': () => jsonResponse({ success: true, row: simReceivedRow() }),
+          '/pursued-1/sim': () => jsonResponse({ success: true, row: uploaded, stoppedFollowUps: false }),
+        },
+      });
+      renderInbox({ initialView: 'inbox' });
+
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      fireEvent.click(within(block).getByRole('button', { name: 'SIM received' }));
+      const file = pdf();
+      fireEvent.change(await within(block).findByLabelText('SIM file for Acme Plumbing'), { target: { files: [file] } });
+
+      expect(await within(block).findByText('SIM uploaded.')).toBeVisible();
+      const [url, options] = postsTo(fetchMock, '/sim')[0];
+      expect(url).toBe(`${PURSUING}/pursued-1/sim`);
+      expect(options.body).toBe(file);
+      expect(options.headers).toEqual({
+        'Content-Type': 'application/pdf', 'X-File-Name': 'sim.pdf', 'X-Idempotency-Key': expect.stringMatching(UUID),
+      });
+      expect(within(block).queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+    });
+
+    test('a refused upload shows the spec copy and keeps the panel open', async () => {
+      stubInboxWithPursuing({
+        pursuing: jsonResponse(pursuingPage([pursuedRow()])),
+        writes: {
+          '/pursued-1/reply-type': () => jsonResponse({ success: true, row: simReceivedRow() }),
+          '/pursued-1/sim': () => jsonResponse({ success: false, code: 'file_too_large', error: 'server words' }, { ok: false, status: 413 }),
+        },
+      });
+      renderInbox({ initialView: 'inbox' });
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      fireEvent.click(within(block).getByRole('button', { name: 'SIM received' }));
+      fireEvent.change(await within(block).findByLabelText('SIM file for Acme Plumbing'), { target: { files: [pdf()] } });
+      expect(await within(block).findByText('This file is larger than 25 MB.')).toBeVisible();
+      expect(within(block).getByLabelText('SIM file for Acme Plumbing')).toBeVisible();
+    });
+
+    test('a viewer sees no upload control', async () => {
+      stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow({ gmailThreadUrl: null })])) });
+      renderInbox({ initialView: 'inbox', readOnly: true });
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      expect(within(block).queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+      expect(within(block).queryByRole('button', { name: /Upload/ })).not.toBeInTheDocument();
+    });
   });
 
   test('a bounce shows Bounced {date} and Mark handled', async () => {
@@ -3400,11 +3458,12 @@ describe('Broker replies in Needs Your Action', () => {
     expect(within(block).getByText('Gmail thread not available yet.')).toBeVisible();
   });
 
-  test('a stop-word reply adds the do-not-email line', async () => {
+  test('a stop-word reply is listed without extra copy', async () => {
     stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow({
       needsAction: { reason: 'reply', at: '2026-11-03T15:00:00.000Z', replyId: 'reply-1', classification: 'stop' } })])) });
     renderInbox({ initialView: 'inbox' });
     const block = await screen.findByRole('list', { name: 'Broker replies' });
-    expect(within(block).getByText('They asked not to be emailed again.')).toBeVisible();
+    expect(within(block).getByText('Acme Plumbing')).toBeVisible();
+    expect(within(block).queryByText('They asked not to be emailed again.')).not.toBeInTheDocument();
   });
 });

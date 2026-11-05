@@ -1,9 +1,8 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import PursuitReplyTypeControl from './PursuitReplyTypeControl.jsx';
-import {
-  PursuedDealsApiError, REFRESH_COPY, SAVE_FAILED_COPY, acknowledgeReply, createIdempotencyKeys, loadPursuedDeals,
-} from './pursuedDealsApi.js';
+import SimUploadPanel, { simUploadRequest, simUploadedMessage, trackerWrite, usePursuedRowWrite } from './PursuitSimUploadPanel.jsx';
+import { acknowledgeReply, loadPursuedDeals } from './pursuedDealsApi.js';
 
 // The "Broker replies" block of Needs Your Action (spec 2026-11-04 §7.3): the pursued deals whose
 // broker wrote back or bounced, read from the tracker rather than from the inbox queue.
@@ -59,43 +58,44 @@ export function useBrokerReplies(enabled, refreshKey) {
 }
 
 function BrokerReplyItem({ row, pinned, readOnly, onRowChange, onPin, onReload }) {
-  const keysRef = useRef(null);
-  if (!keysRef.current) keysRef.current = createIdempotencyKeys();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [simRecorded, setSimRecorded] = useState(false);
+  const { busy, message, setMessage, keys, runWrite } = usePursuedRowWrite({ opportunityId: row.opportunityId, onReload });
+  const [uploadOpen, setUploadOpen] = useState(false);
   const attention = row.needsAction;
   const bounced = attention?.reason === 'bounce';
 
   async function markHandled() {
-    if (busy) return;
-    setBusy(true);
-    setError('');
-    const keys = keysRef.current;
-    const signature = JSON.stringify(['acknowledge', attention.replyId]);
+    const result = await runWrite(JSON.stringify(['acknowledge', attention.replyId]),
+      (idempotencyKey) => acknowledgeReply({ opportunityId: row.opportunityId, acknowledgedReplyId: attention.replyId,
+        idempotencyKey }), trackerWrite);
+    if (result) onRowChange(result.row);
+  }
+
+  // After a network failure the deal is read again, to tell whether the SIM landed. Only this deal
+  // is looked for, and a fresh copy of it replaces the row so a landed SIM shows up.
+  async function rereadDeal() {
     try {
-      const result = await acknowledgeReply({ opportunityId: row.opportunityId, acknowledgedReplyId: attention.replyId,
-        idempotencyKey: keys.keyFor(row.opportunityId, signature) });
-      keys.forget(row.opportunityId, signature);
-      onRowChange(result.row);
-    } catch (failure) {
-      // A network failure keeps the key, so the owner's retry replays; a server answer releases it.
-      if (failure instanceof PursuedDealsApiError) {
-        keys.forget(row.opportunityId, signature);
-        setError(failure.status === 409 ? REFRESH_COPY : failure.message || SAVE_FAILED_COPY);
-        if (failure.status === 409) onReload();
-      } else {
-        setError(SAVE_FAILED_COPY);
-      }
-    } finally {
-      setBusy(false);
+      const result = await loadPursuedDeals('all');
+      const fresh = result.rows?.find((candidate) => candidate.opportunityId === row.opportunityId);
+      if (fresh) onRowChange(fresh);
+      return result.rows || [];
+    } catch {
+      return null;
     }
+  }
+
+  async function upload(file) {
+    const request = simUploadRequest({ row, file, keys, reread: rereadDeal, onLanded: () => setUploadOpen(false) });
+    const result = await runWrite(request.signature, request.write, request.describe);
+    if (!result) return;
+    if (result.row) onRowChange(result.row);
+    setUploadOpen(false);
+    setMessage(simUploadedMessage(result));
   }
 
   function handleRecorded({ kind, replyType, row: nextRow }) {
     onRowChange(nextRow);
     onPin(kind !== 'undone');
-    setSimRecorded(kind !== 'undone' && replyType === 'sim-received');
+    setUploadOpen(kind !== 'undone' && replyType === 'sim-received');
   }
 
   return (
@@ -111,14 +111,13 @@ function BrokerReplyItem({ row, pinned, readOnly, onRowChange, onPin, onReload }
           ? <a className={buttonClass} href={row.gmailThreadUrl} rel="noopener noreferrer" target="_blank">Open in Gmail</a>
           : <span className="text-xs text-ink/58">Gmail thread not available yet.</span>) : null}
       </div>
-      {attention?.classification === 'stop' ? <p className="text-sm text-ink">They asked not to be emailed again.</p> : null}
       {!readOnly && bounced && attention.replyId
         ? <button className={buttonClass} disabled={busy} onClick={markHandled} type="button">Mark handled</button> : null}
       {!readOnly && (attention?.reason === 'reply' || pinned)
         ? <PursuitReplyTypeControl name={row.name} onConflict={onReload} onRecorded={handleRecorded} row={row} /> : null}
-      {!readOnly && simRecorded
-        ? <p className="text-sm"><Link className="font-semibold text-moss hover:underline" to={PURSUED_TAB}>Upload the SIM in Pursued deals →</Link></p> : null}
-      {error ? <p className="text-sm font-semibold text-red-800" role="alert">{error}</p> : null}
+      {!readOnly && uploadOpen
+        ? <SimUploadPanel busy={busy} name={row.name} onChoose={upload} onClose={() => setUploadOpen(false)} /> : null}
+      {message ? <p className={`text-sm font-semibold ${message.tone === 'error' ? 'text-red-800' : 'text-ink'}`} role={message.tone === 'error' ? 'alert' : 'status'}>{message.text}</p> : null}
     </li>
   );
 }

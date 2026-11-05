@@ -1,11 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import PursuitReplyTypeControl from './PursuitReplyTypeControl.jsx';
-import {
-  PursuedDealsApiError, REFRESH_COPY, SAVE_FAILED_COPY, SIM_UPLOADED_COPY, SIM_UPLOADED_STOPPED_COPY,
-  UPLOAD_INTERRUPTED_COPY, acknowledgeReply, createIdempotencyKeys,
-  loadPursuedDeals, moveStage, stopSimRequests, uploadErrorCopy, uploadPursuedSim,
-} from './pursuedDealsApi.js';
+import SimUploadPanel, { simUploadRequest, simUploadedMessage, trackerWrite, usePursuedRowWrite } from './PursuitSimUploadPanel.jsx';
+import { acknowledgeReply, loadPursuedDeals, moveStage, stopSimRequests } from './pursuedDealsApi.js';
 
 // Stage ids and labels, in pipeline order (spec 2026-11-04 §4.1). The UI says "SIM"; the code keeps CIM.
 const STAGES = Object.freeze([
@@ -55,30 +52,9 @@ function DealHunterNav() {
   );
 }
 
-function SimUploadPanel({ name, busy, onChoose, onClose }) {
-  const inputRef = useRef(null);
-  useEffect(() => { inputRef.current?.focus(); }, []);
-  return (
-    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-line bg-fog/60 p-3">
-      <input accept="application/pdf,.pdf" aria-label={`SIM file for ${name}`} className="text-sm" disabled={busy}
-        onChange={(event) => {
-          const file = event.target.files?.[0];
-          if (!file) return;
-          onChoose(file);
-          try { event.target.value = ''; } catch { /* Some browsers refuse; the owner can pick again. */ }
-        }}
-        ref={inputRef} type="file" />
-      <button className={buttonClass} disabled={busy} onClick={onClose} type="button">Upload later</button>
-    </div>
-  );
-}
-
 function PursuedRow({ row, readOnly, onRowChange, onReload }) {
-  const keysRef = useRef(null);
-  if (!keysRef.current) keysRef.current = createIdempotencyKeys();
   const uploadButtonRef = useRef(null);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState(null);
+  const { busy, message, setMessage, keys, runWrite } = usePursuedRowWrite({ opportunityId: row.opportunityId, onReload });
   const [uploadOpen, setUploadOpen] = useState(false);
   const [bandPinned, setBandPinned] = useState(false);
 
@@ -86,39 +62,6 @@ function PursuedRow({ row, readOnly, onRowChange, onReload }) {
   const attention = row.needsAction;
   const release = row.release;
   const gmailAvailable = !readOnly;
-
-  // Runs one owner write under its idempotency key. A definite server answer releases the key; a
-  // network failure keeps it, so the owner's retry replays instead of writing twice.
-  async function runWrite(signature, write, describe) {
-    if (busy) return null;
-    setBusy(true);
-    setMessage(null);
-    const keys = keysRef.current;
-    try {
-      const result = await write(keys.keyFor(row.opportunityId, signature));
-      keys.forget(row.opportunityId, signature);
-      return result;
-    } catch (failure) {
-      let outcome;
-      if (failure instanceof PursuedDealsApiError) {
-        keys.forget(row.opportunityId, signature);
-        outcome = describe.api(failure);
-      } else {
-        outcome = await describe.network();
-      }
-      setMessage(outcome.text ? { tone: outcome.tone || 'error', text: outcome.text } : null);
-      if (outcome.reload) onReload();
-      return null;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const trackerWrite = {
-    api: (failure) => (failure.status === 409
-      ? { text: REFRESH_COPY, reload: true } : { text: failure.message || SAVE_FAILED_COPY, reload: false }),
-    network: () => ({ text: SAVE_FAILED_COPY, reload: false }),
-  };
 
   async function move(stage) {
     if (!stage || stage === row.stage) return;
@@ -139,42 +82,19 @@ function PursuedRow({ row, readOnly, onRowChange, onReload }) {
   async function stop() {
     const campaign = release.campaign;
     const result = await runWrite(JSON.stringify(['stop', campaign.id, campaign.rowVersion, campaign.terminalRevision]),
-      (idempotencyKey) => stopSimRequests({ opportunityId: row.opportunityId, campaign, idempotencyKey }), {
-        api: (failure) => (failure.status === 409
-          ? { text: REFRESH_COPY, reload: true } : { text: failure.message || SAVE_FAILED_COPY, reload: false }),
-        network: () => ({ text: SAVE_FAILED_COPY, reload: false }),
-      });
+      (idempotencyKey) => stopSimRequests({ opportunityId: row.opportunityId, campaign, idempotencyKey }), trackerWrite);
     // The campaign is stopped; reading the page again shows the row's new release status.
     if (result) onReload();
   }
 
   async function upload(file) {
-    const acknowledgedReplyId = attention?.replyId;
-    const signature = JSON.stringify(['sim', file.name, file.size, file.lastModified, acknowledgedReplyId ?? null]);
-    // The server words the OK copy by whether follow-ups were stoppable before the upload.
-    const couldStop = row.release?.canStop === true;
-    const knownDocuments = new Set((row.simDocuments || []).map((document) => document.id));
-    const result = await runWrite(signature,
-      (idempotencyKey) => uploadPursuedSim({ opportunityId: row.opportunityId, file, idempotencyKey, acknowledgedReplyId }), {
-        api: (failure) => ({ text: uploadErrorCopy(failure), reload: false }),
-        // No answer came back, so the upload may or may not have committed. Read the deal again: a
-        // SIM that was not there when the owner started means it landed. If not, say so every time
-        // and keep the key, so the next attempt is a safe retry that replays if it did commit.
-        network: async () => {
-          const rows = await onReload();
-          const fresh = rows?.find((candidate) => candidate.opportunityId === row.opportunityId);
-          if (fresh?.simDocuments?.some((document) => !knownDocuments.has(document.id))) {
-            keysRef.current.forget(row.opportunityId, signature);
-            setUploadOpen(false);
-            return { text: couldStop ? SIM_UPLOADED_STOPPED_COPY : SIM_UPLOADED_COPY, tone: 'ok' };
-          }
-          return { text: UPLOAD_INTERRUPTED_COPY };
-        },
-      });
+    // `onReload` resolves to the rows read again, which the landed check looks through.
+    const request = simUploadRequest({ row, file, keys, reread: onReload, onLanded: () => setUploadOpen(false) });
+    const result = await runWrite(request.signature, request.write, request.describe);
     if (!result) return;
     if (result.row) onRowChange(result.row);
     setUploadOpen(false);
-    setMessage({ tone: 'ok', text: result.stoppedFollowUps ? SIM_UPLOADED_STOPPED_COPY : SIM_UPLOADED_COPY });
+    setMessage(simUploadedMessage(result));
   }
 
   function handleRecorded({ kind, replyType, row: nextRow }) {
