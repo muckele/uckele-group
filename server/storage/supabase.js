@@ -10,8 +10,9 @@ import {
   validateGmailSentIdentityLookup, validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
 import {
-  normalizePursuitBundle, normalizePursuitStageEventRow, PURSUIT_STAGE_EVENT_CONFLICTS,
-  validatePursuitBundleListCommand, validatePursuitStageEventCommand,
+  normalizePursuitBundle, normalizePursuitDocumentRow, normalizePursuitStageEventRow, PURSUIT_SIM_INTAKE_CONFLICTS,
+  PURSUIT_STAGE_EVENT_CONFLICTS, validatePursuitBundleListCommand, validatePursuitSimIntakeCommand,
+  validatePursuitStageEventCommand,
 } from './pursuitTrackerStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
@@ -4349,6 +4350,27 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
       return { applied: data.applied, replay: data.replay, conflict: data.conflict ?? null,
         event: normalizePursuitStageEventRow(data.event) };
+    },
+
+    /**
+     * Records a SIM the owner uploaded through the RPC (spec 2026-11-04 §8.4), which takes the CIM
+     * terminal lock and then the opportunity row, runs the owner event checks and the campaign
+     * submission checks, and inserts the request, document, activity and event in one transaction;
+     * the existing triggers converge materials.
+     */
+    async recordPursuitSimIntake(command = {}) {
+      const intake = validatePursuitSimIntakeCommand(command);
+      const { data, error } = await client.rpc('pursuit_tracker_record_sim_intake_v1', { p_command: intake });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean'
+        || !PURSUIT_SIM_INTAKE_CONFLICTS.includes(data.conflict ?? null)
+        || (data.applied || data.replay) !== Boolean(data.event)
+        // A replay carries the stored document when it still exists.
+        || (data.applied && !data.document) || (!data.applied && !data.replay && data.document)) {
+        throw new Error('Malformed pursuit SIM intake result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict ?? null,
+        event: normalizePursuitStageEventRow(data.event), document: normalizePursuitDocumentRow(data.document) };
     },
 
     /**

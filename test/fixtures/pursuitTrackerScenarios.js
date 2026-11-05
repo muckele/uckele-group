@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 
+import { buildCrmActivityEvent } from '../../server/services/activity.js';
 import { getSourceHealth } from '../../server/services/acquisitionCommandCenter.js';
 import { recordAcquisitionOwnerCommand } from '../../server/services/dealHunterTriage.js';
 import { pursuitStageRequestDigest } from '../../server/storage/pursuitTrackerStorageContract.js';
@@ -443,6 +444,215 @@ const EXPECTED_BUNDLES = [{
     policyVersion: 'pursuit-tracker-v1', createdAt: '2030-01-07T23:00:00.000Z' }],
 }];
 
+// Task 4 (spec §6.3, §8.4): the SIM intake. One transaction writes a synthetic completed upload
+// request, the CIM document, the documents.uploaded activity and the sim-intake event, and the
+// document converges the campaign through the existing materials rules.
+const SIM_BYTES = 1234;
+const SIM_SHA256 = 'ab'.repeat(32);
+
+/** The intake command the upload route builds once the file is on disk. */
+export function simIntake(world, { submissionId, opportunityId = OPPORTUNITY_ID, idempotencyKey = randomUUID(),
+  eventId = randomUUID(), fileBytes = SIM_BYTES, acknowledgedReplyId = null } = {}) {
+  const now = world.clock.peek().toISOString();
+  const requestId = randomUUID();
+  const documentId = randomUUID();
+  const base = { id: eventId, idempotencyKey, opportunityId, expectedPreviousEventId: null, kind: 'sim-intake',
+    replyType: null, fromStage: 'cim-requested', stage: 'cim-received', acknowledgedReplyId,
+    secureDocumentId: documentId, actor: OWNER, now };
+  return {
+    event: { ...base, requestDigest: pursuitStageRequestDigest({ ...base, fileBytes, fileSha256: SIM_SHA256 }) },
+    request: { id: requestId, submission_id: submissionId, created_at: now, updated_at: now,
+      email: 'broker@brokerfirm.test', contact_name: null, requested_by: OWNER, status: 'completed',
+      expires_at: now, nda_required: false, nda_accepted_at: null, last_uploaded_at: now, note: null,
+      requested_documents: [{ category: 'cim', label: 'CIM', required: true }], revoked_at: null, closed_at: now,
+      upload_batch_count: 1 },
+    document: { id: documentId, request_id: requestId, submission_id: submissionId, created_at: now,
+      document_type: 'cim', file_name: `${documentId}-Acme-CIM.pdf`, original_name: 'Acme-CIM.pdf',
+      mime_type: 'application/pdf', size_bytes: fileBytes, storage_path: `/vault/${requestId}/${documentId}-Acme-CIM.pdf`,
+      uploaded_by_email: OWNER, note: null, nda_accepted_at: null },
+    activity: buildCrmActivityEvent({ submissionId, opportunityId, eventType: 'documents.uploaded',
+      summary: 'Owner uploaded the SIM.', actor: OWNER, role: 'admin', metadata: { documentIds: [documentId] },
+      createdAt: now }),
+  };
+}
+
+/** Every row an intake could write, counted for the submission and the deal. */
+async function intakeFootprint(world, submissionId) {
+  return {
+    requests: await world.count('secure_upload_requests', 'submission_id = ?', submissionId),
+    documents: await world.count('secure_documents', 'submission_id = ?', submissionId),
+    activity: await world.count('crm_activity_events', 'submission_id = ? AND event_type = ?', submissionId,
+      'documents.uploaded'),
+    events: await eventCount(world),
+  };
+}
+
+async function simIntakeConvergesMaterials(t, createBackend) {
+  const { world, campaign } = await pursuedWorld(t, createBackend);
+  assert.equal(campaign.state, 'active-follow-up');
+  assert.notDeepEqual(await world.scheduled(campaign), []);
+  const terminalEvents = await world.count('deal_hunter_cim_terminal_events', 'campaign_id = ?', campaign.id);
+  world.clock.set(pacific('2030-01-07', '10:00'));
+  const intake = simIntake(world, { submissionId: campaign.crm_submission_id });
+  const result = await world.storage.recordPursuitSimIntake(intake);
+
+  assert.deepEqual([result.applied, result.replay, result.conflict], [true, false, null]);
+  assert.deepEqual({ ...result.event, id: undefined, idempotencyKey: undefined }, {
+    id: undefined, idempotencyKey: undefined, opportunityId: OPPORTUNITY_ID, previousEventId: 'genesis',
+    kind: 'sim-intake', replyType: null, fromStage: 'cim-requested', stage: 'cim-received',
+    acknowledgedReplyId: null, acknowledgedProcessedAt: null, secureDocumentId: intake.document.id, actor: OWNER,
+    policyVersion: 'pursuit-tracker-v1', createdAt: pacific('2030-01-07', '10:00') });
+  assert.deepEqual(result.document, { id: intake.document.id, documentType: 'cim', originalName: 'Acme-CIM.pdf',
+    sizeBytes: SIM_BYTES, createdAt: pacific('2030-01-07', '10:00') });
+
+  const after = await world.campaignFor(OPPORTUNITY_ID);
+  assert.equal(after.state, 'materials-received');
+  assert.deepEqual(await world.scheduled(campaign), []);
+  const terminal = await world.all(`SELECT reason_code FROM deal_hunter_cim_terminal_events
+    WHERE campaign_id = ? ORDER BY revision DESC`, campaign.id);
+  assert.equal(terminal.length, terminalEvents + 1);
+  assert.equal(terminal[0].reason_code, 'materials_received');
+
+  const documents = await world.all(`SELECT id, request_id, document_type FROM secure_documents
+    WHERE submission_id = ?`, campaign.crm_submission_id);
+  assert.deepEqual(documents.map((row) => ({ ...row })), [{ id: intake.document.id, request_id: intake.request.id,
+    document_type: 'cim' }]);
+  const request = await world.one('SELECT status, upload_batch_count FROM secure_upload_requests WHERE id = ?',
+    intake.request.id);
+  assert.deepEqual([request.status, Number(request.upload_batch_count)], ['completed', 1]);
+  const activity = await world.all(`SELECT id, role FROM crm_activity_events
+    WHERE submission_id = ? AND event_type = 'documents.uploaded'`, campaign.crm_submission_id);
+  assert.deepEqual(activity.map((row) => ({ ...row })), [{ id: intake.activity.id, role: 'admin' }]);
+  assert.equal(await world.count(EVENT_TABLE, 'kind = ?', 'sim-intake'), 1);
+  assert.deepEqual((await bundlesFor(world))[0].documents, [result.document]);
+}
+
+async function simIntakeReplays(t, createBackend) {
+  const { world, campaign } = await pursuedWorld(t, createBackend);
+  world.clock.set(pacific('2030-01-07', '10:00'));
+  const intake = simIntake(world, { submissionId: campaign.crm_submission_id });
+  const first = await world.storage.recordPursuitSimIntake(intake);
+  assert.equal(first.applied, true);
+  const footprint = await intakeFootprint(world, campaign.crm_submission_id);
+  assert.deepEqual(footprint, { requests: 1, documents: 1, activity: 1, events: 1 });
+
+  // A retry of the same upload: new server ids, the same key and the same file.
+  world.clock.set(pacific('2030-01-07', '10:01'));
+  const retry = simIntake(world, { submissionId: campaign.crm_submission_id,
+    idempotencyKey: intake.event.idempotencyKey });
+  retry.event.requestDigest = intake.event.requestDigest;
+  const again = await world.storage.recordPursuitSimIntake(retry);
+  assert.deepEqual(again, { applied: false, replay: true, conflict: null, event: first.event,
+    document: first.document });
+  // The same key with another file is a conflict.
+  const otherFile = simIntake(world, { submissionId: campaign.crm_submission_id,
+    idempotencyKey: intake.event.idempotencyKey, fileBytes: SIM_BYTES + 1 });
+  assert.deepEqual(await world.storage.recordPursuitSimIntake(otherFile), { applied: false, replay: false,
+    conflict: 'idempotency_conflict', event: null, document: null });
+  assert.deepEqual(await intakeFootprint(world, campaign.crm_submission_id), footprint);
+}
+
+async function simIntakeRollsBack(t, createBackend) {
+  const { world, campaign } = await pursuedWorld(t, createBackend);
+  const existing = await record(world, { stage: 'nda-sent', expectedPreviousEventId: 'genesis' });
+  assert.equal(existing.applied, true);
+  const before = await world.campaignFor(OPPORTUNITY_ID);
+  const scheduled = await world.scheduled(campaign);
+  const footprint = await intakeFootprint(world, campaign.crm_submission_id);
+  world.clock.set(pacific('2030-01-07', '10:00'));
+  // The event insert is last; a duplicate id makes it fail after the document went in.
+  const intake = simIntake(world, { submissionId: campaign.crm_submission_id, eventId: existing.event.id });
+  await assert.rejects(world.storage.recordPursuitSimIntake(intake));
+
+  assert.deepEqual(await intakeFootprint(world, campaign.crm_submission_id), footprint);
+  assert.equal(await world.count('secure_upload_requests', 'id = ?', intake.request.id), 0);
+  assert.equal(await world.count('secure_documents', 'id = ?', intake.document.id), 0);
+  assert.equal(await world.count('crm_activity_events', 'id = ?', intake.activity.id), 0);
+  const after = await world.campaignFor(OPPORTUNITY_ID);
+  assert.deepEqual([after.state, Number(after.terminal_revision)], [before.state, Number(before.terminal_revision)]);
+  assert.deepEqual(await world.scheduled(campaign), scheduled);
+}
+
+async function simIntakeOtherSubmission(t, createBackend) {
+  const { world, campaign } = await pursuedWorld(t, createBackend);
+  const elsewhere = await otherSubmission(world, campaign);
+  const footprint = await intakeFootprint(world, elsewhere);
+  const result = await world.storage.recordPursuitSimIntake(simIntake(world, { submissionId: elsewhere }));
+  assert.deepEqual(result, { applied: false, replay: false, conflict: 'no_crm_record', event: null, document: null });
+  assert.deepEqual(await intakeFootprint(world, elsewhere), footprint);
+  assert.equal((await world.campaignFor(OPPORTUNITY_ID)).state, campaign.state);
+}
+
+async function simIntakeSupersededSubmission(t, createBackend) {
+  const { world, campaign } = await pursuedWorld(t, createBackend);
+  const survivor = await otherSubmission(world, campaign);
+  const at = world.clock.peek().toISOString();
+  // A confirmed duplicate: the survivor becomes the deal's primary and the campaign's submission the loser.
+  await world.run('UPDATE contact_submissions SET metadata = ? WHERE id = ?',
+    JSON.stringify({ dealHunter: { opportunityId: OPPORTUNITY_ID } }), survivor);
+  await world.run('UPDATE deal_hunter_opportunities SET primary_submission_id = ? WHERE opportunity_id = ?',
+    survivor, OPPORTUNITY_ID);
+  await world.run(`INSERT INTO deal_hunter_cim_repair_manifests (id, created_at, updated_at, mode, status, actor,
+    checksum) VALUES ('tracker-receipt', ?, ?, 'crm-duplicate-consolidation', 'applied', 'reviewer', ?)`,
+  at, at, 'a'.repeat(64));
+  await world.run(`INSERT INTO crm_submission_supersessions (id, created_at, updated_at, status,
+    survivor_submission_id, superseded_submission_id, opportunity_id, reason_code, reason_text, approved_by,
+    approved_at, actor, repair_version, repair_manifest_id, repair_digest) VALUES ('tracker-relation', ?, ?,
+    'active', ?, ?, ?, 'confirmed-duplicate', 'Fixture', ?, ?, 'reviewer', 'v1', 'tracker-receipt', ?)`,
+  at, at, survivor, campaign.crm_submission_id, OPPORTUNITY_ID, OWNER, at, 'a'.repeat(64));
+  const footprint = await intakeFootprint(world, campaign.crm_submission_id);
+  const result = await world.storage.recordPursuitSimIntake(simIntake(world,
+    { submissionId: campaign.crm_submission_id }));
+  assert.deepEqual(result, { applied: false, replay: false, conflict: 'crm_superseded', event: null,
+    document: null });
+  assert.deepEqual(await intakeFootprint(world, campaign.crm_submission_id), footprint);
+}
+
+async function malformedSimIntakeRefused(t, createBackend) {
+  const { world, campaign } = await pursuedWorld(t, createBackend);
+  const footprint = await intakeFootprint(world, campaign.crm_submission_id);
+  const intake = () => simIntake(world, { submissionId: campaign.crm_submission_id });
+  const bend = (change) => { const command = intake(); change(command); return command; };
+  for (const [command, field] of [
+    [bend((c) => { c.document.document_type = 'teaser'; }), /document\.document_type/],
+    [bend((c) => { c.event.expectedPreviousEventId = 'genesis'; }), /expectedPreviousEventId/],
+    [bend((c) => { c.event.secureDocumentId = randomUUID(); }), /secureDocumentId/],
+    [bend((c) => { c.request.status = 'open'; }), /request\.status/],
+    [bend((c) => { c.request.requested_documents = [{ category: 'financials', label: 'CIM', required: true }]; }),
+      /request\.requested_documents/],
+    [bend((c) => { c.request.closed_at = pacific('2030-01-08', '10:00'); }), /request\.closed_at/],
+    [bend((c) => { c.document.request_id = randomUUID(); }), /document\.request_id/],
+    [bend((c) => { c.activity.role = 'system'; }), /activity\.role/],
+  ]) {
+    await assert.rejects(world.storage.recordPursuitSimIntake(command), field);
+  }
+  // A sim-intake event never goes through the plain event writer.
+  await assert.rejects(world.storage.recordPursuitStageEvent(intake().event), /Invalid kind/);
+  assert.deepEqual(await intakeFootprint(world, campaign.crm_submission_id), footprint);
+}
+
+async function insertSecureDocumentConverges(t, createBackend) {
+  const { world, campaign } = await pursuedWorld(t, createBackend);
+  world.clock.set(pacific('2030-01-07', '10:00'));
+  const at = world.clock.peek().toISOString();
+  const requestId = randomUUID();
+  await world.run(`INSERT INTO secure_upload_requests (id, submission_id, created_at, updated_at, email, status,
+    expires_at) VALUES (?, ?, ?, ?, 'broker@brokerfirm.test', 'open', ?)`, requestId, campaign.crm_submission_id,
+  at, at, pacific('2030-01-14', '10:00'));
+  assert.equal((await world.campaignFor(OPPORTUNITY_ID)).state, 'active-follow-up');
+  const document = { id: randomUUID(), request_id: requestId, submission_id: campaign.crm_submission_id,
+    created_at: at, document_type: 'cim', file_name: 'cim.pdf', original_name: 'cim.pdf',
+    mime_type: 'application/pdf', size_bytes: 10, storage_path: '/vault/cim.pdf', uploaded_by_email: null,
+    note: null, nda_accepted_at: null };
+  await world.storage.insertSecureDocument(document);
+  assert.equal((await world.campaignFor(OPPORTUNITY_ID)).state, 'materials-received');
+  assert.deepEqual(await world.scheduled(campaign), []);
+  const [terminal] = await world.all(`SELECT reason_code, evidence_type, evidence_id, actor
+    FROM deal_hunter_cim_terminal_events WHERE campaign_id = ? ORDER BY revision DESC LIMIT 1`, campaign.id);
+  assert.deepEqual({ ...terminal }, { reason_code: 'materials_received', evidence_type: 'materials',
+    evidence_id: document.id, actor: 'secure-document-writer' });
+}
+
 
 export const PURSUIT_TRACKER_SCENARIOS = Object.freeze([
   ['a stage-move appends after genesis and replays its own key', stageMoveReplays],
@@ -464,4 +674,12 @@ export const PURSUIT_TRACKER_SCENARIOS = Object.freeze([
   ['a merged opportunity that was pursued is still a member', mergedStaysAMember],
   ['events come back oldest first, as the event normalizer shapes them', eventsAndDecisionsOldestFirst],
   ['both adapters return deep-equal bundles for the same world', bundlesMatchAcrossAdapters],
+  ['a SIM intake on an active-follow-up campaign ends materials-received with cancelled touches',
+    simIntakeConvergesMaterials],
+  ['a SIM intake replays by idempotency key and writes nothing twice', simIntakeReplays],
+  ['a failure after the document insert leaves no request, document, activity or event', simIntakeRollsBack],
+  ["a SIM intake for a submission other than the campaign's is no_crm_record", simIntakeOtherSubmission],
+  ["a SIM intake on a superseded campaign submission is crm_superseded", simIntakeSupersededSubmission],
+  ['a malformed SIM intake is refused before any write', malformedSimIntakeRefused],
+  ['insertSecureDocument still converges as before', insertSecureDocumentConverges],
 ]);

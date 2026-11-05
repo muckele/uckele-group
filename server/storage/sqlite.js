@@ -48,8 +48,9 @@ import {
   validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
 import {
-  normalizePursuitBundle, normalizePursuitStageEventRow, PURSUIT_CIM_DOCUMENT_TYPES, PURSUIT_GENESIS,
-  PURSUIT_TRACKER_POLICY_VERSION, validatePursuitBundleListCommand, validatePursuitStageEventCommand,
+  normalizePursuitBundle, normalizePursuitDocumentRow, normalizePursuitStageEventRow, PURSUIT_CIM_DOCUMENT_TYPES,
+  PURSUIT_GENESIS, PURSUIT_TRACKER_POLICY_VERSION, validatePursuitBundleListCommand,
+  validatePursuitSimIntakeCommand, validatePursuitStageEventCommand,
 } from './pursuitTrackerStorageContract.js';
 
 /** The four CRM stage fields a pursuit bundle reads; a value that is not a string is absent. */
@@ -70,6 +71,71 @@ function pursuitCrmFields(metadataJson) {
     pipeline_stage: field('acquisitionCommand', 'pipelineStage'),
     pipeline_updated_at: field('acquisitionCommand', 'updatedAt'),
   };
+}
+
+/**
+ * The checks every owner event write makes inside its write transaction, in order: the
+ * idempotency key (replay or conflict), an active opportunity, a latest owner decision of pursue,
+ * the predecessor (null appends after the chain tip), and the acknowledged reply, whose
+ * processed_at is copied from the latest campaign's conversation. Returns `{ result }` when the
+ * write stops here, otherwise `{ previousEventId, acknowledgedProcessedAt }` for the insert.
+ */
+function pursuitStageEventPreflight(database, event) {
+  const refused = (conflict) => ({ result: { applied: false, replay: false, conflict, event: null } });
+  const existing = database.prepare(`
+    SELECT * FROM deal_hunter_pursuit_stage_events WHERE idempotency_key = ?
+  `).get(event.idempotencyKey);
+  if (existing) {
+    return existing.request_digest === event.requestDigest
+      ? { result: { applied: false, replay: true, conflict: null, event: normalizePursuitStageEventRow(existing) } }
+      : refused('idempotency_conflict');
+  }
+  const opportunity = database.prepare(`
+    SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ?
+  `).get(event.opportunityId);
+  if (!opportunity) return refused('not_pursued');
+  if (opportunity.status !== 'active') return refused('opportunity_not_active');
+  const decision = database.prepare(`
+    SELECT action FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?
+    ORDER BY julianday(created_at) DESC, id DESC LIMIT 1
+  `).get(event.opportunityId);
+  if (decision?.action !== 'pursue') return refused('not_pursued');
+  const latest = database.prepare(`
+    SELECT e.id FROM deal_hunter_pursuit_stage_events e
+    WHERE e.opportunity_id = ? AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_pursuit_stage_events next
+      WHERE next.opportunity_id = e.opportunity_id AND next.previous_event_id = e.id)
+    ORDER BY julianday(e.created_at) DESC, e.id DESC LIMIT 1
+  `).get(event.opportunityId)?.id ?? PURSUIT_GENESIS;
+  if (event.expectedPreviousEventId !== null && event.expectedPreviousEventId !== latest) {
+    return refused('pursuit_stage_changed');
+  }
+  let acknowledgedProcessedAt = null;
+  if (event.acknowledgedReplyId !== null) {
+    const reply = database.prepare(`
+      SELECT reply.processed_at FROM deal_hunter_gmail_reply_messages reply
+      WHERE reply.gmail_message_id = ? AND reply.conversation_id = (
+        SELECT campaign.conversation_id FROM deal_hunter_cim_campaigns campaign
+        WHERE campaign.opportunity_id = ? ORDER BY campaign.generation DESC LIMIT 1)
+    `).get(event.acknowledgedReplyId, event.opportunityId);
+    if (!reply) return refused('unknown_reply');
+    acknowledgedProcessedAt = reply.processed_at;
+  }
+  return { previousEventId: latest, acknowledgedProcessedAt };
+}
+
+/** Inserts a checked owner event after `previousEventId`; returns the stored event. */
+function insertPursuitStageEvent(database, event, { previousEventId, acknowledgedProcessedAt }) {
+  database.prepare(`
+    INSERT INTO deal_hunter_pursuit_stage_events (id, idempotency_key, request_digest,
+      opportunity_id, previous_event_id, kind, reply_type, from_stage, stage, acknowledged_reply_id,
+      acknowledged_processed_at, secure_document_id, actor, policy_version, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(event.id, event.idempotencyKey, event.requestDigest, event.opportunityId, previousEventId, event.kind,
+    event.replyType, event.fromStage, event.stage, event.acknowledgedReplyId, acknowledgedProcessedAt,
+    event.secureDocumentId, event.actor, PURSUIT_TRACKER_POLICY_VERSION, event.now);
+  return normalizePursuitStageEventRow(
+    database.prepare('SELECT * FROM deal_hunter_pursuit_stage_events WHERE id = ?').get(event.id));
 }
 
 function cimSafetyDigest(...parts) {
@@ -8085,6 +8151,27 @@ ${cimCapacityConsumeTriggerSql}
       actor: 'secure-upload-writer', source: 'secure-upload-transaction',
       observedAt, now: observedAt });
   };
+  /**
+   * Inserts a secure document inside the caller's write transaction: the CRM supersession guard,
+   * the row, superseding the submission's current follow-up recommendations, and materials
+   * convergence of the campaigns on that submission. `actor` and `source` name the writer in the
+   * terminal evidence.
+   */
+  const insertSecureDocumentInTransaction = (document, { actor, source }) => {
+    if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
+    insertSecureDocumentStatement.run(document);
+    if (document.submission_id) {
+      database.prepare(`
+        UPDATE crm_follow_up_recommendations
+        SET status = 'superseded', superseded_at = ?
+        WHERE submission_id = ? AND status = 'current'
+      `).run(document.created_at || new Date().toISOString(), document.submission_id);
+      cimTransitions.convergeCimTerminalAuthority({ submissionId: document.submission_id,
+        evaluateMaterialsState: true, evidenceType: 'materials', evidenceId: document.id,
+        actor, source, observedAt: document.created_at, now: document.created_at });
+    }
+    return document;
+  };
   const convergeUnsafeDelivery = (communication) => {
     if (!communication?.id || !['failed', 'bounced', 'complained', 'suppressed']
       .includes(communication.delivery_state)) return;
@@ -9422,22 +9509,8 @@ ${cimCapacityConsumeTriggerSql}
     },
 
     async insertSecureDocument(document) {
-      return database.transaction(() => {
-        if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
-        insertSecureDocumentStatement.run(document);
-        if (document.submission_id) {
-          database.prepare(`
-            UPDATE crm_follow_up_recommendations
-            SET status = 'superseded', superseded_at = ?
-            WHERE submission_id = ? AND status = 'current'
-          `).run(document.created_at || new Date().toISOString(), document.submission_id);
-          cimTransitions.convergeCimTerminalAuthority({ submissionId: document.submission_id,
-            evaluateMaterialsState: true, evidenceType: 'materials', evidenceId: document.id,
-            actor: 'secure-document-writer', source: 'secure-document-transaction',
-            observedAt: document.created_at, now: document.created_at });
-        }
-        return document;
-      }).immediate();
+      return database.transaction(() => insertSecureDocumentInTransaction(document,
+        { actor: 'secure-document-writer', source: 'secure-document-transaction' })).immediate();
     },
 
     async deleteSecureDocument(id) {
@@ -11468,56 +11541,50 @@ ${cimCapacityConsumeTriggerSql}
         const event = validatePursuitStageEventCommand(command);
         if (event.kind === 'sim-intake') throw new TypeError('Invalid kind');
         return database.transaction(() => {
-          const refused = (conflict) => ({ applied: false, replay: false, conflict, event: null });
-          const existing = database.prepare(`
-            SELECT * FROM deal_hunter_pursuit_stage_events WHERE idempotency_key = ?
-          `).get(event.idempotencyKey);
-          if (existing) {
-            return existing.request_digest === event.requestDigest
-              ? { applied: false, replay: true, conflict: null, event: normalizePursuitStageEventRow(existing) }
-              : refused('idempotency_conflict');
+          const checked = pursuitStageEventPreflight(database, event);
+          if (checked.result) return checked.result;
+          return { applied: true, replay: false, conflict: null,
+            event: insertPursuitStageEvent(database, event, checked) };
+        }).immediate();
+      },
+
+      /**
+       * Records a SIM the owner uploaded (spec 2026-11-04 §8.4). In one write transaction, after
+       * the owner event checks: the document's submission must be the latest campaign's
+       * crm_submission_id (`no_crm_record`) and must not be superseded (`crm_superseded`). Then
+       * the synthetic completed upload request, the CIM document with its materials convergence,
+       * the documents.uploaded activity and the sim-intake event; a failure writes none of them.
+       */
+      async recordPursuitSimIntake(command = {}) {
+        const { event, request, document, activity } = validatePursuitSimIntakeCommand(command);
+        return database.transaction(() => {
+          const refused = (conflict) => ({ applied: false, replay: false, conflict, event: null, document: null });
+          const checked = pursuitStageEventPreflight(database, event);
+          if (checked.result) {
+            const stored = checked.result.replay ? database.prepare('SELECT * FROM secure_documents WHERE id = ?')
+              .get(checked.result.event.secureDocumentId) : null;
+            return { ...checked.result, document: normalizePursuitDocumentRow(stored) };
           }
-          const opportunity = database.prepare(`
-            SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ?
+          const campaign = database.prepare(`
+            SELECT crm_submission_id FROM deal_hunter_cim_campaigns WHERE opportunity_id = ?
+            ORDER BY generation DESC LIMIT 1
           `).get(event.opportunityId);
-          if (!opportunity) return refused('not_pursued');
-          if (opportunity.status !== 'active') return refused('opportunity_not_active');
-          const decision = database.prepare(`
-            SELECT action FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?
-            ORDER BY julianday(created_at) DESC, id DESC LIMIT 1
-          `).get(event.opportunityId);
-          if (decision?.action !== 'pursue') return refused('not_pursued');
-          const latest = database.prepare(`
-            SELECT e.id FROM deal_hunter_pursuit_stage_events e
-            WHERE e.opportunity_id = ? AND NOT EXISTS (
-              SELECT 1 FROM deal_hunter_pursuit_stage_events next
-              WHERE next.opportunity_id = e.opportunity_id AND next.previous_event_id = e.id)
-            ORDER BY julianday(e.created_at) DESC, e.id DESC LIMIT 1
-          `).get(event.opportunityId)?.id ?? PURSUIT_GENESIS;
-          if (event.expectedPreviousEventId !== null && event.expectedPreviousEventId !== latest) {
-            return refused('pursuit_stage_changed');
+          if (!campaign?.crm_submission_id || campaign.crm_submission_id !== document.submission_id) {
+            return refused('no_crm_record');
           }
-          let acknowledgedProcessedAt = null;
-          if (event.acknowledgedReplyId !== null) {
-            const reply = database.prepare(`
-              SELECT reply.processed_at FROM deal_hunter_gmail_reply_messages reply
-              WHERE reply.gmail_message_id = ? AND reply.conversation_id = (
-                SELECT campaign.conversation_id FROM deal_hunter_cim_campaigns campaign
-                WHERE campaign.opportunity_id = ? ORDER BY campaign.generation DESC LIMIT 1)
-            `).get(event.acknowledgedReplyId, event.opportunityId);
-            if (!reply) return refused('unknown_reply');
-            acknowledgedProcessedAt = reply.processed_at;
+          try {
+            assertCrmSubmissionWritableInTransaction(document.submission_id);
+          } catch (error) {
+            if (error instanceof CrmSubmissionSupersededError) return refused('crm_superseded');
+            throw error;
           }
-          database.prepare(`
-            INSERT INTO deal_hunter_pursuit_stage_events (id, idempotency_key, request_digest,
-              opportunity_id, previous_event_id, kind, reply_type, from_stage, stage, acknowledged_reply_id,
-              acknowledged_processed_at, secure_document_id, actor, policy_version, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-          `).run(event.id, event.idempotencyKey, event.requestDigest, event.opportunityId, latest, event.kind,
-            event.replyType, event.fromStage, event.stage, event.acknowledgedReplyId, acknowledgedProcessedAt,
-            event.actor, PURSUIT_TRACKER_POLICY_VERSION, event.now);
-          return { applied: true, replay: false, conflict: null, event: normalizePursuitStageEventRow(
-            database.prepare('SELECT * FROM deal_hunter_pursuit_stage_events WHERE id = ?').get(event.id)) };
+          insertSecureUploadRequestStatement.run(serializeUploadRequest(request));
+          insertSecureDocumentInTransaction(document,
+            { actor: event.actor, source: 'pursuit-sim-intake-transaction' });
+          insertCrmActivityEvent(activity);
+          const stored = insertPursuitStageEvent(database, event, checked);
+          return { applied: true, replay: false, conflict: null, event: stored, document: normalizePursuitDocumentRow(
+            database.prepare('SELECT * FROM secure_documents WHERE id = ?').get(document.id)) };
         }).immediate();
       },
 

@@ -31,7 +31,7 @@ const { createServiceRoleClient, dockerCommand, openSession, startDisposableSupa
   await import('./fixtures/postgresServiceRoleClient.js');
 const { HEALTHY_SOURCE_SNAPSHOT, START, autoPursuedAndSent, brokerReplies, createWorld, pacific, pollAt } =
   await import('./fixtures/pursueCimEndToEndFixture.js');
-const { PURSUIT_TRACKER_SCENARIOS } = await import('./fixtures/pursuitTrackerScenarios.js');
+const { PURSUIT_TRACKER_SCENARIOS, simIntake } = await import('./fixtures/pursuitTrackerScenarios.js');
 const { PURSUIT_CIM_DOCUMENT_TYPES, pursuitStageRequestDigest } =
   await import('../server/storage/pursuitTrackerStorageContract.js');
 
@@ -123,6 +123,58 @@ test('an acknowledge waits for a locked stage-move and both commit', { ...gated,
   assert.equal(await world.count('deal_hunter_pursuit_stage_events'), 2);
 });
 
+test('a SIM intake and a concurrent CIM convergence on the same campaign both commit without a deadlock',
+  { ...gated, timeout: 180_000 }, async (t) => {
+    let backend;
+    const world = await createWorld(t, async (context) => {
+      backend = await createPostgresBackend(context);
+      return backend;
+    }, { start: START });
+    const campaign = await autoPursuedAndSent(world, { opportunityId: 'opp-auto' });
+    assert.equal(campaign.state, 'active-follow-up');
+    world.clock.set(pacific('2030-01-07', '10:00'));
+
+    // Session A is a CIM-path transaction. Its first CIM RPC (a convergence that matches no
+    // campaign) takes the CIM advisory lock, held until A commits, without touching this deal.
+    const sessionA = openSession(backend.database.container, backend.database.database);
+    const at = world.clock.peek().toISOString();
+    let result;
+    try {
+      const first = JSON.parse(await sessionA.query(`set role service_role; begin;
+        select public.pursue_cim_converge_terminal_authority_v1(jsonb_build_object(
+          'opportunityId', 'opp-unrelated', 'reasonCode', 'stopped_by_owner', 'evidenceType', 'tracker-test',
+          'evidenceId', 'tracker-lock-order', 'actor', 'tracker-test', 'source', 'tracker-test',
+          'observedAt', '${at}', 'now', '${at}'))::text;`));
+      assert.deepEqual(first.outcomes, []);
+
+      let settled = false;
+      const intake = world.storage.recordPursuitSimIntake(simIntake(world,
+        { submissionId: campaign.crm_submission_id })).finally(() => { settled = true; });
+      await sessionA.query('select pg_sleep(1);');
+      assert.equal(settled, false, 'the intake waits on the CIM advisory lock');
+      // A then writes on the same campaign: a CRM diligence change that the terminal trigger
+      // converges, locking the deal's opportunity row after the advisory lock. An intake that took
+      // the row first and the advisory lock second would deadlock here.
+      await sessionA.query(`update public.contact_submissions
+        set metadata = metadata || '{"diligence": {"stage": "cim-received"}}'::jsonb
+        where id = '${campaign.crm_submission_id}';`);
+      assert.equal(await sessionA.query(`select state from public.deal_hunter_cim_campaigns
+        where id = '${campaign.id}';`), 'materials-received');
+      await sessionA.query('commit;');
+      result = await intake;
+    } finally {
+      await sessionA.close();
+    }
+
+    assert.deepEqual([result.applied, result.conflict, result.event.kind], [true, null, 'sim-intake']);
+    assert.equal((await world.campaignFor('opp-auto')).state, 'materials-received');
+    // A converged the campaign; the intake's document found it already terminal.
+    assert.deepEqual((await world.all(`SELECT reason_code, evidence_type FROM deal_hunter_cim_terminal_events
+      WHERE campaign_id = ? AND reason_code = 'materials_received'`, campaign.id)).map((row) => ({ ...row })),
+    [{ reason_code: 'materials_received', evidence_type: 'diligence' }]);
+    assert.equal(await world.count('secure_documents', 'id = ?', result.document.id), 1);
+  });
+
 test('anon and authenticated cannot read the table or execute the RPC', { ...gated, timeout: 120_000 },
   async (t) => {
     const database = await startDisposableSupabasePostgres(t, 'ug-pursuit-tracker-roles');
@@ -136,7 +188,19 @@ test('anon and authenticated cannot read the table or execute the RPC', { ...gat
         select public.pursuit_tracker_record_event_v1('{}'::jsonb);`), /permission denied/);
       await assert.rejects(query(`set role ${role};
         select public.pursuit_tracker_list_v1('{}'::jsonb);`), /permission denied/);
+      await assert.rejects(query(`set role ${role};
+        select public.pursuit_tracker_record_sim_intake_v1('{}'::jsonb);`), /permission denied/);
     }
+    // The writers' shared helpers are not callable on their own, not even by service_role.
+    for (const role of ['anon', 'authenticated', 'service_role']) {
+      for (const helper of ['pursuit_tracker_event_command_valid_v1(\'{}\'::jsonb)',
+        'pursuit_tracker_event_preflight_v1(\'{}\'::jsonb)',
+        'pursuit_tracker_append_event_v1(\'{}\'::jsonb, \'{}\'::jsonb)']) {
+        await assert.rejects(query(`set role ${role}; select public.${helper};`), /permission denied/);
+      }
+    }
+    await assert.rejects(query(`set role service_role;
+      select public.pursuit_tracker_record_sim_intake_v1('{}'::jsonb);`), /Invalid pursuit SIM intake/);
     // service_role reads the table and writes it only through the RPC.
     assert.equal(await query('set role service_role; select count(*) from public.deal_hunter_pursuit_stage_events;'),
       '0');
@@ -161,7 +225,9 @@ test('the tracker migration is mirrored exactly at the end of the fresh schema',
   const start = schema.indexOf(migration);
   assert.ok(start >= 0, 'the fresh schema must contain the exact tracker block');
   assert.equal(schema.slice(start + migration.length).trim(), '', 'the tracker block is the end of the schema');
-  assert.deepEqual(migrationFunctionNames(migration), ['pursuit_tracker_list_v1', 'pursuit_tracker_record_event_v1',
+  assert.deepEqual(migrationFunctionNames(migration), ['pursuit_tracker_append_event_v1',
+    'pursuit_tracker_event_command_valid_v1', 'pursuit_tracker_event_preflight_v1', 'pursuit_tracker_list_v1',
+    'pursuit_tracker_record_event_v1', 'pursuit_tracker_record_sim_intake_v1',
     'pursuit_tracker_reject_event_mutation_v1']);
   assert.match(migration, /alter table public\.deal_hunter_pursuit_stage_events enable row level security;/);
   assert.match(migration, /revoke all on table public\.deal_hunter_pursuit_stage_events\s+from public, anon, authenticated, service_role;/);
@@ -171,6 +237,21 @@ test('the tracker migration is mirrored exactly at the end of the fresh schema',
   assert.match(rpc, /^create or replace function public\.pursuit_tracker_record_event_v1\(p_command jsonb\)/);
   assert.match(rpc, /security definer\s+set search_path = public/);
   assert.match(rpc, /grant execute on function public\.pursuit_tracker_record_event_v1\(jsonb\) to service_role;/);
+});
+
+test('the SIM intake RPC takes the CIM advisory lock before the opportunity row and is service_role only', () => {
+  const migration = fs.readFileSync(migrationPath, 'utf8');
+  const start = migration.indexOf('create or replace function public.pursuit_tracker_record_sim_intake_v1(');
+  const rpc = migration.slice(start, migration.indexOf('\n$$;', start));
+  assert.match(rpc, /^create or replace function public\.pursuit_tracker_record_sim_intake_v1\(p_command jsonb\)\s+returns jsonb\s+language plpgsql\s+security definer\s+set search_path = public/);
+  const advisory = rpc.indexOf('pg_catalog.pg_advisory_xact_lock(17499,48146)');
+  const rowLock = rpc.search(/from public\.deal_hunter_opportunities where [^;]* for update;/);
+  assert.ok(advisory > 0 && rowLock > advisory, 'advisory lock first, then the opportunity row');
+  assert.ok(rpc.indexOf('insert into') > rowLock, 'both locks before any write');
+  assert.match(migration, /revoke all on function public\.pursuit_tracker_record_sim_intake_v1\(jsonb\)\s+from public, anon, authenticated;/);
+  assert.match(migration, /grant execute on function public\.pursuit_tracker_record_sim_intake_v1\(jsonb\) to service_role;/);
+  assert.doesNotMatch(migration, /create (constraint )?trigger[^;]*(secure_documents|secure_upload_requests|crm_activity_events)/i,
+    'the existing triggers converge; the tracker adds none');
 });
 
 test('the list RPC is stable, security definer, service_role only and spells the CIM document types', () => {

@@ -17,6 +17,13 @@ export const PURSUIT_STAGE_REQUEST_DIGEST_PREFIX = 'pursuit-stage-request:v1';
 export const PURSUIT_STAGE_EVENT_CONFLICTS = Object.freeze([null, 'idempotency_conflict', 'pursuit_stage_changed',
   'not_pursued', 'opportunity_not_active', 'unknown_reply']);
 
+/** The `conflict` values of `recordPursuitSimIntake`: the event's, plus the campaign submission's. */
+export const PURSUIT_SIM_INTAKE_CONFLICTS = Object.freeze([...PURSUIT_STAGE_EVENT_CONFLICTS, 'no_crm_record',
+  'crm_superseded']);
+/** What the synthetic upload request of a SIM intake asked for. */
+export const PURSUIT_SIM_REQUESTED_DOCUMENTS = Object.freeze([Object.freeze({ category: 'cim', label: 'CIM',
+  required: true })]);
+
 /** The most opportunities one `listPursuitBundles` call may name. */
 export const PURSUIT_BUNDLE_MAX_IDS = 200;
 /**
@@ -119,6 +126,106 @@ export function validatePursuitStageEventCommand(command = {}) {
   };
 }
 
+function text(value, name, max = 1000) {
+  if (typeof value !== 'string' || value.length < 1 || value.length > max) throw invalid(name);
+  return value;
+}
+
+function optionalText(value, name, max = 1000) {
+  return value === null || value === undefined ? null : text(value, name, max);
+}
+
+/**
+ * A normalized copy of a SIM intake command `{ event, request, document, activity }` (spec
+ * 2026-11-04 §8.4), or a TypeError naming the bad field. `event` is a sim-intake owner event that
+ * appends after the latest event and names the document. `request` is the synthetic completed
+ * `secure_upload_requests` row, closed at the event instant; `document` is the `cim`
+ * `secure_documents` row on that request; `activity` is the admin `documents.uploaded` CRM event on
+ * the same submission. Rows come back with every column, so both adapters insert the same values.
+ */
+export function validatePursuitSimIntakeCommand(command = {}) {
+  if (!command || typeof command !== 'object') throw invalid('command');
+  const event = validatePursuitStageEventCommand(command.event);
+  if (event.kind !== 'sim-intake') throw invalid('kind');
+  if (event.expectedPreviousEventId !== null) throw invalid('expectedPreviousEventId');
+  const { request: rawRequest, document: rawDocument, activity: rawActivity } = command;
+  if (!rawRequest || typeof rawRequest !== 'object') throw invalid('request');
+  if (!rawDocument || typeof rawDocument !== 'object') throw invalid('document');
+  if (!rawActivity || typeof rawActivity !== 'object') throw invalid('activity');
+  const instant = (value, name) => {
+    if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw invalid(name);
+    return new Date(value).toISOString();
+  };
+  const at = (value, name) => {
+    if (instant(value, name) !== event.now) throw invalid(name);
+    return event.now;
+  };
+  const submissionId = id(rawRequest.submission_id, 'request.submission_id');
+  const request = {
+    id: uuid(rawRequest.id, 'request.id'),
+    submission_id: submissionId,
+    created_at: instant(rawRequest.created_at, 'request.created_at'),
+    updated_at: instant(rawRequest.updated_at, 'request.updated_at'),
+    email: text(rawRequest.email, 'request.email', 320),
+    contact_name: optionalText(rawRequest.contact_name, 'request.contact_name'),
+    requested_by: optionalText(rawRequest.requested_by, 'request.requested_by'),
+    status: oneOf(rawRequest.status, ['completed'], 'request.status'),
+    expires_at: at(rawRequest.expires_at, 'request.expires_at'),
+    nda_required: oneOf(rawRequest.nda_required, [false], 'request.nda_required'),
+    nda_accepted_at: null,
+    last_uploaded_at: at(rawRequest.last_uploaded_at, 'request.last_uploaded_at'),
+    note: optionalText(rawRequest.note, 'request.note'),
+    requested_documents: PURSUIT_SIM_REQUESTED_DOCUMENTS.map((item) => ({ ...item })),
+    revoked_at: null,
+    closed_at: at(rawRequest.closed_at, 'request.closed_at'),
+    upload_batch_count: oneOf(rawRequest.upload_batch_count, [1], 'request.upload_batch_count'),
+  };
+  if (rawRequest.nda_accepted_at !== null && rawRequest.nda_accepted_at !== undefined) {
+    throw invalid('request.nda_accepted_at');
+  }
+  if (rawRequest.revoked_at !== null && rawRequest.revoked_at !== undefined) throw invalid('request.revoked_at');
+  const requested = rawRequest.requested_documents;
+  if (!Array.isArray(requested) || requested.length !== 1 || !requested[0] || typeof requested[0] !== 'object'
+    || Object.keys(requested[0]).length !== 3 || requested[0].category !== 'cim' || requested[0].label !== 'CIM'
+    || requested[0].required !== true) {
+    throw invalid('request.requested_documents');
+  }
+  const sizeBytes = rawDocument.size_bytes;
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0) throw invalid('document.size_bytes');
+  const document = {
+    id: uuid(rawDocument.id, 'document.id'),
+    request_id: oneOf(rawDocument.request_id, [request.id], 'document.request_id'),
+    submission_id: oneOf(rawDocument.submission_id, [submissionId], 'document.submission_id'),
+    created_at: instant(rawDocument.created_at, 'document.created_at'),
+    document_type: oneOf(rawDocument.document_type, ['cim'], 'document.document_type'),
+    file_name: text(rawDocument.file_name, 'document.file_name', 300),
+    original_name: text(rawDocument.original_name, 'document.original_name', 300),
+    mime_type: text(rawDocument.mime_type, 'document.mime_type', 200),
+    size_bytes: sizeBytes,
+    storage_path: text(rawDocument.storage_path, 'document.storage_path', 4096),
+    uploaded_by_email: optionalText(rawDocument.uploaded_by_email, 'document.uploaded_by_email', 320),
+    note: optionalText(rawDocument.note, 'document.note'),
+    nda_accepted_at: rawDocument.nda_accepted_at === null || rawDocument.nda_accepted_at === undefined ? null
+      : instant(rawDocument.nda_accepted_at, 'document.nda_accepted_at'),
+  };
+  if (event.secureDocumentId !== document.id) throw invalid('secureDocumentId');
+  const metadata = rawActivity.metadata ?? {};
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw invalid('activity.metadata');
+  const activity = {
+    id: uuid(rawActivity.id, 'activity.id'),
+    submission_id: oneOf(rawActivity.submission_id, [submissionId], 'activity.submission_id'),
+    opportunity_id: oneOf(rawActivity.opportunity_id ?? null, [null, event.opportunityId],
+      'activity.opportunity_id'),
+    created_at: instant(rawActivity.created_at, 'activity.created_at'),
+    actor: text(rawActivity.actor, 'activity.actor', 200),
+    role: oneOf(rawActivity.role, ['admin'], 'activity.role'),
+    event_type: oneOf(rawActivity.event_type, ['documents.uploaded'], 'activity.event_type'),
+    summary: text(rawActivity.summary, 'activity.summary'),
+    metadata,
+  };
+  return { event, request, document, activity };
+}
+
 /** One `deal_hunter_pursuit_stage_events` row from either adapter; null stays null. */
 export function normalizePursuitStageEventRow(row) {
   if (!row) return null;
@@ -138,6 +245,13 @@ export function normalizePursuitStageEventRow(row) {
     policyVersion: row.policy_version,
     createdAt: optionalInstant(row.created_at),
   };
+}
+
+/** A CIM-type `secure_documents` row as the tracker shows it, from either adapter; null stays null. */
+export function normalizePursuitDocumentRow(row) {
+  if (!row) return null;
+  return { id: row.id, documentType: row.document_type, originalName: row.original_name,
+    sizeBytes: Number(row.size_bytes), createdAt: optionalInstant(row.created_at) };
 }
 
 /**
@@ -179,9 +293,7 @@ export function normalizePursuitBundle(raw) {
     replies: (raw.replies ?? []).map((row) => ({ gmailMessageId: row.gmail_message_id,
       classification: row.classification, processedAt: optionalInstant(row.processed_at),
       messageAt: optionalInstant(row.message_at) })),
-    documents: (raw.documents ?? []).map((row) => ({ id: row.id, documentType: row.document_type,
-      originalName: row.original_name, sizeBytes: Number(row.size_bytes),
-      createdAt: optionalInstant(row.created_at) })),
+    documents: (raw.documents ?? []).map(normalizePursuitDocumentRow),
     crm: crm && {
       diligenceStage: optionalString(crm.diligence_stage),
       diligenceUpdatedAt: lenientInstant(crm.diligence_updated_at),
