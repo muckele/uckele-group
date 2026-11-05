@@ -8,7 +8,9 @@ const {
   DAILY_DEAL_HUNTER_DIGEST_VERSION,
   DAILY_DEAL_HUNTER_TOP_LIMIT,
   buildCurrentDailyDealHunterDigest,
+  buildDailyDealHunterEmailEnvelope,
   projectDailyDealHunterDigest,
+  verifyDailyDealHunterEmailEnvelope,
 } = await import('../server/services/dailyDealHunterDigest.js');
 const { listTriageQueue } = await import('../server/services/dealHunterTriage.js');
 
@@ -843,4 +845,101 @@ test('daily digest keeps legitimate names without creating a broader name policy
       assert.equal(projection.topOpportunities[0].name, name);
     });
   }
+});
+
+function heldListing(index, name = `Held listing ${index}`) {
+  return { exceptionId: `exception-${String(index).padStart(2, '0')}`, name };
+}
+
+function heldEnvelope(projection) {
+  return buildDailyDealHunterEmailEnvelope({
+    projection,
+    recipient: 'owner@example.com',
+    sender: 'Uckele Group <deals@example.com>',
+    preparedAt: generatedAt,
+  });
+}
+
+test('identity-held listings keep the normal digest and add a bounded decision section', async () => {
+  const projection = await buildCurrentDailyDealHunterDigest({
+    businessDate,
+    storage: {},
+    refreshScores: async () => healthyScoreRefresh({
+      identityHeld: [
+        heldListing(1, 'Precision Carbon & Graphite Manufacturer'),
+        heldListing(2, 'Established Legal Tech <Consulting> Firm'),
+      ],
+    }),
+    readSourceHealth: async () => healthySourceHealth(),
+    readTriageQueue: async () => healthyQueue([queueRow(1, { name: 'Scored current row' })]),
+  });
+
+  assert.equal(projection.notificationType, 'normal-digest');
+  assert.equal(projection.sourceAuthority.requiredHealthy, true);
+  assert.equal(projection.actionsAllowed, true);
+  assert.deepEqual(projection.topOpportunities.map((row) => row.name), ['Scored current row']);
+  assert.deepEqual(projection.identityDecisions, {
+    count: 2,
+    names: ['Precision Carbon & Graphite Manufacturer', 'Established Legal Tech <Consulting> Firm'],
+  });
+  assert.doesNotMatch(JSON.stringify(projection), /exception-0/);
+
+  const envelope = heldEnvelope(projection);
+  assert.equal(verifyDailyDealHunterEmailEnvelope(envelope).ok, true);
+  assert.match(envelope.text, /Needs your identity decision \(2\):\n- Precision Carbon & Graphite Manufacturer\n- Established Legal Tech <Consulting> Firm\n/);
+  assert.match(envelope.text, /left out of scoring until you link each one to an existing deal or keep it separate in Deal Hunter/);
+  assert.ok(envelope.text.indexOf('Needs your identity decision') < envelope.text.indexOf('Top opportunities:'));
+  assert.match(envelope.html, /<strong>Needs your identity decision \(2\)<\/strong>/);
+  assert.match(envelope.html, /<li>Precision Carbon &amp; Graphite Manufacturer<\/li>/);
+  assert.match(envelope.html, /<li>Established Legal Tech &lt;Consulting&gt; Firm<\/li>/);
+  assert.doesNotMatch(envelope.html, /<Consulting>/);
+});
+
+test('the identity decision section lists at most five names and counts the rest', () => {
+  const projection = projectDailyDealHunterDigest({
+    businessDate,
+    generatedAt,
+    sourceHealth: healthySourceHealth(),
+    scoreRefresh: healthyScoreRefresh({
+      identityHeld: Array.from({ length: 7 }, (_, index) => heldListing(index + 1)),
+    }),
+    queue: healthyQueue(),
+  });
+
+  assert.equal(projection.identityDecisions.count, 7);
+  assert.equal(projection.identityDecisions.names.length, 5);
+  const envelope = heldEnvelope(projection);
+  assert.match(envelope.text, /Needs your identity decision \(7\):/);
+  assert.match(envelope.text, /- Held listing 5\n- and 2 more\n/);
+  assert.doesNotMatch(envelope.text, /Held listing 6/);
+  assert.match(envelope.html, /<li>and 2 more<\/li>/);
+});
+
+test('no held listings means no identity decision section', () => {
+  for (const identityHeld of [undefined, [], 'not-a-list']) {
+    const projection = projectDailyDealHunterDigest({
+      businessDate,
+      generatedAt,
+      sourceHealth: healthySourceHealth(),
+      scoreRefresh: healthyScoreRefresh(identityHeld === undefined ? {} : { identityHeld }),
+      queue: healthyQueue(),
+    });
+    assert.equal(projection.identityDecisions, null);
+    const envelope = heldEnvelope(projection);
+    assert.doesNotMatch(envelope.text, /identity decision/);
+    assert.doesNotMatch(envelope.html, /identity decision/);
+  }
+});
+
+test('an action-required alert never carries the identity decision section', () => {
+  const projection = projectDailyDealHunterDigest({
+    businessDate,
+    generatedAt,
+    sourceHealth: healthySourceHealth({ healthy: false, issues: [{ sourceId: 'google-sheet-1', affectsHealth: true, classification: 'unavailable' }] }),
+    scoreRefresh: healthyScoreRefresh({ identityHeld: [heldListing(1)] }),
+    queue: healthyQueue(),
+  });
+  assertActionRequired(projection);
+  assert.equal(projection.identityDecisions, null);
+  assert.doesNotMatch(heldEnvelope(projection).text, /identity decision/);
 });

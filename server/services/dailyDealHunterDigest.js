@@ -11,6 +11,8 @@ export const DAILY_DEAL_HUNTER_EMAIL_VERSION = 'daily-deal-hunter-email-v1';
 
 const MAX_BLOCKING_ISSUES = 3;
 const MAX_OPTIONAL_WARNINGS = 1;
+const MAX_IDENTITY_DECISION_NAMES = 5;
+const IDENTITY_DECISION_GUIDANCE = 'These listings are left out of scoring until you link each one to an existing deal or keep it separate in Deal Hunter.';
 const TRIAGE_MISSING_NAME = 'Unnamed opportunity';
 const SUMMARY_FIELDS = Object.freeze([
   'needsReview',
@@ -454,6 +456,17 @@ function normalDigestText(projection) {
     }
   }
 
+  const decisions = projection.identityDecisions;
+  if (decisions?.count > 0) {
+    lines.push('', `Needs your identity decision (${boundedCount(decisions.count)}):`);
+    for (const name of decisions.names.slice(0, MAX_IDENTITY_DECISION_NAMES)) {
+      lines.push(`- ${safeDisplayText(name, 160)}`);
+    }
+    const remaining = boundedCount(decisions.count) - Math.min(decisions.names.length, MAX_IDENTITY_DECISION_NAMES);
+    if (remaining > 0) lines.push(`- and ${remaining} more`);
+    lines.push(IDENTITY_DECISION_GUIDANCE);
+  }
+
   lines.push('', 'Top opportunities:');
   for (const [index, opportunity] of (projection.topOpportunities || []).slice(0, DAILY_DEAL_HUNTER_TOP_LIMIT).entries()) {
     lines.push(
@@ -512,7 +525,16 @@ function normalDigestHtml(projection) {
   const warnings = (projection.sourceAuthority?.optionalWarnings || []).slice(0, MAX_OPTIONAL_WARNINGS).map((warning) => (
     `<li>${emailHtml(safeDisplayText(warning.sourceName, 160))}: ${emailHtml(safeDisplayText(warning.message, 400))}</li>`
   )).join('');
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Daily Deal Hunter</title></head><body style="margin:0;background:#F8F4ED;color:#18211D;font-family:Arial,sans-serif;"><main style="max-width:680px;margin:0 auto;padding:32px 20px;"><h1>Daily Deal Hunter</h1><p><strong>Pacific business date:</strong> ${emailHtml(projection.businessDate)}</p><p>Needs review: ${boundedCount(summary.needsReview)} · High priority: ${boundedCount(summary.highPriority)} · Watchlist: ${boundedCount(summary.watchlist)} · Low confidence: ${boundedCount(summary.lowConfidence)} · Current: ${boundedCount(summary.currentOpportunities)}</p>${warnings ? `<aside><strong>Optional source warning</strong><ul>${warnings}</ul></aside>` : ''}${rows}<p>${emailLink('Open Acquisition Inbox', projection.links?.inbox)} · ${emailLink('Open Operations', projection.links?.operations)}</p></main></body></html>`.slice(0, 96 * 1024);
+  const decisions = projection.identityDecisions;
+  let identityDecisions = '';
+  if (decisions?.count > 0) {
+    const shown = decisions.names.slice(0, MAX_IDENTITY_DECISION_NAMES);
+    const remaining = boundedCount(decisions.count) - shown.length;
+    const items = shown.map((name) => `<li>${emailHtml(safeDisplayText(name, 160))}</li>`).join('')
+      + (remaining > 0 ? `<li>and ${remaining} more</li>` : '');
+    identityDecisions = `<aside><strong>Needs your identity decision (${boundedCount(decisions.count)})</strong><ul>${items}</ul><p>${emailHtml(IDENTITY_DECISION_GUIDANCE)}</p></aside>`;
+  }
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Daily Deal Hunter</title></head><body style="margin:0;background:#F8F4ED;color:#18211D;font-family:Arial,sans-serif;"><main style="max-width:680px;margin:0 auto;padding:32px 20px;"><h1>Daily Deal Hunter</h1><p><strong>Pacific business date:</strong> ${emailHtml(projection.businessDate)}</p><p>Needs review: ${boundedCount(summary.needsReview)} · High priority: ${boundedCount(summary.highPriority)} · Watchlist: ${boundedCount(summary.watchlist)} · Low confidence: ${boundedCount(summary.lowConfidence)} · Current: ${boundedCount(summary.currentOpportunities)}</p>${warnings ? `<aside><strong>Optional source warning</strong><ul>${warnings}</ul></aside>` : ''}${identityDecisions}${rows}<p>${emailLink('Open Acquisition Inbox', projection.links?.inbox)} · ${emailLink('Open Operations', projection.links?.operations)}</p></main></body></html>`.slice(0, 96 * 1024);
 }
 
 function alertDigestHtml(projection) {
@@ -624,6 +646,17 @@ export function verifyDailyDealHunterEmailEnvelope(envelope = {}) {
   }
 }
 
+// Only listing names leave the score refresh: exception identifiers, aliases
+// and candidate evidence stay in the application.
+function projectedIdentityDecisions(identityHeld) {
+  if (!Array.isArray(identityHeld)) return null;
+  const names = identityHeld
+    .map((item) => safeDisplayText(item?.name, 160))
+    .filter(Boolean);
+  if (names.length === 0) return null;
+  return { count: names.length, names: names.slice(0, MAX_IDENTITY_DECISION_NAMES) };
+}
+
 export function projectDailyDealHunterDigest({
   businessDate,
   generatedAt,
@@ -641,6 +674,7 @@ export function projectDailyDealHunterDigest({
   });
   const alert = !authority.requiredHealthy;
   const notificationType = alert ? 'required-source-alert' : 'normal-digest';
+  const identityDecisions = alert ? null : projectedIdentityDecisions(scoreRefresh?.identityHeld);
 
   return {
     version: DAILY_DEAL_HUNTER_DIGEST_VERSION,
@@ -655,6 +689,7 @@ export function projectDailyDealHunterDigest({
       : (Array.isArray(queue?.rows) ? queue.rows : [])
           .slice(0, DAILY_DEAL_HUNTER_TOP_LIMIT)
           .map(projectedOpportunity),
+    identityDecisions,
     job: projectedJob(job, notificationType),
     actionsAllowed: !alert,
     links: applicationLinks(),

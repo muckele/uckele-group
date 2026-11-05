@@ -39,6 +39,7 @@ import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
+  identityHeldReviewWarning,
   previewOpportunityScoreRefresh,
   refreshOpportunityScores,
   requestOpportunityScoreRefresh,
@@ -537,6 +538,13 @@ function scoreRefreshOperatorError(scoreRefresh) {
     return currentTriageReconciliationFailureError;
   }
   return safeScoreRefreshErrors.has(error) ? error : fullBackfillScoreFailureError;
+}
+
+function deferredBackfillWarning(review) {
+  return Array.isArray(review?.sourceSnapshotAdmissionDeferredSources)
+    && review.sourceSnapshotAdmissionDeferredSources.length > 0
+    ? 'Full-backfill scoring is deferred until every required Google Sheet has a complete, uniquely identified source snapshot. Existing persisted scores were left unchanged.'
+    : 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.';
 }
 
 function publicScoreRefreshResult(scoreRefresh) {
@@ -1696,9 +1704,7 @@ export function createApp({
       review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
       const reviewWarning = review.scoringDeferred
-        ? Array.isArray(review.identityExceptions) && review.identityExceptions.length > 0
-          ? 'Full-backfill scoring is deferred until every canonical identity exception is resolved and the required Sheet snapshot is complete. Existing persisted scores were left unchanged.'
-          : 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.'
+        ? deferredBackfillWarning(review)
         : '';
       const scoreRefresh = review.scoringDeferred
         ? null
@@ -1716,36 +1722,13 @@ export function createApp({
           review: deferredReview,
           summary: deferredReview.importSummary,
           scoreRefresh: null,
-          reviewWarning: Array.isArray(deferredReview.identityExceptions)
-            && deferredReview.identityExceptions.length > 0
-            ? 'Full-backfill scoring is deferred until every canonical identity exception is resolved and the required Sheet snapshot is complete. Existing persisted scores were left unchanged.'
-            : 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.',
+          reviewWarning: deferredBackfillWarning(deferredReview),
         });
         return;
       }
-      const identityResolutionDeferred = scoreRefresh?.ok === false
-        && Array.isArray(scoreRefresh.authorityProblems)
-        && scoreRefresh.authorityProblems.length === 1
-        && scoreRefresh.authorityProblems[0] === 'the canonical candidate set contains an unresolved identity'
-        && Array.isArray(scoreRefresh.review?.identityExceptions)
-        && scoreRefresh.review.identityExceptions.length > 0;
-      if (identityResolutionDeferred) {
-        const deferredReview = {
-          ...scoreRefresh.review,
-          dailyEmailJob: review.dailyEmailJob,
-          emailReadiness: review.emailReadiness,
-          scoringDeferred: true,
-          scoringDeferredReason: 'Scoring is deferred until every canonical identity exception in this review is resolved.',
-        };
-        response.json({
-          success: true,
-          review: deferredReview,
-          summary: deferredReview.importSummary,
-          scoreRefresh: null,
-          reviewWarning: 'Full-backfill scoring is deferred until every canonical identity exception in this review is resolved. Existing persisted scores were left unchanged.',
-        });
-        return;
-      }
+      // An unresolved identity that no open identity exception accounts for is
+      // a real authority failure, not an owner decision: it takes the normal
+      // failure response below instead of being reported as a deferral.
       const publicScoreRefresh = publicScoreRefreshResult(scoreRefresh);
       if (scoreRefresh?.ok === false) {
         response.status(scoreRefreshFailureStatus(scoreRefresh)).json({
@@ -1755,12 +1738,15 @@ export function createApp({
         });
         return;
       }
+      // A listing held for an open identity exception no longer defers the
+      // whole backfill; say so instead of leaving the owner to infer it.
+      const finalReviewWarning = reviewWarning || identityHeldReviewWarning(scoreRefresh);
       response.json({
         success: true,
         review,
         summary: review.importSummary,
         scoreRefresh: publicScoreRefresh,
-        ...(reviewWarning ? { reviewWarning } : {}),
+        ...(finalReviewWarning ? { reviewWarning: finalReviewWarning } : {}),
       });
     }),
   );

@@ -2823,7 +2823,10 @@ export default function DashboardPage() {
         message: fullBackfill
           ? result.review?.scoringDeferred
             ? result.reviewWarning || 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.'
-            : `Full backfill scored ${result.review?.totals?.reviewedDeals || 0} canonical listings. No CRM records were changed.`
+            : [
+                `Full backfill scored ${result.review?.totals?.reviewedDeals || 0} canonical listings. No CRM records were changed.`,
+                result.reviewWarning,
+              ].filter(Boolean).join(' ')
           : `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.`,
       });
       await loadCommandCenter();
