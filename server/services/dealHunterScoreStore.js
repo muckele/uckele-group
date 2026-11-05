@@ -43,6 +43,48 @@ function deferredScoringError(review) {
     || 'Scoring is deferred until every required Google Sheet is healthy.';
 }
 
+const maxIdentityHeldListings = 100;
+
+// A candidate whose identity is ambiguous and that the review's open identity
+// exceptions account for is held for an owner decision rather than treated as
+// an unexplained gap in the canonical set.
+function openIdentityExceptionIds(review) {
+  return new Set((Array.isArray(review?.identityExceptions) ? review.identityExceptions : [])
+    .map((item) => normalizeText(item?.id, 160))
+    .filter(Boolean));
+}
+
+function isIdentityHeldCandidate(deal, openExceptionIds) {
+  const exceptionId = normalizeText(deal?.identityExceptionId, 160);
+  return deal?.identityStatus === 'ambiguous'
+    && !deal?.opportunityId
+    && Boolean(exceptionId)
+    && openExceptionIds.has(exceptionId);
+}
+
+function identityHeldListings(review, candidates = []) {
+  const openExceptionIds = openIdentityExceptionIds(review);
+  const held = new Map();
+  for (const deal of candidates) {
+    if (!isIdentityHeldCandidate(deal, openExceptionIds)) continue;
+    const exceptionId = normalizeText(deal.identityExceptionId, 160);
+    if (!held.has(exceptionId)) {
+      held.set(exceptionId, { exceptionId, name: normalizeText(deal.name, 160) || 'Unnamed listing' });
+    }
+  }
+  return [...held.values()]
+    .sort((left, right) => left.name.localeCompare(right.name) || left.exceptionId.localeCompare(right.exceptionId))
+    .slice(0, maxIdentityHeldListings);
+}
+
+export function identityHeldReviewWarning(scoreRefresh) {
+  const count = Array.isArray(scoreRefresh?.identityHeld) ? scoreRefresh.identityHeld.length : 0;
+  if (count === 0) return '';
+  return count === 1
+    ? '1 listing is held for an identity decision and was left out of scoring. Every other listing was scored.'
+    : `${count} listings are held for an identity decision and were left out of scoring. Every other listing was scored.`;
+}
+
 function authoritativeFullBackfillProblems(review, candidates = []) {
   const requiredSheets = (review?.sources || []).filter(
     (source) => source?.required === true && source?.sourceRole === 'required-primary',
@@ -61,7 +103,9 @@ function authoritativeFullBackfillProblems(review, candidates = []) {
   if (Number(review?.totals?.reviewedDeals ?? -1) < candidates.length) {
     problems.push('the canonical candidate count exceeds the reviewed full-backfill count');
   }
-  if (candidates.some((deal) => !deal?.opportunityId || deal.identityStatus !== 'resolved')) {
+  const openExceptionIds = openIdentityExceptionIds(review);
+  if (candidates.some((deal) => (!deal?.opportunityId || deal.identityStatus !== 'resolved')
+    && !isIdentityHeldCandidate(deal, openExceptionIds))) {
     problems.push('the canonical candidate set contains an unresolved identity');
   }
   return problems;
@@ -326,7 +370,11 @@ export async function refreshOpportunityScores({
       // Capture the complete builder-owned set before the per-run score-write
       // batch limit. Existing scores outside this run's write slice must not be
       // deactivated merely because the scorer writes in bounded batches.
-      authoritativeOpportunityIds = Array.from(new Set(candidates.map((deal) => deal.opportunityId)));
+      // Identity-held listings have no canonical opportunity yet, so they are
+      // absent from the current set until the owner resolves the exception.
+      authoritativeOpportunityIds = Array.from(new Set(candidates
+        .filter((deal) => deal?.opportunityId && deal.identityStatus === 'resolved')
+        .map((deal) => deal.opportunityId)));
     }
   }
 
@@ -428,6 +476,7 @@ export async function refreshOpportunityScores({
     ok: counts.failed === 0,
     status: counts.failed > 0 ? 207 : 200,
     ...(authoritativeReview ? { review: authoritativeReview } : {}),
+    ...(authoritativeOpportunityIds ? { identityHeld: identityHeldListings(authoritativeReview, candidates) } : {}),
     ...(authoritativeReview?.outreachCreated !== undefined ? {
       outreachCreated: authoritativeReview.outreachCreated,
       touchesScheduled: authoritativeReview.touchesScheduled,

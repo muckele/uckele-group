@@ -39,6 +39,7 @@ import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
+  identityHeldReviewWarning,
   previewOpportunityScoreRefresh,
   refreshOpportunityScores,
   requestOpportunityScoreRefresh,
@@ -1755,12 +1756,15 @@ export function createApp({
         });
         return;
       }
+      // A listing held for an open identity exception no longer defers the
+      // whole backfill; say so instead of leaving the owner to infer it.
+      const finalReviewWarning = reviewWarning || identityHeldReviewWarning(scoreRefresh);
       response.json({
         success: true,
         review,
         summary: review.importSummary,
         scoreRefresh: publicScoreRefresh,
-        ...(reviewWarning ? { reviewWarning } : {}),
+        ...(finalReviewWarning ? { reviewWarning: finalReviewWarning } : {}),
       });
     }),
   );

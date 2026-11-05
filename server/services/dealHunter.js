@@ -5859,18 +5859,26 @@ function buildCompleteSheetObservationScopes(sourceResults = [], reviewMode = 'd
       unresolved: [],
       complete: true,
       identityComplete: true,
+      // A raw source-record identity defect (duplicate scope, missing or
+      // repeated record id, mixed source names) is distinct from a record that
+      // is merely held for an open identity exception: only a defect means the
+      // full backfill cannot name its complete canonical set.
+      identityDefect: false,
     };
     if (scopes.has(sourceId)) {
       const priorScope = scopes.get(sourceId);
       priorScope.complete = false;
       priorScope.identityComplete = false;
+      priorScope.identityDefect = true;
       scope.complete = false;
       scope.identityComplete = false;
+      scope.identityDefect = true;
     }
     scopes.set(sourceId, scope);
     const markIdentityIncomplete = () => {
       scope.complete = false;
       scope.identityComplete = false;
+      scope.identityDefect = true;
     };
 
     const collectedDeals = Array.isArray(result?.deals) ? result.deals : [];
@@ -7957,9 +7965,11 @@ async function buildDailyDealReview({
   // A cap or an incremental review is intentionally merely ineligible for
   // source-wide replacement. Ambiguous raw source-record identities are more
   // serious: a full backfill cannot safely claim a complete canonical set, so
-  // defer scoring without touching the last-good Sheet observations.
+  // defer scoring without touching the last-good Sheet observations. A record
+  // held only for an open identity exception is not such a defect: it is
+  // admitted as unresolved, left out of scoring, and surfaced for a decision.
   const ambiguousCompleteSheetIdentitySourceIds = [...completeSheetObservationScopes.values()]
-    .filter((scope) => scope.identityComplete === false)
+    .filter((scope) => scope.identityComplete === false && scope.identityDefect === true)
     .map((scope) => scope.sourceId)
     .sort();
   const seenDeals = await loadDealHunterHistory(storage);
