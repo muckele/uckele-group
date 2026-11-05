@@ -94,7 +94,7 @@ import {
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
 import { getAutoPursueStatus, runAutoPursue, setAutoPursueMode } from './services/autoPursue.js';
-import { listPursuedDeals } from './services/pursuedDeals.js';
+import { listPursuedDeals, recordPursuitOwnerEvent } from './services/pursuedDeals.js';
 import {
   createManualSubmission,
   enforceContactBodyRateLimit,
@@ -2513,6 +2513,24 @@ export function createApp({
       response.status(result.status).json({ success: result.ok, ...result });
     }),
   );
+
+  // The tracker's owner writes (spec §6.2): tracker events only, never a campaign (§6.3). Admin only.
+  for (const [action, kind] of [['reply-type', 'reply-type'], ['stage', 'stage-move'], ['acknowledge', 'acknowledge']]) {
+    app.post(
+      `/api/admin/deal-hunter/pursuing/:opportunityId/${action}`,
+      asyncRoute(async (request, response) => {
+        const session = await requireAdmin(request);
+        if (!session) {
+          response.status(401).json({ success: false, error: 'Administrator access is required.' });
+          return;
+        }
+        const result = await recordPursuitOwnerEvent({ storage: getStorage(), config,
+          opportunityId: request.params.opportunityId, kind, input: request.body,
+          actor: session.username || session.principal_id, role: session.role });
+        response.status(result.status).json({ success: result.ok, ...result });
+      }),
+    );
+  }
 
   // Gmail connect flow (spec §4.2). Admin role only. The callback always redirects back to
   // Operations with a code; token material never reaches a response, a URL or a log line.

@@ -73,6 +73,19 @@ async function get(origin, query, cookie) {
   return { status: response.status, body, json: JSON.parse(body) };
 }
 
+async function post(origin, opportunityId, action, body, cookie) {
+  const response = await fetch(`${origin}${route}/${opportunityId}/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  return { status: response.status, body: text, json: JSON.parse(text) };
+}
+
+const eventCount = (opportunityId) => database.prepare(
+  'SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events WHERE opportunity_id = ?').get(opportunityId).n;
+
 /** An active opportunity the owner chose Pursue on at `at`, with no campaign. */
 async function seedPursuedDeal(storage, opportunityId, at) {
   await storage.upsertDealHunterOpportunity({ opportunity_id: opportunityId, created_at: at, updated_at: at,
@@ -255,6 +268,222 @@ test('GET /api/admin/deal-hunter/pursuing', async (t) => {
       assert.equal(json.counts.needsAction, 1);
       const requested = await get(origin, '?stage=cim-requested', adminCookie);
       assert.deepEqual([requested.json.rows.length, requested.json.truncated], [200, true]);
+    });
+
+    // ---- Task 6: the owner's writes (reply type, stage move, acknowledge) ----
+    let minute = 0;
+    const tick = () => { minute += 1; world.clock.set(pacific('2030-01-07', `15:${String(minute).padStart(2, '0')}`)); };
+    // The list is capped at 200 rows, so only the needs-action deal is read from it; the others by chain tip.
+    const rowOf = async (opportunityId) => (await get(origin, '', adminCookie)).json.rows
+      .find((row) => row.opportunityId === opportunityId);
+    const tipOf = (opportunityId) => database.prepare(`SELECT e.id FROM deal_hunter_pursuit_stage_events e
+      WHERE e.opportunity_id = ? AND NOT EXISTS (SELECT 1 FROM deal_hunter_pursuit_stage_events n
+        WHERE n.previous_event_id = e.id)`).get(opportunityId)?.id ?? 'genesis';
+
+    await t.test('one reply-type click moves the stage, clears attention, and Undo moves it back', async () => {
+      tick();
+      const before = await rowOf('opp-auto');
+      assert.equal(before.needsAction.reason, 'reply');
+      assert.equal(before.latestEventId, 'genesis');
+      const recorded = await post(origin, 'opp-auto', 'reply-type', { replyType: 'nda-requested',
+        idempotencyKey: randomUUID(), expectedLatestEventId: 'genesis',
+        acknowledgedReplyId: before.needsAction.replyId }, adminCookie);
+      assert.deepEqual([recorded.status, recorded.json.success, recorded.json.replay, recorded.json.row.stage,
+        recorded.json.row.needsAction, recorded.json.row.stageSource], [200, true, false, 'nda-sent', null, 'owner']);
+      assert.notEqual(recorded.json.row.latestEventId, 'genesis');
+      assert.equal(typeof recorded.json.row.gmailThreadUrl, 'string');
+      assert.deepEqual(recorded.json.row.release, before.release); // the campaign is untouched
+
+      tick();
+      const undo = await post(origin, 'opp-auto', 'stage', { stage: 'broker-replied', idempotencyKey: randomUUID(),
+        expectedLatestEventId: recorded.json.row.latestEventId }, adminCookie);
+      assert.deepEqual([undo.status, undo.json.row.stage, undo.json.row.needsAction],
+        [200, 'broker-replied', null]);
+      assert.equal(eventCount('opp-auto'), 2);
+    });
+
+    await t.test('not available moves the deal to passed in this tab only: no owner decision, no CRM archive, campaign unchanged', async () => {
+      const stored = await world.campaignFor('opp-auto');
+      const crmBefore = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(stored.crm_submission_id);
+      const decisionsBefore = database.prepare(
+        'SELECT COUNT(*) AS n FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?').get('opp-auto').n;
+      const opportunityBefore = database.prepare(
+        'SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?').get('opp-auto');
+      tick();
+      const moved = await post(origin, 'opp-auto', 'reply-type', { replyType: 'not-available',
+        idempotencyKey: randomUUID(), expectedLatestEventId: tipOf('opp-auto') }, adminCookie);
+      assert.deepEqual([moved.status, moved.json.row.stage, moved.json.row.passedInDealHunter,
+        moved.json.row.opportunityActive], [200, 'passed', false, true]);
+      assert.deepEqual(await world.campaignFor('opp-auto'), stored);
+      assert.deepEqual(database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(stored.crm_submission_id),
+        crmBefore);
+      assert.deepEqual(database.prepare('SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?')
+        .get('opp-auto'), opportunityBefore);
+      assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?')
+        .get('opp-auto').n, decisionsBefore);
+      assert.deepEqual(moved.json.row.release.campaign, { id: stored.id, state: stored.state,
+        rowVersion: Number(stored.row_version), terminalRevision: Number(stored.terminal_revision) });
+
+      tick(); // put it back so the later tests start from a live deal
+      const back = await post(origin, 'opp-auto', 'stage', { stage: 'broker-replied', idempotencyKey: randomUUID(),
+        expectedLatestEventId: moved.json.row.latestEventId }, adminCookie);
+      assert.equal(back.json.row.stage, 'broker-replied');
+    });
+
+    await t.test('two replies then one click: the later reply still needs action', async () => {
+      const insert = database.prepare(`INSERT INTO deal_hunter_gmail_reply_messages (gmail_message_id,
+        gmail_thread_id, conversation_id, classification, from_fingerprint, message_at, processed_at, applied)
+        VALUES (?, ?, ?, ?, NULL, ?, ?, 1)`);
+      const second = pacific('2030-01-07', '15:20');
+      const third = pacific('2030-01-07', '15:25');
+      insert.run('later-reply-2', threadId, campaign.conversation_id, 'reply', second, second);
+      insert.run('later-reply-3', threadId, campaign.conversation_id, 'reply', third, third);
+      const waiting = await rowOf('opp-auto');
+      assert.deepEqual([waiting.needsAction.reason, waiting.needsAction.replyId], ['reply', 'later-reply-2']);
+
+      world.clock.set(pacific('2030-01-07', '15:30'));
+      const clicked = await post(origin, 'opp-auto', 'reply-type', { replyType: 'question', idempotencyKey: randomUUID(),
+        expectedLatestEventId: waiting.latestEventId, acknowledgedReplyId: 'later-reply-2' }, adminCookie);
+      assert.equal(clicked.status, 200);
+      assert.deepEqual([clicked.json.row.needsAction.replyId, clicked.json.row.needsAction.reason],
+        ['later-reply-3', 'reply']);
+
+      world.clock.set(pacific('2030-01-07', '15:31'));
+      const cleared = await post(origin, 'opp-auto', 'acknowledge', { acknowledgedReplyId: 'later-reply-3',
+        idempotencyKey: randomUUID() }, adminCookie);
+      assert.deepEqual([cleared.status, cleared.json.row.needsAction, cleared.json.row.stage], [200, null, 'broker-replied']);
+    });
+
+    await t.test('acknowledge clears a bounce row', async () => {
+      database.prepare(`UPDATE deal_hunter_cim_campaigns SET state = 'action-required', reason_code = 'recipient_bounced'
+        WHERE id = ?`).run(campaign.id);
+      const bounceAt = pacific('2030-01-07', '15:40');
+      database.prepare(`INSERT INTO deal_hunter_gmail_reply_messages (gmail_message_id, gmail_thread_id,
+        conversation_id, classification, from_fingerprint, message_at, processed_at, applied)
+        VALUES ('bounce-1', ?, ?, 'bounce', NULL, ?, ?, 1)`).run(threadId, campaign.conversation_id, bounceAt, bounceAt);
+      const waiting = await rowOf('opp-auto');
+      assert.deepEqual([waiting.needsAction.reason, waiting.needsAction.replyId, waiting.needsAction.classification],
+        ['bounce', 'bounce-1', 'bounce']);
+      world.clock.set(pacific('2030-01-07', '15:41'));
+      const cleared = await post(origin, 'opp-auto', 'acknowledge', { acknowledgedReplyId: 'bounce-1',
+        idempotencyKey: randomUUID() }, adminCookie);
+      assert.deepEqual([cleared.status, cleared.json.row.needsAction], [200, null]);
+    });
+
+    await t.test('a stale expectedLatestEventId is 409 pursuit_stage_changed; same key replays; same key other body is 409 idempotency_conflict', async () => {
+      const tip = tipOf('opp-nda');
+      assert.notEqual(tip, 'genesis');
+      const key = randomUUID();
+      const body = { stage: 'loi-candidate', idempotencyKey: key, expectedLatestEventId: tip };
+      const eventsBefore = eventCount('opp-nda');
+
+      world.clock.set(pacific('2030-01-07', '15:50'));
+      const stale = await post(origin, 'opp-nda', 'stage', { ...body, idempotencyKey: randomUUID(),
+        expectedLatestEventId: 'genesis' }, adminCookie);
+      assert.deepEqual([stale.status, stale.json.success, stale.json.code], [409, false, 'pursuit_stage_changed']);
+      assert.equal(typeof stale.json.error, 'string');
+      assert.equal(eventCount('opp-nda'), eventsBefore);
+
+      const applied = await post(origin, 'opp-nda', 'stage', body, adminCookie);
+      assert.deepEqual([applied.status, applied.json.replay, applied.json.row.stage], [200, false, 'loi-candidate']);
+      const replay = await post(origin, 'opp-nda', 'stage', body, adminCookie);
+      assert.deepEqual([replay.status, replay.json.success, replay.json.replay, replay.json.row.stage,
+        replay.json.row.latestEventId], [200, true, true, 'loi-candidate', applied.json.row.latestEventId]);
+      assert.equal(eventCount('opp-nda'), eventsBefore + 1);
+
+      const reused = await post(origin, 'opp-nda', 'stage', { ...body, stage: 'financial-review' }, adminCookie);
+      assert.deepEqual([reused.status, reused.json.code], [409, 'idempotency_conflict']);
+      assert.equal(eventCount('opp-nda'), eventsBefore + 1);
+    });
+
+    await t.test('a reply-type retry still replays after the derived stage moved on', async () => {
+      const body = { replyType: 'question', idempotencyKey: randomUUID(), expectedLatestEventId: tipOf('opp-plain') };
+      world.clock.set(pacific('2030-01-07', '15:51'));
+      const first = await post(origin, 'opp-plain', 'reply-type', body, adminCookie);
+      assert.deepEqual([first.status, first.json.row.stage], [200, 'broker-replied']);
+      world.clock.set(pacific('2030-01-07', '15:52'));
+      const moved = await post(origin, 'opp-plain', 'stage', { stage: 'loi-candidate', idempotencyKey: randomUUID(),
+        expectedLatestEventId: first.json.row.latestEventId }, adminCookie);
+      assert.equal(moved.json.row.stage, 'loi-candidate');
+      const retry = await post(origin, 'opp-plain', 'reply-type', body, adminCookie);
+      assert.deepEqual([retry.status, retry.json.replay, retry.json.row.stage], [200, true, 'loi-candidate']);
+    });
+
+    await t.test('viewer and anonymous writes are 401 and write nothing', async () => {
+      const eventsBefore = database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events').get().n;
+      const bodies = { 'reply-type': { replyType: 'question', idempotencyKey: randomUUID(), expectedLatestEventId: 'genesis' },
+        stage: { stage: 'passed', idempotencyKey: randomUUID(), expectedLatestEventId: 'genesis' },
+        acknowledge: { acknowledgedReplyId: 'later-reply-2', idempotencyKey: randomUUID() } };
+      for (const [action, body] of Object.entries(bodies)) {
+        for (const cookie of [viewerCookie, null]) {
+          const response = await post(origin, 'opp-nda', action, body, cookie);
+          assert.deepEqual([response.status, response.json], [401, { success: false, error: 'Administrator access is required.' }]);
+        }
+      }
+      assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events').get().n, eventsBefore);
+    });
+
+    await t.test('unknown reply id is 422 unknown_reply; a watched, passed-in-Deal-Hunter or missing deal is 404 not_pursued', async () => {
+      const eventsBefore = database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events').get().n;
+      const unknown = await post(origin, 'opp-auto', 'acknowledge', { acknowledgedReplyId: 'no-such-reply',
+        idempotencyKey: randomUUID() }, adminCookie);
+      assert.deepEqual([unknown.status, unknown.json.success, unknown.json.code], [422, false, 'unknown_reply']);
+      // A reply that belongs to another deal's conversation is just as unknown.
+      const foreign = await post(origin, 'opp-nda', 'acknowledge', { acknowledgedReplyId: 'later-reply-2',
+        idempotencyKey: randomUUID() }, adminCookie);
+      assert.deepEqual([foreign.status, foreign.json.code], [422, 'unknown_reply']);
+
+      const at = pacific('2030-01-07', '16:00');
+      await seedPursuedDeal(storage, 'opp-watched', pacific('2030-01-07', '11:00'));
+      await seedPursuedDeal(storage, 'opp-passed-in-dh', pacific('2030-01-07', '11:00'));
+      const decide = database.prepare(`INSERT INTO deal_hunter_owner_decision_events (id, idempotency_key,
+        request_digest, opportunity_id, action, actor, expected_discovery_revision, expected_material_revision,
+        observed_discovery_revision, observed_material_revision, policy_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'owner-decision-v1', ?)`);
+      decide.run('watch-opp-watched', 'watch-key-1', 'd'.repeat(64), 'opp-watched', 'watch', OWNER, at);
+      decide.run('pass-opp-passed-in-dh', 'pass-key-1', 'd'.repeat(64), 'opp-passed-in-dh', 'pass', OWNER, at);
+      for (const opportunityId of ['opp-watched', 'opp-passed-in-dh', 'no-such-opportunity', 'bad%20id']) {
+        for (const [action, body] of [
+          ['reply-type', { replyType: 'question', idempotencyKey: randomUUID(), expectedLatestEventId: 'genesis' }],
+          ['stage', { stage: 'passed', idempotencyKey: randomUUID(), expectedLatestEventId: 'genesis' }],
+          ['acknowledge', { acknowledgedReplyId: 'later-reply-2', idempotencyKey: randomUUID() }]]) {
+          const response = await post(origin, opportunityId, action, body, adminCookie);
+          assert.deepEqual([opportunityId, action, response.status, response.json.success, response.json.code],
+            [opportunityId, action, 404, false, 'not_pursued']);
+        }
+      }
+      assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events').get().n, eventsBefore);
+    });
+
+    await t.test('an archived opportunity is 409 opportunity_not_active', async () => {
+      const response = await post(origin, 'warmup-opp-0', 'stage', { stage: 'passed', idempotencyKey: randomUUID(),
+        expectedLatestEventId: 'genesis' }, adminCookie);
+      assert.deepEqual([response.status, response.json.code], [409, 'opportunity_not_active']);
+    });
+
+    await t.test('bad bodies are 400 with a named code and write nothing', async () => {
+      const eventsBefore = database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events').get().n;
+      const ok = { idempotencyKey: randomUUID(), expectedLatestEventId: tipOf('opp-nda') };
+      const cases = [
+        ['reply-type', { ...ok, replyType: 'bogus' }, 'invalid_reply_type'],
+        ['reply-type', { ...ok }, 'invalid_reply_type'],
+        ['stage', { ...ok, stage: 'bogus' }, 'invalid_stage'],
+        ['stage', { ...ok }, 'invalid_stage'],
+        ['stage', { stage: 'passed', expectedLatestEventId: ok.expectedLatestEventId }, 'invalid_idempotency_key'],
+        ['stage', { stage: 'passed', expectedLatestEventId: ok.expectedLatestEventId, idempotencyKey: 'not-a-uuid' }, 'invalid_idempotency_key'],
+        ['reply-type', { replyType: 'question', idempotencyKey: ok.idempotencyKey }, 'invalid_expected_latest_event_id'],
+        ['stage', { stage: 'passed', idempotencyKey: ok.idempotencyKey, expectedLatestEventId: null }, 'invalid_expected_latest_event_id'],
+        ['stage', { stage: 'passed', idempotencyKey: ok.idempotencyKey, expectedLatestEventId: 'a b' }, 'invalid_expected_latest_event_id'],
+        ['reply-type', { ...ok, replyType: 'question', acknowledgedReplyId: 42 }, 'invalid_acknowledged_reply_id'],
+        ['acknowledge', { idempotencyKey: ok.idempotencyKey }, 'invalid_acknowledged_reply_id'],
+        ['acknowledge', { idempotencyKey: ok.idempotencyKey, acknowledgedReplyId: '' }, 'invalid_acknowledged_reply_id'],
+      ];
+      for (const [action, body, code] of cases) {
+        const response = await post(origin, 'opp-nda', action, body, adminCookie);
+        assert.deepEqual([action, response.status, response.json.success, response.json.code],
+          [action, 400, false, code], JSON.stringify(body));
+      }
+      assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events').get().n, eventsBefore);
     });
   });
 });

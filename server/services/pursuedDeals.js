@@ -1,9 +1,10 @@
 // The Pursued deals tracker's read side (spec 2026-11-04 §6.1): every pursued deal folded to a
 // stage, filtered, sorted and capped, each row carrying the campaign's release status. Reads
 // only; nothing here sends or writes.
-import { PURSUIT_STAGES } from '../storage/pursuitTrackerStorageContract.js';
+import { randomUUID } from 'node:crypto';
+import { PURSUIT_REPLY_TYPES, PURSUIT_STAGES, pursuitStageRequestDigest } from '../storage/pursuitTrackerStorageContract.js';
 import { getPursueCimReleaseReport } from './pursueCimRelease.js';
-import { buildGmailThreadUrl, foldPursuitStage, STAGE_LABELS } from './pursuitTracker.js';
+import { buildGmailThreadUrl, foldPursuitStage, STAGE_LABELS, stageAfterReplyType } from './pursuitTracker.js';
 
 export const PURSUED_DEALS_ROW_CAP = 200;
 /** Postgres release reports are several reads each, so they run this many at a time. */
@@ -150,4 +151,89 @@ export async function getPursuedDealRow({ storage, config, opportunityId, role, 
   return buildPursuedDealRow({ bundle, projection, role,
     gmailAddress: await gmailAddressFor({ storage, config }),
     release: await releaseFor({ storage, opportunityId, now: new Date(now).toISOString() }) });
+}
+
+const OWNER_EVENT_KINDS = Object.freeze({ 'reply-type': 'reply-type', 'stage-move': 'stage-move', acknowledge: 'acknowledge' });
+// The client idempotency key format of dealHunterTriage.js (owner decisions).
+const IDEMPOTENCY_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Opportunity, event and Gmail message ids: the storage contract's id shape.
+const ID_SHAPE = /^[A-Za-z0-9_-]{1,240}$/;
+const isId = (value) => typeof value === 'string' && ID_SHAPE.test(value);
+
+const REFUSALS = Object.freeze({
+  not_pursued: [404, 'This deal is not in your pursued deals.'],
+  unknown_reply: [422, 'That reply does not belong to this deal\'s conversation.'],
+  pursuit_stage_changed: [409, 'This deal changed since you loaded it. Refresh and try again.'],
+  idempotency_conflict: [409, 'That request key was already used for a different change.'],
+  opportunity_not_active: [409, 'This deal is no longer active, so its stage cannot be changed.'],
+});
+const refusal = (code) => {
+  const [status, error] = REFUSALS[code] ?? [409, 'The change could not be recorded.'];
+  return { ok: false, status, code, error };
+};
+const badRequest = (code, error) => ({ ok: false, status: 400, code, error });
+
+// Checks the body for `kind`; returns `{ fields }` or the 400.
+function validateOwnerEventInput(kind, input) {
+  const body = input && typeof input === 'object' ? input : {};
+  const { idempotencyKey, expectedLatestEventId, replyType, stage, acknowledgedReplyId } = body;
+  if (typeof idempotencyKey !== 'string' || !IDEMPOTENCY_KEY.test(idempotencyKey)) {
+    return badRequest('invalid_idempotency_key', 'A valid client idempotency key is required.');
+  }
+  if (kind === 'reply-type' && !PURSUIT_REPLY_TYPES.includes(replyType)) {
+    return badRequest('invalid_reply_type', 'Choose one of the reply types.');
+  }
+  if (kind === 'stage-move' && !PURSUIT_STAGES.includes(stage)) {
+    return badRequest('invalid_stage', 'Choose one of the stages.');
+  }
+  // `genesis` is a valid id too: it names the empty chain.
+  if (kind !== 'acknowledge' && !isId(expectedLatestEventId)) {
+    return badRequest('invalid_expected_latest_event_id', 'The deal\'s latest event id is required.');
+  }
+  const hasReply = acknowledgedReplyId !== undefined && acknowledgedReplyId !== null;
+  if ((kind === 'acknowledge' || hasReply) && !isId(acknowledgedReplyId)) {
+    return badRequest('invalid_acknowledged_reply_id', 'A valid reply id is required.');
+  }
+  return { fields: { idempotencyKey, replyType: kind === 'reply-type' ? replyType : null,
+    requestedStage: kind === 'stage-move' ? stage : null,
+    // An acknowledgement waits for no one: it appends after whatever the chain tip is.
+    expectedPreviousEventId: kind === 'acknowledge' ? null : expectedLatestEventId,
+    acknowledgedReplyId: hasReply ? acknowledgedReplyId : null } };
+}
+
+/**
+ * One owner write on a pursued deal (spec 2026-11-04 §6.2): `kind` is `reply-type`,
+ * `stage-move` or `acknowledge`. Tracker only: it appends an owner event and never touches a
+ * campaign, a CRM record or an owner decision (§6.3). The deal's current stage is folded fresh at
+ * request time; the response row is read back the same role-safe way as the list (also on replay).
+ */
+export async function recordPursuitOwnerEvent({ storage, config, opportunityId, kind, input, actor, role,
+  now = new Date() } = {}) {
+  if (!OWNER_EVENT_KINDS[kind]) throw new TypeError('Invalid kind');
+  const checked = validateOwnerEventInput(kind, input);
+  if (!checked.fields) return checked;
+  const { idempotencyKey, replyType, requestedStage, expectedPreviousEventId, acknowledgedReplyId } = checked.fields;
+
+  if (!isId(opportunityId)) return refusal('not_pursued');
+  const [bundle] = await storage.listPursuitBundles({ opportunityIds: [opportunityId] });
+  const current = bundle ? foldPursuitStage(bundle) : null;
+  // A deal passed in Deal Hunter is read-only here (§5.1): refuse before writing anything.
+  if (!current?.member || current.passedInDealHunter) return refusal('not_pursued');
+
+  const fromStage = current.stage;
+  const stage = kind === 'stage-move' ? requestedStage
+    : kind === 'reply-type' ? stageAfterReplyType(fromStage, replyType) : fromStage;
+  const at = new Date(now).toISOString();
+  const command = { id: randomUUID(), idempotencyKey, opportunityId, expectedPreviousEventId, kind, replyType,
+    fromStage, stage, acknowledgedReplyId, actor, now: at };
+  // The digest binds what the owner asked for. The stage of a reply-type click or an
+  // acknowledgement is derived from the fold, which evidence can move between a request and its
+  // retry, so it stays out of the digest: a retry must replay, not conflict.
+  const requestDigest = pursuitStageRequestDigest({ ...command, stage: kind === 'stage-move' ? stage : null });
+  const result = await storage.recordPursuitStageEvent({ ...command, requestDigest });
+  if (!result.applied && !result.replay) return refusal(result.conflict);
+
+  const row = await getPursuedDealRow({ storage, config, opportunityId, role, now: at });
+  if (!row) return refusal('not_pursued');
+  return { ok: true, status: 200, row, replay: result.replay };
 }
