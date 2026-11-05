@@ -95,7 +95,7 @@ const mimeTypesByExtension = new Map([
   ['.zip', 'application/zip'],
 ]);
 
-function sanitizeFileName(fileName) {
+export function sanitizeFileName(fileName) {
   const cleaned = String(fileName || 'document')
     .replace(/[^a-zA-Z0-9._-]+/g, '-')
     .replace(/-+/g, '-')
@@ -242,7 +242,7 @@ function hasTextSignature(buffer) {
   return buffer.length > 0 && !buffer.subarray(0, Math.min(buffer.length, 4096)).includes(0);
 }
 
-function bufferMatchesMimeType(buffer, mimeType) {
+export function bufferMatchesMimeType(buffer, mimeType) {
   if (mimeType === 'application/pdf') {
     return buffer.subarray(0, 5).toString('ascii') === '%PDF-';
   }

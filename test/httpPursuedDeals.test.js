@@ -4,8 +4,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 
 import Database from 'better-sqlite3';
@@ -29,8 +31,10 @@ const { createApp } = await import('../server/app.js');
 const { getStorage } = await import('../server/storage/index.js');
 const { getPursueCimReleaseReport } = await import('../server/services/pursueCimRelease.js');
 const { pursuitStageRequestDigest } = await import('../server/storage/pursuitTrackerStorageContract.js');
-const { HEALTHY_SOURCE_SNAPSHOT, START, autoPursuedAndSent, brokerReplies, createWorld, pacific, pollAt } =
-  await import('./fixtures/pursueCimEndToEndFixture.js');
+const { getConfig } = await import('../server/config.js');
+const { createBackupBundle, verifyBackupBundle } = await import('../server/services/backups.js');
+const { HEALTHY_SOURCE_SNAPSHOT, START, autoPursuedAndSent, brokerReplies, createWorld, ownerRequestsSim, pacific,
+  pollAt, seedDeal } = await import('./fixtures/pursueCimEndToEndFixture.js');
 
 fs.writeFileSync(process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH, JSON.stringify(HEALTHY_SOURCE_SNAPSHOT));
 
@@ -45,15 +49,94 @@ test.after(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-async function withServer(run) {
-  const server = createApp().listen(0, '127.0.0.1');
+// `bodyBytesRead` counts, per `X-Test-Tag` request header, the body bytes the server's request
+// stream delivered to a reader ('data' events), without changing how the request is read.
+async function withServer(run, appOptions = {}) {
+  const server = createApp(appOptions).listen(0, '127.0.0.1');
+  const bodyBytesRead = new Map();
+  server.prependListener('request', (request) => {
+    const tag = request.headers['x-test-tag'];
+    if (!tag) return;
+    bodyBytesRead.set(tag, 0);
+    const emit = request.emit;
+    request.emit = function countData(event, ...args) {
+      if (event === 'data') bodyBytesRead.set(tag, bodyBytesRead.get(tag) + args[0].length);
+      return emit.call(this, event, ...args);
+    };
+  });
   await new Promise((resolve, reject) => { server.once('listening', resolve); server.once('error', reject); });
   try {
-    await run(`http://127.0.0.1:${server.address().port}`);
+    await run(`http://127.0.0.1:${server.address().port}`, { bodyBytesRead });
   } finally {
+    server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
   }
 }
+
+const SIM_MAX_BYTES = 25 * 1024 * 1024;
+const pdfBytes = Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.alloc(150_000, 0x41), Buffer.from('\n%%EOF\n')]);
+const pngBytes = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)]);
+
+/**
+ * A raw SIM upload over its own socket. The request line and headers go out at once; the body is
+ * written only if given, and the request is left open when `hold` is set. `response` settles with
+ * the server's answer, or with `{ error }` when the server closed the socket instead.
+ */
+function openUpload(origin, opportunityId, { cookie, headers = {}, body = null, hold = false, tag = randomUUID() }) {
+  const { hostname, port } = new URL(origin);
+  const request = http.request({ hostname, port, method: 'POST', path: `${route}/${opportunityId}/sim`,
+    headers: { 'X-Test-Tag': tag, ...(cookie ? { Cookie: cookie } : {}), ...headers } });
+  const response = new Promise((resolve) => {
+    request.on('response', (incoming) => {
+      const chunks = [];
+      incoming.on('data', (chunk) => chunks.push(chunk));
+      incoming.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve({ status: incoming.statusCode, headers: incoming.headers, body: text,
+          json: text ? JSON.parse(text) : null });
+      });
+      incoming.on('error', (error) => resolve({ error }));
+    });
+    request.on('error', (error) => resolve({ error }));
+  });
+  if (body) request.write(body);
+  if (hold) request.flushHeaders();
+  else request.end();
+  return { request, response, tag };
+}
+
+const simHeaders = ({ key = randomUUID(), name = 'Acme-SIM.pdf', length, type = 'application/pdf' } = {}) => ({
+  'Content-Type': type, 'Content-Length': String(length), 'X-Idempotency-Key': key, 'X-File-Name': name });
+
+async function waitFor(predicate, what) {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (await predicate()) return;
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+/** Every file under the vault that no secure_documents row names, and every empty upload directory. */
+function vaultLitter() {
+  const root = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  if (!fs.existsSync(root)) return [];
+  const stored = new Set(database.prepare('SELECT storage_path FROM secure_documents').all()
+    .map((row) => row.storage_path));
+  const litter = [];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === '.trash') continue;
+    const directory = path.join(root, entry.name);
+    const files = fs.readdirSync(directory);
+    if (files.length === 0) litter.push(directory);
+    for (const file of files) {
+      if (!stored.has(path.join(directory, file))) litter.push(path.join(directory, file));
+    }
+  }
+  return litter;
+}
+
+const unsettledCleanupJobs = () => database.prepare(
+  "SELECT id, status FROM secure_document_cleanup_jobs WHERE status <> 'completed'").all();
 
 let loginSequence = 0;
 async function login(origin, username, password) {
@@ -118,7 +201,7 @@ test('GET /api/admin/deal-hunter/pursuing', async (t) => {
   const warnings = [];
   t.mock.method(console, 'warn', (...args) => { warnings.push(args); });
 
-  await withServer(async (origin) => {
+  await withServer(async (origin, { bodyBytesRead }) => {
     const adminCookie = await login(origin, 'admin', 'change-me-now');
     const viewerCookie = await login(origin, 'pursued-viewer', 'pursued-viewer-password');
 
@@ -484,6 +567,274 @@ test('GET /api/admin/deal-hunter/pursuing', async (t) => {
           [action, 400, false, code], JSON.stringify(body));
       }
       assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events').get().n, eventsBefore);
+    });
+
+    // ---- Task 7: the owner's streaming SIM upload ----
+    // A deal the owner requested a SIM on: its campaign is live, so an upload stops it.
+    world.clock.set(pacific('2030-01-07', '16:30'));
+    await seedDeal(world, { opportunityId: 'opp-sim', name: 'Bayside HVAC', fitScore: 82, criteriaGroup: 'review',
+      brokerEmail: 'casey.park@simbroker.test' });
+    await ownerRequestsSim(world, 'opp-sim');
+    const simCampaign = await world.campaignFor('opp-sim');
+    assert.equal(typeof simCampaign.crm_submission_id, 'string');
+    const storageDir = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+    const documentCount = () => database.prepare('SELECT COUNT(*) AS n FROM secure_documents').get().n;
+    const documentRow = (id) => database.prepare('SELECT * FROM secure_documents WHERE id = ?').get(id);
+    const simEvents = () => database.prepare(
+      "SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events WHERE kind = 'sim-intake'").get().n;
+    const upload = (opportunityId, body, { key, name = 'Acme-SIM.pdf', length = body.length } = {}) =>
+      openUpload(origin, opportunityId, { cookie: adminCookie, headers: simHeaders({ key, name, length }), body });
+    let firstUpload;
+
+    await t.test('a PDF upload stores a 0600 file, marks SIM received, and stops follow-ups', async () => {
+      world.clock.set(pacific('2030-01-07', '16:40'));
+      assert.equal(simCampaign.state, 'initial-pending');
+      const sentBefore = world.mailProvider.sent.length;
+      const key = randomUUID();
+      const sent = upload('opp-sim', pdfBytes, { key, name: encodeURIComponent('Acme SIM (final).pdf') });
+      const response = await sent.response;
+      assert.equal(response.status, 201, response.body);
+      assert.equal(response.json.success, true);
+      assert.equal(response.json.row.stage, 'cim-received');
+      assert.equal(response.json.stoppedFollowUps, true);
+      assert.equal(bodyBytesRead.get(sent.tag), pdfBytes.length);
+
+      const stored = documentRow(response.json.document.id);
+      assert.deepEqual(response.json.document, { id: stored.id, name: 'Acme-SIM-final-.pdf', sizeBytes: pdfBytes.length,
+        uploadedAt: stored.created_at });
+      assert.deepEqual([stored.document_type, stored.submission_id, stored.mime_type, stored.file_name],
+        ['cim', simCampaign.crm_submission_id, 'application/pdf', `${stored.id}-Acme-SIM-final-.pdf`]);
+      const storedPath = path.join(storageDir, stored.request_id, stored.file_name);
+      assert.equal(stored.storage_path, storedPath);
+      assert.equal((fs.statSync(storedPath).mode & 0o777), 0o600);
+      assert.equal((fs.statSync(path.dirname(storedPath)).mode & 0o777), 0o700);
+      assert.deepEqual(fs.readFileSync(storedPath), pdfBytes);
+      assert.equal((await world.campaignFor('opp-sim')).state, 'materials-received');
+      assert.equal(response.json.row.simDocuments[0].id, stored.id);
+
+      const request = database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(stored.request_id);
+      assert.deepEqual([request.status, request.requested_by, request.nda_required, request.closed_at],
+        ['completed', 'admin', 0, request.expires_at]);
+      const event = database.prepare(`SELECT kind, secure_document_id, actor FROM deal_hunter_pursuit_stage_events
+        WHERE idempotency_key = ?`).get(key);
+      assert.deepEqual({ ...event }, { kind: 'sim-intake', secure_document_id: stored.id, actor: 'admin' });
+      const activity = database.prepare(`SELECT role, opportunity_id FROM crm_activity_events
+        WHERE submission_id = ? AND event_type = 'documents.uploaded'`).all(stored.submission_id);
+      assert.deepEqual(activity.map((row) => ({ ...row })), [{ role: 'admin', opportunity_id: 'opp-sim' }]);
+
+      // The write-ahead cleanup job, settled: no requestId, so the reconciler never resets the request.
+      const [job] = database.prepare('SELECT * FROM secure_document_cleanup_jobs WHERE files LIKE ?')
+        .all(`%${stored.id}%`);
+      assert.equal(job.status, 'completed');
+      const metadata = JSON.parse(job.metadata);
+      assert.deepEqual(metadata, { reason: 'ambiguous-secure-upload-finalization', documentIds: [stored.id],
+        reconcileAfter: metadata.reconcileAfter, writeAheadIntent: true });
+      assert.equal(Number.isFinite(Date.parse(metadata.reconcileAfter)), true);
+      assert.deepEqual(JSON.parse(job.files), [{ documentId: stored.id, originalPath: storedPath,
+        stagedPath: path.join(job.trash_directory, `0-${stored.file_name}`), staged: false,
+        purgeOriginalIfStagedMissing: true }]);
+      assert.equal(world.mailProvider.sent.length, sentBefore); // the upload sends nothing
+      assert.deepEqual(vaultLitter(), []);
+      firstUpload = { key, response };
+    });
+
+    await t.test('anonymous and viewer uploads are 401 before any body byte is read', async () => {
+      const documents = documentCount();
+      for (const cookie of [null, viewerCookie]) {
+        const held = openUpload(origin, 'opp-sim', { cookie, headers: simHeaders({ length: pdfBytes.length }),
+          hold: true });
+        const response = await held.response;
+        assert.deepEqual([response.status, response.json], [401,
+          { success: false, error: 'Administrator access is required.' }]);
+        assert.equal(bodyBytesRead.get(held.tag), 0);
+        held.request.destroy();
+      }
+      assert.equal(documentCount(), documents);
+    });
+
+    let holders;
+    await t.test('a full capacity gate is 503 with Retry-After 30 before any body byte is read', async () => {
+      // Two uploads hold both slots mid-stream.
+      holders = [0, 1].map(() => openUpload(origin, 'opp-sim', { cookie: adminCookie,
+        headers: simHeaders({ length: pdfBytes.length }), body: pdfBytes.subarray(0, 4096), hold: true }));
+      await waitFor(() => holders.every((held) => bodyBytesRead.get(held.tag) === 4096), 'both uploads to stream');
+      const refused = openUpload(origin, 'opp-sim', { cookie: adminCookie,
+        headers: simHeaders({ length: pdfBytes.length }), hold: true });
+      const response = await refused.response;
+      assert.deepEqual([response.status, response.headers['retry-after'], response.json], [503, '30',
+        { success: false, code: 'upload_capacity', error: 'Uploads are busy. Try again in 30 seconds.' }]);
+      assert.equal(bodyBytesRead.get(refused.tag), 0);
+      refused.request.destroy();
+    });
+
+    await t.test('a client abort mid-stream leaves no file and frees the capacity slot', async () => {
+      const documents = documentCount();
+      await waitFor(() => vaultLitter().length === 2, 'the two partial files');
+      for (const held of holders) held.request.destroy();
+      for (const held of holders) assert.ok((await held.response).error);
+      await waitFor(() => vaultLitter().length === 0 && unsettledCleanupJobs().length === 0,
+        'the aborted uploads to be cleaned up');
+      // Both slots are free again: two more uploads stream at the same time.
+      const again = [0, 1].map(() => openUpload(origin, 'opp-sim', { cookie: adminCookie,
+        headers: simHeaders({ length: pdfBytes.length }), body: pdfBytes.subarray(0, 4096), hold: true }));
+      await waitFor(() => again.every((held) => bodyBytesRead.get(held.tag) === 4096), 'two uploads to stream');
+      for (const held of again) held.request.destroy();
+      await waitFor(() => vaultLitter().length === 0 && unsettledCleanupJobs().length === 0,
+        'the second aborted uploads to be cleaned up');
+      assert.equal(documentCount(), documents);
+    });
+
+    await t.test('header refusals: 415 pdf_only, 411 length_required, 413 by header, 400 invalid_idempotency_key, 400 invalid_file_name for %E0%A4%A', async () => {
+      const documents = documentCount();
+      const ok = simHeaders({ length: 100 });
+      const { 'Content-Length': _length, ...chunked } = ok;
+      const cases = [
+        [{ ...ok, 'Content-Type': 'application/octet-stream' }, 415, 'pdf_only', 'Only PDF files can be uploaded as a SIM.'],
+        [{ ...ok, 'Content-Type': 'application/pdf; charset=binary' }, 415, 'pdf_only'],
+        [{ ...ok, 'Content-Type': 'text/html', 'Content-Length': String(SIM_MAX_BYTES + 1) }, 415, 'pdf_only'],
+        [{ ...chunked, 'Transfer-Encoding': 'chunked' }, 411, 'length_required'],
+        [{ ...ok, 'Content-Length': String(SIM_MAX_BYTES + 1) }, 413, 'file_too_large', 'This file is larger than 25 MB.'],
+        [{ ...ok, 'Content-Length': String(SIM_MAX_BYTES + 1), 'X-Idempotency-Key': 'nope' }, 413, 'file_too_large'],
+        [{ ...ok, 'X-Idempotency-Key': 'not-a-uuid', 'X-File-Name': '%E0%A4%A' }, 400, 'invalid_idempotency_key'],
+        [{ ...ok, 'X-File-Name': '%E0%A4%A' }, 400, 'invalid_file_name',
+          'The file name couldn\'t be read. Rename it and try again.'],
+      ];
+      for (const [headers, status, code, copy] of cases) {
+        const held = openUpload(origin, 'opp-sim', { cookie: adminCookie, headers, hold: true });
+        const response = await held.response;
+        assert.deepEqual([response.status, response.json.success, response.json.code], [status, false, code],
+          JSON.stringify(headers));
+        if (copy) assert.equal(response.json.error, copy);
+        assert.equal(bodyBytesRead.get(held.tag), 0);
+        held.request.destroy();
+      }
+      assert.equal(documentCount(), documents);
+    });
+
+    await t.test('a body longer than its Content-Length or 25 MiB is 413 and leaves no file', async () => {
+      // Node's HTTP parser never hands a request stream more than its Content-Length, so the
+      // stream check is driven directly with request streams that overrun it.
+      const { SIM_MAX_BYTES: maxBytes, receivePursuitSimUpload } = await import('../server/services/pursuedDealsSimUpload.js');
+      assert.equal(maxBytes, SIM_MAX_BYTES);
+      const documents = documentCount();
+      const events = simEvents();
+      const receive = (request, contentLength) => receivePursuitSimUpload({ storage, config: getConfig(), request,
+        opportunityId: 'opp-sim', actor: 'admin', role: 'admin',
+        headers: { idempotencyKey: randomUUID(), fileName: 'Long.pdf', contentLength, acknowledgedReplyId: null },
+        diskStats: async () => ({ bavail: 2 ** 30, bsize: 4096 }) });
+      const longer = await receive(Readable.from([pdfBytes, Buffer.alloc(10)]), pdfBytes.length);
+      assert.deepEqual([longer.status, longer.body.code], [413, 'file_too_large']);
+      const mebibyte = Buffer.alloc(1024 * 1024, 0x20);
+      function* overMax() {
+        yield Buffer.from('%PDF-');
+        for (let index = 0; index < 25; index += 1) yield mebibyte;
+      }
+      const huge = await receive(Readable.from(overMax()), SIM_MAX_BYTES);
+      assert.deepEqual([huge.status, huge.body.code], [413, 'file_too_large']);
+      // A stream that ends short of its Content-Length is refused too.
+      const shorter = await receive(Readable.from([pdfBytes.subarray(0, 100)]), pdfBytes.length);
+      assert.deepEqual([shorter.status, shorter.body.code], [411, 'length_required']);
+      assert.deepEqual([documentCount(), simEvents(), vaultLitter(), unsettledCleanupJobs()],
+        [documents, events, [], []]);
+    });
+
+    await t.test('a PNG renamed .pdf is 422 not_a_pdf and leaves no file', async () => {
+      const documents = documentCount();
+      const events = simEvents();
+      const response = await upload('opp-sim', pngBytes, { name: 'scan.pdf' }).response;
+      assert.deepEqual([response.status, response.json], [422,
+        { success: false, code: 'not_a_pdf', error: 'That file isn\'t a valid PDF.' }]);
+      const tiny = await upload('opp-sim', Buffer.from('%PD'), { name: 'tiny.pdf' }).response;
+      assert.deepEqual([tiny.status, tiny.json.code], [422, 'not_a_pdf']);
+      assert.deepEqual([documentCount(), simEvents(), vaultLitter(), unsettledCleanupJobs()],
+        [documents, events, [], []]);
+    });
+
+    await t.test('../../etc/x.pdf is stored as a sanitized basename inside the request directory', async () => {
+      for (const [name, expected] of [[encodeURIComponent('../../etc/x.pdf'), 'x.pdf'], ['..%2F..%2Fetc%2Fx.pdf', 'x.pdf'],
+        [encodeURIComponent('Q3 numbers'), 'Q3-numbers.pdf'], ['a'.repeat(200), `${'a'.repeat(176)}.pdf`]]) {
+        world.clock.set(new Date(Date.now() + 60_000).toISOString());
+        const response = await upload('opp-sim', pdfBytes, { name }).response;
+        assert.equal(response.status, 201, response.body);
+        const stored = documentRow(response.json.document.id);
+        assert.deepEqual([stored.original_name, response.json.document.name], [expected, expected]);
+        assert.equal(stored.storage_path, path.join(storageDir, stored.request_id, `${stored.id}-${expected}`));
+        assert.equal(path.relative(storageDir, stored.storage_path).startsWith('..'), false);
+        assert.equal(fs.existsSync(stored.storage_path), true);
+      }
+      assert.equal(fs.existsSync(path.join(storageDir, '..', 'etc')), false);
+      assert.deepEqual(vaultLitter(), []);
+    });
+
+    await t.test('507 storage_full when diskStats reports less than the reserve', async () => {
+      const documents = documentCount();
+      const jobs = database.prepare('SELECT COUNT(*) AS n FROM secure_document_cleanup_jobs').get().n;
+      const asked = [];
+      await withServer(async (lowOrigin) => {
+        const held = openUpload(lowOrigin, 'opp-sim', { cookie: adminCookie,
+          headers: simHeaders({ length: pdfBytes.length }), hold: true });
+        const response = await held.response;
+        assert.deepEqual([response.status, response.json], [507, { success: false, code: 'storage_full',
+          error: 'The server is low on storage space. Tell your engineer before uploading more.' }]);
+        held.request.destroy();
+      }, { diskStats: async (directory) => { asked.push(directory); return { bavail: 1, bsize: 4096 }; } });
+      assert.deepEqual(asked, [storageDir]);
+      assert.equal(documentCount(), documents);
+      assert.equal(database.prepare('SELECT COUNT(*) AS n FROM secure_document_cleanup_jobs').get().n, jobs);
+      assert.deepEqual(vaultLitter(), []);
+    });
+
+    await t.test('a replayed key returns the first result without reading the body', async () => {
+      const documents = documentCount();
+      const events = simEvents();
+      const held = openUpload(origin, 'opp-sim', { cookie: adminCookie,
+        headers: simHeaders({ key: firstUpload.key, length: pdfBytes.length }), hold: true });
+      const response = await held.response;
+      assert.deepEqual([response.status, response.json.success, response.json.replay, response.json.row.opportunityId],
+        [200, true, true, 'opp-sim']);
+      assert.equal(response.json.row.simDocuments.some((document) => document.id === firstUpload.response.json.document.id),
+        true);
+      assert.equal(bodyBytesRead.get(held.tag), 0);
+      await waitFor(() => held.request.socket?.destroyed, 'the server to close the replayed upload');
+      assert.deepEqual([documentCount(), simEvents()], [documents, events]);
+
+      // A key another write already used is a conflict, not a replay.
+      const { idempotency_key: usedKey } = database.prepare(
+        "SELECT idempotency_key FROM deal_hunter_pursuit_stage_events WHERE kind = 'stage-move' LIMIT 1").get();
+      const reused = await openUpload(origin, 'opp-sim', { cookie: adminCookie,
+        headers: simHeaders({ key: usedKey, length: pdfBytes.length }), hold: true }).response;
+      assert.deepEqual([reused.status, reused.json.code], [409, 'idempotency_conflict']);
+      assert.deepEqual([documentCount(), simEvents()], [documents, events]);
+    });
+
+    await t.test('no campaign is 409 no_crm_record', async () => {
+      await seedPursuedDeal(storage, 'opp-sim-no-crm', pacific('2030-01-07', '12:00'));
+      const documents = documentCount();
+      const held = openUpload(origin, 'opp-sim-no-crm', { cookie: adminCookie,
+        headers: simHeaders({ length: pdfBytes.length }), hold: true });
+      const response = await held.response;
+      assert.deepEqual([response.status, response.json], [409, { success: false, code: 'no_crm_record',
+        error: 'This deal has no CRM record yet, so a SIM can\'t be stored.' }]);
+      assert.equal(bodyBytesRead.get(held.tag), 0);
+      held.request.destroy();
+      const missing = await openUpload(origin, 'no-such-deal', { cookie: adminCookie,
+        headers: simHeaders({ length: pdfBytes.length }), hold: true }).response;
+      assert.deepEqual([missing.status, missing.json.code], [404, 'not_pursued']);
+      assert.equal(documentCount(), documents);
+      assert.deepEqual(vaultLitter(), []);
+    });
+
+    await t.test('an upload during a backup leaves both consistent', async () => {
+      world.clock.set(new Date(Date.now() + 60_000).toISOString());
+      const backup = createBackupBundle({ storage, config: getConfig() });
+      const sent = upload('opp-sim', pdfBytes, { name: 'during-backup.pdf' });
+      const [bundle, response] = await Promise.all([backup, sent.response]);
+      assert.equal(response.status, 201, response.body);
+      assert.equal((await verifyBackupBundle(bundle.path)).ok, true);
+      const stored = documentRow(response.json.document.id);
+      assert.ok(stored);
+      assert.deepEqual(fs.readFileSync(stored.storage_path), pdfBytes);
+      assert.deepEqual([vaultLitter(), unsettledCleanupJobs()], [[], []]);
     });
   });
 });

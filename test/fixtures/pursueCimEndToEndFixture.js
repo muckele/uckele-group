@@ -207,7 +207,7 @@ async function ownerActivatesAutoPursue(world) {
  * criteria group, its Sheet facts (one named listing broker), accepted with the Sheet's
  * accepted generation. Ingestion is upstream of this feature, so the acceptance is seeded.
  */
-async function seedDeal(world, { opportunityId, name, fitScore, criteriaGroup, brokerEmail = BROKER_EMAIL }) {
+export async function seedDeal(world, { opportunityId, name, fitScore, criteriaGroup, brokerEmail = BROKER_EMAIL }) {
   const { storage } = world;
   const at = new Date(Date.now() - 2 * HOUR).toISOString();
   await storage.upsertDealHunterOpportunity({
@@ -247,7 +247,7 @@ async function seedDeal(world, { opportunityId, name, fitScore, criteriaGroup, b
 }
 
 /** The owner clicks Request SIM on a deal (POST /api/admin/deal-hunter/triage/:id/action). */
-async function ownerRequestsSim(world, opportunityId) {
+export async function ownerRequestsSim(world, opportunityId) {
   const opportunity = await world.storage.getCurrentDealHunterOpportunity(opportunityId);
   const result = await recordAcquisitionOwnerCommand({ opportunityId, action: 'pursue',
     idempotencyKey: randomUUID(), expectedDiscoveryRevision: Number(opportunity.discovery_revision),
