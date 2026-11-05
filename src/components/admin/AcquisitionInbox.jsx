@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight, ExternalLink, Search } from 'lucide-react';
 import { NavLink, useNavigationType, useSearchParams } from 'react-router-dom';
 import OpportunityDrawer, { PassForm, safeListingUrl } from './OpportunityDrawer.jsx';
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
+import BrokerRepliesBlock, { useBrokerReplies } from './BrokerReplies.jsx';
 import { AutoPursueModeBadge, CriteriaLine, NearMissConfirmDialog, NotAutomaticReason, isNearMiss } from './AcquisitionCriteria.jsx';
 
 const emptySummary = { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 };
@@ -427,6 +428,11 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     })();
     return () => { live = false; };
   }, [hasAutoPursueArea, queue.areas, autoPursueReloads]);
+
+  const hasActionPreviewArea = view === 'inbox' && Array.isArray(queue.areas)
+    && queue.areas.some((item) => item.id === 'action-preview');
+  // Broker replies come from the pursued-deals tracker, not the inbox queue; a failed read hides the block.
+  const brokerReplies = useBrokerReplies(hasActionPreviewArea, queue.areas);
 
   const loadCimRelease = useCallback(async (opportunityId, { preserveData = false } = {}) => {
     if (readOnly) {
@@ -1307,7 +1313,8 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           <ul aria-label="SIM requested automatically today" className="mt-2 space-y-1">{autoPursueStatus.todayPursued.map((entry) => <li className="flex flex-wrap items-center justify-between gap-2 text-sm text-ink" key={entry.opportunityId}><span>{entry.name}</span>{autoStop.stoppedIds.includes(entry.opportunityId) ? <span className="text-xs font-semibold text-ink/58">Stopped</span> : !readOnly ? <button aria-label={`Stop SIM request to ${entry.name}`} className={`${buttonClass} text-red-700`} disabled={Boolean(autoStop.pendingId)} onClick={() => stopAutoPursued(entry)} type="button">{autoStop.pendingId === entry.opportunityId ? 'Stopping…' : 'Stop SIM request'}</button> : null}</li>)}</ul>
           {autoStop.error ? <p className="mt-2 text-xs font-semibold text-red-800" role="alert">{autoStop.error}</p> : null}
         </div> : null}
-        {item.rows.length === 0 ? <p className="p-4 text-sm text-ink/60">No opportunities in this area.</p> : nearMissCollapsed
+        {preview ? <BrokerRepliesBlock readOnly={readOnly} replies={brokerReplies} /> : null}
+        {item.rows.length === 0 ? (preview && brokerReplies.items.length > 0 ? null : <p className="p-4 text-sm text-ink/60">No opportunities in this area.</p>) : nearMissCollapsed
           ? <div className="p-4"><button aria-expanded="false" className={buttonClass} onClick={() => setShowNearMisses(true)} type="button">Show near misses ({item.total})</button></div> : preview
           ? <ol aria-label="Action preview" className="divide-y divide-line/70">{item.rows.map((row) => <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-2" key={row.opportunityId}><div><button className="text-left text-sm font-semibold text-ink hover:text-moss" onClick={(event) => openDetail(row.opportunityId, event.currentTarget)} type="button">{row.name}</button><p className="text-xs text-ink/58">{row.freshness?.actionReason === 'broker_reply' ? 'Broker reply needs review' : row.freshness?.actionReason === 'materials_ready' ? 'Broker materials received' : row.freshness?.dueAction ? 'Due follow-up' : 'Owner priority'} · Fit {row.fitScore} · {formatLabel(row.operatorPriority)}</p></div><div className="flex flex-wrap items-center gap-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} />{!readOnly ? <ActionButtons disabled={Boolean(pendingId) || !actionsAllowed} name={row.name} onAction={(action, event) => handleRowAction(row, action, event)} /> : null}</div></li>)}</ol>
           : <ul aria-label={`${heading} opportunities`} className="divide-y divide-line/70">{item.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => handleRowAction(row, action, event)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} showNotAutomatic={item.id === 'your-review'} />)}</ul>}
