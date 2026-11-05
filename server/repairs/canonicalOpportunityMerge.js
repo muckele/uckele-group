@@ -20,6 +20,18 @@ export const CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION =
 
 export const GARAGE_DOOR_CANONICAL_OPPORTUNITY_MERGE_INCIDENT = garageIncident;
 
+// A pair-scoped approval scans Pursue CIM authority only for rows tied to the approved pair
+// (historical approvals block on any row in those tables), pins the pair's payload-immutable pending
+// CIM safety/audit evidence, CRM ownership baselines, and freshness evidence by count and
+// digest, and separately refuses any global authority that could send email.
+export const CANONICAL_OPPORTUNITY_MERGE_PAIR_SCOPED_POLICY = 'pair-scoped-preservation-v1';
+
+// A descriptor count that is pinned by the reviewed dry-run plan instead of in source. Only used
+// for evidence that legitimately grows every day while the exception stays open (Sheet freshness
+// evidence deferred to the exception); the plan records its exact count and digest, the plan
+// checksum binds apply to that review, and apply re-reads both inside its transaction.
+export const CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT = null;
+
 function deeplyFreeze(value) {
   if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
   for (const nested of Object.values(value)) deeplyFreeze(nested);
@@ -142,7 +154,13 @@ const linkedProspectSubmissionBlockingReason =
 const linkedProspectParentRedundancyReason =
   'Retired prospect discovery run, provider-source, and website identity cannot independently establish Deal Hunter canonical authority; any CRM-relevant row is already selected through its submission_id by the linked CRM state scanner.';
 const inertPursueCimAuthorityBlockingReason =
-  'Package 1A Pursue CIM authorities are inert and empty; any row blocks this legacy canonical merge until a later package adds relationship-specific repair semantics.';
+  'Pursue CIM authority rows block the canonical merge. Historical approvals treat any row in the table as a blocker; pair-scoped approvals block every row tied to the approved pair directly or through its campaigns, conversations, and transmissions.';
+const preservedCimSafetyEventReason =
+  'CIM safety evidence tied to the approved pair blocks the merge, except that a pair-scoped approval may pin pending, unconsumed, outcome-free events by exact count and digest; their payload cannot be rewritten, they stay on their original opportunity, and the merge never reparents or consumes them.';
+const preservedCimAuditEventReason =
+  'CIM audit evidence tied to the approved pair blocks the merge, except that a pair-scoped approval may pin safety-emitted pending rows with no campaign, conversation, touch, transmission, activation, or authorization link by exact count and digest; audit rows are append-only and never rewritten.';
+const crmOwnershipRevisionReason =
+  'Nonbaseline CRM ownership history blocks the canonical merge; null-owner revision-1 cutover baselines have no selected submission, stay on their original opportunity, and are pinned by exact count and digest for pair-scoped approvals.';
 
 const relationshipInventoryEntries = [
   ...relationshipEntries({
@@ -366,7 +384,7 @@ const relationshipInventoryEntries = [
     columns: ['opportunity_id', 'submission_id'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
     scannerPath: 'dependentState.records.pursueCimAuthorities',
-    reason: 'Nonbaseline CRM ownership history blocks the legacy canonical merge; null-owner cutover baselines have no selected submission.',
+    reason: crmOwnershipRevisionReason,
   }),
   ...relationshipEntries({
     table: 'deal_hunter_broker_conversations',
@@ -447,7 +465,7 @@ const relationshipInventoryEntries = [
     ],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
     scannerPath: 'dependentState.records.pursueCimAuthorities',
-    reason: inertPursueCimAuthorityBlockingReason,
+    reason: preservedCimSafetyEventReason,
   }),
   ...relationshipEntries({
     table: 'deal_hunter_cim_audit_events',
@@ -457,7 +475,7 @@ const relationshipInventoryEntries = [
     ],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
     scannerPath: 'dependentState.records.pursueCimAuthorities',
-    reason: inertPursueCimAuthorityBlockingReason,
+    reason: preservedCimAuditEventReason,
   }),
   ...relationshipEntries({
     table: 'deal_hunter_cim_capability_activations',
@@ -1157,7 +1175,220 @@ const garageDoorApproval = deeplyFreeze({
   ],
 });
 
-const approvals = [hvacApproval, garageDoorApproval];
+const precisionCarbonIncident = 'precision-carbon-2026-11-02';
+const precisionCarbonExceptionId = '0cfa01f1fb4666903281f0c8d2b2da00027b307446a266c5adba7e0192343f56';
+// Values below come from the owner-approved read-only production capture of 2026-11-05.
+// Survivor rule (senior engineering decision, recorded in docs/canonical-opportunity-merge-repair.md):
+// keep the earliest-created canonical opportunity. Neither deal carries owner review, Pursue, CIM,
+// or CRM state that would argue for the later one; the earliest row is the deal's first discovery,
+// and here it is also the deal that holds the broker recipient, the BizBuySell listing ID, and the
+// fingerprint alias (the DealStream deal has no recipient).
+const precisionCarbonSurvivorId = 'opp_8cc53064-bf61-4d2f-9862-2694c2773e0e';
+const precisionCarbonSupersededId = 'opp_910e6860-deea-4e3d-bcf2-20c6e0a0fc92';
+const precisionBizBuySellPath = 'business-opportunity/precision-carbon-and-graphite-manufacturer/2561135';
+const precisionDealStreamPath = 'd/biz-sale/manufacturing/epyg2g';
+const precisionAlias = (aliasType, aliasValue, opportunityId) => (
+  alias(aliasType, aliasValue, opportunityId, { deterministicId: true })
+);
+
+const precisionCarbonApproval = deeplyFreeze({
+  incident: precisionCarbonIncident,
+  repairType: CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+  approvalSchema: CANONICAL_OPPORTUNITY_MERGE_APPROVAL_SCHEMA,
+  dependentPolicy: CANONICAL_OPPORTUNITY_MERGE_PAIR_SCOPED_POLICY,
+  exceptionId: precisionCarbonExceptionId,
+  survivorId: precisionCarbonSurvivorId,
+  supersededId: precisionCarbonSupersededId,
+  survivorRule: 'earliest-created',
+  confirmation: `MERGE ${precisionCarbonSupersededId} INTO ${precisionCarbonSurvivorId} FOR EXCEPTION ${precisionCarbonExceptionId}`,
+  approvedResolutionReason: 'Owner confirmed the BizBuySell (Alameda, CA, listing 2561135) and DealStream (Hayward, CA) Precision Carbon & Graphite Manufacturer listings are the same business listed on two sites; keep the earliest-created deal and retire the duplicate.',
+  expectedOpportunityStatus: 'active',
+  expectedExceptionStatus: 'open',
+  expectedExceptionReason: 'conflicting-canonical-aliases',
+  expectedEvidenceVersion: 'cim-opportunity-v1',
+  // A Sheet row whose aliases have two owners opens the exception with no candidate IDs (as Garage).
+  expectedExceptionCandidateOpportunityIds: [],
+  expectedAliasOwnerIds: [precisionCarbonSupersededId, precisionCarbonSurvivorId],
+  expectedDependentCounts: {
+    opportunityScores: 2,
+    scoreEvidence: 25,
+    sourceObservations: 39,
+    // Preservation-only categories whose exact count the reviewed plan pins (see expectedPreservedState).
+    historicalIdentityEvidence: CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT,
+    freshnessEvidence: CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT,
+  },
+  expectedPreservedState: {
+    sourceObservations: {
+      supersededCount: 17,
+      survivorCount: 22,
+      collisionCount: CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT,
+    },
+    opportunityScores: { supersededCount: 1, survivorCount: 1 },
+    scoreEvidence: { supersededCount: 13, survivorCount: 12 },
+    historicalIdentityEvidence: { count: CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT },
+    // Deferred Sheet evidence bound to this open exception grows with every daily run (40 on 2026-11-05).
+    freshnessEvidence: {
+      supersededCount: 5,
+      survivorCount: 5,
+      unboundCount: CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT,
+    },
+    cimSafetyEvents: { supersededCount: 2, survivorCount: 2 },
+    cimAuditEvents: { supersededCount: 2, survivorCount: 2 },
+    crmOwnershipRevisions: { supersededCount: 1, survivorCount: 1 },
+  },
+  approvedFactsByOpportunityId: {
+    [precisionCarbonSupersededId]: {
+      canonicalName: 'Precision Carbon & Graphite Manufacturer',
+      canonicalLocation: 'Hayward, CA, US',
+      identityName: 'precision carbon and graphite manufacturer',
+      identityLocation: 'hayward ca us',
+      identityDescriptionLength: 975,
+      city: 'hayward',
+      county: '',
+      state: 'ca',
+      country: 'us',
+      askingPrice: 8_000_000,
+      revenue: 2_709_516,
+      profit: 435_645,
+      recipientPresent: false,
+      listingIds: ['dealstream:/d/biz-sale/manufacturing/epyg2g'],
+      listingUrl: `https://dealstream.com/${precisionDealStreamPath}`,
+    },
+    [precisionCarbonSurvivorId]: {
+      canonicalName: 'Precision Carbon & Graphite Manufacturer',
+      canonicalLocation: 'Alameda, Alameda County, CA, US',
+      identityName: 'precision carbon and graphite manufacturer',
+      identityLocation: 'alameda alameda county ca us',
+      identityDescriptionLength: 978,
+      city: 'alameda',
+      county: 'alameda county',
+      state: 'ca',
+      country: 'us',
+      askingPrice: 8_000_000,
+      revenue: 2_709_516,
+      profit: 435_645,
+      recipientPresent: true,
+      listingIds: ['costar:2561135'],
+      listingUrl: `https://bizbuysell.com/${precisionBizBuySellPath}`,
+    },
+  },
+  // The two listings were written up separately: only the duplicate lacks a recipient, and the
+  // descriptions and locations differ. Each deal's facts are pinned exactly above instead.
+  pairCompatibility: {
+    requireEqualCanonicalRecipient: false,
+    requireEqualRecipientEvidence: false,
+    requireEqualDescriptionEvidence: false,
+    requireEqualSourceIds: true,
+    requireEqualLocationEvidence: false,
+  },
+  expectedAliases: [
+    precisionAlias('deal-key', `url:https://www.dealstream.com/${precisionDealStreamPath}`, precisionCarbonSupersededId),
+    precisionAlias('listing-id', 'dealstream:/d/biz-sale/manufacturing/epyg2g', precisionCarbonSupersededId),
+    precisionAlias('listing-url', `https://dealstream.com/${precisionDealStreamPath}`, precisionCarbonSupersededId),
+    precisionAlias('source-identity', `url:dealstream.com/${precisionDealStreamPath}`, precisionCarbonSupersededId),
+    precisionAlias('deal-key', `url:https://www.bizbuysell.com/${precisionBizBuySellPath}/`, precisionCarbonSurvivorId),
+    precisionAlias('fingerprint-v1', 'c38b9ef62ba57423d87d3b802a0b818001544cfc1227adf8a27684b500351a2e', precisionCarbonSurvivorId),
+    precisionAlias('listing-id', 'costar:2561135', precisionCarbonSurvivorId),
+    precisionAlias('listing-url', `https://bizbuysell.com/${precisionBizBuySellPath}`, precisionCarbonSurvivorId),
+    precisionAlias('source-identity', `url:bizbuysell.com/${precisionBizBuySellPath}`, precisionCarbonSurvivorId),
+  ],
+  sourceObservations: [
+    {
+      sourceRecordId: 'precision-carbon-dealstream',
+      listingUrl: `https://www.dealstream.com/${precisionDealStreamPath}`,
+      durableAliasKeys: [
+        `deal-key:url:https://www.dealstream.com/${precisionDealStreamPath}`,
+        'listing-id:dealstream:/d/biz-sale/manufacturing/epyg2g',
+        `listing-url:https://dealstream.com/${precisionDealStreamPath}`,
+        `source-identity:url:dealstream.com/${precisionDealStreamPath}`,
+      ],
+      identityAliases: [`url:dealstream.com/${precisionDealStreamPath}`, 'dealstream:/d/biz-sale/manufacturing/epyg2g'],
+    },
+    {
+      sourceRecordId: 'precision-carbon-bizbuysell',
+      listingUrl: `https://www.bizbuysell.com/${precisionBizBuySellPath}/`,
+      durableAliasKeys: [
+        `deal-key:url:https://www.bizbuysell.com/${precisionBizBuySellPath}/`,
+        'fingerprint-v1:c38b9ef62ba57423d87d3b802a0b818001544cfc1227adf8a27684b500351a2e',
+        'listing-id:costar:2561135',
+        `listing-url:https://bizbuysell.com/${precisionBizBuySellPath}`,
+        `source-identity:url:bizbuysell.com/${precisionBizBuySellPath}`,
+      ],
+      identityAliases: ['costar:2561135', `url:bizbuysell.com/${precisionBizBuySellPath}`],
+    },
+  ],
+});
+
+export const PRECISION_CARBON_CANONICAL_OPPORTUNITY_MERGE_INCIDENT = precisionCarbonIncident;
+
+const approvals = [hvacApproval, garageDoorApproval, precisionCarbonApproval];
+
+// Only preservation-only categories (rows the merge never writes, pinned by digest in the plan) may
+// leave their exact count to the reviewed plan; every blocking category stays an exact source pin.
+const planPinnableCounts = Object.freeze({
+  expectedDependentCounts: new Set(['freshnessEvidence', 'historicalIdentityEvidence']),
+  freshnessEvidence: new Set(['unboundCount']),
+  sourceObservations: new Set(['collisionCount']),
+  historicalIdentityEvidence: new Set(['count']),
+});
+
+/**
+ * Structural guard over every checked-in descriptor, run at module load. The plan-pinned (null)
+ * count is allowed only where evidence legitimately grows daily, and only on pair-scoped
+ * approvals; a pair-scoped approval must pin every category its scanner stops treating as a
+ * blocker, and must carry an exact resolution reason and survivor rule.
+ */
+export function assertCanonicalOpportunityMergeApprovalShape(approval) {
+  const label = approval?.incident || approval?.exceptionId || 'unknown approval';
+  const pairScoped = isPairScopedCanonicalOpportunityMergeApproval(approval);
+  if (approval?.dependentPolicy !== undefined && !pairScoped) {
+    throw new Error(`Canonical opportunity merge approval ${label} names an unknown dependent policy.`);
+  }
+  const nullKeys = (object = {}) => Object.entries(object).filter(([, value]) => value === null).map(([key]) => key);
+  for (const key of nullKeys(approval?.expectedDependentCounts)) {
+    if (!pairScoped || !planPinnableCounts.expectedDependentCounts.has(key)) {
+      throw new Error(`Canonical opportunity merge approval ${label} cannot leave dependent count ${key} to the plan.`);
+    }
+  }
+  for (const [category, value] of Object.entries(approval?.expectedPreservedState || {})) {
+    for (const key of nullKeys(value)) {
+      if (!pairScoped || !planPinnableCounts[category]?.has(key)) {
+        throw new Error(`Canonical opportunity merge approval ${label} cannot leave ${category}.${key} to the plan.`);
+      }
+    }
+  }
+  if (!pairScoped) return true;
+  const preserved = approval.expectedPreservedState || {};
+  for (const category of ['sourceObservations', 'opportunityScores', 'scoreEvidence', 'historicalIdentityEvidence',
+    ...pairScopedPreservedCategories]) {
+    if (!preserved[category]) {
+      throw new Error(`Pair-scoped canonical opportunity merge approval ${label} must pin ${category}.`);
+    }
+  }
+  if (!approval.incident || !approval.confirmation) {
+    throw new Error(`Pair-scoped canonical opportunity merge approval ${label} must be an incident with its own confirmation.`);
+  }
+  const resolutionReason = String(approval.approvedResolutionReason || '');
+  if (normalizedText(resolutionReason, 1000).length < 20 || resolutionReason.includes("'")) {
+    throw new Error(`Pair-scoped canonical opportunity merge approval ${label} needs a specific, shell-safe approved resolution reason.`);
+  }
+  if (approval.survivorRule !== 'earliest-created') {
+    throw new Error(`Pair-scoped canonical opportunity merge approval ${label} must record its survivor rule.`);
+  }
+  return true;
+}
+
+
+export function isPairScopedCanonicalOpportunityMergeApproval(approval) {
+  return approval?.dependentPolicy === CANONICAL_OPPORTUNITY_MERGE_PAIR_SCOPED_POLICY;
+}
+
+/** The checked-in merge approval that resolves an identity exception, or null. */
+export function findCanonicalOpportunityMergeApprovalForException(exceptionId = '') {
+  const id = String(exceptionId || '').trim();
+  if (!id) return null;
+  return approvals.find((approval) => approval.exceptionId === id) || null;
+}
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -1264,12 +1495,21 @@ function validateOpportunity(opportunity, opportunityId, approval) {
   if (facts.recipientPresent && (!opportunity.canonical_recipient || !snapshot.recipient)) {
     throw new Error(`Canonical opportunity ${opportunityId} recipient evidence drifted from approval.`);
   }
+  if (facts.recipientPresent === false && (opportunity.canonical_recipient || snapshot.recipient)) {
+    throw new Error(`Canonical opportunity ${opportunityId} acquired recipient evidence after approval.`);
+  }
   if (!sameStringSet(snapshot.listingIds || [], facts.listingIds)) {
     throw new Error(`Canonical opportunity ${opportunityId} listing IDs drifted from approval.`);
   }
 }
 
 function validateOpportunityPairCompatibility(survivor, superseded, approval) {
+  if (
+    approval?.survivorRule === 'earliest-created'
+    && !(Date.parse(survivor?.created_at) < Date.parse(superseded?.created_at))
+  ) {
+    throw new Error('The approved survivor is no longer the earliest-created canonical opportunity.');
+  }
   const survivorSnapshot = survivor?.metadata?.identitySnapshot || {};
   const supersededSnapshot = superseded?.metadata?.identitySnapshot || {};
   const policy = approval?.pairCompatibility || {
@@ -1384,7 +1624,9 @@ function validateDependentState(dependentState = {}, approval = {}) {
   validateCrmSubmissionSupersessionState(dependentState);
   const expected = approval.expectedDependentCounts || {};
   const drifted = Object.entries(dependentState.counts || {}).filter(([name, count]) => (
-    Number(count) !== Number(expected[name] || 0)
+    expected[name] === CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT
+      ? !Number.isInteger(count) || count < 0
+      : Number(count) !== Number(expected[name] || 0)
   ));
   const missingExpected = Object.keys(expected).filter((name) => !(name in (dependentState.counts || {})));
   if (drifted.length > 0 || missingExpected.length > 0) {
@@ -1394,6 +1636,13 @@ function validateDependentState(dependentState = {}, approval = {}) {
     ].join(', ')}.`);
   }
 }
+
+const pairScopedPreservedCategories = Object.freeze([
+  'freshnessEvidence',
+  'cimSafetyEvents',
+  'cimAuditEvents',
+  'crmOwnershipRevisions',
+]);
 
 function validatePreservedIncidentState(state, approval) {
   const expected = approval.expectedPreservedState;
@@ -1414,14 +1663,48 @@ function validatePreservedIncidentState(state, approval) {
       throw new Error(`Canonical opportunity merge ${category} preservation topology drifted.`);
     }
   }
-  if (state.sourceObservations.collisionCount !== expected.sourceObservations.collisionCount) {
+  const planPinned = (approved) => approved === CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT;
+  const countMatches = (actual, approved) => Number.isInteger(actual) && actual >= 0
+    && (planPinned(approved) || actual === approved);
+  if (!countMatches(state.sourceObservations.collisionCount, expected.sourceObservations.collisionCount)) {
     throw new Error('Canonical opportunity merge source observation collision topology drifted.');
+  }
+  for (const category of pairScopedPreservedCategories) {
+    const approved = expected[category];
+    const actual = state?.[category];
+    if (!approved) {
+      if (actual !== undefined) {
+        throw new Error(`Canonical opportunity merge ${category} preservation is not part of this approval.`);
+      }
+      continue;
+    }
+    if (
+      !isPairScopedCanonicalOpportunityMergeApproval(approval)
+      || !actual
+      || actual.superseded?.opportunityId !== approval.supersededId
+      || actual.survivor?.opportunityId !== approval.survivorId
+      || actual.superseded?.count !== approved.supersededCount
+      || actual.survivor?.count !== approved.survivorCount
+      || !digestValid(actual.superseded?.digest)
+      || !digestValid(actual.survivor?.digest)
+      || (category === 'freshnessEvidence' && (
+        actual.unbound?.exceptionId !== approval.exceptionId
+        || !Number.isInteger(actual.unbound?.count)
+        || actual.unbound.count < 0
+        || (approved.unboundCount !== CANONICAL_OPPORTUNITY_MERGE_PLAN_PINNED_COUNT
+          && actual.unbound.count !== approved.unboundCount)
+        || !digestValid(actual.unbound?.digest)
+        || actual.otherCount !== 0
+      ))
+    ) {
+      throw new Error(`Canonical opportunity merge ${category} preservation topology drifted.`);
+    }
   }
   const history = state?.historicalIdentityEvidence;
   if (
     !history
-    || history.count !== expected.historicalIdentityEvidence.count
-    || history.records?.length !== expected.historicalIdentityEvidence.count
+    || !countMatches(history.count, expected.historicalIdentityEvidence.count)
+    || history.records?.length !== history.count
     || !digestValid(history.digest)
     || history.records.some((record) => (
       !record.id || !validDate(record.firstSeenAt) || !validDate(record.lastSeenAt)
@@ -1462,7 +1745,35 @@ function validatePreservedOperationalState(preservedOperationalState = {}) {
   }
 }
 
-function validateAuthorityGrantingOperationalState(authorityGrantingOperationalState = {}) {
+const pursueCimAuthorityCountKeys = Object.freeze([
+  'currentCapabilityActivations',
+  'openLiveProviderAuthorizations',
+  'currentAutoPursueActivations',
+  'enabledLiveSendingControls',
+]);
+
+function validatePursueCimAuthorityState(authority) {
+  if (
+    !authority
+    || authority.authorityEffect !== 'granting'
+    || stableCanonicalJson(Object.keys(authority).sort())
+      !== stableCanonicalJson(['authorityEffect', ...pursueCimAuthorityCountKeys].sort())
+    || pursueCimAuthorityCountKeys.some((key) => !Number.isInteger(authority[key]) || authority[key] < 0)
+  ) {
+    throw new Error('Canonical opportunity merge Pursue CIM authority state is incomplete.');
+  }
+  const granting = pursueCimAuthorityCountKeys.filter((key) => authority[key] > 0);
+  if (granting.length > 0) {
+    throw new Error(`Canonical opportunity merge found authority that can send email: ${granting.join(', ')}. Turn it off before merging.`);
+  }
+}
+
+function validateAuthorityGrantingOperationalState(authorityGrantingOperationalState = {}, approval = {}) {
+  if (isPairScopedCanonicalOpportunityMergeApproval(approval)) {
+    validatePursueCimAuthorityState(authorityGrantingOperationalState.pursueCimAuthority);
+  } else if (authorityGrantingOperationalState.pursueCimAuthority !== undefined) {
+    throw new Error('Canonical opportunity merge Pursue CIM authority state is not part of this approval.');
+  }
   const activations = authorityGrantingOperationalState.stage2Activations;
   if (
     !activations
@@ -1602,7 +1913,7 @@ export function validateCanonicalOpportunityMergeReplayManifest({
     validateDependentState(plan.dependentState, approval);
     validatePreservedIncidentState(plan.preservedIncidentState, approval);
     validatePreservedOperationalState(plan.preservedOperationalState);
-    validateAuthorityGrantingOperationalState(plan.authorityGrantingOperationalState);
+    validateAuthorityGrantingOperationalState(plan.authorityGrantingOperationalState, approval);
     validateCanonicalOpportunityMergeRelationshipInventory({ inspection: plan });
     validateRelationshipInventorySummary(plan.relationshipInventory);
   } catch (error) {
@@ -1657,11 +1968,19 @@ export function validateCanonicalOpportunityMergeReplayManifest({
   };
 }
 
+export function assertApprovedResolutionReason(approval, reason) {
+  if (!approval?.approvedResolutionReason) return;
+  if (normalizedText(reason, 1000) !== normalizedText(approval.approvedResolutionReason, 1000)) {
+    throw new Error(`Canonical opportunity merge for this incident requires the owner-approved resolution reason exactly: ${approval.approvedResolutionReason}`);
+  }
+}
+
 export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor, reason } = {}) {
   const normalizedActor = normalizedText(actor, 160);
   const normalizedReason = normalizedText(reason, 1000);
   if (!normalizedActor) throw new Error('Canonical opportunity merge requires an accountable actor.');
   if (normalizedReason.length < 20) throw new Error('Canonical opportunity merge requires a specific human reason.');
+  assertApprovedResolutionReason(approval, normalizedReason);
   const opportunityById = new Map((inspection?.opportunities || []).map((item) => [item.opportunity_id, item]));
   const survivor = opportunityById.get(approval.survivorId);
   const superseded = opportunityById.get(approval.supersededId);
@@ -1675,7 +1994,7 @@ export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor
   validateDependentState(inspection.dependentState, approval);
   validatePreservedIncidentState(inspection.preservedIncidentState, approval);
   validatePreservedOperationalState(inspection.preservedOperationalState);
-  validateAuthorityGrantingOperationalState(inspection.authorityGrantingOperationalState);
+  validateAuthorityGrantingOperationalState(inspection.authorityGrantingOperationalState, approval);
   validateCanonicalOpportunityMergeRelationshipInventory({ inspection });
 
   const manifestId = canonicalOpportunityMergeManifestId(approval);
@@ -1736,6 +2055,70 @@ export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor
   };
 }
 
+function preservedCountSummary(state = {}) {
+  return Object.fromEntries(Object.entries(state)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([category, value]) => [category, value?.superseded ? {
+      supersededCount: value.superseded.count,
+      survivorCount: value.survivor.count,
+      ...(value.unbound ? { unboundCount: value.unbound.count } : {}),
+    } : { count: value?.count ?? 0 }]));
+}
+
+/**
+ * The complete, human-readable list of writes an apply of this exact plan would make, and of the
+ * dependent rows it deliberately leaves untouched. Derived only from the checksummed plan.
+ */
+export function describeCanonicalOpportunityMergeChanges({ plan, planChecksum, manifestId } = {}) {
+  const tuple = plan?.approvalTuple || {};
+  return {
+    writes: [
+      {
+        table: 'deal_hunter_opportunity_aliases',
+        action: 'reassign-owner',
+        rowCount: plan.aliasMoves.length,
+        rows: plan.aliasMoves.map(({ aliasKey, beforeOpportunityId, afterOpportunityId }) => ({
+          aliasKey,
+          from: beforeOpportunityId,
+          to: afterOpportunityId,
+        })),
+      },
+      {
+        table: 'deal_hunter_opportunities',
+        action: 'mark-superseded',
+        rowCount: 1,
+        opportunityId: tuple.supersededId,
+        status: { from: 'active', to: 'superseded' },
+        addsMetadata: 'canonicalOpportunityMerge',
+        mergedInto: tuple.survivorId,
+      },
+      {
+        table: 'deal_hunter_identity_exceptions',
+        action: 'resolve',
+        rowCount: 1,
+        exceptionId: tuple.exceptionId,
+        status: { from: 'open', to: 'resolved' },
+        resolvedBy: plan.actor,
+        resolutionReason: plan.reason,
+        addsMetadata: ['canonicalOpportunityMerge', 'resolvedOpportunityId'],
+        resolvedOpportunityId: tuple.survivorId,
+      },
+      {
+        table: 'deal_hunter_cim_repair_manifests',
+        action: 'insert',
+        rowCount: 1,
+        manifestId,
+        planChecksum,
+      },
+    ],
+    deletes: 0,
+    unchanged: {
+      survivor: { opportunityId: tuple.survivorId, status: 'active' },
+      preservedWithoutWrites: preservedCountSummary(plan.preservedIncidentState || {}),
+    },
+  };
+}
+
 export function getCanonicalOpportunityMergeApproval({
   incident: requestedIncident = '',
   exceptionId: requestedExceptionId = '',
@@ -1760,3 +2143,6 @@ export function getCanonicalOpportunityMergeApproval({
   if (!match) throw new Error('This is not an approved canonical opportunity merge tuple.');
   return match;
 }
+
+// Every checked-in descriptor must pass the structural guard before the module can be used.
+for (const approval of approvals) assertCanonicalOpportunityMergeApprovalShape(approval);

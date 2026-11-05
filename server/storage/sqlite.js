@@ -254,6 +254,7 @@ import {
   canonicalOpportunityMergeRelationshipSchemaPresenceByTable,
   getCanonicalOpportunityMergeApproval,
   isCanonicalOpportunityMergeRelationshipColumn,
+  isPairScopedCanonicalOpportunityMergeApproval,
   stableCanonicalJson,
   validateCanonicalOpportunityMergeReplayManifest,
 } from '../repairs/canonicalOpportunityMerge.js';
@@ -1825,6 +1826,137 @@ function inspectInertPursueCimAuthorities(database, approval) {
   )).sort();
 }
 
+function canonicalMergeAuthorityRecordIds(table, rows, identityColumns) {
+  return rows.map((row) => `${table}:${identityColumns.map((column) => row[column]).join(':')}`);
+}
+
+function isPreservableCanonicalMergeSafetyEvent(row) {
+  return row.status === 'pending'
+    && row.consumed_at === null
+    && row.outcome_evidence_id === null
+    && row.outcome_revision === null;
+}
+
+function isPreservableCanonicalMergeAuditEvent(row, opportunityIds) {
+  return row.event_type === 'safety-emitted'
+    && row.prior_state === null
+    && row.next_state === 'pending'
+    && opportunityIds.includes(row.opportunity_id)
+    && ['campaign_id', 'conversation_id', 'touch_id', 'transmission_id', 'activation_id', 'authorization_id']
+      .every((column) => row[column] === null);
+}
+
+function isCanonicalMergeCrmOwnershipBaseline(row) {
+  return Number(row.revision) === 1 && row.submission_id === null;
+}
+
+// Pair-scoped approvals: every Pursue CIM authority row tied to the approved pair, directly
+// or through its campaigns, conversations, and transmissions, blocks the merge except the
+// pending safety evidence (payload-immutable), its safety-emitted audit rows, and the null-owner CRM
+// ownership baselines, which are returned for exact count-and-digest preservation.
+function inspectPairScopedPursueCimAuthorities(database, approval) {
+  const opportunityIds = [approval.survivorId, approval.supersededId];
+  const byOpportunity = { column: 'opportunity_id', values: opportunityIds };
+  const campaigns = selectCanonicalMergeRows(database, 'deal_hunter_cim_campaigns', [byOpportunity]);
+  const campaignIds = campaigns.map((row) => row.id);
+  const campaignTouches = selectCanonicalMergeRows(database, 'deal_hunter_cim_campaign_touches', [
+    byOpportunity,
+    { column: 'campaign_id', values: campaignIds },
+  ]);
+  const transmissionTouches = selectCanonicalMergeRows(database, 'deal_hunter_cim_transmission_touches', [
+    byOpportunity,
+    { column: 'campaign_id', values: campaignIds },
+  ]);
+  const conversationIds = campaigns.map((row) => row.conversation_id);
+  const transmissionIds = [
+    ...campaignTouches.map((row) => row.transmission_id),
+    ...transmissionTouches.map((row) => row.transmission_id),
+  ];
+  const transmissions = selectCanonicalMergeRows(database, 'deal_hunter_cim_transmissions', [
+    { column: 'id', values: transmissionIds },
+    { column: 'conversation_id', values: conversationIds },
+  ]);
+  const allTransmissionIds = [...transmissionIds, ...transmissions.map((row) => row.id)];
+  const blocking = [
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_owner_decision_events',
+      selectCanonicalMergeRows(database, 'deal_hunter_owner_decision_events', [byOpportunity]), ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_pursuit_enrollments',
+      selectCanonicalMergeRows(database, 'deal_hunter_pursuit_enrollments', [byOpportunity]), ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_auto_pursue_decision_evidence',
+      selectCanonicalMergeRows(database, 'deal_hunter_auto_pursue_decision_evidence', [byOpportunity]),
+      ['decision_event_id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_pursuit_stage_events',
+      selectCanonicalMergeRows(database, 'deal_hunter_pursuit_stage_events', [byOpportunity]), ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_opportunity_timezone_revisions',
+      selectCanonicalMergeRows(database, 'deal_hunter_opportunity_timezone_revisions', [byOpportunity]),
+      ['opportunity_id', 'revision']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_campaigns', campaigns, ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_campaign_touches', campaignTouches, ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_transmission_touches', transmissionTouches,
+      ['transmission_id', 'touch_id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_transmissions', transmissions, ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_broker_conversations',
+      selectCanonicalMergeRows(database, 'deal_hunter_broker_conversations', [
+        { column: 'id', values: conversationIds },
+      ]), ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_gmail_reply_messages',
+      selectCanonicalMergeRows(database, 'deal_hunter_gmail_reply_messages', [
+        { column: 'conversation_id', values: conversationIds },
+      ]), ['gmail_message_id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_capacity_reservations',
+      selectCanonicalMergeRows(database, 'deal_hunter_cim_capacity_reservations', [
+        { column: 'campaign_id', values: campaignIds },
+        { column: 'conversation_id', values: conversationIds },
+        { column: 'transmission_id', values: allTransmissionIds },
+      ]), ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_terminal_events',
+      selectCanonicalMergeRows(database, 'deal_hunter_cim_terminal_events', [
+        { column: 'campaign_id', values: campaignIds },
+        { column: 'conversation_id', values: conversationIds },
+        { column: 'scope_id', values: [...campaignIds, ...conversationIds, ...allTransmissionIds] },
+      ]), ['id']),
+  ];
+  const liveAuthorizations = selectCanonicalMergeRows(database, 'deal_hunter_cim_live_provider_authorizations', [
+    { column: 'transmission_id', values: allTransmissionIds },
+  ]);
+  const safetyEvents = selectCanonicalMergeRows(database, 'deal_hunter_cim_safety_events', [byOpportunity]);
+  const auditEvents = selectCanonicalMergeRows(database, 'deal_hunter_cim_audit_events', [
+    byOpportunity,
+    { column: 'campaign_id', values: campaignIds },
+    { column: 'conversation_id', values: conversationIds },
+    { column: 'touch_id', values: [...campaignTouches.map((row) => row.id), ...transmissionTouches.map((row) => row.touch_id)] },
+    { column: 'transmission_id', values: allTransmissionIds },
+    { column: 'authorization_id', values: liveAuthorizations.map((row) => row.id) },
+    { column: 'metadata', values: opportunityIds, contains: true },
+  ]);
+  const ownershipRevisions = selectCanonicalMergeRows(database, 'deal_hunter_crm_ownership_revisions', [
+    byOpportunity,
+  ]);
+  blocking.push(...canonicalMergeAuthorityRecordIds('deal_hunter_cim_live_provider_authorizations',
+    liveAuthorizations, ['id']));
+  const preservedSafetyEvents = safetyEvents.filter(isPreservableCanonicalMergeSafetyEvent);
+  const preservedAuditEvents = auditEvents
+    .filter((row) => isPreservableCanonicalMergeAuditEvent(row, opportunityIds));
+  const preservedOwnershipRevisions = ownershipRevisions.filter(isCanonicalMergeCrmOwnershipBaseline);
+  blocking.push(
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_safety_events',
+      safetyEvents.filter((row) => !isPreservableCanonicalMergeSafetyEvent(row)), ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_cim_audit_events',
+      auditEvents.filter((row) => !isPreservableCanonicalMergeAuditEvent(row, opportunityIds)), ['id']),
+    ...canonicalMergeAuthorityRecordIds('deal_hunter_crm_ownership_revisions',
+      ownershipRevisions.filter((row) => !isCanonicalMergeCrmOwnershipBaseline(row)),
+      ['opportunity_id', 'revision']),
+  );
+  return {
+    blocking: uniqueCanonicalMergeValues(blocking),
+    preserved: {
+      cimSafetyEvents: preservedSafetyEvents,
+      cimAuditEvents: preservedAuditEvents,
+      crmOwnershipRevisions: preservedOwnershipRevisions,
+    },
+  };
+}
+
 function canonicalMergeRowsDigest(rows = []) {
   const canonicalRows = rows
     .map((row) => stableCanonicalJson(row))
@@ -1838,6 +1970,8 @@ function inspectCanonicalMergePreservedIncidentState({
   scoreEvidence,
   sourceObservations,
   historicalIdentityEvidence,
+  freshnessEvidence = [],
+  pairScopedPreserved = null,
 }) {
   if (!approval.expectedPreservedState) return null;
   const ownerState = (rows) => {
@@ -1881,6 +2015,24 @@ function inspectCanonicalMergePreservedIncidentState({
         })),
       digest: canonicalMergeRowsDigest(historicalIdentityEvidence),
     },
+    ...(pairScopedPreserved ? {
+      freshnessEvidence: {
+        ...ownerState(freshnessEvidence.map((row) => ({ ...row, opportunity_id: row.current_canonical_id }))),
+        unbound: (() => {
+          const rows = freshnessEvidence.filter((row) => (
+            row.current_canonical_id === null && row.identity_exception_id === approval.exceptionId
+          ));
+          return { exceptionId: approval.exceptionId, count: rows.length, digest: canonicalMergeRowsDigest(rows) };
+        })(),
+        otherCount: freshnessEvidence.filter((row) => !(
+          [approval.survivorId, approval.supersededId].includes(row.current_canonical_id)
+          || (row.current_canonical_id === null && row.identity_exception_id === approval.exceptionId)
+        )).length,
+      },
+      cimSafetyEvents: ownerState(pairScopedPreserved.cimSafetyEvents),
+      cimAuditEvents: ownerState(pairScopedPreserved.cimAuditEvents),
+      crmOwnershipRevisions: ownerState(pairScopedPreserved.crmOwnershipRevisions),
+    } : {}),
   };
 }
 
@@ -1946,7 +2098,11 @@ export function inspectCanonicalMergeDependentState(database, approval) {
   const referenceValues = uniqueCanonicalMergeValues([...opportunityIds, ...aliasValues, ...aliasKeys]);
   const metadataFilter = { column: 'metadata', values: referenceValues, contains: true };
   const legacyDealHunterCandidates = inspectCanonicalMergeLegacyDealHunterCandidates(database, approval);
-  const pursueCimAuthorities = inspectInertPursueCimAuthorities(database, approval);
+  const pairScoped = isPairScopedCanonicalOpportunityMergeApproval(approval);
+  const pairScopedAuthorities = pairScoped ? inspectPairScopedPursueCimAuthorities(database, approval) : null;
+  const pursueCimAuthorities = pairScoped
+    ? pairScopedAuthorities.blocking
+    : inspectInertPursueCimAuthorities(database, approval);
   const crmSubmissionSupersessions = database.prepare(`
     SELECT * FROM crm_submission_supersessions
     WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
@@ -2181,6 +2337,8 @@ export function inspectCanonicalMergeDependentState(database, approval) {
     scoreEvidence,
     sourceObservations,
     historicalIdentityEvidence,
+    freshnessEvidence,
+    pairScopedPreserved: pairScopedAuthorities?.preserved || null,
   });
   return {
     counts,
@@ -2221,6 +2379,9 @@ function inspectCanonicalMergeOperationalState(database, approval) {
       SUM(CASE WHEN status = 'current' THEN 1 ELSE 0 END) AS active_count
     FROM deal_hunter_cim_stage2_activations
   `).get();
+  const pursueCimAuthority = isPairScopedCanonicalOpportunityMergeApproval(approval)
+    ? inspectCanonicalMergePursueCimAuthority(database)
+    : null;
   return {
     preservedOperationalState: {
       emailSuppressions: {
@@ -2240,7 +2401,32 @@ function inspectCanonicalMergeOperationalState(database, approval) {
         activeCount: Number(stage2ActivationCounts.active_count || 0),
         authorityEffect: 'granting',
       },
+      ...(pursueCimAuthority ? { pursueCimAuthority } : {}),
     },
+  };
+}
+
+function canonicalMergeCount(database, table, where) {
+  const exists = database.prepare(`
+    SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1
+  `).get(table);
+  if (!exists) return 0;
+  return Number(database.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`).get().count || 0);
+}
+
+// Global Pursue CIM authority that could send email. Shadow and off modes never send; this
+// mirrors the activation-chain checks in the CIM capacity and transmission triggers.
+function inspectCanonicalMergePursueCimAuthority(database) {
+  return {
+    currentCapabilityActivations: canonicalMergeCount(database, 'deal_hunter_cim_capability_activations',
+      "status = 'current' AND mode NOT IN ('off', 'shadow')"),
+    openLiveProviderAuthorizations: canonicalMergeCount(database, 'deal_hunter_cim_live_provider_authorizations',
+      "consumed_at IS NULL AND withdrawn_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"),
+    currentAutoPursueActivations: canonicalMergeCount(database, 'deal_hunter_auto_pursue_activations',
+      "status = 'current' AND mode NOT IN ('off', 'shadow')"),
+    enabledLiveSendingControls: canonicalMergeCount(database, 'deal_hunter_pursue_send_controls',
+      "control_key = 'live_sending' AND enabled = 1"),
+    authorityEffect: 'granting',
   };
 }
 
@@ -2804,6 +2990,8 @@ function validateCanonicalMergeFinalState(database, {
     || exceptionMerge?.survivorId !== approval.survivorId
     || exceptionMerge?.supersededId !== approval.supersededId
     || exceptionMerge?.planChecksum !== planChecksum
+    || (isPairScopedCanonicalOpportunityMergeApproval(approval)
+      && identityException?.metadata?.resolvedOpportunityId !== approval.survivorId)
   ) {
     throw new Error('Canonical opportunity merge exception resolution failed final validation.');
   }
@@ -2836,8 +3024,11 @@ function validateCanonicalMergeFinalState(database, {
   if (!Array.isArray(dependentState?.records?.crmSubmissionSupersessions)) {
     throw new Error('Canonical opportunity merge final state could not inspect CRM submission supersession history completely.');
   }
+  const plannedCounts = manifest?.manifest?.plan?.dependentState?.counts || {};
   const unexpected = Object.entries(dependentState.counts).filter(([name, count]) => (
-    count !== Number(approval.expectedDependentCounts?.[name] || 0)
+    approval.expectedDependentCounts?.[name] === null
+      ? count !== plannedCounts[name]
+      : count !== Number(approval.expectedDependentCounts?.[name] || 0)
   ));
   if (dependentState.records.crmSubmissionSupersessions.length !== 0) {
     throw new Error('Canonical opportunity merge final state acquired unexpected dependents: crmSubmissionSupersessions.');
@@ -13296,6 +13487,12 @@ ${cimCapacityConsumeTriggerSql}
             supersededId: checkedApproval.supersededId,
             planChecksum: planned.planChecksum,
           },
+          // Same key a manual link writes, so freshness treats the merge like a link: a listing
+          // whose earliest accepted evidence was deferred to this exception binds its first
+          // discovery to the survivor. Historical approvals keep their reviewed write set.
+          ...(isPairScopedCanonicalOpportunityMergeApproval(checkedApproval)
+            ? { resolvedOpportunityId: checkedApproval.survivorId }
+            : {}),
         };
         const exceptionUpdate = database.prepare(`
           UPDATE deal_hunter_identity_exceptions

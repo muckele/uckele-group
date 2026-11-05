@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
+import { findCanonicalOpportunityMergeApprovalForException } from '../repairs/canonicalOpportunityMerge.js';
 
 export const CIM_IDENTITY_EVIDENCE_VERSION = 'cim-opportunity-v1';
 
@@ -1042,6 +1043,27 @@ export async function createCimRecipientOverride({
   return { ok: true, status: 201, override };
 }
 
+/** The distinct deals that currently own a set of alias rows, sorted. */
+export function distinctAliasOwnerIds(aliasRows = []) {
+  return [...new Set(aliasRows.map((item) => item?.opportunity_id).filter(Boolean))].sort();
+}
+
+/**
+ * Whether each open identity exception's aliases are owned by two or more deals right now.
+ * That is the state in which link and keep-distinct both refuse and only a merge can resolve it,
+ * so the review and the resolve route use the same live ownership check.
+ */
+export async function identityExceptionAliasOwners(identityExceptions = [], storage = getStorage()) {
+  const aliasKeys = [...new Set(identityExceptions.flatMap((item) => item?.metadata?.aliases || []).filter(Boolean))];
+  const rows = aliasKeys.length > 0 && storage.listDealHunterOpportunityAliases
+    ? await storage.listDealHunterOpportunityAliases({ aliasKeys, limit: Math.max(100, aliasKeys.length) })
+    : [];
+  return new Map(identityExceptions.map((item) => {
+    const keys = new Set((item?.metadata?.aliases || []).filter(Boolean));
+    return [item.id, distinctAliasOwnerIds(rows.filter((row) => keys.has(row.alias_key)))];
+  }));
+}
+
 export async function resolveCimIdentityException({
   exceptionId = '',
   opportunityId = '',
@@ -1087,6 +1109,20 @@ export async function resolveCimIdentityException({
   const existingAliases = aliasKeys.length > 0 && storage.listDealHunterOpportunityAliases
     ? await storage.listDealHunterOpportunityAliases({ aliasKeys, limit: Math.max(100, aliasKeys.length) })
     : [];
+  const aliasOwnerIds = distinctAliasOwnerIds(existingAliases);
+  if (aliasOwnerIds.length > 1) {
+    // Linking or keeping distinct can never succeed while two deals own this listing's
+    // aliases; only the reviewed merge repair can combine them. Route the owner there.
+    const mergeApproval = findCanonicalOpportunityMergeApprovalForException(identityException.id);
+    return {
+      ok: false,
+      status: 409,
+      code: 'IDENTITY_EXCEPTION_REQUIRES_MERGE',
+      error: 'This listing already belongs to two different deals, so it cannot be linked or kept distinct. The two deals have to be merged with the reviewed merge repair; no identity change was applied.',
+      aliasOwnerIds,
+      mergeIncident: mergeApproval?.incident || '',
+    };
+  }
   if (action === 'keep-distinct') {
     if (existingAliases.length > 0) {
       return { ok: false, status: 409, error: 'One or more aliases already belong to a canonical opportunity. Resolve that ownership conflict before keeping this observation distinct.' };

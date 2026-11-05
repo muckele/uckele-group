@@ -3,11 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://example.invalid/daily-deal-hunter.csv';
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 
+const { resolveCimIdentityException } = await import('../server/services/cimOpportunityIdentity.js');
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
 const {
   identityHeldReviewWarning,
@@ -52,7 +54,7 @@ function withSheetStorage(t) {
     globalThis.fetch = originalFetch;
     fs.rmSync(directory, { recursive: true, force: true });
   });
-  return { storage, sheet };
+  return { storage, sheet, sqlitePath: path.join(directory, 'hold.sqlite') };
 }
 
 async function currentNames(storage) {
@@ -158,4 +160,105 @@ test('a raw source-record identity defect still defers scoring even when another
   );
   assert.equal(deferred.identityHeld, undefined);
   assert.deepEqual(await currentNames(storage), ['Steady Plumbing Co'], 'deferral leaves the last-good current set');
+});
+
+test('a cross-listed business on two deals is routed to the merge, not to link or keep-distinct', async (t) => {
+  const { storage, sheet } = withSheetStorage(t);
+  assert.equal((await refreshOpportunityScores({ storage, recordActivity: false })).ok, true);
+  sheet.rows = crossListedRows;
+  const held = await refreshOpportunityScores({ storage, recordActivity: false });
+  const [openException] = await storage.listDealHunterIdentityExceptions({ statuses: ['open'], limit: 10 });
+  const reviewItem = held.review.identityExceptions.find((item) => item.id === openException.id);
+  assert.equal(reviewItem.mergeRequired, true);
+  assert.equal(reviewItem.mergeIncident, '', 'no checked-in merge covers this fixture exception');
+  assert.equal(reviewItem.mergeSurvivorId, '');
+
+  const owners = await storage.listDealHunterOpportunityAliases({
+    aliasKeys: openException.metadata.aliases, limit: 100,
+  });
+  const ownerIds = [...new Set(owners.map((row) => row.opportunity_id))].sort();
+  assert.equal(ownerIds.length, 2);
+  for (const action of ['keep-distinct', 'link']) {
+    const result = await resolveCimIdentityException({
+      exceptionId: openException.id,
+      action,
+      opportunityId: action === 'link' ? ownerIds[0] : '',
+      confirmed: true,
+      reason: 'Owner confirmed this is one business on two sites.',
+      actor: 'identity-hold-test',
+      storage,
+    });
+    assert.equal(result.status, 409, action);
+    assert.equal(result.code, 'IDENTITY_EXCEPTION_REQUIRES_MERGE', action);
+    assert.deepEqual(result.aliasOwnerIds, ownerIds, action);
+  }
+  const [stillOpen] = await storage.listDealHunterIdentityExceptions({ statuses: ['open'], limit: 10 });
+  assert.deepEqual(stillOpen, openException);
+});
+
+// The exact rows a pair-scoped canonical merge apply writes (aliases, the duplicate's status,
+// the exception resolution with resolvedOpportunityId), applied here to the real cross-listed
+// shape so the next Sheet run can be observed end to end.
+function applyMergeWrites(sqlitePath, { exceptionId, survivorId, supersededId, withResolvedOpportunityId }) {
+  const database = new Database(sqlitePath);
+  try {
+    database.transaction(() => {
+      const now = '2026-11-05T21:00:00.000Z';
+      database.prepare('UPDATE deal_hunter_opportunity_aliases SET opportunity_id = ? WHERE opportunity_id = ?')
+        .run(survivorId, supersededId);
+      database.prepare(`UPDATE deal_hunter_opportunities SET status = 'superseded', updated_at = ?,
+        metadata = json_set(metadata, '$.canonicalOpportunityMerge', json(?)) WHERE opportunity_id = ?`)
+        .run(now, JSON.stringify({ mergedInto: survivorId, supersededOpportunityId: supersededId }), supersededId);
+      const merge = { decision: 'merge', survivorId, supersededId };
+      database.prepare(`UPDATE deal_hunter_identity_exceptions SET status = 'resolved', updated_at = ?,
+        resolved_at = ?, resolved_by = 'owner', resolution_reason = 'Owner confirmed one business on two sites.',
+        metadata = json_set(metadata, '$.canonicalOpportunityMerge', json(?)${withResolvedOpportunityId
+    ? ", '$.resolvedOpportunityId', ?" : ''}) WHERE id = ?`)
+        .run(now, now, JSON.stringify(merge), ...(withResolvedOpportunityId ? [survivorId] : []), exceptionId);
+    })();
+  } finally {
+    database.close();
+  }
+}
+
+test('after a merge the next Sheet run scores only the survivor and keeps deferred evidence as history', async (t) => {
+  const { storage, sheet, sqlitePath } = withSheetStorage(t);
+  assert.equal((await refreshOpportunityScores({ storage, recordActivity: false })).ok, true);
+  sheet.rows = crossListedRows;
+  assert.equal((await refreshOpportunityScores({ storage, recordActivity: false })).ok, true);
+  const [openException] = await storage.listDealHunterIdentityExceptions({ statuses: ['open'], limit: 10 });
+  const owners = await storage.listDealHunterOpportunityAliases({ aliasKeys: openException.metadata.aliases, limit: 100 });
+  const pair = await Promise.all([...new Set(owners.map((row) => row.opportunity_id))]
+    .map((id) => storage.getDealHunterOpportunity(id)));
+  pair.sort((left, right) => left.created_at.localeCompare(right.created_at) || left.opportunity_id.localeCompare(right.opportunity_id));
+  const [survivor, superseded] = pair;
+  const countUnbound = () => {
+    const database = new Database(sqlitePath, { readonly: true });
+    try {
+      return database.prepare(`SELECT COUNT(*) AS n FROM deal_hunter_freshness_evidence
+        WHERE identity_exception_id = ? AND current_canonical_id IS NULL`).get(openException.id).n;
+    } finally {
+      database.close();
+    }
+  };
+  const unboundBefore = countUnbound();
+  assert.ok(unboundBefore > 0, 'the open exception deferred Sheet freshness evidence');
+
+  applyMergeWrites(sqlitePath, {
+    exceptionId: openException.id,
+    survivorId: survivor.opportunity_id,
+    supersededId: superseded.opportunity_id,
+    withResolvedOpportunityId: true,
+  });
+  const next = await refreshOpportunityScores({ storage, recordActivity: false });
+
+  assert.equal(next.ok, true, JSON.stringify(next));
+  assert.deepEqual(next.identityHeld, []);
+  assert.deepEqual(await storage.listDealHunterIdentityExceptions({ statuses: ['open'], limit: 10 }), []);
+  assert.deepEqual(await currentNames(storage), ['Precision Carbon Maker', 'Steady Plumbing Co']);
+  assert.ok(await storage.getCurrentDealHunterOpportunityScore(survivor.opportunity_id));
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore(superseded.opportunity_id), null);
+  // Both listings were accepted before the exception opened, so their earliest evidence is already
+  // bound; the deferred rows stay attached to the resolved exception as history (as after a link).
+  assert.equal(countUnbound(), unboundBefore);
 });

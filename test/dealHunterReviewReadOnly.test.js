@@ -266,6 +266,9 @@ test('authenticated review stays read-only and materializes fresh ambiguity only
     const persisted = backfillPayload.review.identityExceptions.find((item) => item.id === observedExceptionId);
     assert.ok(persisted, 'the explicit full-backfill action materializes the observed exception');
     assert.equal(persisted.reason, 'ambiguous-similarity');
+    assert.equal(persisted.mergeRequired, false, 'an ambiguous listing keeps its link and keep-distinct actions');
+    assert.equal(persisted.mergeIncident, '');
+    assert.equal(persisted.mergeSurvivorId, '');
     assert.equal(persisted.candidateOpportunityIds.length, 1);
     [candidateOpportunityId] = persisted.candidateOpportunityIds;
     assert.equal(candidateOpportunityId, opportunity.opportunity_id);
