@@ -28,7 +28,7 @@ async function main() {
 
   if (command === 'create') {
     const backup = await createBackupBundle({ storage: getStorage(), config });
-    console.log(JSON.stringify({ ok: true, path: backup.path, manifest: backup.manifest }, null, 2));
+    console.log(JSON.stringify({ ok: true, path: backup.path, manifest: backup.manifest, documentsDegraded: backup.documentsDegraded }, null, 2));
     return;
   }
 
@@ -51,12 +51,13 @@ async function main() {
       databasePath,
       documentsDirectory,
       overwrite: process.argv.includes('--overwrite') || restoringLive,
+      acceptDegradedDocuments: process.argv.includes('--accept-degraded-documents'),
     });
     console.log(JSON.stringify(result, null, 2));
     return;
   }
 
-  throw new Error('Usage: npm run backup:create | npm run backup:verify -- [--bundle PATH] | npm run backup:restore -- [--bundle PATH] [--database PATH] [--documents PATH] [--overwrite] [--confirm-live]');
+  throw new Error('Usage: npm run backup:create | npm run backup:verify -- [--bundle PATH] | npm run backup:restore -- [--bundle PATH] [--database PATH] [--documents PATH] [--overwrite] [--confirm-live] [--accept-degraded-documents]');
 }
 
 main().catch((error) => {
