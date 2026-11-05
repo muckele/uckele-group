@@ -634,6 +634,8 @@ describe('Acquisition Inbox dashboard entry', () => {
     expect(await screen.findByRole('heading', { name: 'Acquisition Inbox' })).toBeVisible();
     expect(within(screen.getByRole('navigation', { name: 'Deal Hunter views' })).getByRole('link', { name: 'Operations' }))
       .toHaveAttribute('href', '/admin/deal-hunter?view=operations');
+    expect(within(screen.getByRole('navigation', { name: 'Deal Hunter views' })).getAllByRole('link').map((link) => link.textContent))
+      .toEqual(['Inbox', 'Pursued deals', 'Operations']);
     expect(await screen.findByText('4')).toBeVisible();
     expect(screen.getAllByText('Needs Review').length).toBeGreaterThan(0);
 
@@ -657,6 +659,29 @@ describe('Acquisition Inbox dashboard entry', () => {
     ]));
     expect(requestSignatures.some((signature) => /^(POST|PUT|PATCH|DELETE) /.test(signature))).toBe(false);
     expect(requestedUrls.some((url) => /\/review|\/backfill-review|\/send|\/cim-|\/deal-os-import/.test(url))).toBe(false);
+  });
+
+  test('?view=pursued opens the Pursued deals tab, and Operations links to it', async () => {
+    const fetchMock = vi.fn(async (input) => {
+      const url = String(input);
+      if (url === '/api/admin/session') {
+        return jsonResponse({ authenticated: true, username: 'admin@example.com', role: 'admin', authMode: 'hybrid',
+          magicLinkEnabled: true, passwordEnabled: true, viewerAccessEnabled: true });
+      }
+      if (url.startsWith('/api/admin/deal-hunter/pursuing')) {
+        return jsonResponse({ success: true, asOf: '2026-11-04T12:00:00.000Z',
+          counts: { needsAction: 0, byStage: { 'cim-requested': 0 } }, rows: [], truncated: false });
+      }
+      if (url === '/api/admin/onboarding') return jsonResponse({ success: true, progress: [] });
+      return jsonResponse({ success: false, error: `Unexpected request: ${url}` }, { ok: false, status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/deal-hunter?view=pursued');
+
+    expect(await screen.findByRole('heading', { name: 'Pursued deals' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Acquisition Inbox' })).not.toBeInTheDocument();
+    expect(await screen.findByText('No pursued deals yet. Deals you Pursue — or that are pursued automatically at 90+ — show up here.')).toBeVisible();
   });
 });
 

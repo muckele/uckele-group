@@ -1322,7 +1322,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       <div className="panel overflow-hidden">
         <header className="flex flex-col gap-5 border-b border-line/80 p-5 sm:p-7 lg:flex-row lg:items-start lg:justify-between">
           <div><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Deal Hunter</p><h2 className="mt-2 text-2xl font-semibold text-ink sm:text-3xl">Acquisition Inbox</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68">Review the authoritative opportunity queue, understand the evidence, and record a human decision without triggering scoring or outreach.</p></div>
-          <nav aria-label="Deal Hunter views" className="flex rounded-full border border-line bg-fog/70 p-1"><NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" end to="/admin/deal-hunter">Inbox</NavLink><NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" to="/admin/deal-hunter?view=operations">Operations</NavLink></nav>
+          <nav aria-label="Deal Hunter views" className="flex rounded-full border border-line bg-fog/70 p-1"><NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" end to="/admin/deal-hunter">Inbox</NavLink><NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" to="/admin/deal-hunter?view=pursued">Pursued deals</NavLink><NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" to="/admin/deal-hunter?view=operations">Operations</NavLink></nav>
         </header>
 
         <nav aria-label="Fresh Inbox areas" className="flex flex-wrap gap-2 border-b border-line/80 px-4 py-3 sm:px-5">{[

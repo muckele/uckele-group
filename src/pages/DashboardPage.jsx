@@ -41,6 +41,7 @@ const DealHunterTriage = lazy(() => import('../components/admin/DealHunterTriage
 const DealHunterWorkspace = lazy(() => import('../components/admin/DealHunterWorkspace'));
 const FollowUpsWorkspace = lazy(() => import('../components/admin/FollowUpsWorkspace'));
 const OperationsCenter = lazy(() => import('../components/admin/OperationsCenter'));
+const PursuedDeals = lazy(() => import('../components/admin/PursuedDeals'));
 const EmailSendingCard = lazy(() => import('../components/admin/EmailSendingCard'));
 const UnassignedCommunicationsInbox = lazy(() => import('../components/admin/UnassignedCommunicationsInbox'));
 
@@ -1402,6 +1403,7 @@ export default function DashboardPage() {
   const isReadOnly = authState.role === 'viewer';
   const requestedDealHunterView = new URLSearchParams(location.search).get('view');
   const showDealHunterOperations = requestedDealHunterView === 'operations' || requestedDealHunterView === 'cim-approvals';
+  const showDealHunterPursued = requestedDealHunterView === 'pursued';
   const crmListSearch = crmSearchFromFilters(filters);
   const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
   const basePageMeta = adminSectionMeta[isCrmDetailView ? 'crm-detail' : activeSection] || adminSectionMeta.overview;
@@ -3920,11 +3922,12 @@ export default function DashboardPage() {
 
       {activeSection === 'deal-hunter' ? (
         <Suspense fallback={<div className="section-shell mt-8"><WorkspaceFallback /></div>}>
-          {!showDealHunterOperations ? <AcquisitionInbox readOnly={isReadOnly} /> : (
+          {showDealHunterPursued ? <PursuedDeals readOnly={isReadOnly} /> : !showDealHunterOperations ? <AcquisitionInbox readOnly={isReadOnly} /> : (
           <>
           <section className="section-shell mt-8">
             <nav aria-label="Deal Hunter views" className="mb-5 flex w-fit rounded-full border border-line bg-white p-1">
               <NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" end to="/admin/deal-hunter">Inbox</NavLink>
+              <NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" to="/admin/deal-hunter?view=pursued">Pursued deals</NavLink>
               <NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" to="/admin/deal-hunter?view=operations">Operations</NavLink>
             </nav>
           </section>
