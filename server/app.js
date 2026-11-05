@@ -94,6 +94,7 @@ import {
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
 import { getAutoPursueStatus, runAutoPursue, setAutoPursueMode } from './services/autoPursue.js';
+import { listPursuedDeals } from './services/pursuedDeals.js';
 import {
   createManualSubmission,
   enforceContactBodyRateLimit,
@@ -2494,6 +2495,22 @@ export function createApp({
         actor: session.username,
       });
       response.status(result.status || (result.ok ? 200 : 409)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  // The Pursued deals tracker (spec 2026-11-04 §6.1). Read-only viewers may read it; the Gmail
+  // link and the reply id are admin-only and the service leaves them out for a viewer.
+  app.get(
+    '/api/admin/deal-hunter/pursuing',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const result = await listPursuedDeals({ storage: getStorage(), config, role: session.role,
+        stage: request.query.stage ?? 'all' });
+      response.status(result.status).json({ success: result.ok, ...result });
     }),
   );
 
