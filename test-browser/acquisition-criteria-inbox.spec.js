@@ -147,6 +147,9 @@ async function installFixture(page) {
     const method = request.method();
     if (method === 'GET' && url.pathname === '/api/admin/deal-hunter/triage') {
       await fulfillJson(route, queueResponse());
+    } else if (method === 'GET' && url.pathname === '/api/admin/deal-hunter/pursuing') {
+      // The Broker replies block reads the tracker; these fixtures have no pursued deals.
+      await fulfillJson(route, { success: true, asOf: '2030-01-07T00:00:00.000Z', counts: { needsAction: 0, byStage: {} }, rows: [], truncated: false });
     } else if (method === 'GET' && url.pathname === '/api/admin/deal-hunter/auto-pursue') {
       await fulfillJson(route, { success: true, mode: 'shadow', dailyCap: 1, todayCommands: 0, warmup: { ready: true }, latestRun: null });
     } else if (method === 'GET' && url.pathname === '/api/admin/deal-hunter/triage/opp-review') {
