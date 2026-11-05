@@ -304,6 +304,37 @@ function setProtectedResponseHeaders(_request, response, next) {
   next();
 }
 
+function securityHeaders(config) {
+  return (_request, response, next) => {
+    response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('X-Frame-Options', 'DENY');
+    response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    response.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "connect-src 'self' https://challenges.cloudflare.com",
+        "font-src 'self' data: https://fonts.gstatic.com",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "frame-src https://challenges.cloudflare.com",
+        "img-src 'self' data: blob:",
+        "object-src 'none'",
+        "script-src 'self' https://challenges.cloudflare.com",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      ].join('; '),
+    );
+
+    if (config.isProduction) {
+      response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+
+    next();
+  };
+}
+
 function protectMutationOrigin(config) {
   return (request, response, next) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
@@ -578,6 +609,7 @@ export function createApp({
     limit: '1kb',
   });
   let activeSecureUploads = 0;
+  const setSecurityHeaders = securityHeaders(config);
 
   app.disable('x-powered-by');
   app.use((request, response, next) => {
@@ -742,9 +774,11 @@ export function createApp({
   );
   // The owner's SIM upload (spec 2026-11-04 §8): a raw PDF body streamed into the vault, so it is
   // mounted ahead of every body parser. The admin check, the upload capacity it shares with the
-  // public secure upload, and the header checks all answer before any body byte is read.
+  // public secure upload, and the header checks all answer before any body byte is read. Being
+  // mounted this early, it sets the global security headers itself.
   app.post(
     '/api/admin/deal-hunter/pursuing/:opportunityId/sim',
+    setSecurityHeaders,
     async (request, response, next) => {
       try {
         const session = await requireAdmin(request);
@@ -805,34 +839,7 @@ export function createApp({
   app.use(express.json(jsonParserOptions('512kb')));
   app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
-  app.use((request, response, next) => {
-    response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    response.setHeader('X-Content-Type-Options', 'nosniff');
-    response.setHeader('X-Frame-Options', 'DENY');
-    response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    response.setHeader(
-      'Content-Security-Policy',
-      [
-        "default-src 'self'",
-        "base-uri 'self'",
-        "connect-src 'self' https://challenges.cloudflare.com",
-        "font-src 'self' data: https://fonts.gstatic.com",
-        "form-action 'self'",
-        "frame-ancestors 'none'",
-        "frame-src https://challenges.cloudflare.com",
-        "img-src 'self' data: blob:",
-        "object-src 'none'",
-        "script-src 'self' https://challenges.cloudflare.com",
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-      ].join('; '),
-    );
-
-    if (config.isProduction) {
-      response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    }
-
-    next();
-  });
+  app.use(setSecurityHeaders);
 
   app.get('/api/health', (_request, response) => {
     response.json({

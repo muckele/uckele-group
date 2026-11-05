@@ -881,5 +881,32 @@ test('GET /api/admin/deal-hunter/pursuing', async (t) => {
       assert.deepEqual([vaultLitter(), unsettledCleanupJobs()], [[], []]);
       assert.equal(errors.some((line) => line.includes(stored.id) && line.includes('read-back failed')), true);
     });
+
+    await t.test('SIM upload answers carry the same security headers as the other admin routes', async () => {
+      const SECURITY_HEADERS = ['content-security-policy', 'permissions-policy', 'referrer-policy',
+        'x-content-type-options', 'x-frame-options', 'cache-control', 'pragma'];
+      const pick = (headers) => Object.fromEntries(SECURITY_HEADERS.map((name) => [name, headers.get?.(name)
+        ?? headers[name] ?? null]));
+      const expected = pick((await fetch(`${origin}${route}`, { headers: { Cookie: adminCookie } })).headers);
+      assert.equal(expected['x-content-type-options'], 'nosniff');
+      assert.equal(expected['x-frame-options'], 'DENY');
+      assert.ok(expected['content-security-policy']);
+
+      world.clock.set(new Date(Date.now() + 60_000).toISOString());
+      const stored = await upload('opp-sim', pdfBytes, { name: 'headers.pdf' }).response;
+      assert.equal(stored.status, 201, stored.body);
+      const refused = openUpload(origin, 'opp-sim', { cookie: adminCookie,
+        headers: simHeaders({ length: 100, type: 'text/plain' }), hold: true });
+      const refusal = await refused.response;
+      refused.request.destroy();
+      assert.equal(refusal.status, 415);
+      const anonymous = openUpload(origin, 'opp-sim', { headers: simHeaders({ length: 100 }), hold: true });
+      const unauthorized = await anonymous.response;
+      anonymous.request.destroy();
+      assert.equal(unauthorized.status, 401);
+      for (const answer of [stored, refusal, unauthorized]) {
+        assert.deepEqual(pick(answer.headers), expected, `status ${answer.status}`);
+      }
+    });
   });
 });
