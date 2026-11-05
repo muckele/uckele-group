@@ -9,6 +9,11 @@ import {
   normalizeGmailSentIdentityRow, validateGmailReplyMessage, validateGmailReplyMessageLookup,
   validateGmailSentIdentityLookup, validateGmailPendingReplyLookup,
 } from './gmailSendStorageContract.js';
+import {
+  normalizePursuitBundle, normalizePursuitDocumentRow, normalizePursuitStageEventRow, PURSUIT_SIM_INTAKE_CONFLICTS,
+  PURSUIT_STAGE_EVENT_CONFLICTS, validatePursuitBundleListCommand, validatePursuitSimIntakeCommand,
+  validatePursuitStageEventCommand,
+} from './pursuitTrackerStorageContract.js';
 import { createClient } from '@supabase/supabase-js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
@@ -4320,6 +4325,67 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         throw new Error('Malformed Gmail reply message result');
       }
       return { applied: data.applied, replay: data.replay };
+    },
+
+    async getPursuitStageEventByIdempotencyKey(key) {
+      const { data, error } = await client.from('deal_hunter_pursuit_stage_events').select('*')
+        .eq('idempotency_key', String(key)).maybeSingle();
+      if (error) throw error;
+      return normalizePursuitStageEventRow(data);
+    },
+
+    /**
+     * Appends one Pursued deals tracker owner event through the RPC, which locks the
+     * opportunity row and then checks the key, membership, predecessor and acknowledged reply.
+     */
+    async recordPursuitStageEvent(command = {}) {
+      const event = validatePursuitStageEventCommand(command);
+      if (event.kind === 'sim-intake') throw new TypeError('Invalid kind');
+      const { data, error } = await client.rpc('pursuit_tracker_record_event_v1', { p_command: event });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean'
+        || !PURSUIT_STAGE_EVENT_CONFLICTS.includes(data.conflict ?? null)
+        || (data.applied || data.replay) !== Boolean(data.event)) {
+        throw new Error('Malformed pursuit stage event result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict ?? null,
+        event: normalizePursuitStageEventRow(data.event) };
+    },
+
+    /**
+     * Records a SIM the owner uploaded through the RPC (spec 2026-11-04 §8.4), which takes the CIM
+     * terminal lock and then the opportunity row, runs the owner event checks and the campaign
+     * submission checks, and inserts the request, document, activity and event in one transaction;
+     * the existing triggers converge materials.
+     */
+    async recordPursuitSimIntake(command = {}) {
+      const intake = validatePursuitSimIntakeCommand(command);
+      const { data, error } = await client.rpc('pursuit_tracker_record_sim_intake_v1', { p_command: intake });
+      if (error) throw error;
+      if (!data || typeof data.applied !== 'boolean' || typeof data.replay !== 'boolean'
+        || !PURSUIT_SIM_INTAKE_CONFLICTS.includes(data.conflict ?? null)
+        || (data.applied || data.replay) !== Boolean(data.event)
+        // A replay carries the stored document when it still exists.
+        || (data.applied && !data.document) || (!data.applied && !data.replay && data.document)) {
+        throw new Error('Malformed pursuit SIM intake result');
+      }
+      return { applied: data.applied, replay: data.replay, conflict: data.conflict ?? null,
+        event: normalizePursuitStageEventRow(data.event), document: normalizePursuitDocumentRow(data.document) };
+    },
+
+    /**
+     * The evidence each pursued deal's tracker row is folded from (spec 2026-11-04 §4.4), from one
+     * read-only RPC statement. Members are every opportunity with a pursue decision, whatever its
+     * status now; `opportunityIds` (at most 200) narrows the list.
+     */
+    async listPursuitBundles(command = {}) {
+      const { opportunityIds } = validatePursuitBundleListCommand(command);
+      const { data, error } = await client.rpc('pursuit_tracker_list_v1', {
+        p_command: opportunityIds === null ? {} : { opportunityIds },
+      });
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed pursuit bundle list result');
+      return data.map(normalizePursuitBundle);
     },
 
     async getCurrentAutoPursueActivation() {

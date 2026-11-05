@@ -22,7 +22,7 @@ function run(command, args, input) {
 }
 
 /** One psql session; `query(sql)` runs statements in order and returns stdout, or throws. */
-function openSession(container, database) {
+export function openSession(container, database) {
   const child = spawn(dockerCommand, ['exec', '-i', container, 'psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=0',
     '-U', 'postgres', '-d', database], { cwd: root });
   let stdout = '';

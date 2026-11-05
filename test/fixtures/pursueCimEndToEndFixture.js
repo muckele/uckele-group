@@ -21,6 +21,10 @@
 // importing this module.
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { Readable } from 'node:stream';
 
 import { getSourceHealth } from '../../server/services/acquisitionCommandCenter.js';
 import { AUTO_PURSUE_CONFIRMATIONS, runAutoPursue, setAutoPursueMode } from '../../server/services/autoPursue.js';
@@ -28,6 +32,8 @@ import { setCimOutreachPaused } from '../../server/services/cimOpportunityIdenti
 import { recordAcquisitionOwnerCommand } from '../../server/services/dealHunterTriage.js';
 import { createFakeCimProvider } from '../../server/services/fakeCimProvider.js';
 import { buildGmailConnectUrl, completeGmailConnect, disconnectGmail } from '../../server/services/gmailConnection.js';
+import { listPursuedDeals, recordPursuitOwnerEvent } from '../../server/services/pursuedDeals.js';
+import { receivePursuitSimUpload } from '../../server/services/pursuedDealsSimUpload.js';
 import { runPursueCimReplyPoll } from '../../server/services/pursueCimReplyPoller.js';
 import { startPursueCimReplyPollerScheduler } from '../../server/services/pursueCimReplyPollerScheduler.js';
 import { readPursueCimProviderReadiness } from '../../server/services/pursueCimReadiness.js';
@@ -87,7 +93,7 @@ function installClock(t, startIso) {
 }
 
 /** Pacific wall time `HH:MM` on `date` (YYYY-MM-DD) in January, as an ISO instant (PST, UTC-8). */
-function pacific(date, time) {
+export function pacific(date, time) {
   const [hour, minute] = time.split(':').map(Number);
   const [year, month, day] = date.split('-').map(Number);
   return new RealDate(RealDate.UTC(year, month - 1, day, hour + 8, minute)).toISOString();
@@ -105,7 +111,7 @@ const iso = (value) => (value === null || value === undefined ? value : new Real
  * A world on one backend. `createBackend(t)` returns `{ storage, all(sql, ...params),
  * run(sql, ...params) }` with `?` placeholders; it is created after the clock is installed.
  */
-async function createWorld(t, createBackend, { start, config: initialConfig = gmailConfig() }) {
+export async function createWorld(t, createBackend, { start, config: initialConfig = gmailConfig() }) {
   const clock = installClock(t, start);
   const backend = await createBackend(t);
   const { storage } = backend;
@@ -207,7 +213,7 @@ async function ownerActivatesAutoPursue(world) {
  * criteria group, its Sheet facts (one named listing broker), accepted with the Sheet's
  * accepted generation. Ingestion is upstream of this feature, so the acceptance is seeded.
  */
-async function seedDeal(world, { opportunityId, name, fitScore, criteriaGroup, brokerEmail = BROKER_EMAIL }) {
+export async function seedDeal(world, { opportunityId, name, fitScore, criteriaGroup, brokerEmail = BROKER_EMAIL }) {
   const { storage } = world;
   const at = new Date(Date.now() - 2 * HOUR).toISOString();
   await storage.upsertDealHunterOpportunity({
@@ -247,7 +253,7 @@ async function seedDeal(world, { opportunityId, name, fitScore, criteriaGroup, b
 }
 
 /** The owner clicks Request SIM on a deal (POST /api/admin/deal-hunter/triage/:id/action). */
-async function ownerRequestsSim(world, opportunityId) {
+export async function ownerRequestsSim(world, opportunityId) {
   const opportunity = await world.storage.getCurrentDealHunterOpportunity(opportunityId);
   const result = await recordAcquisitionOwnerCommand({ opportunityId, action: 'pursue',
     idempotencyKey: randomUUID(), expectedDiscoveryRevision: Number(opportunity.discovery_revision),
@@ -264,18 +270,18 @@ function autoPursueRuns(world) {
     triggeredBy: 'sheet-sync', currentFingerprints: fingerprints });
 }
 
-async function sendAt(world, at) {
+export async function sendAt(world, at) {
   world.clock.set(at);
   return world.send();
 }
 
-async function pollAt(world, at) {
+export async function pollAt(world, at) {
   world.clock.set(at);
   return world.poll();
 }
 
 /** The broker answers in the campaign's Gmail thread, to our latest email. */
-async function brokerReplies(world, campaign, { body, from = `Jordan Lee <${BROKER_EMAIL}>` }) {
+export async function brokerReplies(world, campaign, { body, from = `Jordan Lee <${BROKER_EMAIL}>` }) {
   const { gmail_thread_id: threadId } = await world.conversation(campaign.conversation_id);
   const ours = world.mailProvider.sent.filter((message) => message.threadId === threadId);
   return world.mailProvider.injectReply(threadId, {
@@ -293,7 +299,7 @@ function expectedEmail(world, { kind, followUpNumber, isFinal = false, name }) {
 }
 
 /** Sets up sending, automatic Pursue picks a 90+ deal, and its initial goes out Monday 08:05. */
-async function autoPursuedAndSent(world, { opportunityId = 'opp-auto', name = 'Acme Plumbing' } = {}) {
+export async function autoPursuedAndSent(world, { opportunityId = 'opp-auto', name = 'Acme Plumbing' } = {}) {
   await ownerTurnsSendingOn(world);
   await ownerActivatesAutoPursue(world);
   await seedDeal(world, { opportunityId, name, fitScore: 93, criteriaGroup: 'auto' });
@@ -304,7 +310,7 @@ async function autoPursuedAndSent(world, { opportunityId = 'opp-auto', name = 'A
   return world.campaignFor(opportunityId);
 }
 
-const START = pacific('2030-01-07', '06:30');
+export const START = pacific('2030-01-07', '06:30');
 
 /** 90+ deal → auto-Pursue active → initial in window → 2 follow-ups → broker reply → responded. */
 async function autoPursueReplyStops(t, createBackend) {
@@ -707,6 +713,124 @@ async function controlledTestFromInbox(t, createBackend) {
   assert.equal(world.mailProvider.attempts.length, 2);
 }
 
+/** The world's config with the SIM vault in a temporary directory removed after the test; the
+ *  disk reserve reads the missing SQLite file as 0 bytes. */
+function vaultConfig(t, world) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-pursued-e2e-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return { ...world.config,
+    secureDocuments: { storageDir: path.join(directory, 'secure-documents') },
+    storage: { sqlitePath: path.join(directory, 'absent.sqlite') } };
+}
+
+/** The owner uploads a small SIM PDF for the deal (the service behind the streaming route). */
+function uploadSim(world, config, opportunityId) {
+  const pdfBytes = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(2048, 0x20), Buffer.from('%%EOF\n')]);
+  return receivePursuitSimUpload({ storage: world.storage, config,
+    request: Object.assign(Readable.from([pdfBytes]), { headers: {} }), opportunityId,
+    headers: { idempotencyKey: randomUUID(), fileName: 'Acme-SIM.pdf', contentLength: pdfBytes.length,
+      acknowledgedReplyId: null },
+    actor: OWNER, role: 'admin', diskStats: async () => ({ bavail: 2 ** 30, bsize: 4096 }),
+    now: world.clock.peek() });
+}
+
+/**
+ * The Pursued deals tracker (spec 2026-11-04) end to end: a broker reply lands in Needs Your
+ * Action, the owner marks it an NDA request and uploads the SIM, and not one email goes out after
+ * the initial. The tracker's writes never reach the mail provider, the sender or the poller.
+ * The broker reply already ended the campaign, so its no-send proof is the sent-count check
+ * before the send windows; the live-campaign scenario below proves the send windows stay quiet.
+ */
+async function pursuedDealSendsNothing(t, createBackend) {
+  const world = await createWorld(t, createBackend, { start: START });
+  const campaign = await autoPursuedAndSent(world);
+  const opportunityId = campaign.opportunity_id;
+  const sentAfterInitial = world.mailProvider.sent.length;
+  assert.equal(sentAfterInitial, 1);
+
+  const config = vaultConfig(t, world);
+  const rowOf = async () => {
+    const page = await listPursuedDeals({ storage: world.storage, config, role: 'admin', now: world.clock.peek() });
+    assert.equal(page.ok, true, JSON.stringify(page));
+    return page.rows.find((row) => row.opportunityId === opportunityId);
+  };
+
+  // The broker answers; the next reply check puts the deal at the top of Needs Your Action.
+  world.clock.set(pacific('2030-01-07', '10:00'));
+  const reply = await brokerReplies(world, campaign, { body: 'Happy to share. Please sign the attached NDA first.' });
+  assert.ok(reply);
+  const poll = await pollAt(world, pacific('2030-01-07', '10:05'));
+  assert.equal(poll.responded, 1, JSON.stringify(poll));
+  const page = await listPursuedDeals({ storage: world.storage, config, role: 'admin', now: world.clock.peek() });
+  assert.equal(page.rows[0].opportunityId, opportunityId);
+  assert.equal(page.rows[0].needsAction.reason, 'reply');
+  assert.equal(page.counts.needsAction, 1);
+
+  // The owner marks the reply an NDA request: the stage is NDA and the row stops needing action.
+  const nda = await recordPursuitOwnerEvent({ storage: world.storage, config, opportunityId, kind: 'reply-type',
+    input: { idempotencyKey: randomUUID(), replyType: 'nda-requested',
+      expectedLatestEventId: page.rows[0].latestEventId, acknowledgedReplyId: page.rows[0].needsAction.replyId },
+    actor: OWNER, role: 'admin', now: world.clock.peek() });
+  assert.equal(nda.ok, true, JSON.stringify(nda));
+  let row = await rowOf();
+  assert.deepEqual([row.stage, row.needsAction], ['nda-sent', null]);
+
+  // The owner uploads the SIM: SIM received. The broker's reply already ended the campaign
+  // (`responded` is terminal), so the existing materials convergence has nothing left to move;
+  // only a still-live campaign goes to `materials-received` (covered in test/httpPursuedDeals.test.js).
+  world.clock.set(pacific('2030-01-07', '11:00'));
+  const upload = await uploadSim(world, config, opportunityId);
+  assert.equal(upload.status, 201, JSON.stringify(upload.body));
+  row = await rowOf();
+  assert.equal(row.stage, 'cim-received');
+  assert.equal(row.simDocuments.length, 1);
+  const ended = await world.campaignFor(opportunityId);
+  assert.deepEqual([ended.state, ended.reason_code], ['responded', 'reply_received']);
+
+  // Nothing was sent: not by the tracker's writes, and not by the sender on the days follow-ups were due.
+  assert.equal(world.mailProvider.sent.length, sentAfterInitial);
+  for (const at of [pacific('2030-01-09', '08:05'), pacific('2030-01-14', '08:05')]) {
+    const later = await sendAt(world, at);
+    assert.deepEqual([later.sentInitial, later.sentFollowUps], [0, 0], JSON.stringify(later));
+    assert.equal(world.mailProvider.sent.length, sentAfterInitial);
+  }
+  assert.equal(world.mailProvider.attempts.length, sentAfterInitial);
+}
+
+/**
+ * The upload on a LIVE campaign: no broker reply, so the SIM intake itself converges the campaign
+ * on materials-received and cancels its scheduled touches. Follow-up 1 was due 2030-01-09 08:00,
+ * so the sender windows at 2030-01-09 08:05 and 2030-01-14 08:05 are exactly when follow-ups would
+ * otherwise have gone out; nothing is sent in either.
+ */
+async function pursuedDealLiveCampaignSimUpload(t, createBackend) {
+  const world = await createWorld(t, createBackend, { start: START });
+  let campaign = await autoPursuedAndSent(world);
+  const opportunityId = campaign.opportunity_id;
+  const config = vaultConfig(t, world);
+  assert.equal(campaign.state, 'active-follow-up');
+  assert.deepEqual(await world.scheduled(campaign), [['follow-up-1', pacific('2030-01-09', '08:00')]]);
+  const sentAfterInitial = world.mailProvider.sent.length;
+  const attemptsAfterInitial = world.mailProvider.attempts.length;
+  assert.deepEqual([sentAfterInitial, attemptsAfterInitial], [1, 1]);
+
+  world.clock.set(pacific('2030-01-07', '11:00'));
+  const upload = await uploadSim(world, config, opportunityId);
+  assert.equal(upload.status, 201, JSON.stringify(upload.body));
+  assert.equal(upload.body.stoppedFollowUps, true);
+  assert.equal(upload.body.row.stage, 'cim-received');
+  campaign = await world.campaignFor(opportunityId);
+  assert.equal(campaign.state, 'materials-received');
+  assert.deepEqual(await world.scheduled(campaign), []);
+
+  for (const at of [pacific('2030-01-09', '08:05'), pacific('2030-01-14', '08:05')]) {
+    const later = await sendAt(world, at);
+    assert.deepEqual([later.sentInitial, later.sentFollowUps], [0, 0], JSON.stringify(later));
+    assert.equal(world.mailProvider.sent.length, sentAfterInitial);
+    assert.equal(world.mailProvider.attempts.length, attemptsAfterInitial);
+  }
+}
+
 /** The scenarios by their spec test names, each `(t, createBackend) => Promise`. */
 export const END_TO_END_SCENARIOS = Object.freeze([
   ['90+ deal → auto-Pursue active → initial sent in window → 2 follow-ups → broker reply → campaign responded, no more sends',
@@ -721,4 +845,8 @@ export const END_TO_END_SCENARIOS = Object.freeze([
     reconnectKeepsReplies],
   ['controlled Gmail test from the Inbox: a test listing whose only broker email is the test inbox → Request SIM → initial → threaded follow-up → reply stops',
     controlledTestFromInbox],
+  ['pursued deal: broker reply → Broker replies row → NDA requested → SIM upload → SIM received, with no email sent after the initial',
+    pursuedDealSendsNothing],
+  ['pursued deal: live campaign → SIM upload → materials-received, and no follow-up is sent',
+    pursuedDealLiveCampaignSimUpload],
 ]);

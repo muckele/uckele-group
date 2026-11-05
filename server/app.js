@@ -1,5 +1,5 @@
 import { restoreCurrentUnlinkedOpportunity } from './services/currentUnlinkedRestore.js';
-import { existsSync } from 'node:fs';
+import fs, { existsSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import express from 'express';
@@ -94,6 +94,12 @@ import {
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
 import { getAutoPursueStatus, runAutoPursue, setAutoPursueMode } from './services/autoPursue.js';
+import { listPursuedDeals, recordPursuitOwnerEvent } from './services/pursuedDeals.js';
+import {
+  checkSimUploadHeaders,
+  receivePursuitSimUpload,
+  simUploadRefusal,
+} from './services/pursuedDealsSimUpload.js';
 import {
   createManualSubmission,
   enforceContactBodyRateLimit,
@@ -296,6 +302,37 @@ function setProtectedResponseHeaders(_request, response, next) {
   response.setHeader('Cache-Control', 'no-store, private');
   response.setHeader('Pragma', 'no-cache');
   next();
+}
+
+function securityHeaders(config) {
+  return (_request, response, next) => {
+    response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('X-Frame-Options', 'DENY');
+    response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    response.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "connect-src 'self' https://challenges.cloudflare.com",
+        "font-src 'self' data: https://fonts.gstatic.com",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "frame-src https://challenges.cloudflare.com",
+        "img-src 'self' data: blob:",
+        "object-src 'none'",
+        "script-src 'self' https://challenges.cloudflare.com",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      ].join('; '),
+    );
+
+    if (config.isProduction) {
+      response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+
+    next();
+  };
 }
 
 function protectMutationOrigin(config) {
@@ -559,6 +596,7 @@ export function createApp({
   dailyDealHunterRunner = runClaimedDailyDealHunterEmail,
   sourceAuthorityRevalidator = revalidateRequiredSourceAuthority,
   gmailFetcher = (...args) => globalThis.fetch(...args),
+  diskStats = (directory) => fs.promises.statfs(directory),
 } = {}) {
   const config = getConfig();
   const app = express();
@@ -571,6 +609,7 @@ export function createApp({
     limit: '1kb',
   });
   let activeSecureUploads = 0;
+  const setSecurityHeaders = securityHeaders(config);
 
   app.disable('x-powered-by');
   app.use((request, response, next) => {
@@ -733,37 +772,74 @@ export function createApp({
       strictEmptyDigestBodyParser(request, response, next);
     },
   );
+  // The owner's SIM upload (spec 2026-11-04 §8): a raw PDF body streamed into the vault, so it is
+  // mounted ahead of every body parser. The admin check, the upload capacity it shares with the
+  // public secure upload, and the header checks all answer before any body byte is read. Being
+  // mounted this early, it sets the global security headers itself.
+  app.post(
+    '/api/admin/deal-hunter/pursuing/:opportunityId/sim',
+    setSecurityHeaders,
+    async (request, response, next) => {
+      try {
+        const session = await requireAdmin(request);
+        if (!session) {
+          response.status(401).json({ success: false, error: 'Administrator access is required.' });
+          return;
+        }
+        request.simUploadSession = session;
+        next();
+      } catch (error) {
+        next(error);
+      }
+    },
+    (request, response, next) => {
+      if (activeSecureUploads >= config.secureDocuments.maxConcurrentUploads) {
+        const { status, body } = simUploadRefusal('upload_capacity');
+        response.setHeader('Retry-After', '30');
+        response.status(status).json(body);
+        return;
+      }
+
+      activeSecureUploads += 1;
+      let released = false;
+      const release = () => {
+        if (!released) {
+          released = true;
+          activeSecureUploads = Math.max(0, activeSecureUploads - 1);
+        }
+      };
+      response.once('finish', release);
+      response.once('close', release);
+      next();
+    },
+    (request, response, next) => {
+      const checked = checkSimUploadHeaders(request.headers);
+      if (!checked.ok) {
+        response.status(checked.status).json({ success: false, code: checked.code, error: checked.error });
+        return;
+      }
+      request.simUploadHeaders = checked;
+      next();
+    },
+    asyncRoute(async (request, response) => {
+      const session = request.simUploadSession;
+      const result = await receivePursuitSimUpload({ storage: getStorage(), config, request,
+        opportunityId: request.params.opportunityId, headers: request.simUploadHeaders,
+        actor: session.username || session.principal_id, role: session.role, diskStats });
+      // An upload that broke mid-body took its connection with it: there is no one to answer.
+      if (response.destroyed || request.socket?.destroyed) return;
+      if (result.discardBody) {
+        // A replay never reads the body: answer, then drop the connection instead of draining it.
+        response.setHeader('Connection', 'close');
+        response.once('finish', () => request.destroy());
+      }
+      response.status(result.status).json(result.body);
+    }),
+  );
   app.use(express.json(jsonParserOptions('512kb')));
   app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
-  app.use((request, response, next) => {
-    response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    response.setHeader('X-Content-Type-Options', 'nosniff');
-    response.setHeader('X-Frame-Options', 'DENY');
-    response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    response.setHeader(
-      'Content-Security-Policy',
-      [
-        "default-src 'self'",
-        "base-uri 'self'",
-        "connect-src 'self' https://challenges.cloudflare.com",
-        "font-src 'self' data: https://fonts.gstatic.com",
-        "form-action 'self'",
-        "frame-ancestors 'none'",
-        "frame-src https://challenges.cloudflare.com",
-        "img-src 'self' data: blob:",
-        "object-src 'none'",
-        "script-src 'self' https://challenges.cloudflare.com",
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-      ].join('; '),
-    );
-
-    if (config.isProduction) {
-      response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    }
-
-    next();
-  });
+  app.use(setSecurityHeaders);
 
   app.get('/api/health', (_request, response) => {
     response.json({
@@ -2496,6 +2572,40 @@ export function createApp({
       response.status(result.status || (result.ok ? 200 : 409)).json({ success: Boolean(result.ok), ...result });
     }),
   );
+
+  // The Pursued deals tracker (spec 2026-11-04 §6.1). Read-only viewers may read it; the Gmail
+  // link and the reply id are admin-only and the service leaves them out for a viewer.
+  app.get(
+    '/api/admin/deal-hunter/pursuing',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const result = await listPursuedDeals({ storage: getStorage(), config, role: session.role,
+        stage: request.query.stage ?? 'all' });
+      response.status(result.status).json({ success: result.ok, ...result });
+    }),
+  );
+
+  // The tracker's owner writes (spec §6.2): tracker events only, never a campaign (§6.3). Admin only.
+  for (const [action, kind] of [['reply-type', 'reply-type'], ['stage', 'stage-move'], ['acknowledge', 'acknowledge']]) {
+    app.post(
+      `/api/admin/deal-hunter/pursuing/:opportunityId/${action}`,
+      asyncRoute(async (request, response) => {
+        const session = await requireAdmin(request);
+        if (!session) {
+          response.status(401).json({ success: false, error: 'Administrator access is required.' });
+          return;
+        }
+        const result = await recordPursuitOwnerEvent({ storage: getStorage(), config,
+          opportunityId: request.params.opportunityId, kind, input: request.body,
+          actor: session.username || session.principal_id, role: session.role });
+        response.status(result.status).json({ success: result.ok, ...result });
+      }),
+    );
+  }
 
   // Gmail connect flow (spec §4.2). Admin role only. The callback always redirects back to
   // Operations with a code; token material never reaches a response, a URL or a log line.

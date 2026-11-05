@@ -1072,6 +1072,13 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
     const path = url.pathname;
     state.requests.push({ method, path, search: url.search });
 
+    // The Broker replies block of Needs Your Action reads the Pursued deals tracker; these
+    // fixtures have no pursued deals, so it is an empty list that no scenario audits.
+    if (method === 'GET' && path === '/api/admin/deal-hunter/pursuing') {
+      await fulfillPhase1Json(route, { success: true, asOf: '2030-01-07T00:00:00.000Z', counts: { needsAction: 0, byStage: {} }, rows: [], truncated: false });
+      return;
+    }
+
     if (method === 'GET' && path === '/api/admin/deal-hunter/triage' && phase1QueueQueryIsClosed(url)) {
       try {
         await fulfillPhase1Json(route, phase1QueueResponse(state, url));
@@ -1498,6 +1505,11 @@ async function installPhase1OperationsFixture(page) {
   const state = createPhase1FixtureState();
   await installPhase1RequestAudit(page, state);
   await installPhase1AdminRoutes(page, state, { commandCenter: true });
+
+  // The Inbox's Broker replies block reads the Pursued deals tracker; none are pursued here.
+  await page.route('**/api/admin/deal-hunter/pursuing?*', async (route) => {
+    await fulfillPhase1Json(route, { success: true, asOf: '2030-01-07T00:00:00.000Z', counts: { needsAction: 0, byStage: {} }, rows: [], truncated: false });
+  });
 
   await page.route('**/api/admin/deal-hunter/triage?*', async (route) => {
     const request = route.request();
@@ -2135,6 +2147,7 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
     'GET /api/admin/onboarding',
     'GET /api/admin/deal-hunter/triage?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25',
+    'GET /api/admin/deal-hunter/pursuing?stage=needs-action',
     'GET /api/admin/deal-hunter/review',
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
     'GET /api/admin/communications/unassigned?page=1&pageSize=25',
@@ -2316,6 +2329,7 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
     'GET /api/admin/onboarding',
     'GET /api/admin/deal-hunter/triage?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25',
+    'GET /api/admin/deal-hunter/pursuing?stage=needs-action',
     'GET /api/admin/deal-hunter/review',
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
     'GET /api/admin/communications/unassigned?page=1&pageSize=25',
@@ -2815,6 +2829,8 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     'GET /api/admin/deal-hunter/triage?view=all&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=dismissed&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=dismissed&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/pursuing?stage=needs-action',
+    'GET /api/admin/deal-hunter/pursuing?stage=needs-action',
     'GET /api/admin/deal-hunter/triage/opp-cascade',
     'GET /api/admin/deal-hunter/triage/opp-evergreen',
     'GET /api/admin/deal-hunter/triage/opp-evergreen',
@@ -2828,11 +2844,11 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     'POST /api/admin/deal-hunter/triage/opp-evergreen/action',
     'PUT /api/admin/deal-hunter/opportunities/opp-evergreen/facts/seller_name',
   ].sort();
-  expect(state.requests).toHaveLength(35);
+  expect(state.requests).toHaveLength(37);
   expect(state.requests.map(phase1RequestSignature).sort()).toEqual(expectedDealHunterRequests);
   const independentlyObservedDealHunterRequests = state.apiRequests
     .filter(({ path }) => path.startsWith('/api/admin/deal-hunter/'));
-  expect(independentlyObservedDealHunterRequests).toHaveLength(35);
+  expect(independentlyObservedDealHunterRequests).toHaveLength(37);
   expect(independentlyObservedDealHunterRequests.map(phase1RequestSignature).sort()).toEqual(expectedDealHunterRequests);
   const expectedInboxApiRequests = [
     ...expectedDealHunterRequests,
@@ -2841,7 +2857,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     'GET /api/admin/onboarding',
     'GET /api/admin/onboarding',
   ].sort();
-  expect(state.apiRequests).toHaveLength(39);
+  expect(state.apiRequests).toHaveLength(41);
   expect(state.apiRequests.map(phase1RequestSignature).sort()).toEqual(expectedInboxApiRequests);
   expect(state.actionPayloads).toHaveLength(3);
   for (const [index, action, opportunityId, machineScore] of [

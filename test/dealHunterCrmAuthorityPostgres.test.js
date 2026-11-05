@@ -441,7 +441,9 @@ test('PostgreSQL CRM authority on fresh and upgraded disposable schemas', {
     assert.equal(over.submissionCount, null);
     assert.deepEqual(over.rows, []);
     assert.deepEqual(over.supersessions, []);
-    sql(container, database, 'truncate public.contact_submissions cascade;');
+    // The cascade reaches the append-only pursuit stage evidence, whose before-truncate guard
+    // fires in the default replication role; this superuser reset runs in replica mode.
+    sql(container, database, 'set session_replication_role = replica; truncate public.contact_submissions cascade;');
     // Superuser bypasses FKs and validation solely to isolate the supersession bound,
     // as the SQLite boundary fixture does; production writes keep all guards enabled.
     sql(container, database, `set session_replication_role = replica;

@@ -634,6 +634,8 @@ describe('Acquisition Inbox dashboard entry', () => {
     expect(await screen.findByRole('heading', { name: 'Acquisition Inbox' })).toBeVisible();
     expect(within(screen.getByRole('navigation', { name: 'Deal Hunter views' })).getByRole('link', { name: 'Operations' }))
       .toHaveAttribute('href', '/admin/deal-hunter?view=operations');
+    expect(within(screen.getByRole('navigation', { name: 'Deal Hunter views' })).getAllByRole('link').map((link) => link.textContent))
+      .toEqual(['Inbox', 'Pursued deals', 'Operations']);
     expect(await screen.findByText('4')).toBeVisible();
     expect(screen.getAllByText('Needs Review').length).toBeGreaterThan(0);
 
@@ -657,6 +659,29 @@ describe('Acquisition Inbox dashboard entry', () => {
     ]));
     expect(requestSignatures.some((signature) => /^(POST|PUT|PATCH|DELETE) /.test(signature))).toBe(false);
     expect(requestedUrls.some((url) => /\/review|\/backfill-review|\/send|\/cim-|\/deal-os-import/.test(url))).toBe(false);
+  });
+
+  test('?view=pursued opens the Pursued deals tab, and Operations links to it', async () => {
+    const fetchMock = vi.fn(async (input) => {
+      const url = String(input);
+      if (url === '/api/admin/session') {
+        return jsonResponse({ authenticated: true, username: 'admin@example.com', role: 'admin', authMode: 'hybrid',
+          magicLinkEnabled: true, passwordEnabled: true, viewerAccessEnabled: true });
+      }
+      if (url.startsWith('/api/admin/deal-hunter/pursuing')) {
+        return jsonResponse({ success: true, asOf: '2026-11-04T12:00:00.000Z',
+          counts: { needsAction: 0, byStage: { 'cim-requested': 0 } }, rows: [], truncated: false });
+      }
+      if (url === '/api/admin/onboarding') return jsonResponse({ success: true, progress: [] });
+      return jsonResponse({ success: false, error: `Unexpected request: ${url}` }, { ok: false, status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/deal-hunter?view=pursued');
+
+    expect(await screen.findByRole('heading', { name: 'Pursued deals' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Acquisition Inbox' })).not.toBeInTheDocument();
+    expect(await screen.findByText('No pursued deals yet. Deals you Pursue — or that are pursued automatically at 90+ — show up here.')).toBeVisible();
   });
 });
 
@@ -3198,5 +3223,247 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       expect(await within(auto).findByText('Pursued Air')).toBeVisible();
       expect(within(auto).queryByRole('button', { name: /^Stop SIM request/ })).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('Broker replies in Needs Your Action', () => {
+  const PURSUING = '/api/admin/deal-hunter/pursuing';
+  const GMAIL = 'https://mail.google.com/mail/?authuser=owner%40example.com#all/thread-1';
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const pursuedRow = (overrides = {}) => ({
+    opportunityId: 'pursued-1', name: 'Acme Plumbing', crmSubmissionId: 'crm-1',
+    stage: 'cim-requested', stageLabel: 'SIM requested', stageSince: '2026-11-02T15:00:00.000Z', stageSource: 'evidence',
+    lastReplyAt: '2026-11-03T15:00:00.000Z',
+    needsAction: { reason: 'reply', at: '2026-11-03T15:00:00.000Z', replyId: 'reply-1', classification: 'reply' },
+    simDocuments: [], latestEventId: 'evt-1', release: { status: null, canStop: false, campaign: null },
+    passedInDealHunter: false, opportunityActive: true, gmailThreadUrl: GMAIL,
+    ...overrides,
+  });
+  const bounceRow = (overrides = {}) => pursuedRow({
+    opportunityId: 'bounced-1', name: 'Bounced Heating',
+    needsAction: { reason: 'bounce', at: '2026-11-03T15:00:00.000Z', replyId: 'bounce-1', classification: 'bounce' },
+    ...overrides,
+  });
+  const pursuingPage = (rows) => ({ success: true, counts: { needsAction: rows.length, byStage: {} }, rows, truncated: false });
+  const emptyAction = () => queueResponse({ view: 'inbox', areas: [{ id: 'action-preview', rows: [], total: 0, counts: {} }], rows: [] });
+
+  function stubInboxWithPursuing({ pursuing, writes = {}, queue = emptyAction() }) {
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (options.method === 'POST' && url.startsWith(PURSUING)) {
+        const handler = writes[url.slice(PURSUING.length)];
+        return handler ? handler(typeof options.body === 'string' ? JSON.parse(options.body) : options.body) : jsonResponse({ success: false, error: 'Unexpected' }, { ok: false, status: 404 });
+      }
+      if (url.startsWith(PURSUING)) return typeof pursuing === 'function' ? pursuing(url) : pursuing;
+      if (url.includes('/auto-pursue')) return jsonResponse({ error: 'nope' }, { ok: false, status: 503 });
+      return jsonResponse(queue);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+  const postsTo = (fetchMock, suffix) => fetchMock.mock.calls.filter(([url, options]) => options?.method === 'POST' && String(url).endsWith(suffix));
+
+  test('Needs Your Action lists a Gmail reply with Open in Gmail and the reply-type control', async () => {
+    const fetchMock = stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow()])) });
+    renderInbox({ initialView: 'inbox' });
+
+    const block = await screen.findByRole('list', { name: 'Broker replies' });
+    const region = screen.getByRole('region', { name: 'Needs Your Action' });
+    expect(region).toContainElement(block);
+    expect(within(region).getByText('Broker replies')).toBeVisible();
+    expect(within(block).getByText('Acme Plumbing')).toBeVisible();
+    expect(within(block).getByText(/^Replied Nov 3, 2026$/)).toBeVisible();
+    const gmail = within(block).getByRole('link', { name: 'Open in Gmail' });
+    expect(gmail).toHaveAttribute('href', GMAIL);
+    expect(gmail).toHaveAttribute('target', '_blank');
+    expect(gmail).toHaveAttribute('rel', 'noopener noreferrer');
+    const group = within(block).getByRole('group', { name: 'Reply type for Acme Plumbing' });
+    for (const label of ['NDA requested', 'SIM received', 'Not available', 'Question', 'Other']) {
+      expect(within(group).getByRole('button', { name: label })).toBeVisible();
+    }
+    expect(within(region).getByRole('link', { name: 'All pursued deals →' })).toHaveAttribute('href', '/admin/deal-hunter?view=pursued');
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === `${PURSUING}?stage=needs-action`)).toBe(true);
+  });
+
+  test('one click records the reply type and the row stays until the next refresh', async () => {
+    const after = pursuedRow({ stage: 'nda-sent', stageLabel: 'NDA', latestEventId: 'evt-2', needsAction: null });
+    const fetchMock = stubInboxWithPursuing({
+      pursuing: jsonResponse(pursuingPage([pursuedRow()])),
+      writes: { '/pursued-1/reply-type': () => jsonResponse({ success: true, row: after }) },
+    });
+    renderInbox({ initialView: 'inbox' });
+
+    const block = await screen.findByRole('list', { name: 'Broker replies' });
+    fireEvent.click(within(block).getByRole('button', { name: 'NDA requested' }));
+    expect(await within(block).findByText(/^Recorded: NDA requested\./)).toBeVisible();
+    expect(JSON.parse(postsTo(fetchMock, '/reply-type')[0][1].body)).toEqual({
+      replyType: 'nda-requested', expectedLatestEventId: 'evt-1', acknowledgedReplyId: 'reply-1',
+      idempotencyKey: expect.stringMatching(UUID),
+    });
+    expect(within(block).getByText('Acme Plumbing')).toBeVisible();
+  });
+
+  describe('SIM received opens the upload panel', () => {
+    const simReceivedRow = () => pursuedRow({ stage: 'cim-received', stageLabel: 'SIM received', latestEventId: 'evt-2', needsAction: null });
+    const pdf = (name = 'sim.pdf') => new File(['%PDF-1.4'], name, { type: 'application/pdf' });
+
+    test('recording SIM received opens the upload panel with the input focused; Upload later closes it', async () => {
+      stubInboxWithPursuing({
+        pursuing: jsonResponse(pursuingPage([pursuedRow()])),
+        writes: { '/pursued-1/reply-type': () => jsonResponse({ success: true, row: simReceivedRow() }) },
+      });
+      renderInbox({ initialView: 'inbox' });
+
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      fireEvent.click(within(block).getByRole('button', { name: 'SIM received' }));
+      const input = await within(block).findByLabelText('SIM file for Acme Plumbing');
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(within(block).getByText(/^Recorded: SIM received\./)).toBeVisible();
+      expect(within(block).queryByRole('link', { name: /Upload the SIM/ })).not.toBeInTheDocument();
+
+      fireEvent.click(within(block).getByRole('button', { name: 'Upload later' }));
+      expect(within(block).queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+    });
+
+    test('an upload from the block posts to the SIM route like the tab and shows the upload-OK copy', async () => {
+      const uploaded = { ...simReceivedRow(), simDocuments: [{ id: 'doc-1', name: 'sim.pdf', sizeBytes: 8, uploadedAt: '2026-11-04T12:00:00.000Z' }] };
+      const fetchMock = stubInboxWithPursuing({
+        pursuing: jsonResponse(pursuingPage([pursuedRow()])),
+        writes: {
+          '/pursued-1/reply-type': () => jsonResponse({ success: true, row: simReceivedRow() }),
+          '/pursued-1/sim': () => jsonResponse({ success: true, row: uploaded, stoppedFollowUps: false }),
+        },
+      });
+      renderInbox({ initialView: 'inbox' });
+
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      fireEvent.click(within(block).getByRole('button', { name: 'SIM received' }));
+      const file = pdf();
+      fireEvent.change(await within(block).findByLabelText('SIM file for Acme Plumbing'), { target: { files: [file] } });
+
+      expect(await within(block).findByText('SIM uploaded.')).toBeVisible();
+      const [url, options] = postsTo(fetchMock, '/sim')[0];
+      expect(url).toBe(`${PURSUING}/pursued-1/sim`);
+      expect(options.body).toBe(file);
+      expect(options.headers).toEqual({
+        'Content-Type': 'application/pdf', 'X-File-Name': 'sim.pdf', 'X-Idempotency-Key': expect.stringMatching(UUID),
+      });
+      expect(within(block).queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+    });
+
+    test('a refused upload shows the spec copy and keeps the panel open', async () => {
+      stubInboxWithPursuing({
+        pursuing: jsonResponse(pursuingPage([pursuedRow()])),
+        writes: {
+          '/pursued-1/reply-type': () => jsonResponse({ success: true, row: simReceivedRow() }),
+          '/pursued-1/sim': () => jsonResponse({ success: false, code: 'file_too_large', error: 'server words' }, { ok: false, status: 413 }),
+        },
+      });
+      renderInbox({ initialView: 'inbox' });
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      fireEvent.click(within(block).getByRole('button', { name: 'SIM received' }));
+      fireEvent.change(await within(block).findByLabelText('SIM file for Acme Plumbing'), { target: { files: [pdf()] } });
+      expect(await within(block).findByText('This file is larger than 25 MB.')).toBeVisible();
+      expect(within(block).getByLabelText('SIM file for Acme Plumbing')).toBeVisible();
+    });
+
+    test('a viewer sees no upload control', async () => {
+      stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow({ gmailThreadUrl: null })])) });
+      renderInbox({ initialView: 'inbox', readOnly: true });
+      const block = await screen.findByRole('list', { name: 'Broker replies' });
+      expect(within(block).queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+      expect(within(block).queryByRole('button', { name: /Upload/ })).not.toBeInTheDocument();
+    });
+  });
+
+  test('a bounce shows Bounced {date} and Mark handled', async () => {
+    const fetchMock = stubInboxWithPursuing({
+      pursuing: jsonResponse(pursuingPage([bounceRow()])),
+      writes: { '/bounced-1/acknowledge': () => jsonResponse({ success: true, row: bounceRow({ needsAction: null, latestEventId: 'evt-2' }) }) },
+    });
+    renderInbox({ initialView: 'inbox' });
+
+    const block = await screen.findByRole('list', { name: 'Broker replies' });
+    expect(within(block).getByText('Bounced Nov 3, 2026')).toBeVisible();
+    expect(within(block).getByRole('link', { name: 'Open in Gmail' })).toBeVisible();
+    expect(within(block).queryByRole('group', { name: /Reply type for/ })).not.toBeInTheDocument();
+    fireEvent.click(within(block).getByRole('button', { name: 'Mark handled' }));
+    await waitFor(() => expect(postsTo(fetchMock, '/acknowledge')).toHaveLength(1));
+    expect(JSON.parse(postsTo(fetchMock, '/acknowledge')[0][1].body)).toEqual({
+      acknowledgedReplyId: 'bounce-1', idempotencyKey: expect.stringMatching(UUID),
+    });
+    await waitFor(() => expect(screen.queryByText('Bounced Heating')).not.toBeInTheDocument());
+    expect(screen.queryByRole('list', { name: 'Broker replies' })).not.toBeInTheDocument();
+  });
+
+  test('a delisted pursued deal still appears in Broker replies', async () => {
+    stubInboxWithPursuing({
+      pursuing: jsonResponse(pursuingPage([pursuedRow({ opportunityActive: false, passedInDealHunter: true })])),
+    });
+    renderInbox({ initialView: 'inbox' });
+    const block = await screen.findByRole('list', { name: 'Broker replies' });
+    expect(within(block).getByText('Acme Plumbing')).toBeVisible();
+    expect(within(block).getByRole('group', { name: 'Reply type for Acme Plumbing' })).toBeVisible();
+  });
+
+  test('the empty-area text is hidden while Broker replies has items', async () => {
+    stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow()])) });
+    renderInbox({ initialView: 'inbox' });
+    const region = await screen.findByRole('region', { name: 'Needs Your Action' });
+    await within(region).findByRole('list', { name: 'Broker replies' });
+    expect(within(region).queryByText('No opportunities in this area.')).not.toBeInTheDocument();
+  });
+
+  test('rows without needsAction are ignored and the empty-area text stays', async () => {
+    stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow({ needsAction: null })])) });
+    renderInbox({ initialView: 'inbox' });
+    const region = await screen.findByRole('region', { name: 'Needs Your Action' });
+    await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => String(url).startsWith(PURSUING))).toBe(true));
+    expect(within(region).getByText('No opportunities in this area.')).toBeVisible();
+    expect(within(region).queryByText('Broker replies')).not.toBeInTheDocument();
+  });
+
+  test('a failed pursuing read leaves the inbox unchanged', async () => {
+    stubInboxWithPursuing({ pursuing: jsonResponse({ success: false, error: 'boom' }, { ok: false, status: 500 }) });
+    renderInbox({ initialView: 'inbox' });
+    const region = await screen.findByRole('region', { name: 'Needs Your Action' });
+    await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => String(url).startsWith(PURSUING))).toBe(true));
+    expect(within(region).getByText('No opportunities in this area.')).toBeVisible();
+    expect(within(region).queryByText('Broker replies')).not.toBeInTheDocument();
+    expect(within(region).queryByRole('link', { name: 'All pursued deals →' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  test('a viewer sees replies without write controls or Gmail links', async () => {
+    const viewerRow = pursuedRow({ gmailThreadUrl: null, needsAction: { reason: 'reply', at: '2026-11-03T15:00:00.000Z', classification: 'reply' } });
+    stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([viewerRow, bounceRow({ gmailThreadUrl: null,
+      needsAction: { reason: 'bounce', at: '2026-11-03T15:00:00.000Z', classification: 'bounce' } })])) });
+    renderInbox({ initialView: 'inbox', readOnly: true });
+
+    const block = await screen.findByRole('list', { name: 'Broker replies' });
+    expect(within(block).getByText('Acme Plumbing')).toBeVisible();
+    expect(within(block).getByText('Replied Nov 3, 2026')).toBeVisible();
+    expect(within(block).getByText('Bounced Nov 3, 2026')).toBeVisible();
+    expect(within(block).queryByRole('link', { name: 'Open in Gmail' })).not.toBeInTheDocument();
+    expect(within(block).queryByText('Gmail thread not available yet.')).not.toBeInTheDocument();
+    expect(within(block).queryByRole('group', { name: /Reply type for/ })).not.toBeInTheDocument();
+    expect(within(block).queryByRole('button')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Needs Your Action' })).getByRole('link', { name: 'All pursued deals →' })).toBeVisible();
+  });
+
+  test('an admin row without a Gmail link says so', async () => {
+    stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow({ gmailThreadUrl: null })])) });
+    renderInbox({ initialView: 'inbox' });
+    const block = await screen.findByRole('list', { name: 'Broker replies' });
+    expect(within(block).getByText('Gmail thread not available yet.')).toBeVisible();
+  });
+
+  test('a stop-word reply is listed without extra copy', async () => {
+    stubInboxWithPursuing({ pursuing: jsonResponse(pursuingPage([pursuedRow({
+      needsAction: { reason: 'reply', at: '2026-11-03T15:00:00.000Z', replyId: 'reply-1', classification: 'stop' } })])) });
+    renderInbox({ initialView: 'inbox' });
+    const block = await screen.findByRole('list', { name: 'Broker replies' });
+    expect(within(block).getByText('Acme Plumbing')).toBeVisible();
+    expect(within(block).queryByText('They asked not to be emailed again.')).not.toBeInTheDocument();
   });
 });

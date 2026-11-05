@@ -14,7 +14,7 @@ const relevantDocumentTypes = new Set([
   'balance_sheet',
 ]);
 
-const cimDocumentTypes = new Set([
+export const cimDocumentTypes = new Set([
   'cim',
   'teaser',
   'prospectus',
