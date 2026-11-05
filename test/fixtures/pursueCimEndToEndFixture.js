@@ -713,10 +713,33 @@ async function controlledTestFromInbox(t, createBackend) {
   assert.equal(world.mailProvider.attempts.length, 2);
 }
 
+/** The world's config with the SIM vault in a temporary directory removed after the test; the
+ *  disk reserve reads the missing SQLite file as 0 bytes. */
+function vaultConfig(t, world) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-pursued-e2e-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return { ...world.config,
+    secureDocuments: { storageDir: path.join(directory, 'secure-documents') },
+    storage: { sqlitePath: path.join(directory, 'absent.sqlite') } };
+}
+
+/** The owner uploads a small SIM PDF for the deal (the service behind the streaming route). */
+function uploadSim(world, config, opportunityId) {
+  const pdfBytes = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(2048, 0x20), Buffer.from('%%EOF\n')]);
+  return receivePursuitSimUpload({ storage: world.storage, config,
+    request: Object.assign(Readable.from([pdfBytes]), { headers: {} }), opportunityId,
+    headers: { idempotencyKey: randomUUID(), fileName: 'Acme-SIM.pdf', contentLength: pdfBytes.length,
+      acknowledgedReplyId: null },
+    actor: OWNER, role: 'admin', diskStats: async () => ({ bavail: 2 ** 30, bsize: 4096 }),
+    now: world.clock.peek() });
+}
+
 /**
  * The Pursued deals tracker (spec 2026-11-04) end to end: a broker reply lands in Needs Your
  * Action, the owner marks it an NDA request and uploads the SIM, and not one email goes out after
  * the initial. The tracker's writes never reach the mail provider, the sender or the poller.
+ * The broker reply already ended the campaign, so its no-send proof is the sent-count check
+ * before the send windows; the live-campaign scenario below proves the send windows stay quiet.
  */
 async function pursuedDealSendsNothing(t, createBackend) {
   const world = await createWorld(t, createBackend, { start: START });
@@ -725,12 +748,7 @@ async function pursuedDealSendsNothing(t, createBackend) {
   const sentAfterInitial = world.mailProvider.sent.length;
   assert.equal(sentAfterInitial, 1);
 
-  // The upload writes its PDF under a temporary vault; the disk reserve reads a missing SQLite file as 0.
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-pursued-e2e-'));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const config = { ...world.config,
-    secureDocuments: { storageDir: path.join(directory, 'secure-documents') },
-    storage: { sqlitePath: path.join(directory, 'absent.sqlite') } };
+  const config = vaultConfig(t, world);
   const rowOf = async () => {
     const page = await listPursuedDeals({ storage: world.storage, config, role: 'admin', now: world.clock.peek() });
     assert.equal(page.ok, true, JSON.stringify(page));
@@ -760,13 +778,8 @@ async function pursuedDealSendsNothing(t, createBackend) {
   // The owner uploads the SIM: SIM received. The broker's reply already ended the campaign
   // (`responded` is terminal), so the existing materials convergence has nothing left to move;
   // only a still-live campaign goes to `materials-received` (covered in test/httpPursuedDeals.test.js).
-  const pdfBytes = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(2048, 0x20), Buffer.from('%%EOF\n')]);
   world.clock.set(pacific('2030-01-07', '11:00'));
-  const upload = await receivePursuitSimUpload({ storage: world.storage, config,
-    request: Object.assign(Readable.from([pdfBytes]), { headers: {} }), opportunityId,
-    headers: { idempotencyKey: randomUUID(), fileName: 'Acme-SIM.pdf', contentLength: pdfBytes.length,
-      acknowledgedReplyId: null },
-    actor: OWNER, role: 'admin', diskStats: async () => ({ bavail: 2 ** 30, bsize: 4096 }), now: world.clock.peek() });
+  const upload = await uploadSim(world, config, opportunityId);
   assert.equal(upload.status, 201, JSON.stringify(upload.body));
   row = await rowOf();
   assert.equal(row.stage, 'cim-received');
@@ -784,6 +797,40 @@ async function pursuedDealSendsNothing(t, createBackend) {
   assert.equal(world.mailProvider.attempts.length, sentAfterInitial);
 }
 
+/**
+ * The upload on a LIVE campaign: no broker reply, so the SIM intake itself converges the campaign
+ * on materials-received and cancels its scheduled touches. Follow-up 1 was due 2030-01-09 08:00,
+ * so the sender windows at 2030-01-09 08:05 and 2030-01-14 08:05 are exactly when follow-ups would
+ * otherwise have gone out; nothing is sent in either.
+ */
+async function pursuedDealLiveCampaignSimUpload(t, createBackend) {
+  const world = await createWorld(t, createBackend, { start: START });
+  let campaign = await autoPursuedAndSent(world);
+  const opportunityId = campaign.opportunity_id;
+  const config = vaultConfig(t, world);
+  assert.equal(campaign.state, 'active-follow-up');
+  assert.deepEqual(await world.scheduled(campaign), [['follow-up-1', pacific('2030-01-09', '08:00')]]);
+  const sentAfterInitial = world.mailProvider.sent.length;
+  const attemptsAfterInitial = world.mailProvider.attempts.length;
+  assert.deepEqual([sentAfterInitial, attemptsAfterInitial], [1, 1]);
+
+  world.clock.set(pacific('2030-01-07', '11:00'));
+  const upload = await uploadSim(world, config, opportunityId);
+  assert.equal(upload.status, 201, JSON.stringify(upload.body));
+  assert.equal(upload.body.stoppedFollowUps, true);
+  assert.equal(upload.body.row.stage, 'cim-received');
+  campaign = await world.campaignFor(opportunityId);
+  assert.equal(campaign.state, 'materials-received');
+  assert.deepEqual(await world.scheduled(campaign), []);
+
+  for (const at of [pacific('2030-01-09', '08:05'), pacific('2030-01-14', '08:05')]) {
+    const later = await sendAt(world, at);
+    assert.deepEqual([later.sentInitial, later.sentFollowUps], [0, 0], JSON.stringify(later));
+    assert.equal(world.mailProvider.sent.length, sentAfterInitial);
+    assert.equal(world.mailProvider.attempts.length, attemptsAfterInitial);
+  }
+}
+
 /** The scenarios by their spec test names, each `(t, createBackend) => Promise`. */
 export const END_TO_END_SCENARIOS = Object.freeze([
   ['90+ deal → auto-Pursue active → initial sent in window → 2 follow-ups → broker reply → campaign responded, no more sends',
@@ -798,6 +845,8 @@ export const END_TO_END_SCENARIOS = Object.freeze([
     reconnectKeepsReplies],
   ['controlled Gmail test from the Inbox: a test listing whose only broker email is the test inbox → Request SIM → initial → threaded follow-up → reply stops',
     controlledTestFromInbox],
-  ['pursued deal: broker reply → Broker replies row → NDA requested → SIM upload → materials-received, with no email sent after the initial',
+  ['pursued deal: broker reply → Broker replies row → NDA requested → SIM upload → SIM received, with no email sent after the initial',
     pursuedDealSendsNothing],
+  ['pursued deal: live campaign → SIM upload → materials-received, and no follow-up is sent',
+    pursuedDealLiveCampaignSimUpload],
 ]);
