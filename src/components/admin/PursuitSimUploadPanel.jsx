@@ -34,9 +34,15 @@ export const trackerWrite = Object.freeze({
   network: () => ({ text: SAVE_FAILED_COPY, reload: false }),
 });
 
+// A 5xx with no error code may have come after the write committed (a proxy's 502, a failed
+// read-back), so it is as ambiguous as a network failure. A coded answer is definite.
+const isDefiniteAnswer = (failure) => failure instanceof PursuedDealsApiError
+  && !(failure.status >= 500 && !failure.code);
+
 /**
  * Runs one owner write on a deal under its idempotency key. A definite server answer releases the
- * key; a network failure keeps it, so the owner's retry replays instead of writing twice.
+ * key; a network failure or an uncoded 5xx keeps it, so the owner's retry replays instead of
+ * writing twice.
  * `describe` = { api(failure), network() } -> { text, tone?, reload? }. `onReload()` follows a
  * describe with `reload: true`. Returns the write's result, or null when it failed or was skipped.
  */
@@ -57,7 +63,7 @@ export function usePursuedRowWrite({ opportunityId, onReload }) {
       return result;
     } catch (failure) {
       let outcome;
-      if (failure instanceof PursuedDealsApiError) {
+      if (isDefiniteAnswer(failure)) {
         keys.forget(opportunityId, signature);
         outcome = describe.api(failure);
       } else {
@@ -75,8 +81,8 @@ export function usePursuedRowWrite({ opportunityId, onReload }) {
 }
 
 /**
- * The upload of `file` for `row`, as arguments for `runWrite`. On a network failure no answer came
- * back, so the upload may or may not have committed: `reread()` reads the deal again (resolving to
+ * The upload of `file` for `row`, as arguments for `runWrite`. On a network failure (or an uncoded
+ * 5xx) no definite answer came back, so the upload may or may not have committed: `reread()` reads the deal again (resolving to
  * rows, or null). A SIM that was not there when the owner started means it landed (`onLanded()`
  * follows, with the OK copy). If not, the interrupted copy shows every time and the key is kept, so
  * the next attempt is a safe retry that replays if it did commit.

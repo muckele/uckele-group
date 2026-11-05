@@ -166,6 +166,17 @@ async function post(origin, opportunityId, action, body, cookie) {
   return { status: response.status, body: text, json: JSON.parse(text) };
 }
 
+/** `storage` with some methods replaced; every other method stays bound to the real storage. */
+function storageWith(storage, overrides) {
+  return new Proxy(storage, {
+    get(target, property) {
+      if (Object.hasOwn(overrides, property)) return overrides[property];
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 const eventCount = (opportunityId) => database.prepare(
   'SELECT COUNT(*) AS n FROM deal_hunter_pursuit_stage_events WHERE opportunity_id = ?').get(opportunityId).n;
 
@@ -835,6 +846,40 @@ test('GET /api/admin/deal-hunter/pursuing', async (t) => {
       assert.ok(stored);
       assert.deepEqual(fs.readFileSync(stored.storage_path), pdfBytes);
       assert.deepEqual([vaultLitter(), unsettledCleanupJobs()], [[], []]);
+    });
+
+    await t.test('a row read-back that throws after the commit still answers 201, with row null', async (st) => {
+      world.clock.set(new Date(Date.now() + 60_000).toISOString());
+      const { receivePursuitSimUpload } = await import('../server/services/pursuedDealsSimUpload.js');
+      const errors = [];
+      st.mock.method(console, 'error', (...args) => { errors.push(args.join(' ')); });
+      let committed = false;
+      const flaky = storageWith(storage, {
+        recordPursuitSimIntake: async (command) => {
+          const result = await storage.recordPursuitSimIntake(command);
+          committed = true;
+          return result;
+        },
+        listPursuitBundles: async (...args) => {
+          if (committed) throw new Error('read-back failed');
+          return storage.listPursuitBundles(...args);
+        },
+      });
+      const events = simEvents();
+      const result = await receivePursuitSimUpload({ storage: flaky, config: getConfig(), request: Readable.from([pdfBytes]),
+        opportunityId: 'opp-sim', actor: 'admin', role: 'admin',
+        headers: { idempotencyKey: randomUUID(), fileName: 'Read-back.pdf', contentLength: pdfBytes.length,
+          acknowledgedReplyId: null },
+        diskStats: async () => ({ bavail: 2 ** 30, bsize: 4096 }) });
+      assert.equal(committed, true);
+      assert.equal(result.status, 201, JSON.stringify(result.body));
+      assert.deepEqual([result.body.success, result.body.row], [true, null]);
+      const stored = documentRow(result.body.document.id);
+      assert.ok(stored, 'the document row exists');
+      assert.deepEqual(fs.readFileSync(stored.storage_path), pdfBytes);
+      assert.equal(simEvents(), events + 1);
+      assert.deepEqual([vaultLitter(), unsettledCleanupJobs()], [[], []]);
+      assert.equal(errors.some((line) => line.includes(stored.id) && line.includes('read-back failed')), true);
     });
   });
 });

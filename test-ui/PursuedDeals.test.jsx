@@ -530,6 +530,50 @@ describe('Upload SIM', () => {
     expect(keys[0]).toMatch(UUID);
     expect(new Set(keys).size).toBe(1);
   });
+
+  // A 5xx without a code may have come after the commit (a proxy's 502, a failed read-back), so it
+  // is ambiguous like a network failure; a coded 5xx (upload_capacity, storage_full) stays definite.
+  test.each([
+    ['a 502 with no body', () => ({ ok: false, status: 502, json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } })],
+    ['a 500 without a code', () => jsonResponse({ success: false, error: 'Internal server error.' }, 500)],
+  ])('%s runs the landed check and the retry reuses the key', async (_label, failure) => {
+    const fetchMock = stubFetch({
+      [`GET ${LIST}`]: () => jsonResponse(page([dealRow()], { needsAction: 0 })),
+      'POST /api/admin/deal-hunter/pursuing/opp-1/sim': failure,
+    });
+    renderTab();
+    await screen.findByRole('button', { name: 'Upload SIM' });
+    const loadsBefore = listCalls(fetchMock).length;
+
+    const file = pdf();
+    fireEvent.change(await openUpload(), { target: { files: [file] } });
+    expect(await screen.findByText('The upload was interrupted. Try again.')).toBeVisible();
+    expect(listCalls(fetchMock).length).toBeGreaterThan(loadsBefore); // the deal was read again
+
+    fireEvent.change(screen.getByLabelText('SIM file for Acme Plumbing'), { target: { files: [file] } });
+    await waitFor(() => expect(postsTo(fetchMock, '/sim')).toHaveLength(2));
+    expect(await screen.findByText('The upload was interrupted. Try again.')).toBeVisible();
+    const keys = postsTo(fetchMock, '/sim').map(([, options]) => options.headers['X-Idempotency-Key']);
+    expect(keys[0]).toMatch(UUID);
+    expect(keys[1]).toBe(keys[0]);
+  });
+
+  test('a 502 whose reload shows the new SIM closes the panel with the OK copy', async () => {
+    let posted = false;
+    const landed = dealRow({ latestEventId: 'evt-2',
+      simDocuments: [{ id: 'doc-1', name: 'sim.pdf', sizeBytes: 8, uploadedAt: '2026-11-04T12:00:00.000Z' }] });
+    stubFetch({
+      [`GET ${LIST}`]: () => jsonResponse(page([posted ? landed : dealRow()], { needsAction: 0 })),
+      'POST /api/admin/deal-hunter/pursuing/opp-1/sim': () => {
+        posted = true; // The upload committed; the answer was lost behind a 502.
+        return { ok: false, status: 502, json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } };
+      },
+    });
+    renderTab();
+    fireEvent.change(await openUpload(), { target: { files: [pdf()] } });
+    expect(await screen.findByText('SIM uploaded.')).toBeVisible();
+    expect(screen.queryByLabelText('SIM file for Acme Plumbing')).not.toBeInTheDocument();
+  });
 });
 
 describe('uploadPursuedSim', () => {

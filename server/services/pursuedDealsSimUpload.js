@@ -322,8 +322,15 @@ export async function receivePursuitSimUpload({ storage, config, request, opport
   unregisterSecureDocumentCleanupIntent(job.id);
   await settleCleanupJob(storage, job);
 
-  const row = await getPursuedDealRow({ storage, config, opportunityId, role, now: instant() });
+  // The SIM is stored: a failed read-back must not turn that into an error the client would take
+  // as "not stored". The row is left out instead, and the client keeps its own copy.
   const { document } = result;
+  let row = null;
+  try {
+    row = await getPursuedDealRow({ storage, config, opportunityId, role, now: instant() });
+  } catch (error) {
+    console.error(`[pursued-deals] SIM upload ${document.id} committed, but its row could not be read back: ${error.message}`);
+  }
   return {
     status: 201,
     body: {
