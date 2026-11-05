@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import PursuitReplyTypeControl from './PursuitReplyTypeControl.jsx';
 import {
   PursuedDealsApiError, REFRESH_COPY, SAVE_FAILED_COPY, SIM_UPLOADED_COPY, SIM_UPLOADED_STOPPED_COPY,
-  UPLOAD_CHECKING_COPY, UPLOAD_INTERRUPTED_COPY, acknowledgeReply, createIdempotencyKeys,
+  UPLOAD_INTERRUPTED_COPY, acknowledgeReply, createIdempotencyKeys,
   loadPursuedDeals, moveStage, stopSimRequests, uploadErrorCopy, uploadPursuedSim,
 } from './pursuedDealsApi.js';
 
@@ -151,6 +151,8 @@ function PursuedRow({ row, readOnly, onRowChange, onReload }) {
   async function upload(file) {
     const acknowledgedReplyId = attention?.replyId;
     const signature = JSON.stringify(['sim', file.name, file.size, file.lastModified, acknowledgedReplyId ?? null]);
+    // The server words the OK copy by whether follow-ups were stoppable before the upload.
+    const couldStop = row.release?.canStop === true;
     const knownDocuments = new Set((row.simDocuments || []).map((document) => document.id));
     const result = await runWrite(signature,
       (idempotencyKey) => uploadPursuedSim({ opportunityId: row.opportunityId, file, idempotencyKey, acknowledgedReplyId }), {
@@ -159,13 +161,12 @@ function PursuedRow({ row, readOnly, onRowChange, onReload }) {
         // SIM that was not there when the owner started means it landed. If not, say so every time
         // and keep the key, so the next attempt is a safe retry that replays if it did commit.
         network: async () => {
-          setMessage({ tone: 'ok', text: UPLOAD_CHECKING_COPY });
           const rows = await onReload();
           const fresh = rows?.find((candidate) => candidate.opportunityId === row.opportunityId);
           if (fresh?.simDocuments?.some((document) => !knownDocuments.has(document.id))) {
             keysRef.current.forget(row.opportunityId, signature);
             setUploadOpen(false);
-            return { text: SIM_UPLOADED_COPY, tone: 'ok' };
+            return { text: couldStop ? SIM_UPLOADED_STOPPED_COPY : SIM_UPLOADED_COPY, tone: 'ok' };
           }
           return { text: UPLOAD_INTERRUPTED_COPY };
         },
