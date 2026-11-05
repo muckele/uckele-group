@@ -8072,10 +8072,11 @@ async function buildDailyDealReview({
     optionalSourceWarnings: coverage.optionalSourceWarnings,
     stage2CoverageWarnings: coverage.stage2Warnings,
     scoringDeferred: ambiguousCompleteSheetIdentitySourceIds.length > 0,
+    // Only a raw source-record identity defect defers scoring now; listings
+    // held for open identity exceptions are scored around, so the reason
+    // names the defect rather than the exceptions.
     scoringDeferredReason: ambiguousCompleteSheetIdentitySourceIds.length > 0
-      ? identityExceptions.length > 0
-        ? 'Scoring and scored-opportunity actions are deferred until every canonical identity exception is resolved and the required Google Sheet has a complete source snapshot.'
-        : 'Scoring and scored-opportunity actions are deferred until every required Google Sheet has a complete, uniquely identified source snapshot.'
+      ? 'Scoring and scored-opportunity actions are deferred until every required Google Sheet has a complete, uniquely identified source snapshot.'
       : '',
     sourceSnapshotAdmissionDeferredSources: ambiguousCompleteSheetIdentitySourceIds,
     cimOutreachPause: outreachGate.status,

@@ -255,10 +255,14 @@ test('authenticated review stays read-only and materializes fresh ambiguity only
 
     assert.equal(backfill.status, 200, JSON.stringify(backfillPayload));
     assert.equal(backfillPayload.success, true);
-    assert.equal(backfillPayload.review.scoringDeferred, true);
-    assert.match(backfillPayload.review.scoringDeferredReason, /canonical identity exception.*resolved/i);
-    assert.match(backfillPayload.reviewWarning, /identity exception.*resolved.*scores were left unchanged/i);
-    assert.equal(backfillPayload.scoreRefresh, null);
+    // A listing held for its open identity exception no longer defers the
+    // whole backfill: it is left out of scoring and everything else is scored.
+    assert.equal(backfillPayload.review.scoringDeferred, false);
+    assert.equal(
+      backfillPayload.reviewWarning,
+      '1 listing is held for an identity decision and was left out of scoring. Every other listing was scored.',
+    );
+    assert.equal(backfillPayload.scoreRefresh?.ok, true, JSON.stringify(backfillPayload.scoreRefresh));
     const persisted = backfillPayload.review.identityExceptions.find((item) => item.id === observedExceptionId);
     assert.ok(persisted, 'the explicit full-backfill action materializes the observed exception');
     assert.equal(persisted.reason, 'ambiguous-similarity');

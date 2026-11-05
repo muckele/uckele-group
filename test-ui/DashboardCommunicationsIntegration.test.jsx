@@ -466,6 +466,32 @@ describe('Dashboard Deal Hunter communications integration', () => {
     expect(screen.queryByText(/Current-triage eligibility could not be reconciled/i)).not.toBeInTheDocument();
   });
 
+  test('names identity-held listings after a successful full backfill', async () => {
+    const fallbackFetch = createDealHunterFetch();
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      if (String(input) === '/api/admin/deal-hunter/backfill-review') {
+        return jsonResponse({
+          success: true,
+          review: { ...dealHunterReview(), reviewMode: 'full-backfill', scoringDeferred: false },
+          scoreRefresh: { ok: true, status: 200, counts: { considered: 2, scored: 2, failed: 0 } },
+          reviewWarning: '1 listing is held for an identity decision and was left out of scoring. Every other listing was scored.',
+        });
+      }
+      return fallbackFetch(input, options);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/deal-hunter?view=operations');
+
+    const backfillButton = await screen.findByRole('button', { name: 'Score Full Backfill' });
+    await waitFor(() => expect(backfillButton).toBeEnabled());
+    fireEvent.click(backfillButton);
+
+    expect(await screen.findByText(
+      'Full backfill scored 2 canonical listings. No CRM records were changed. 1 listing is held for an identity decision and was left out of scoring. Every other listing was scored.',
+    )).toHaveAttribute('role', 'status');
+  });
+
   test('loads durable history and the admin inbox, persists approval passes and card dismissals, retries safely, and assigns inbound mail', async () => {
     const fetchMock = createDealHunterFetch();
     vi.stubGlobal('fetch', fetchMock);
