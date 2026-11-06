@@ -1047,7 +1047,7 @@ export function createApp({
       const allowedRecipient = readiness.allowedTestRecipients.includes(requestedRecipient);
 
       if (!readiness.outboundConfigured) {
-        response.status(409).json({ success: false, error: 'Resend outbound delivery is not fully configured.', readiness });
+        response.status(409).json({ success: false, error: 'Resend outbound delivery is not fully configured.', readiness: projectBrowserEmailReadiness(readiness) });
         return;
       }
 
@@ -1055,7 +1055,7 @@ export function createApp({
         response.status(400).json({
           success: false,
           error: 'Test emails may only be sent to a configured internal administrator address.',
-          readiness,
+          readiness: projectBrowserEmailReadiness(readiness),
         });
         return;
       }
@@ -1068,7 +1068,7 @@ export function createApp({
       response.status(emailResult.status === 'failed' ? 502 : 201).json({
         success: emailResult.status !== 'failed',
         emailResult,
-        readiness: refreshedReadiness,
+        readiness: projectBrowserEmailReadiness(refreshedReadiness),
       });
     }),
   );

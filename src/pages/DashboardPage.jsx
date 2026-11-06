@@ -1997,15 +1997,16 @@ export default function DashboardPage() {
       return;
     }
 
+    // Browsers only see whether a test recipient is configured, not the address; the server
+    // sends to the configured administrator address.
     const readiness = dealHunterReview?.emailReadiness || operations?.email;
-    const recipient = readiness?.testRecipient || '';
-    if (!recipient) {
+    if (!(readiness?.recipientConfigured || readiness?.testRecipient)) {
       setDealHunterFeedback({ error: 'No configured internal email-test recipient is available.', message: '' });
       setOperationsError('No configured internal email-test recipient is available.');
       return;
     }
 
-    if (!window.confirm(`Send a controlled email delivery test to ${recipient}?`)) return;
+    if (!window.confirm('Send a controlled email delivery test to the configured administrator address?')) return;
 
     setEmailTestSending(true);
     setDealHunterFeedback({ error: '', message: '' });
@@ -2016,7 +2017,7 @@ export default function DashboardPage() {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipient }),
+        body: JSON.stringify({}),
       });
       const result = await response.json();
 
@@ -2031,7 +2032,7 @@ export default function DashboardPage() {
 
       setDealHunterFeedback({
         error: '',
-        message: `Test email accepted for ${recipient}. Reply to it without changing the subject to verify inbound reply tracking.`,
+        message: 'Test email accepted for the configured administrator address. Reply to it without changing the subject to verify inbound reply tracking.',
       });
     } catch (error) {
       const message = error.message || 'Unable to send the controlled email test.';

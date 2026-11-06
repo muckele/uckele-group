@@ -1070,6 +1070,42 @@ test('browser email readiness projection is an explicit non-mutating safe-field 
   });
 });
 
+test('email test route never returns configured addresses to the browser', async () => {
+  const sentinels = {
+    admin: 'email-test-private-admin@example.invalid',
+    fallback: 'email-test-private-fallback@example.invalid',
+    digest: 'email-test-private-digest@example.invalid',
+    sender: 'email-test-private-sender@example.invalid',
+    replyTo: 'email-test-private-reply@example.invalid',
+  };
+  await withEmailReadinessAddressConfig({
+    adminEmail: sentinels.admin,
+    fallbackRecipient: sentinels.fallback,
+    dealHunterRecipient: sentinels.digest,
+    fromAddress: `Email Test Sender <${sentinels.sender}>`,
+    replyToAddress: sentinels.replyTo,
+    followUpSenderAddress: sentinels.sender,
+    followUpReplyToAddress: sentinels.replyTo,
+  }, async () => {
+    await withServer(async (origin) => {
+      const cookie = await signInForCookie(origin);
+      // A recipient outside the configured administrator addresses is refused before any send.
+      const response = await fetch(`${origin}/api/admin/email/test`, {
+        method: 'POST',
+        headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: 'someone-else@example.invalid' }),
+      });
+      const payload = await response.json();
+      assert.equal(response.status, 400);
+      assert.equal(payload.readiness.recipientConfigured, true);
+      assert.equal(Object.hasOwn(payload.readiness, 'testRecipient'), false);
+      assert.equal(Object.hasOwn(payload.readiness, 'allowedTestRecipients'), false);
+      const serialized = JSON.stringify(payload);
+      for (const sentinel of Object.values(sentinels)) assert.equal(serialized.includes(sentinel), false, sentinel);
+    });
+  });
+});
+
 test('Operations hides configured readiness addresses from administrator and viewer browsers', async () => {
   const sentinels = {
     testRecipient: 'operations-private-admin@example.invalid',
