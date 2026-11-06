@@ -233,10 +233,10 @@ When the rule is off, the existing per-recipient path is unchanged and still wor
 ### 8.1 Templates
 
 Templates live in `server/services/pursueCimTemplates.js`:
-- the initial email is `pursue-cim-initial-v2`;
+- the initial email is `pursue-cim-initial-v3`;
 - the follow-ups are `pursue-cim-follow-up-v2`, with variants A, B, C, D and Final.
 
-v2 (2026-11-05) replaces the v1 body copy with the owner's operator-voice wording. The subject, greeting, signature and footer are unchanged, so threading and reply classification are unaffected.
+v2 (2026-11-05) replaced the v1 body copy with the owner's operator-voice wording. Initial v3 (2026-11-06) uses the owner's own buyer-profile draft: four labeled sections, each label on its own line, with a $350K-$1.25M SDE/EBITDA range. The follow-ups stay v2. The subject, greeting, signature and footer are unchanged throughout, so threading and reply classification are unaffected.
 
 Follow-up *n* (n ≥ 1) uses variant `['A','B','C','D'][(n-1) % 4]`. The last follow-up uses **Final** instead. "Last" means `calculateNextCimSlot` would land at or after the campaign's expiry.
 
@@ -258,15 +258,21 @@ Placeholders: `{business}`, `{greeting}` (`Hi {broker first name},`, or `Hi ther
 
 > {greeting}
 >
-> I'd like to evaluate {business}. Happy to sign your NDA. Could you send it over along with the CIM?
+> I'm reaching out regarding {business}. Based on what I've seen so far, it looks like a business I'd like to evaluate further.
 >
-> What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I'm based in Southern California and open to strong opportunities nationwide.
+> Acquisition focus:
+> I'm actively pursuing the acquisition of a cash-flowing service business in the $350K-$1.25M SDE/EBITDA range. I'm most interested in businesses with recurring or repeat demand, established teams, and opportunities to professionalize operations. I'm based in Southern California and open to strong opportunities nationwide.
 >
-> How I operate: as an active owner. I step in to learn the business and earn the trust of the team and customers, then build the systems and leadership so it runs well for the long term.
+> Operating approach:
+> I acquire with the intent to be an active owner. I step in initially to learn the business, stabilize operations, and build trust with the team and customers. As the business grows, I focus on strengthening systems, leadership, and accountability, with the goal of building a durable management structure over time.
 >
-> Background: I co-founded and run Golden Behavior Connection, an ABA therapy company I've built since 2023, overseeing operations, staffing, compliance, revenue cycle, and financial performance. Before that I worked at Tripadvisor, Better Mortgage, and Wayfair.
+> Background:
+> I'm the co-founder and President of Golden Behavior Connection, an ABA therapy company launched in 2023. I've built the business from the ground up, overseeing day-to-day operations, staffing, compliance, revenue cycle management, and financial performance. In parallel, my prior roles at Tripadvisor, Better Mortgage, and Wayfair sharpened my discipline around sales execution, process improvement, and operating with clear metrics.
 >
-> Ability to close: I'm aligned with an SBA 7(a) lender, have my equity ready, and can submit an LOI quickly once I've reviewed the financials. Proof of funds is available on request.
+> Ability to close:
+> I'm aligned with an SBA 7(a) lender, have the required equity prepared, and am positioned to submit an LOI quickly once financials are reviewed. Proof of funds and lender information are available upon request.
+>
+> If this sounds aligned, I'd welcome the opportunity to review the CIM and discuss next steps.
 >
 > Best,
 > {name}

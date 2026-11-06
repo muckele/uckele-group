@@ -24,15 +24,21 @@ const sampleDeal = { name: 'Sample Plumbing Co.', brokerName: 'Jordan Lee' };
 // period is not followed by the template's own period ("Co." once, never "Co..").
 const INITIAL_FIXTURE = `Hi Jordan,
 
-I'd like to evaluate Sample Plumbing Co. Happy to sign your NDA. Could you send it over along with the CIM?
+I'm reaching out regarding Sample Plumbing Co. Based on what I've seen so far, it looks like a business I'd like to evaluate further.
 
-What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I'm based in Southern California and open to strong opportunities nationwide.
+Acquisition focus:
+I'm actively pursuing the acquisition of a cash-flowing service business in the $350K-$1.25M SDE/EBITDA range. I'm most interested in businesses with recurring or repeat demand, established teams, and opportunities to professionalize operations. I'm based in Southern California and open to strong opportunities nationwide.
 
-How I operate: as an active owner. I step in to learn the business and earn the trust of the team and customers, then build the systems and leadership so it runs well for the long term.
+Operating approach:
+I acquire with the intent to be an active owner. I step in initially to learn the business, stabilize operations, and build trust with the team and customers. As the business grows, I focus on strengthening systems, leadership, and accountability, with the goal of building a durable management structure over time.
 
-Background: I co-founded and run Golden Behavior Connection, an ABA therapy company I've built since 2023, overseeing operations, staffing, compliance, revenue cycle, and financial performance. Before that I worked at Tripadvisor, Better Mortgage, and Wayfair.
+Background:
+I'm the co-founder and President of Golden Behavior Connection, an ABA therapy company launched in 2023. I've built the business from the ground up, overseeing day-to-day operations, staffing, compliance, revenue cycle management, and financial performance. In parallel, my prior roles at Tripadvisor, Better Mortgage, and Wayfair sharpened my discipline around sales execution, process improvement, and operating with clear metrics.
 
-Ability to close: I'm aligned with an SBA 7(a) lender, have my equity ready, and can submit an LOI quickly once I've reviewed the financials. Proof of funds is available on request.
+Ability to close:
+I'm aligned with an SBA 7(a) lender, have the required equity prepared, and am positioned to submit an LOI quickly once financials are reviewed. Proof of funds and lender information are available upon request.
+
+If this sounds aligned, I'd welcome the opportunity to review the CIM and discuss next steps.
 
 Best,
 Pat Example
@@ -62,7 +68,7 @@ test('initial text equals the spec draft for the sample deal', () => {
   const email = renderPursueCimEmail({ kind: 'initial', deal: sampleDeal, sender });
   assert.equal(email.subject, 'CIM / NDA request for Sample Plumbing Co.');
   assert.equal(email.text, INITIAL_FIXTURE);
-  assert.equal(email.templateVersion, 'pursue-cim-initial-v2');
+  assert.equal(email.templateVersion, 'pursue-cim-initial-v3');
   assert.equal(email.templateVersion, PURSUE_CIM_INITIAL_TEMPLATE_VERSION);
   assert.equal(email.variant, 'initial');
 });
@@ -140,9 +146,9 @@ test('digest changes when any template or signature field changes and not when t
 });
 
 test('a business name ending in a period keeps one period before the template period, and the digest is unchanged', () => {
-  // The digest of the v2 wording for this sender. It changes only when the wording does.
+  // The digest of the current wording for this sender. It changes only when the wording does.
   assert.equal(pursueCimWordingDigest(sender),
-    'e071822c713ac797293aa900afbbac225aa730f9360aee48c427fee8919d6e18');
+    '9a9e057ebf8aef973f69c69a06aada181a0a930f2b0e74568b3c6f57c31b0f08');
   const emails = [renderPursueCimEmail({ kind: 'initial', deal: sampleDeal, sender }),
     ...[1, 2, 3, 4].map((followUpNumber) => renderPursueCimEmail({ kind: 'follow-up', followUpNumber,
       deal: sampleDeal, sender })),
@@ -157,12 +163,12 @@ test('a business name ending in a period keeps one period before the template pe
 
   // Only one period is dropped, and only before the template's period.
   const plain = renderPursueCimEmail({ kind: 'initial', deal: { name: 'Acme Plumbing', brokerName: 'Sam' }, sender });
-  assert.match(plain.text, /evaluate Acme Plumbing\. Happy to sign/);
+  assert.match(plain.text, /regarding Acme Plumbing\. Based on/);
   const dots = renderPursueCimEmail({ kind: 'follow-up', followUpNumber: 5, isFinal: true,
     deal: { name: 'Acme Inc...', brokerName: 'Sam' }, sender });
   assert.match(dots.text, /on Acme Inc\.\.\. If it comes back to market/);
   assert.equal(pursueCimWordingDigest(sender),
-    'e071822c713ac797293aa900afbbac225aa730f9360aee48c427fee8919d6e18');
+    '9a9e057ebf8aef973f69c69a06aada181a0a930f2b0e74568b3c6f57c31b0f08');
 });
 
 test('senderSignatureComplete is false when name, title, phone, or postal is blank', () => {
@@ -195,11 +201,14 @@ test('html escapes business names', () => {
 test('html mirrors the text: paragraphs in <p>, signature and footer lines joined with <br>', () => {
   const email = renderPursueCimEmail({ kind: 'initial', deal: sampleDeal, sender });
   const paragraphs = email.html.match(/<p>[\s\S]*?<\/p>/g);
-  assert.equal(paragraphs.length, 8);
+  assert.equal(paragraphs.length, 9);
   assert.equal(paragraphs[0], '<p>Hi Jordan,</p>');
-  assert.equal(paragraphs[6], '<p>Best,<br>Pat Example<br>Founder, Uckele Group<br>555-0100</p>');
+  // A labeled section keeps its label on its own line.
+  assert.match(paragraphs[2], /^<p>Acquisition focus:<br>I&#39;m actively pursuing/);
+  assert.match(paragraphs[5], /^<p>Ability to close:<br>I&#39;m aligned with an SBA 7\(a\) lender/);
+  assert.equal(paragraphs[7], '<p>Best,<br>Pat Example<br>Founder, Uckele Group<br>555-0100</p>');
   assert.equal(
-    paragraphs[7],
+    paragraphs[8],
     '<p>If you would rather I not reach out about future listings, just reply &quot;stop&quot;.<br>1 Example Way, Portland, OR 97201</p>',
   );
 });
