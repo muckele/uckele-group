@@ -68,7 +68,7 @@ export function resolveCimProviderProfile(environment = process.env) {
   const profile = String(environment.DEAL_HUNTER_CIM_PROVIDER_PROFILE || '').trim();
   if (profile === CONTROLLED_CIM_MAILBOX_PROFILE) {
     // The owner's controlled test can go through Gmail instead of Resend (spec §10 step 5).
-    const gmail = String(environment.DEAL_HUNTER_CIM_MAILBOX_PROVIDER || '').trim() === 'gmail';
+    const gmail = String(environment.DEAL_HUNTER_CIM_MAILBOX_PROVIDER || '').trim().toLowerCase() === 'gmail';
     if (gmail) {
       return {
         enabled,
@@ -974,6 +974,13 @@ export function validateConfig(config = getConfig()) {
   }
 
   if (config.isProduction) {
+    // The keyless Resend controlled harness blanks the app's own email, so production can't run
+    // it (2026-11-06 outage). Name the cause before the delivery errors it produces.
+    const cimProfile = config.dealHunter?.cimProvider;
+    if (['controlled-mailbox', 'controlled-mailbox-limited-smoke'].includes(cimProfile?.mode)
+      && cimProfile?.provider !== 'gmail') {
+      errors.push(`DEAL_HUNTER_CIM_PROVIDER_PROFILE=${cimProfile.profile} needs DEAL_HUNTER_CIM_MAILBOX_PROVIDER=gmail in production; without it the controlled harness turns off the app's own email. Unset the profile or set the provider to gmail.`);
+    }
     requireValue(config.admin.email, 'ADMIN_EMAIL');
 
     if (String(config.admin.sessionSecret || '').length < 32) {

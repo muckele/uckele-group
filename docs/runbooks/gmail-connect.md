@@ -195,6 +195,9 @@ address (a personal address works).
 
    - Put exactly one address in `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS`. With none, or more
      than one, nothing is sent.
+   - Always set `DEAL_HUNTER_CIM_MAILBOX_PROVIDER=gmail` together with the profile. Without it,
+     the profile selects an offline test harness that turns off the app's own email, and the app
+     refuses to start.
    - The app restarts. Check that it came back (`fly status` shows the machine `started` and
      passing) before going on. The daily digest and admin sign-in emails keep going through Resend
      during the test; only broker email is confined to your test inbox.
@@ -205,8 +208,9 @@ address (a personal address works).
    - While that pause is on, the **Email sending** card's readiness says **All CIM outreach is
      paused.** and nothing sends.
    - The `DEAL_HUNTER_CIM_OUTREACH_PAUSED` setting in `fly.toml` stays `true`. It keeps the
-     older send paths shut and doesn't affect the Gmail sender, so the button may still read
-     **Resume** afterwards.
+     older send paths shut and doesn't affect the Gmail sender. Because of it, the button still
+     reads **Resume all CIM outreach** afterwards; that's expected. Check the **Email sending**
+     card's readiness instead: it no longer lists the pause.
 3. In the **Email sending** card, click **Turn on Live sending** and confirm.
    - The Live sending part says **Sending setup: controlled test (one allowed recipient)**.
    - Readiness should say **Ready to send.** If it doesn't, fix what it lists first. Right after
@@ -227,8 +231,8 @@ address (a personal address works).
       - **Broker Name:** your name. **Broker Email:** your test inbox, and no other email address
         anywhere in the row. Don't use a shared mailbox like `info@` or `sales@`.
    2. After the next Sheet sync, find the listing in the Deal Hunter Inbox and open it.
-      While `DEAL_HUNTER_SHEET_SYNC_ENABLED` is off, new Sheet rows only arrive with the weekday
-      08:00 (Pacific) digest, so a row added after 08:00 shows up the next weekday morning. Under
+      While `DEAL_HUNTER_SHEET_SYNC_ENABLED` is off, new Sheet rows only arrive with the daily
+      08:00 (Pacific) digest, so a row added after 08:00 shows up the next morning. Under
       **Broker & Seller**, your test inbox is the only broker email.
 5. Click **Request SIM** on the test listing.
    - If **Request SIM** isn't offered, the listing isn't ready yet (for example the sync hasn't
@@ -300,7 +304,9 @@ and contact your engineer. Don't go on to step 6.
 
 - **To stop all Pursue sending right away:** click **Turn off Live sending** and confirm. It
   takes effect before the next send. Emails that were about to go out go back on schedule and
-  wait. The **Pause all CIM outreach** switch in Operations also stops everything.
+  wait. While `fly.toml` keeps `DEAL_HUNTER_CIM_OUTREACH_PAUSED="true"`, the Operations outreach
+  button always reads **Resume all CIM outreach** and can't pause the Gmail sender, so use
+  **Turn off Live sending**.
 - **To stop checking replies too:** turn off Live sending first, then set
   `DEAL_HUNTER_PURSUE_REPLY_POLLER_ENABLED=false`. Without reply checks a broker's reply could
   not stop a campaign, so follow-ups are held while reply checking is off or hasn't run in the

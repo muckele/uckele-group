@@ -147,3 +147,19 @@ test('the Resend controlled harness still blanks the app delivery settings', () 
   assert.equal(booted.followUp.senderEmail, '');
   assert.equal(booted.webhook.requireSignedProviderEvent, true);
 });
+
+test('production names the cause when the controlled profile is set without the Gmail provider', () => {
+  const booted = bootProductionConfig({
+    DEAL_HUNTER_CIM_PROVIDER_ENABLED: 'true',
+    DEAL_HUNTER_CIM_PROVIDER_PROFILE: 'controlled-mailbox-v1',
+    DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS: 'tester@example.net',
+  });
+  assert.match(booted.errors[0], /DEAL_HUNTER_CIM_MAILBOX_PROVIDER=gmail in production/);
+});
+
+test('the Gmail provider setting is matched without regard to case or spaces', () => {
+  const booted = bootProductionConfig({ ...RUNBOOK_STAGES['step 5 controlled test through Gmail'],
+    DEAL_HUNTER_CIM_MAILBOX_PROVIDER: ' Gmail ' });
+  assert.deepEqual(booted.errors, []);
+  assert.equal(booted.cimProvider.provider, 'gmail');
+});
