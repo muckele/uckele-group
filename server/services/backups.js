@@ -20,14 +20,20 @@ const activeBackupPaths = new Set();
 // Recorded verification results live beside the bundles, outside any bundle directory, so recording
 // never changes a bundle's own files or its modification time.
 const verificationRecordDirectoryName = '.verification-cache';
+// Bump whenever verifyBackupBundle's checks or result semantics change, so older records stop
+// being trusted at once instead of at the next nightly retention pass.
 const verificationRecordVersion = 1;
-// A recorded result is trusted only for files whose mtime is clearly older than the moment the
-// bundle was fingerprinted. A file written just before or during verification can keep the same
-// mtime on a filesystem with coarse timestamps, so such a "racy" bundle is verified again.
+// A write after a bundle was fingerprinted gives the file an mtime between the fingerprint time
+// and now, give or take the filesystem's timestamp granularity. A recorded result is therefore
+// not trusted while any fingerprinted mtime falls in that "racy" window, because a write there
+// could have kept the recorded mtime; such a bundle is verified again and re-recorded.
 const racyTimestampMarginMs = 2000;
-const defaultStatusVerificationBudgetMs = 5000;
+const defaultStatusVerificationBudgetMs = 2000;
+const abandonedRecordTemporaryMs = 60 * 60 * 1000;
+const verificationWarmUpDelayMs = 60 * 1000;
 const pendingVerifications = new Map();
 let verificationQueue = Promise.resolve();
+let verificationRecordWriteWarned = false;
 
 function isObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -503,11 +509,11 @@ async function fingerprintBackupBundle(bundlePath) {
     }
   }
 
-  let newestMtimeMs = 0;
+  const mtimesMs = [];
   const files = await Promise.all(targets.map(async ({ relativePath, statFile }) => {
     try {
       const stat = await statFile(path.resolve(bundlePath, relativePath), { bigint: true });
-      newestMtimeMs = Math.max(newestMtimeMs, Number(stat.mtimeNs / 1_000_000n));
+      mtimesMs.push(Number(stat.mtimeNs / 1_000_000n));
       return [relativePath, stat.isFile(), String(stat.dev), String(stat.ino), String(stat.size), String(stat.mtimeNs)];
     } catch (error) {
       return [relativePath, error.code || 'unreadable'];
@@ -523,7 +529,7 @@ async function fingerprintBackupBundle(bundlePath) {
     ])),
     manifest,
     takenAtMs,
-    newestMtimeMs,
+    mtimesMs,
   };
 }
 
@@ -536,7 +542,12 @@ async function readVerificationRecord(config, bundlePath, fingerprint) {
   }
   if (!isObject(record) || record.version !== verificationRecordVersion || record.fingerprint !== fingerprint.key) return null;
   const fingerprintedAtMs = Date.parse(record.fingerprintedAt || '');
-  if (!Number.isFinite(fingerprintedAtMs) || fingerprint.newestMtimeMs >= fingerprintedAtMs - racyTimestampMarginMs) return null;
+  if (!Number.isFinite(fingerprintedAtMs)) return null;
+  // Spanning both instants also covers a clock that stepped backwards since the record was made,
+  // and a file whose mtime is still in the future stays trusted until the clock nears it.
+  const racyFrom = Math.min(fingerprintedAtMs, fingerprint.takenAtMs) - racyTimestampMarginMs;
+  const racyUntil = Math.max(fingerprintedAtMs, fingerprint.takenAtMs) + racyTimestampMarginMs;
+  if (fingerprint.mtimesMs.some((mtimeMs) => mtimeMs >= racyFrom && mtimeMs <= racyUntil)) return null;
   const result = record.result;
   if (!isObject(result)
       || !['current', 'legacy', 'degraded', 'invalid'].includes(result.classification)
@@ -553,7 +564,10 @@ async function writeVerificationRecord(config, bundlePath, fingerprint, verifica
   const recordPath = verificationRecordPath(config, bundlePath);
   const temporaryPath = path.join(directory, `.${path.basename(recordPath)}.${randomUUID()}.tmp`);
   try {
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    // Not recursive: a backup directory removed in the meantime must not be recreated.
+    await fs.mkdir(directory, { mode: 0o700 }).catch((error) => {
+      if (error.code !== 'EEXIST') throw error;
+    });
     await secureWriteJson(temporaryPath, {
       version: verificationRecordVersion,
       bundle: path.basename(bundlePath),
@@ -569,9 +583,13 @@ async function writeVerificationRecord(config, bundlePath, fingerprint, verifica
       },
     });
     await fs.rename(temporaryPath, recordPath);
-  } catch {
+  } catch (error) {
     // A record is only an optimization; the bundle is verified again on the next read.
     await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    if (!verificationRecordWriteWarned) {
+      verificationRecordWriteWarned = true;
+      console.warn(`[backup] could not record backup verification in ${directory}: ${error.message}`);
+    }
   }
 }
 
@@ -583,6 +601,12 @@ async function pruneVerificationRecords(config) {
     return;
   }
   for (const name of names) {
+    if (name.startsWith('.') && name.endsWith('.tmp')) {
+      const temporaryPath = path.join(verificationRecordDirectory(config), name);
+      const stat = await fs.stat(temporaryPath).catch(() => null);
+      if (stat && Date.now() - stat.mtimeMs > abandonedRecordTemporaryMs) await fs.rm(temporaryPath, { force: true }).catch(() => {});
+      continue;
+    }
     if (!name.startsWith('backup-') || !name.endsWith('.json')) continue;
     const bundlePath = path.join(config.backup.directory, name.slice(0, -'.json'.length));
     try {
@@ -593,16 +617,30 @@ async function pruneVerificationRecords(config) {
   }
 }
 
+async function manifestIsGone(bundlePath) {
+  try {
+    await fs.access(path.join(bundlePath, manifestFileName));
+    return false;
+  } catch (error) {
+    return error.code === 'ENOENT';
+  }
+}
+
 // The fingerprint is taken before verification starts, so a file that changes while it is being
 // verified no longer matches the recorded fingerprint and is verified again on the next read.
+// A manifest that existed when fingerprinted but is gone afterwards means the bundle was removed
+// (normally by retention) while it waited or was verified: it is neither recorded nor reported.
 async function verifyAndRecordBundle(config, bundlePath, fingerprint, verifyBundle) {
   const verification = await verifyBundle(bundlePath);
-  if (fingerprint) await writeVerificationRecord(config, bundlePath, fingerprint, verification);
+  if (!fingerprint) return verification;
+  if (await manifestIsGone(bundlePath)) return { ...verification, gone: true };
+  await writeVerificationRecord(config, bundlePath, fingerprint, verification);
   return verification;
 }
 
-// Status reads verify unrecorded bundles one at a time in the background, so concurrent page loads
-// share a single pass instead of each re-hashing every bundle.
+// Every fingerprinted verification runs one at a time through this queue, whether a status read,
+// the startup warm-up or retention asked for it, so concurrent callers share a single pass instead
+// of each re-hashing every bundle and holding several database snapshots in memory at once.
 function queueBundleVerification(config, bundlePath, fingerprint, verifyBundle) {
   const key = `${path.resolve(bundlePath)}\u0000${fingerprint.key}`;
   const pending = pendingVerifications.get(key);
@@ -643,8 +681,8 @@ function inspectedBundle(bundlePath, modifiedAt, manifest, verification) {
   };
 }
 
-// Without useRecordedVerification every bundle is fully verified (and the result recorded), as
-// retention and the backup CLI require. With it, a bundle whose fingerprint still matches its
+// Without useRecordedVerification every bundle is fully verified now (and the result recorded), as
+// retention and the backup CLI require; a pass already running for an unchanged bundle is joined. With it, a bundle whose fingerprint still matches its
 // recorded result is not re-read; the rest are verified within verificationBudgetMs and reported as
 // 'pending' if their verification is still running when the budget runs out.
 async function inspectBackupDirectory(config, {
@@ -696,8 +734,11 @@ async function inspectBackupDirectory(config, {
       continue;
     }
 
-    // An unreadable manifest fails verification before any file is hashed, so it is never queued.
-    const verification = await verifyAndRecordBundle(config, bundlePath, fingerprint, verifyBundle);
+    // An unreadable manifest fails verification before any file is hashed, so it is not queued.
+    const verification = fingerprint
+      ? await queueBundleVerification(config, bundlePath, fingerprint, verifyBundle)
+      : await verifyBundle(bundlePath);
+    if (verification.gone) continue;
     bundles.push(inspectedBundle(bundlePath, modifiedAt, verification.manifest, verification));
   }
 
@@ -705,6 +746,7 @@ async function inspectBackupDirectory(config, {
   for (const [index, { bundlePath, modifiedAt, manifest }] of awaiting.entries()) {
     const outcome = outcomes[index];
     if (outcome?.error) throw outcome.error;
+    if (outcome?.value.gone) continue;
     if (outcome) {
       bundles.push(inspectedBundle(bundlePath, modifiedAt, outcome.value.manifest, outcome.value));
     } else {
@@ -1250,12 +1292,17 @@ export function startBackupScheduler({
     console.log('[backup:scheduler] automated SQLite backups disabled');
     return { stop() {} };
   }
-  warmBackupVerification(config).catch((error) => {
-    console.error(`[backup:scheduler] backup verification warm-up failed: ${error.message}`);
-  });
   let stopped = false;
   let timer = null;
   let inFlight = false;
+  // Delayed so the warm-up pass does not compete with startup and the first readiness checks.
+  const warmUpTimer = scheduleTimer(() => {
+    if (stopped) return;
+    Promise.resolve()
+      .then(() => warmBackupVerification(config))
+      .catch((error) => console.error(`[backup:scheduler] backup verification warm-up failed: ${error.message}`));
+  }, verificationWarmUpDelayMs);
+  warmUpTimer?.unref?.();
   const [hour, minute] = config.backup.time.split(':').map(Number);
 
   async function tick() {
@@ -1283,5 +1330,11 @@ export function startBackupScheduler({
   }
   tick();
   schedule();
-  return { stop() { stopped = true; if (timer) clearTimeout(timer); } };
+  return {
+    stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      if (warmUpTimer) clearTimeout(warmUpTimer);
+    },
+  };
 }

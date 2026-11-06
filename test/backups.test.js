@@ -963,12 +963,76 @@ test('status reads of N bundles reuse recorded verification instead of re-verify
 test('a recorded result is not trusted while bundle files are inside the racy-timestamp window', async (t) => {
   const { config, storage } = backupSetup(t, 'ug-backup-racy-');
   await seedVaultDocument(storage, config);
-  await createBackupBundle({ storage, config });
+  const backup = await createBackupBundle({ storage, config });
+  ageBundleFiles([backup]);
+  const touchDatabase = () => {
+    const justNow = new Date();
+    fs.utimesSync(backupDatabasePath(backup), justNow, justNow);
+  };
 
   const verifier = countingVerifier();
+  touchDatabase();
   assert.equal((await getBackupStatus(config, { verifyBundle: verifier })).status, 'healthy');
+  touchDatabase();
   assert.equal((await getBackupStatus(config, { verifyBundle: verifier })).status, 'healthy');
-  assert.equal(verifier.calls.length, 2, 'a just-written database snapshot is verified on every read until it ages');
+  assert.equal(verifier.calls.length, 2, 'a just-written database snapshot is verified on every read');
+});
+
+test('a file whose mtime is still in the future does not force re-verification on every read', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-future-mtime-');
+  await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config });
+  ageBundleFiles([backup], -24 * 60 * 60 * 1000);
+
+  const verifier = countingVerifier();
+  for (let read = 0; read < 3; read += 1) {
+    assert.equal((await getBackupStatus(config, { verifyBundle: verifier })).status, 'healthy');
+  }
+  assert.equal(verifier.calls.length, 1);
+});
+
+test('retention and the backup listing always fully verify, catching damage that kept size and mtime, and refresh the record', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-silent-damage-');
+  await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config });
+  ageBundleFiles([backup]);
+  assert.equal((await getBackupStatus(config)).status, 'healthy');
+
+  // Same-size in-place write with the old timestamps restored: the fingerprint cannot see it.
+  const bundled = bundledDocumentPath(backup);
+  const { atime, mtime } = fs.statSync(bundled);
+  fs.writeFileSync(bundled, 'y'.repeat(Buffer.byteLength(documentContent)));
+  fs.utimesSync(bundled, atime, mtime);
+  assert.equal((await getBackupStatus(config)).status, 'healthy', 'documented limitation of the status read');
+
+  const [listed] = await listBackupBundles(config);
+  assert.equal(listed.state, 'degraded');
+  assert.equal((await getBackupStatus(config)).status, 'degraded', 'the full pass refreshed the record');
+
+  fs.writeFileSync(bundled, documentContent);
+  fs.utimesSync(bundled, atime, mtime);
+  assert.equal((await getBackupStatus(config)).status, 'degraded');
+  await enforceBackupRetention(config);
+  assert.equal((await getBackupStatus(config)).status, 'healthy', 'the retention pass also refreshes the record');
+});
+
+test('a bundle removed while it is being verified is neither reported nor recorded, and its directory is not recreated', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-removed-mid-verify-');
+  await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config });
+  ageBundleFiles([backup]);
+  fs.rmSync(path.join(config.backup.directory, '.verification-cache'), { recursive: true, force: true });
+
+  const status = await getBackupStatus(config, {
+    verificationBudgetMs: Infinity,
+    verifyBundle: async (bundlePath) => {
+      fs.rmSync(config.backup.directory, { recursive: true, force: true });
+      return verifyBackupBundle(bundlePath);
+    },
+  });
+  assert.equal(status.status, 'missing');
+  assert.deepEqual(status.bundleCounts, { valid: 0, degraded: 0, legacy: 0, invalid: 0, incomplete: 0 });
+  assert.equal(fs.existsSync(config.backup.directory), false);
 });
 
 test('bundles still verifying when the status budget runs out are reported as verifying and finish in the background', async (t) => {
@@ -1030,18 +1094,29 @@ test('a verified backup stays the latest while an older bundle is still verifyin
   assert.deepEqual(status.bundleCounts, { valid: 1, degraded: 0, legacy: 0, invalid: 0, incomplete: 0, verifying: 1 });
   assert.match(status.message, /within the expected daily window\. 1 backup bundle is still being verified; refresh in a few minutes\.$/);
   release();
+  // Join the background verification so it cannot outlive this test.
+  assert.equal((await getBackupStatus(config, { verificationBudgetMs: Infinity })).status, 'degraded');
 });
 
 test('the backup scheduler warms verification records in the background at startup', async (t) => {
   const { config, storage } = backupSetup(t, 'ug-backup-warm-');
   const warmed = [];
+  const timers = [];
   const scheduler = startBackupScheduler({
     storage,
     config,
     getNow: () => new Date('2026-11-06T09:00:00.000Z'),
-    scheduleTimer: () => ({ unref() {} }),
+    scheduleTimer: (callback, delayMs) => {
+      timers.push({ callback, delayMs });
+      return { unref() {} };
+    },
     warmBackupVerification: async (warmConfig) => { warmed.push(warmConfig); },
   });
   t.after(() => scheduler.stop());
+  assert.deepEqual(warmed, [], 'the warm-up waits until startup has settled');
+  const warmUp = timers.find(({ delayMs }) => delayMs === 60_000);
+  assert.ok(warmUp);
+  warmUp.callback();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(warmed, [config]);
 });
