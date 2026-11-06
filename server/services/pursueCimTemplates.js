@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 // Changing any template string, version, or sender signature field changes the wording
 // digest, which pauses sending until the owner approves the wording again.
 
-export const PURSUE_CIM_INITIAL_TEMPLATE_VERSION = 'pursue-cim-initial-v2';
+export const PURSUE_CIM_INITIAL_TEMPLATE_VERSION = 'pursue-cim-initial-v3';
 export const PURSUE_CIM_FOLLOW_UP_TEMPLATE_VERSION = 'pursue-cim-follow-up-v2';
 
 const GREETING_TEMPLATE = 'Hi {firstName},';
@@ -13,12 +13,27 @@ const GREETING_FALLBACK = 'Hi there,';
 const INITIAL_SUBJECT_TEMPLATE = 'CIM / NDA request for {business}';
 const FOLLOW_UP_SUBJECT_PREFIX = 'Re: ';
 
+// A string is one paragraph. An array is one paragraph whose lines break, used for the owner's
+// labeled sections ("Acquisition focus:" on its own line, then the section text).
 const INITIAL_PARAGRAPHS = [
-  "I'd like to evaluate {business}. Happy to sign your NDA. Could you send it over along with the CIM?",
-  "What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I'm based in Southern California and open to strong opportunities nationwide.",
-  "How I operate: as an active owner. I step in to learn the business and earn the trust of the team and customers, then build the systems and leadership so it runs well for the long term.",
-  "Background: I co-founded and run Golden Behavior Connection, an ABA therapy company I've built since 2023, overseeing operations, staffing, compliance, revenue cycle, and financial performance. Before that I worked at Tripadvisor, Better Mortgage, and Wayfair.",
-  "Ability to close: I'm aligned with an SBA 7(a) lender, have my equity ready, and can submit an LOI quickly once I've reviewed the financials. Proof of funds is available on request.",
+  "I'm reaching out regarding {business}. Based on what I've seen so far, it looks like a business I'd like to evaluate further.",
+  [
+    'Acquisition focus:',
+    "I'm actively pursuing the acquisition of a cash-flowing service business in the $350K-$1.25M SDE/EBITDA range. I'm most interested in businesses with recurring or repeat demand, established teams, and opportunities to professionalize operations. I'm based in Southern California and open to strong opportunities nationwide.",
+  ],
+  [
+    'Operating approach:',
+    'I acquire with the intent to be an active owner. I step in initially to learn the business, stabilize operations, and build trust with the team and customers. As the business grows, I focus on strengthening systems, leadership, and accountability, with the goal of building a durable management structure over time.',
+  ],
+  [
+    'Background:',
+    "I'm the co-founder and President of Golden Behavior Connection, an ABA therapy company launched in 2023. I've built the business from the ground up, overseeing day-to-day operations, staffing, compliance, revenue cycle management, and financial performance. In parallel, my prior roles at Tripadvisor, Better Mortgage, and Wayfair sharpened my discipline around sales execution, process improvement, and operating with clear metrics.",
+  ],
+  [
+    'Ability to close:',
+    "I'm aligned with an SBA 7(a) lender, have the required equity prepared, and am positioned to submit an LOI quickly once financials are reviewed. Proof of funds and lender information are available upon request.",
+  ],
+  "If this sounds aligned, I'd welcome the opportunity to review the CIM and discuss next steps.",
 ];
 
 const FOLLOW_UP_PARAGRAPHS = {
@@ -132,7 +147,7 @@ export function renderPursueCimEmail({
   // Each block is a paragraph; a block with several lines (signature, footer) breaks between lines.
   const blocks = [
     [greeting.template],
-    ...bodyParagraphs.map((paragraph) => [paragraph]),
+    ...bodyParagraphs.map((paragraph) => (Array.isArray(paragraph) ? paragraph : [paragraph])),
     SIGNATURE_LINES,
     FOOTER_LINES,
   ];
