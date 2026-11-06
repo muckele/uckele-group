@@ -17,6 +17,17 @@ const backupJobName = 'sqlite-application-backup';
 const abandonedBundleGraceMs = 24 * 60 * 60 * 1000;
 const sqliteSidecarSuffixes = ['-wal', '-shm', '-journal'];
 const activeBackupPaths = new Set();
+// Recorded verification results live beside the bundles, outside any bundle directory, so recording
+// never changes a bundle's own files or its modification time.
+const verificationRecordDirectoryName = '.verification-cache';
+const verificationRecordVersion = 1;
+// A recorded result is trusted only for files whose mtime is clearly older than the moment the
+// bundle was fingerprinted. A file written just before or during verification can keep the same
+// mtime on a filesystem with coarse timestamps, so such a "racy" bundle is verified again.
+const racyTimestampMarginMs = 2000;
+const defaultStatusVerificationBudgetMs = 5000;
+const pendingVerifications = new Map();
+let verificationQueue = Promise.resolve();
 
 function isObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -448,7 +459,199 @@ async function copySecureDocuments({ databasePath, documentsDirectory, destinati
   return manifestDocuments;
 }
 
-async function inspectBackupDirectory(config) {
+function bundleStateFromVerification(verification) {
+  if (verification.classification === 'legacy') return 'legacy';
+  if (verification.ok) return 'valid';
+  return verification.classification === 'degraded' ? 'degraded' : 'invalid';
+}
+
+function verificationRecordDirectory(config) {
+  return path.join(config.backup.directory, verificationRecordDirectoryName);
+}
+
+function verificationRecordPath(config, bundlePath) {
+  return path.join(verificationRecordDirectory(config), `${path.basename(bundlePath)}.json`);
+}
+
+// A cheap identity for everything verifyBackupBundle reads: the exact manifest bytes plus the
+// device, inode, size and mtime of the database snapshot, its possible SQLite sidecars and every
+// manifest document. Change time is deliberately left out: each nightly bundle hardlinks the same
+// vault inodes, which bumps their ctime without touching their content.
+async function fingerprintBackupBundle(bundlePath) {
+  const takenAtMs = Date.now();
+  let manifestBytes;
+  let manifest;
+  try {
+    manifestBytes = await fs.readFile(path.join(bundlePath, manifestFileName));
+    manifest = JSON.parse(manifestBytes.toString('utf8'));
+  } catch {
+    return null;
+  }
+  if (!isObject(manifest)) return null;
+
+  const targets = [];
+  if (isNonEmptyString(manifest.database?.relativePath)) {
+    targets.push({ relativePath: manifest.database.relativePath, statFile: fs.lstat });
+    for (const suffix of sqliteSidecarSuffixes) {
+      targets.push({ relativePath: `${manifest.database.relativePath}${suffix}`, statFile: fs.lstat });
+    }
+  }
+  const documents = Array.isArray(manifest.secureDocuments?.files) ? manifest.secureDocuments.files : [];
+  for (const document of documents) {
+    if (isObject(document) && isNonEmptyString(document.relativePath)) {
+      targets.push({ relativePath: document.relativePath, statFile: fs.stat });
+    }
+  }
+
+  let newestMtimeMs = 0;
+  const files = await Promise.all(targets.map(async ({ relativePath, statFile }) => {
+    try {
+      const stat = await statFile(path.resolve(bundlePath, relativePath), { bigint: true });
+      newestMtimeMs = Math.max(newestMtimeMs, Number(stat.mtimeNs / 1_000_000n));
+      return [relativePath, stat.isFile(), String(stat.dev), String(stat.ino), String(stat.size), String(stat.mtimeNs)];
+    } catch (error) {
+      return [relativePath, error.code || 'unreadable'];
+    }
+  }));
+
+  return {
+    key: sha256Bytes(JSON.stringify([
+      verificationRecordVersion,
+      path.basename(bundlePath),
+      sha256Bytes(manifestBytes),
+      files,
+    ])),
+    manifest,
+    takenAtMs,
+    newestMtimeMs,
+  };
+}
+
+async function readVerificationRecord(config, bundlePath, fingerprint) {
+  let record;
+  try {
+    record = JSON.parse(await fs.readFile(verificationRecordPath(config, bundlePath), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!isObject(record) || record.version !== verificationRecordVersion || record.fingerprint !== fingerprint.key) return null;
+  const fingerprintedAtMs = Date.parse(record.fingerprintedAt || '');
+  if (!Number.isFinite(fingerprintedAtMs) || fingerprint.newestMtimeMs >= fingerprintedAtMs - racyTimestampMarginMs) return null;
+  const result = record.result;
+  if (!isObject(result)
+      || !['current', 'legacy', 'degraded', 'invalid'].includes(result.classification)
+      || typeof result.ok !== 'boolean'
+      || !Array.isArray(result.errors)
+      || !Array.isArray(result.documentsDegraded)) {
+    return null;
+  }
+  return record;
+}
+
+async function writeVerificationRecord(config, bundlePath, fingerprint, verification) {
+  const directory = verificationRecordDirectory(config);
+  const recordPath = verificationRecordPath(config, bundlePath);
+  const temporaryPath = path.join(directory, `.${path.basename(recordPath)}.${randomUUID()}.tmp`);
+  try {
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await secureWriteJson(temporaryPath, {
+      version: verificationRecordVersion,
+      bundle: path.basename(bundlePath),
+      fingerprint: fingerprint.key,
+      fingerprintedAt: new Date(fingerprint.takenAtMs).toISOString(),
+      verifiedAt: new Date().toISOString(),
+      result: {
+        classification: verification.classification,
+        ok: verification.ok,
+        databaseVerified: verification.databaseVerified,
+        errors: verification.errors,
+        documentsDegraded: verification.documentsDegraded || [],
+      },
+    });
+    await fs.rename(temporaryPath, recordPath);
+  } catch {
+    // A record is only an optimization; the bundle is verified again on the next read.
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
+async function pruneVerificationRecords(config) {
+  let names;
+  try {
+    names = await fs.readdir(verificationRecordDirectory(config));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith('backup-') || !name.endsWith('.json')) continue;
+    const bundlePath = path.join(config.backup.directory, name.slice(0, -'.json'.length));
+    try {
+      await fs.access(bundlePath);
+    } catch (error) {
+      if (error.code === 'ENOENT') await fs.rm(path.join(verificationRecordDirectory(config), name), { force: true }).catch(() => {});
+    }
+  }
+}
+
+// The fingerprint is taken before verification starts, so a file that changes while it is being
+// verified no longer matches the recorded fingerprint and is verified again on the next read.
+async function verifyAndRecordBundle(config, bundlePath, fingerprint, verifyBundle) {
+  const verification = await verifyBundle(bundlePath);
+  if (fingerprint) await writeVerificationRecord(config, bundlePath, fingerprint, verification);
+  return verification;
+}
+
+// Status reads verify unrecorded bundles one at a time in the background, so concurrent page loads
+// share a single pass instead of each re-hashing every bundle.
+function queueBundleVerification(config, bundlePath, fingerprint, verifyBundle) {
+  const key = `${path.resolve(bundlePath)}\u0000${fingerprint.key}`;
+  const pending = pendingVerifications.get(key);
+  if (pending) return pending;
+  const run = verificationQueue.then(() => verifyAndRecordBundle(config, bundlePath, fingerprint, verifyBundle));
+  verificationQueue = run.catch(() => {});
+  const tracked = run.finally(() => pendingVerifications.delete(key));
+  tracked.catch(() => {});
+  pendingVerifications.set(key, tracked);
+  return tracked;
+}
+
+async function settleWithinBudget(promises, budgetMs) {
+  const outcomes = promises.map(() => null);
+  const settled = Promise.all(promises.map((promise, index) => promise.then(
+    (value) => { outcomes[index] = { value }; },
+    (error) => { outcomes[index] = { error }; },
+  )));
+  if (Number.isFinite(budgetMs)) {
+    let timer;
+    await Promise.race([settled, new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, budgetMs)); })]);
+    clearTimeout(timer);
+  } else {
+    await settled;
+  }
+  return outcomes;
+}
+
+function inspectedBundle(bundlePath, modifiedAt, manifest, verification) {
+  return {
+    path: bundlePath,
+    manifest,
+    state: bundleStateFromVerification(verification),
+    errors: verification.errors,
+    documentsDegraded: verification.documentsDegraded || [],
+    createdAt: Date.parse(manifest?.createdAt || '') || modifiedAt,
+    modifiedAt,
+  };
+}
+
+// Without useRecordedVerification every bundle is fully verified (and the result recorded), as
+// retention and the backup CLI require. With it, a bundle whose fingerprint still matches its
+// recorded result is not re-read; the rest are verified within verificationBudgetMs and reported as
+// 'pending' if their verification is still running when the budget runs out.
+async function inspectBackupDirectory(config, {
+  useRecordedVerification = false,
+  verificationBudgetMs = Infinity,
+  verifyBundle = verifyBackupBundle,
+} = {}) {
   let entries;
   try {
     entries = await fs.readdir(config.backup.directory, { withFileTypes: true });
@@ -458,8 +661,12 @@ async function inspectBackupDirectory(config) {
   }
 
   const bundles = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith('backup-')) continue;
+  const awaiting = [];
+  // Newest first, so a background verification pass reaches the latest bundle first.
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('backup-'))
+    .sort((left, right) => right.name.localeCompare(left.name));
+  for (const entry of candidates) {
     const bundlePath = path.join(config.backup.directory, entry.name);
     let modifiedAt = 0;
     try {
@@ -473,20 +680,55 @@ async function inspectBackupDirectory(config) {
       continue;
     }
 
-    const verification = await verifyBackupBundle(bundlePath);
-    bundles.push({
-      path: bundlePath,
-      manifest: verification.manifest,
-      state: verification.classification === 'legacy'
-        ? 'legacy'
-        : verification.ok ? 'valid' : verification.classification === 'degraded' ? 'degraded' : 'invalid',
-      errors: verification.errors,
-      documentsDegraded: verification.documentsDegraded || [],
-      createdAt: Date.parse(verification.manifest?.createdAt || '') || modifiedAt,
-      modifiedAt,
-    });
+    const fingerprint = await fingerprintBackupBundle(bundlePath);
+    if (useRecordedVerification && fingerprint) {
+      const record = await readVerificationRecord(config, bundlePath, fingerprint);
+      if (record) {
+        bundles.push(inspectedBundle(bundlePath, modifiedAt, fingerprint.manifest, record.result));
+        continue;
+      }
+      awaiting.push({
+        bundlePath,
+        modifiedAt,
+        manifest: fingerprint.manifest,
+        promise: queueBundleVerification(config, bundlePath, fingerprint, verifyBundle),
+      });
+      continue;
+    }
+
+    // An unreadable manifest fails verification before any file is hashed, so it is never queued.
+    const verification = await verifyAndRecordBundle(config, bundlePath, fingerprint, verifyBundle);
+    bundles.push(inspectedBundle(bundlePath, modifiedAt, verification.manifest, verification));
   }
+
+  const outcomes = await settleWithinBudget(awaiting.map(({ promise }) => promise), verificationBudgetMs);
+  for (const [index, { bundlePath, modifiedAt, manifest }] of awaiting.entries()) {
+    const outcome = outcomes[index];
+    if (outcome?.error) throw outcome.error;
+    if (outcome) {
+      bundles.push(inspectedBundle(bundlePath, modifiedAt, outcome.value.manifest, outcome.value));
+    } else {
+      bundles.push({
+        path: bundlePath,
+        manifest,
+        state: 'pending',
+        errors: [],
+        documentsDegraded: [],
+        createdAt: Date.parse(manifest?.createdAt || '') || modifiedAt,
+        modifiedAt,
+      });
+    }
+  }
+
+  await pruneVerificationRecords(config);
   return bundles.sort((left, right) => right.createdAt - left.createdAt || right.modifiedAt - left.modifiedAt);
+}
+
+// Verify and record every bundle that has no matching record yet, so the first Operations page
+// load after a deploy or restart does not have to wait for it. Callers run it in the background.
+export function warmBackupVerificationRecords(config = getConfig(), options = {}) {
+  return inspectBackupDirectory(config, { ...options, useRecordedVerification: true, verificationBudgetMs: Infinity })
+    .then(() => undefined);
 }
 
 export async function enforceBackupRetention(config = getConfig(), now = new Date()) {
@@ -739,26 +981,45 @@ function summarizeDegradedDocuments(degradedBundles) {
   return [...byId.values()].slice(0, 20);
 }
 
-export async function getBackupStatus(config = getConfig()) {
-  const inspected = await inspectBackupDirectory(config);
+// Reads recorded verification results instead of re-hashing every bundle on each call. Bundles
+// with no matching record are verified for up to verificationBudgetMs; any still running after
+// that are counted as `verifying` and finish in the background.
+export async function getBackupStatus(config = getConfig(), {
+  verificationBudgetMs = defaultStatusVerificationBudgetMs,
+  verifyBundle = verifyBackupBundle,
+} = {}) {
+  const inspected = await inspectBackupDirectory(config, { useRecordedVerification: true, verificationBudgetMs, verifyBundle });
   const valid = inspected.filter((bundle) => bundle.state === 'valid');
   const degraded = inspected.filter((bundle) => bundle.state === 'degraded');
   const legacy = inspected.filter((bundle) => bundle.state === 'legacy');
   const invalid = inspected.filter((bundle) => bundle.state === 'invalid');
   const incomplete = inspected.filter((bundle) => bundle.state === 'incomplete');
+  const verifying = inspected.filter((bundle) => bundle.state === 'pending');
   const bundleCounts = {
     valid: valid.length,
     degraded: degraded.length,
     legacy: legacy.length,
     invalid: invalid.length,
     incomplete: incomplete.length,
+    ...(verifying.length > 0 ? { verifying: verifying.length } : {}),
   };
   if (!config.backup.enabled) {
     return { status: 'disabled', message: 'Automated application backups are disabled.', latest: null, bundleCounts };
   }
 
+  const verifyingTail = verifying.length > 0
+    ? ` ${verifying.length} backup ${verifying.length === 1 ? 'bundle is' : 'bundles are'} still being verified; refresh in a few minutes.`
+    : '';
   const [latest] = inspected.filter((bundle) => ['valid', 'degraded'].includes(bundle.state));
   if (!latest?.manifest) {
+    if (verifying.length > 0) {
+      return {
+        status: 'verifying',
+        message: `Backup verification is still running for ${verifying.length} ${verifying.length === 1 ? 'bundle' : 'bundles'}; refresh in a few minutes.`,
+        latest: null,
+        bundleCounts,
+      };
+    }
     if (invalid.length > 0) {
       return {
         status: 'invalid',
@@ -809,8 +1070,8 @@ export async function getBackupStatus(config = getConfig()) {
     return {
       status: 'degraded',
       message: degraded.length > 0
-        ? `${degraded.length} backup ${degraded.length === 1 ? 'bundle holds' : 'bundles hold'} documents that changed after they were backed up (${documentIds.length === 1 ? 'id' : 'ids'}: ${documentIds.join(', ')}). Their database backups are intact and kept. Check the live vault file and recover it from a Fly volume snapshot. Use --accept-degraded-documents only if you must restore the database from one of these bundles.${attentionTail}${staleTail}`
-        : `A valid application backup is available, but ${issueSummary} backup bundle(s) require attention.${staleTail}`,
+        ? `${degraded.length} backup ${degraded.length === 1 ? 'bundle holds' : 'bundles hold'} documents that changed after they were backed up (${documentIds.length === 1 ? 'id' : 'ids'}: ${documentIds.join(', ')}). Their database backups are intact and kept. Check the live vault file and recover it from a Fly volume snapshot. Use --accept-degraded-documents only if you must restore the database from one of these bundles.${attentionTail}${staleTail}${verifyingTail}`
+        : `A valid application backup is available, but ${issueSummary} backup bundle(s) require attention.${staleTail}${verifyingTail}`,
       latest: latestSummary,
       bundleCounts,
       verificationErrors: invalid.flatMap((bundle) => bundle.errors).slice(0, 20),
@@ -819,7 +1080,7 @@ export async function getBackupStatus(config = getConfig()) {
   }
   return {
     status: stale ? 'stale' : 'healthy',
-    message: stale ? 'The latest application backup is older than 36 hours.' : 'The latest application backup is within the expected daily window.',
+    message: `${stale ? 'The latest application backup is older than 36 hours.' : 'The latest application backup is within the expected daily window.'}${verifyingTail}`,
     latest: latestSummary,
     bundleCounts,
   };
@@ -978,11 +1239,20 @@ export async function runClaimedBackup({ storage = getStorage(), config = getCon
   }
 }
 
-export function startBackupScheduler({ storage = getStorage(), config = getConfig(), getNow = () => new Date(), scheduleTimer = setTimeout } = {}) {
+export function startBackupScheduler({
+  storage = getStorage(),
+  config = getConfig(),
+  getNow = () => new Date(),
+  scheduleTimer = setTimeout,
+  warmBackupVerification = warmBackupVerificationRecords,
+} = {}) {
   if (!config.backup.enabled || storage.provider !== 'sqlite') {
     console.log('[backup:scheduler] automated SQLite backups disabled');
     return { stop() {} };
   }
+  warmBackupVerification(config).catch((error) => {
+    console.error(`[backup:scheduler] backup verification warm-up failed: ${error.message}`);
+  });
   let stopped = false;
   let timer = null;
   let inFlight = false;

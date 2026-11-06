@@ -115,6 +115,19 @@ describe('Operations Center partial failures', () => {
     expect(screen.getByText('Bundles: 1 valid · 0 invalid · 0 incomplete')).toBeVisible();
   });
 
+  test('backup card shows bundles whose verification is still running as a warning', () => {
+    render(<OperationsCenter data={{
+      scheduler: { runs: [] }, sources: {}, audit: {}, cleanup: {}, storage: {},
+      backup: {
+        status: 'verifying',
+        message: 'Backup verification is still running for 3 bundles; refresh in a few minutes.',
+        bundleCounts: { valid: 0, degraded: 0, invalid: 0, incomplete: 0, verifying: 3 },
+      },
+    }} />);
+    expect(screen.getByText('verifying')).toHaveClass('bg-amber-50');
+    expect(screen.getByText('Bundles: 0 valid · 0 invalid · 0 incomplete · 3 still verifying')).toBeVisible();
+  });
+
   test('shows configured, evidence, effective, activation, every gate, and zero-send/live summaries without granting viewer controls', () => {
     render(<OperationsCenter readOnly data={{
       scheduler: { runs: [], failures: 0, pending: 0 },
