@@ -570,7 +570,8 @@ export function startDealHunterDailyEmailScheduler({
     lastAttemptAt = nowMs;
 
     try {
-      // After a restart this runs once per date; the durable job record decides whether it sends.
+      // Logged before every attempt, including the first check after a restart; the durable job
+      // record decides whether anything is sent.
       console.log(`[deal-hunter:scheduler] checking daily email for ${dateKey} at ${schedule.time} ${schedule.timezone}`);
       const result = await runEmail({ triggeredBy: 'scheduler', now, getNow });
 

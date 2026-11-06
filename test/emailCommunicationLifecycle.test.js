@@ -1074,6 +1074,25 @@ for (const [label, environment] of [
     const configOverride = { ...base, dealHunter: { ...base.dealHunter,
       cimProvider: resolveCimProviderProfile(environment) } };
     assert.equal(configOverride.dealHunter.cimProvider.provider, 'gmail');
+    // The webhook's first fetch uses the same key.
+    const webhookStorage = createStorage();
+    const webhookAuthorizations = [];
+    const accepted = await recordEmailEventsFromWebhook(sharedSecretRequest(receivedPayload({
+      id: `evt-gmail-first-${label}`, emailId: 'received-gmail-0', from: 'Unknown <unknown@example.com>' })), {
+      storage: webhookStorage,
+      configOverride,
+      fetcher: async (_url, options) => {
+        webhookAuthorizations.push(options.headers.Authorization);
+        return response({ id: 'received-gmail-0', from: 'Unknown <unknown@example.com>',
+          to: ['deals@inbound.example.com'], subject: 'Re: CIM request', text: 'Read on arrival.', attachments: [] });
+      },
+    });
+    assert.equal(accepted.ok, true);
+    assert.deepEqual(webhookAuthorizations, [`Bearer ${process.env.RESEND_API_KEY}`]);
+    assert.equal(webhookStorage.state.communications[0].content_state, 'complete');
+    assert.equal(webhookStorage.state.communications[0].body_text, 'Read on arrival.');
+
+    // A fetch that failed earlier is retried with the same key.
     const storage = createStorage();
     const body = receivedPayload({ id: `evt-gmail-${label}`, emailId: 'received-gmail-1', from: 'Unknown <unknown@example.com>' });
     const failed = await recordEmailEventsFromWebhook(sharedSecretRequest(body), {
