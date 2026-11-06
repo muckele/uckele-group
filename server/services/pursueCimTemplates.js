@@ -15,7 +15,7 @@ const FOLLOW_UP_SUBJECT_PREFIX = 'Re: ';
 
 const INITIAL_PARAGRAPHS = [
   "I'd like to evaluate {business}. Happy to sign your NDA. Could you send it over along with the CIM?",
-  "What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I focus on professional, healthcare, and tech-enabled services. I'm based in Southern California and open to strong opportunities nationwide.",
+  "What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I'm based in Southern California and open to strong opportunities nationwide.",
   "How I operate: as an active owner. I step in to learn the business and earn the trust of the team and customers, then build the systems and leadership so it runs well for the long term.",
   "Background: I co-founded and run Golden Behavior Connection, an ABA therapy company I've built since 2023, overseeing operations, staffing, compliance, revenue cycle, and financial performance. Before that I worked at Tripadvisor, Better Mortgage, and Wayfair.",
   "Ability to close: I'm aligned with an SBA 7(a) lender, have my equity ready, and can submit an LOI quickly once I've reviewed the financials. Proof of funds is available on request.",
