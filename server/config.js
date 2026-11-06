@@ -979,7 +979,9 @@ export function validateConfig(config = getConfig()) {
     const cimProfile = config.dealHunter?.cimProvider;
     if (['controlled-mailbox', 'controlled-mailbox-limited-smoke'].includes(cimProfile?.mode)
       && cimProfile?.provider !== 'gmail') {
-      errors.push(`DEAL_HUNTER_CIM_PROVIDER_PROFILE=${cimProfile.profile} needs DEAL_HUNTER_CIM_MAILBOX_PROVIDER=gmail in production; without it the controlled harness turns off the app's own email. Unset the profile or set the provider to gmail.`);
+      errors.push(cimProfile.mode === 'controlled-mailbox'
+        ? `DEAL_HUNTER_CIM_PROVIDER_PROFILE=${cimProfile.profile} needs DEAL_HUNTER_CIM_MAILBOX_PROVIDER=gmail in production; without it the controlled harness turns off the app's own email. Unset the profile or set the provider to gmail.`
+        : `DEAL_HUNTER_CIM_PROVIDER_PROFILE=${cimProfile.profile} is an offline harness that turns off the app's own email, so production can't run it. Unset the profile.`);
     }
     requireValue(config.admin.email, 'ADMIN_EMAIL');
 

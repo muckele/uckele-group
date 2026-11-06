@@ -263,7 +263,9 @@ address (a personal address works).
    - No more follow-ups are sent. You can check again after the next follow-up's due date.
 9. Finish the test and switch to real sending:
    1. Click **Turn off Live sending** and confirm.
-   2. Change the sending setup to production and remove the test-only settings:
+   2. Change the sending setup to production and remove the test-only settings. Run the two
+      commands **in this order**: removing `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` while the profile
+      is still `controlled-mailbox-v1` stops the app from starting.
 
       ```
       fly secrets set DEAL_HUNTER_CIM_PROVIDER_PROFILE=production-gmail-v1
