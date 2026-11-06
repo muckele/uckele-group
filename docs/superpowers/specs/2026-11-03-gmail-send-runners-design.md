@@ -236,7 +236,7 @@ Templates live in `server/services/pursueCimTemplates.js`:
 - the initial email is `pursue-cim-initial-v2`;
 - the follow-ups are `pursue-cim-follow-up-v2`, with variants A, B, C, D and Final.
 
-v2 (2026-11-06) replaces the v1 body copy with the owner's operator-voice wording. The subject, greeting, signature and footer are unchanged, so threading and reply classification are unaffected.
+v2 (2026-11-05) replaces the v1 body copy with the owner's operator-voice wording. The subject, greeting, signature and footer are unchanged, so threading and reply classification are unaffected.
 
 Follow-up *n* (n ≥ 1) uses variant `['A','B','C','D'][(n-1) % 4]`. The last follow-up uses **Final** instead. "Last" means `calculateNextCimSlot` would land at or after the campaign's expiry.
 
