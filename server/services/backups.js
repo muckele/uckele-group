@@ -31,6 +31,7 @@ const racyTimestampMarginMs = 2000;
 const defaultStatusVerificationBudgetMs = 2000;
 const abandonedRecordTemporaryMs = 60 * 60 * 1000;
 const verificationWarmUpDelayMs = 60 * 1000;
+const slowVerificationWarningMs = 10 * 60 * 1000;
 const pendingVerifications = new Map();
 let verificationQueue = Promise.resolve();
 let verificationRecordWriteWarned = false;
@@ -645,7 +646,19 @@ function queueBundleVerification(config, bundlePath, fingerprint, verifyBundle) 
   const key = `${path.resolve(bundlePath)}\u0000${fingerprint.key}`;
   const pending = pendingVerifications.get(key);
   if (pending) return pending;
-  const run = verificationQueue.then(() => verifyAndRecordBundle(config, bundlePath, fingerprint, verifyBundle));
+  const run = verificationQueue.then(async () => {
+    // Retention waits on this queue too, so a stuck verification would silently hold up nightly
+    // backups; make it visible in the logs.
+    const slowTimer = setTimeout(() => {
+      console.warn(`[backup] verification of ${path.basename(bundlePath)} has been running for over ${slowVerificationWarningMs / 60_000} minutes; later verifications and backup retention are waiting on it`);
+    }, slowVerificationWarningMs);
+    slowTimer.unref?.();
+    try {
+      return await verifyAndRecordBundle(config, bundlePath, fingerprint, verifyBundle);
+    } finally {
+      clearTimeout(slowTimer);
+    }
+  });
   verificationQueue = run.catch(() => {});
   const tracked = run.finally(() => pendingVerifications.delete(key));
   tracked.catch(() => {});
@@ -682,9 +695,10 @@ function inspectedBundle(bundlePath, modifiedAt, manifest, verification) {
 }
 
 // Without useRecordedVerification every bundle is fully verified now (and the result recorded), as
-// retention and the backup CLI require; a pass already running for an unchanged bundle is joined. With it, a bundle whose fingerprint still matches its
-// recorded result is not re-read; the rest are verified within verificationBudgetMs and reported as
-// 'pending' if their verification is still running when the budget runs out.
+// retention and the backup CLI require; a pass already running for an unchanged bundle is joined.
+// With it, a bundle whose fingerprint still matches its recorded result is not re-read; the rest
+// are verified within verificationBudgetMs and reported as 'pending' if their verification is
+// still running when the budget runs out.
 async function inspectBackupDirectory(config, {
   useRecordedVerification = false,
   verificationBudgetMs = Infinity,
