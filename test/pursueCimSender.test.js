@@ -151,13 +151,13 @@ test('follow-ups run every 2 business days and the last before day 28 uses Final
     .map((date) => `${date}T08:00:00`));
   const followUps = fixture.mailProvider.sent.slice(1);
   assert.equal(followUps.length, 10);
-  const expected = ['I wanted to follow up', 'Checking in on', 'Following up on', 'Circling back on'];
+  const expected = ['Bumping this up', 'Any update on', 'just let me know', 'handles buyer inquiries'];
   followUps.forEach((message, index) => {
     assert.equal(message.subject, `Re: ${INITIAL_SUBJECT}`);
     assert.equal(message.threadId, initial.threadId);
     assert.equal(message.inReplyTo, initial.rfcMessageId);
     const final = index === followUps.length - 1;
-    assert.equal(message.text.includes('This is my last note on Acme Plumbing'), final, `#${index + 1}`);
+    assert.equal(message.text.includes('Last note from me on Acme Plumbing'), final, `#${index + 1}`);
     if (!final) assert.ok(message.text.includes(expected[index % 4]), `#${index + 1}`);
   });
   // Nothing is scheduled after Final; the day-28 sweep then expires the campaign.

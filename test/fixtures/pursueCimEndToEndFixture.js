@@ -461,7 +461,7 @@ async function requestSimToExpiry(t, createBackend) {
     return copy.variant;
   });
   assert.deepEqual(variants, ['A', 'B', 'C', 'D', 'A', 'B', 'C', 'D', 'A', 'Final']);
-  assert.match(followUps.at(-1).text, /This is my last note on Bayside HVAC\./);
+  assert.match(followUps.at(-1).text, /Last note from me on Bayside HVAC\./);
 
   // The day-28 sweep expired the campaign on the first run after its expiry; nothing is left.
   assert.deepEqual(expiredAt, ['2030-02-04 16:30']);

@@ -270,7 +270,7 @@ test('payload marks the last follow-up before expiry as Final', async (t) => {
     deal, sender: SENDER_SETTINGS, initialSubject: fixture.initialSubject });
   assert.equal(final.isFinal, true);
   assert.equal(final.bodyText, finalCopy.text);
-  assert.match(final.bodyText, /This is my last note on Acme Plumbing\./);
+  assert.match(final.bodyText, /Last note from me on Acme Plumbing\./);
   assert.equal(final.subject, regular.subject);
 });
 
@@ -294,7 +294,7 @@ test('payload threads to the initial Message-ID', async (t) => {
   assert.deepEqual(payload.tags, [
     `cim_conversation_id=${ids.conversationId}`,
     `cim_touch_id=${candidate.touch_id}`,
-    'cim_template=pursue-cim-follow-up-v1',
+    'cim_template=pursue-cim-follow-up-v2',
     `cim_in_reply_to=${initialMessageId}`,
   ]);
 

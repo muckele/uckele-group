@@ -5,8 +5,8 @@ import { createHash } from 'node:crypto';
 // Changing any template string, version, or sender signature field changes the wording
 // digest, which pauses sending until the owner approves the wording again.
 
-export const PURSUE_CIM_INITIAL_TEMPLATE_VERSION = 'pursue-cim-initial-v1';
-export const PURSUE_CIM_FOLLOW_UP_TEMPLATE_VERSION = 'pursue-cim-follow-up-v1';
+export const PURSUE_CIM_INITIAL_TEMPLATE_VERSION = 'pursue-cim-initial-v2';
+export const PURSUE_CIM_FOLLOW_UP_TEMPLATE_VERSION = 'pursue-cim-follow-up-v2';
 
 const GREETING_TEMPLATE = 'Hi {firstName},';
 const GREETING_FALLBACK = 'Hi there,';
@@ -14,19 +14,19 @@ const INITIAL_SUBJECT_TEMPLATE = 'CIM / NDA request for {business}';
 const FOLLOW_UP_SUBJECT_PREFIX = 'Re: ';
 
 const INITIAL_PARAGRAPHS = [
-  'I am reaching out regarding {business}. Based on the information available, it looks like the type of durable service business I would like to evaluate further.',
-  'By way of background, I am an operator and small business buyer focused on acquiring a cash-flowing service business with repeat or recurring demand, a strong local reputation, and a transition path where the team and customers are protected.',
-  'I am currently the co-founder and President of Golden Behavior Connection, an ABA therapy company I helped build from the ground up. My day-to-day work includes operations, staffing, compliance, revenue cycle management, sales execution, and financial performance. Earlier in my career, I held operating and sales roles at Tripadvisor, Better Mortgage, and Wayfair.',
-  'I am prepared to move quickly if the opportunity is a fit. I have acquisition equity available, am working with SBA financing, and can provide proof of funds or lender context upon request.',
-  'Could you please send over the CIM or teaser, or let me know the NDA process? If there is a specific process you prefer buyers to follow, I am happy to follow it. I will treat all materials confidentially.',
+  "I'd like to evaluate {business}. Happy to sign your NDA. Could you send it over along with the CIM?",
+  "What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I focus on professional, healthcare, and tech-enabled services. I'm based in Southern California and open to strong opportunities nationwide.",
+  "How I operate: as an active owner. I step in to learn the business and earn the trust of the team and customers, then build the systems and leadership so it runs well for the long term.",
+  "Background: I co-founded and run Golden Behavior Connection, an ABA therapy company I've built since 2023, overseeing operations, staffing, compliance, revenue cycle, and financial performance. Before that I worked at Tripadvisor, Better Mortgage, and Wayfair.",
+  "Ability to close: I'm aligned with an SBA 7(a) lender, have my equity ready, and can submit an LOI quickly once I've reviewed the financials. Proof of funds is available on request.",
 ];
 
 const FOLLOW_UP_PARAGRAPHS = {
-  A: 'I wanted to follow up on my note below about {business}. If it is still available, I would appreciate the CIM or teaser, or the next step in your NDA process.',
-  B: 'Checking in on {business}. I am an active buyer with SBA financing lined up and can review materials quickly. If an NDA is the first step, I am happy to sign it.',
-  C: 'Following up on {business}. If the timing is not right, or it is already under LOI, a quick note is completely fine and I will close the loop.',
-  D: 'Circling back on {business}. If there is a better contact for buyer inquiries on this listing, I would be grateful if you could point me to them.',
-  Final: 'This is my last note on {business}. If it is still available, I would welcome the CIM or the NDA process. If not, no reply is needed. Thank you for your time.',
+  A: 'Bumping this up. Still interested in {business}, and happy to sign the NDA today.',
+  B: "Any update on {business}? My funding is in place, so I can give you a quick read once I see the CIM.",
+  C: "If {business} is under LOI or the timing is off, just let me know and I'll stop following up.",
+  D: 'If someone else handles buyer inquiries for {business}, could you point me their way?',
+  Final: "Last note from me on {business}. If it comes back to market, I'd still like a look.",
 };
 
 const ROTATING_VARIANTS = ['A', 'B', 'C', 'D'];
