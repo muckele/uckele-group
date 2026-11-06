@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { getCimProviderDeliveryConfig, getConfig } from '../config.js';
+import { getConfig, getInboundContentConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { commitCrmActivityMutation } from './activity.js';
@@ -1027,7 +1027,7 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
 
   try {
     const received = await fetchReceivedEmail(providerMessageId, {
-      config: getCimProviderDeliveryConfig(configOverride || getConfig()), fetcher });
+      config: getInboundContentConfig(configOverride || getConfig()), fetcher });
     const resolved = await resolveAndAssignInboundCommunication({
       storage,
       communication,
@@ -1063,7 +1063,7 @@ export async function retryPendingInboundIngestion({ storage = getStorage(), lim
   for (const communication of rows) {
     try {
       const received = await fetchReceivedEmail(communication.provider_message_id, {
-        config: getCimProviderDeliveryConfig(configOverride || getConfig()), fetcher });
+        config: getInboundContentConfig(configOverride || getConfig()), fetcher });
       const resolved = await resolveAndAssignInboundCommunication({ storage, communication, received });
       const updated = await updateInboundContent(storage, resolved.communication, received);
       await applyObviousInboundOptOut(storage, updated);

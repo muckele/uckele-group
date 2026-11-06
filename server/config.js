@@ -188,6 +188,15 @@ export function getCimProviderDeliveryConfig(config) {
   };
 }
 
+/**
+ * The config for fetching received email content from Resend. Replies to the Resend reply domain
+ * arrive through Resend even when broker email is sent through Gmail, and the Gmail profiles carry
+ * no Resend key, so they read content with the app's own Resend key.
+ */
+export function getInboundContentConfig(config) {
+  return cimProviderUsesGmail(config) ? config : getCimProviderDeliveryConfig(config);
+}
+
 export function getCimWebhookAuthority(config) {
   const profile = config?.dealHunter?.cimProvider;
   // Gmail sends produce no Resend events, so the Gmail controlled test keeps the app's own
