@@ -1059,6 +1059,67 @@ test('scheduled content retry re-resolves the fetched reply alias and stops the 
   assert.ok(storage.state.activities.some((activity) => activity.event_type === 'cim.response-received'));
 });
 
+for (const [label, environment] of [
+  ['production Gmail', { DEAL_HUNTER_CIM_PROVIDER_ENABLED: 'true', DEAL_HUNTER_CIM_PROVIDER_PROFILE: 'production-gmail-v1',
+    DEAL_HUNTER_GMAIL_SENDER_ADDRESS: 'sender@example.com' }],
+  ['the Gmail controlled test', { DEAL_HUNTER_CIM_PROVIDER_ENABLED: 'true', DEAL_HUNTER_CIM_PROVIDER_PROFILE: 'controlled-mailbox-v1',
+    DEAL_HUNTER_CIM_MAILBOX_PROVIDER: 'gmail', DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS: 'tester@example.net',
+    DEAL_HUNTER_GMAIL_SENDER_ADDRESS: 'sender@example.com' }],
+]) {
+  test(`received content is fetched with the app's own Resend key under ${label}`, async () => {
+    // Gmail profiles carry no Resend key for broker email, but replies to the Resend reply domain
+    // still arrive through Resend and must be readable.
+    const { getConfig, resolveCimProviderProfile } = await import('../server/config.js');
+    const base = getConfig();
+    const configOverride = { ...base, dealHunter: { ...base.dealHunter,
+      cimProvider: resolveCimProviderProfile(environment) } };
+    assert.equal(configOverride.dealHunter.cimProvider.provider, 'gmail');
+    // The webhook's first fetch uses the same key.
+    const webhookStorage = createStorage();
+    const webhookAuthorizations = [];
+    const accepted = await recordEmailEventsFromWebhook(sharedSecretRequest(receivedPayload({
+      id: `evt-gmail-first-${label}`, emailId: 'received-gmail-0', from: 'Unknown <unknown@example.com>' })), {
+      storage: webhookStorage,
+      configOverride,
+      fetcher: async (_url, options) => {
+        webhookAuthorizations.push(options.headers.Authorization);
+        return response({ id: 'received-gmail-0', from: 'Unknown <unknown@example.com>',
+          to: ['deals@inbound.example.com'], subject: 'Re: CIM request', text: 'Read on arrival.', attachments: [] });
+      },
+    });
+    assert.equal(accepted.ok, true);
+    assert.deepEqual(webhookAuthorizations, [`Bearer ${process.env.RESEND_API_KEY}`]);
+    assert.equal(webhookStorage.state.communications[0].content_state, 'complete');
+    assert.equal(webhookStorage.state.communications[0].body_text, 'Read on arrival.');
+
+    // A fetch that failed earlier is retried with the same key.
+    const storage = createStorage();
+    const body = receivedPayload({ id: `evt-gmail-${label}`, emailId: 'received-gmail-1', from: 'Unknown <unknown@example.com>' });
+    const failed = await recordEmailEventsFromWebhook(sharedSecretRequest(body), {
+      storage,
+      fetcher: async () => response({}, 503),
+    });
+    assert.equal(failed.ok, true);
+    assert.equal(storage.state.communications[0].content_state, 'failed');
+
+    const authorizations = [];
+    const retried = await retryPendingInboundIngestion({
+      storage,
+      configOverride,
+      now: new Date(Date.now() + 16 * 60 * 1000),
+      fetcher: async (_url, options) => {
+        authorizations.push(options.headers.Authorization);
+        return response({ id: 'received-gmail-1', from: 'Unknown <unknown@example.com>',
+          to: ['deals@inbound.example.com'], subject: 'Re: CIM request', text: 'Read under Gmail.', attachments: [] });
+      },
+    });
+
+    assert.equal(retried.completed, 1);
+    assert.deepEqual(authorizations, [`Bearer ${process.env.RESEND_API_KEY}`]);
+    assert.equal(storage.state.communications[0].body_text, 'Read under Gmail.');
+  });
+}
+
 test('received content and generic email-event metadata are byte bounded before durable storage', async () => {
   const storage = createStorage();
   const oversizedPayload = JSON.stringify({

@@ -214,6 +214,29 @@ function taskThreeRunOptions({ storage, now, markerDir = '', projection, sendPre
   };
 }
 
+test('a restarted scheduler logs a check, not a send, when the date is already sent', async (t) => {
+  const logs = [];
+  t.mock.method(console, 'log', (message) => logs.push(String(message)));
+  let runs = 0;
+  const scheduler = startDealHunterDailyEmailScheduler({
+    getNow: () => new Date('2026-07-16T18:00:00.000Z'),
+    scheduleTimer: () => ({ unref() {} }),
+    scheduleOverride: { enabled: true, time: '00:00', timezone: 'UTC', retryIntervalMs: 0 },
+    runEmail: async () => {
+      runs += 1;
+      return { alreadySent: true, emailResult: { status: 'already-sent', error: '' } };
+    },
+  });
+
+  await scheduler.tick();
+  await scheduler.tick();
+  scheduler.stop();
+  assert.equal(runs, 1, 'an already-sent date is checked once per process');
+  assert.ok(logs.some((line) => line.includes('checking daily email for 2026-07-16')));
+  assert.ok(logs.some((line) => line.includes('daily email already sent date=2026-07-16')));
+  assert.equal(logs.some((line) => line.includes('sending daily email')), false);
+});
+
 test('daily scheduler is due at 08:00 Pacific in winter PST', () => {
   const before = shouldRunDailyDealHunterEmail({ now: new Date('2026-01-15T15:59:59.000Z'), scheduleTime: '08:00' });
   const due = shouldRunDailyDealHunterEmail({ now: new Date('2026-01-15T16:00:00.000Z'), scheduleTime: '08:00' });
