@@ -1652,7 +1652,7 @@ export function createApp({
         const reviewed = await reviewDailyDeals({ reviewMode: requestedReviewMode, withScoredDeals: true });
         review = reviewed.review;
         review.dailyEmailJob = await getDailyDealHunterJobStatus();
-        review.emailReadiness = await getEmailReadiness();
+        review.emailReadiness = projectBrowserEmailReadiness(await getEmailReadiness());
         if (review.scoringDeferred) {
           reviewWarning = 'The export was imported and retained, but scoring is deferred until every required Google Sheet is healthy.';
         } else {
@@ -1701,7 +1701,7 @@ export function createApp({
       const reviewed = await reviewDailyDeals({ reviewMode: 'full-backfill', withScoredDeals: true });
       const review = reviewed.review;
       review.dailyEmailJob = await getDailyDealHunterJobStatus();
-      review.emailReadiness = await getEmailReadiness();
+      review.emailReadiness = projectBrowserEmailReadiness(await getEmailReadiness());
       await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
       const reviewWarning = review.scoringDeferred
         ? deferredBackfillWarning(review)
@@ -2259,7 +2259,7 @@ export function createApp({
       });
       if (result.review) {
         result.review.dailyEmailJob = await getDailyDealHunterJobStatus();
-        result.review.emailReadiness = await getEmailReadiness();
+        result.review.emailReadiness = projectBrowserEmailReadiness(await getEmailReadiness());
       }
       response.status(result.status || (result.ok ? 200 : 400)).json({
         success: Boolean(result.ok),

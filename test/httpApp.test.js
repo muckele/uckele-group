@@ -1106,6 +1106,59 @@ test('email test route never returns configured addresses to the browser', async
   });
 });
 
+test('email test with no recipient sends to the configured administrator address and stays sanitized', async () => {
+  const sentinels = {
+    admin: 'email-test-ok-admin@example.invalid',
+    fallback: 'email-test-ok-fallback@example.invalid',
+    digest: 'email-test-ok-digest@example.invalid',
+    sender: 'email-test-ok-sender@example.invalid',
+    replyTo: 'email-test-ok-reply@example.invalid',
+  };
+  const realFetch = globalThis.fetch;
+  const resendBodies = [];
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).startsWith('https://api.resend.com/')) {
+      resendBodies.push(JSON.parse(options.body || '{}'));
+      return new Response(JSON.stringify({ id: '7b6c2c5e-0d2f-4b8f-9a39-1f2a3b4c5d6e' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return realFetch(url, options);
+  };
+  try {
+    await withEmailReadinessAddressConfig({
+      adminEmail: sentinels.admin,
+      fallbackRecipient: sentinels.fallback,
+      dealHunterRecipient: sentinels.digest,
+      fromAddress: `Email Test Sender <${sentinels.sender}>`,
+      replyToAddress: sentinels.replyTo,
+      followUpSenderAddress: sentinels.sender,
+      followUpReplyToAddress: sentinels.replyTo,
+    }, async () => {
+      await withServer(async (origin) => {
+        const cookie = await signInForCookie(origin);
+        const response = await realFetch(`${origin}/api/admin/email/test`, {
+          method: 'POST',
+          headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const payload = await response.json();
+        assert.equal(response.status, 201, JSON.stringify(payload.emailResult || payload.error));
+        assert.equal(payload.success, true);
+        assert.equal(resendBodies.length, 1);
+        assert.deepEqual([].concat(resendBodies[0].to), [sentinels.admin]);
+        assert.equal(payload.readiness.recipientConfigured, true);
+        assert.equal(payload.readiness.senderConfigured, true);
+        const serializedReadiness = JSON.stringify(payload.readiness);
+        for (const sentinel of Object.values(sentinels)) {
+          assert.equal(serializedReadiness.includes(sentinel), false, sentinel);
+        }
+      });
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('Operations hides configured readiness addresses from administrator and viewer browsers', async () => {
   const sentinels = {
     testRecipient: 'operations-private-admin@example.invalid',

@@ -188,6 +188,13 @@ describe('Operations Center partial failures', () => {
     expect(screen.getByRole('button', { name: 'Send Test' })).toBeDisabled();
   });
 
+  test('sender and reply-to show as configured without their addresses', () => {
+    render(<EmailReadinessPanel data={{ provider: 'resend', outboundConfigured: true, recipientConfigured: true,
+      senderConfigured: true, replyToConfigured: false }} />);
+    expect(screen.getByText('From:').parentElement).toHaveTextContent('From: Configured');
+    expect(screen.getByText('Reply-to:').parentElement).toHaveTextContent('Reply-to: Not configured');
+  });
+
   test('shows generic email gates and body-free operational metrics without overstating delivery', () => {
     render(<EmailReadinessPanel data={{
       provider: 'resend',

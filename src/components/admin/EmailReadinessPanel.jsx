@@ -92,7 +92,7 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
             type="button"
           >
             <Send className="h-4 w-4" />
-            {testSending ? 'Sending Test…' : `Send Test${data.testRecipient ? ` to ${data.testRecipient}` : ''}`}
+            {testSending ? 'Sending Test…' : 'Send Test'}
           </button>
         ) : null}
       </div>
@@ -121,8 +121,8 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
       </div>
 
       <div className="mt-5 grid gap-3 text-xs leading-6 text-ink/65 md:grid-cols-2">
-        <p><strong className="text-ink">From:</strong> {data.fromAddress || 'Not configured'}</p>
-        <p><strong className="text-ink">Reply-to:</strong> {data.replyToAddress || 'Not configured'}</p>
+        <p><strong className="text-ink">From:</strong> {data.fromAddress || (data.senderConfigured ? 'Configured' : 'Not configured')}</p>
+        <p><strong className="text-ink">Reply-to:</strong> {data.replyToAddress || (data.replyToConfigured ? 'Configured' : 'Not configured')}</p>
         <p><strong className="text-ink">Inbound domain:</strong> {data.inboundDomain || 'Not configured'}</p>
         <p><strong className="text-ink">Last delivery event:</strong> {formatDate(data.latestDeliveryEvent?.createdAt)}</p>
         <p><strong className="text-ink">Verified test reply:</strong> {formatDate(data.latestVerifiedReplyEvent?.createdAt)}</p>
