@@ -26,7 +26,7 @@ const INITIAL_FIXTURE = `Hi Jordan,
 
 I'd like to evaluate Sample Plumbing Co. Happy to sign your NDA. Could you send it over along with the CIM?
 
-What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I focus on professional, healthcare, and tech-enabled services. I'm based in Southern California and open to strong opportunities nationwide.
+What I'm buying: cash-flowing service businesses with $600K-$2M in SDE/EBITDA, recurring or repeat demand, and an established team. I'm based in Southern California and open to strong opportunities nationwide.
 
 How I operate: as an active owner. I step in to learn the business and earn the trust of the team and customers, then build the systems and leadership so it runs well for the long term.
 
@@ -142,7 +142,7 @@ test('digest changes when any template or signature field changes and not when t
 test('a business name ending in a period keeps one period before the template period, and the digest is unchanged', () => {
   // The digest of the v2 wording for this sender. It changes only when the wording does.
   assert.equal(pursueCimWordingDigest(sender),
-    '8515eec127246ece449756d5ad06551e06826a72849c9c9b0c47e9b9641a491e');
+    'e071822c713ac797293aa900afbbac225aa730f9360aee48c427fee8919d6e18');
   const emails = [renderPursueCimEmail({ kind: 'initial', deal: sampleDeal, sender }),
     ...[1, 2, 3, 4].map((followUpNumber) => renderPursueCimEmail({ kind: 'follow-up', followUpNumber,
       deal: sampleDeal, sender })),
@@ -162,7 +162,7 @@ test('a business name ending in a period keeps one period before the template pe
     deal: { name: 'Acme Inc...', brokerName: 'Sam' }, sender });
   assert.match(dots.text, /on Acme Inc\.\.\. If it comes back to market/);
   assert.equal(pursueCimWordingDigest(sender),
-    '8515eec127246ece449756d5ad06551e06826a72849c9c9b0c47e9b9641a491e');
+    'e071822c713ac797293aa900afbbac225aa730f9360aee48c427fee8919d6e18');
 });
 
 test('senderSignatureComplete is false when name, title, phone, or postal is blank', () => {
