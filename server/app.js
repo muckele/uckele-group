@@ -1047,7 +1047,7 @@ export function createApp({
       const allowedRecipient = readiness.allowedTestRecipients.includes(requestedRecipient);
 
       if (!readiness.outboundConfigured) {
-        response.status(409).json({ success: false, error: 'Resend outbound delivery is not fully configured.', readiness });
+        response.status(409).json({ success: false, error: 'Resend outbound delivery is not fully configured.', readiness: projectBrowserEmailReadiness(readiness) });
         return;
       }
 
@@ -1055,7 +1055,7 @@ export function createApp({
         response.status(400).json({
           success: false,
           error: 'Test emails may only be sent to a configured internal administrator address.',
-          readiness,
+          readiness: projectBrowserEmailReadiness(readiness),
         });
         return;
       }
@@ -1068,7 +1068,7 @@ export function createApp({
       response.status(emailResult.status === 'failed' ? 502 : 201).json({
         success: emailResult.status !== 'failed',
         emailResult,
-        readiness: refreshedReadiness,
+        readiness: projectBrowserEmailReadiness(refreshedReadiness),
       });
     }),
   );
@@ -1652,7 +1652,7 @@ export function createApp({
         const reviewed = await reviewDailyDeals({ reviewMode: requestedReviewMode, withScoredDeals: true });
         review = reviewed.review;
         review.dailyEmailJob = await getDailyDealHunterJobStatus();
-        review.emailReadiness = await getEmailReadiness();
+        review.emailReadiness = projectBrowserEmailReadiness(await getEmailReadiness());
         if (review.scoringDeferred) {
           reviewWarning = 'The export was imported and retained, but scoring is deferred until every required Google Sheet is healthy.';
         } else {
@@ -1701,7 +1701,7 @@ export function createApp({
       const reviewed = await reviewDailyDeals({ reviewMode: 'full-backfill', withScoredDeals: true });
       const review = reviewed.review;
       review.dailyEmailJob = await getDailyDealHunterJobStatus();
-      review.emailReadiness = await getEmailReadiness();
+      review.emailReadiness = projectBrowserEmailReadiness(await getEmailReadiness());
       await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
       const reviewWarning = review.scoringDeferred
         ? deferredBackfillWarning(review)
@@ -2259,7 +2259,7 @@ export function createApp({
       });
       if (result.review) {
         result.review.dailyEmailJob = await getDailyDealHunterJobStatus();
-        result.review.emailReadiness = await getEmailReadiness();
+        result.review.emailReadiness = projectBrowserEmailReadiness(await getEmailReadiness());
       }
       response.status(result.status || (result.ok ? 200 : 400)).json({
         success: Boolean(result.ok),

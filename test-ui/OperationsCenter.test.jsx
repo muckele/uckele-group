@@ -169,6 +169,32 @@ describe('Operations Center partial failures', () => {
     expect(screen.queryByRole('button', { name: /canary/i })).not.toBeInTheDocument();
   });
 
+  test('Send Test works from the sanitized readiness the server sends to browsers', () => {
+    // The browser never receives the test address (only recipientConfigured); the server picks it.
+    const onSendTest = vi.fn();
+    const { rerender } = render(<EmailReadinessPanel data={{ provider: 'resend', outboundConfigured: true,
+      recipientConfigured: true }} onSendTest={onSendTest} />);
+    const button = screen.getByRole('button', { name: 'Send Test' });
+    expect(button).toBeEnabled();
+    button.click();
+    expect(onSendTest).toHaveBeenCalledTimes(1);
+
+    rerender(<EmailReadinessPanel data={{ provider: 'resend', outboundConfigured: true,
+      recipientConfigured: false }} onSendTest={onSendTest} />);
+    expect(screen.getByRole('button', { name: 'Send Test' })).toBeDisabled();
+
+    rerender(<EmailReadinessPanel data={{ provider: 'resend', outboundConfigured: false,
+      recipientConfigured: true }} onSendTest={onSendTest} />);
+    expect(screen.getByRole('button', { name: 'Send Test' })).toBeDisabled();
+  });
+
+  test('sender and reply-to show as configured without their addresses', () => {
+    render(<EmailReadinessPanel data={{ provider: 'resend', outboundConfigured: true, recipientConfigured: true,
+      senderConfigured: true, replyToConfigured: false }} />);
+    expect(screen.getByText('From:').parentElement).toHaveTextContent('From: Configured');
+    expect(screen.getByText('Reply-to:').parentElement).toHaveTextContent('Reply-to: Not configured');
+  });
+
   test('shows generic email gates and body-free operational metrics without overstating delivery', () => {
     render(<EmailReadinessPanel data={{
       provider: 'resend',
