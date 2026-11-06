@@ -45,7 +45,7 @@
   - Provider name: `gmail`.
   - Provider profile: `production-gmail-v1`.
   - Contact policy: `listing-broker-inquiry-v1`.
-  - Template versions: `pursue-cim-initial-v1` and `pursue-cim-follow-up-v1`.
+  - Template versions: `pursue-cim-initial-v1` and `pursue-cim-follow-up-v1` (superseded on 2026-11-05 by v2, the owner's operator-voice wording; see the spec, section 8).
   - Payload versions: `deal-hunter-cim-pursue-initial-v2` and `deal-hunter-cim-pursue-follow-up-v1`.
   - Message-ID format: `<{transmissionId}@{sender domain}>`.
 - **Readiness reason codes:** `gmail_not_connected`, `gmail_token_invalid`, `gmail_address_mismatch`, `wording_not_approved`, `contact_rule_off`, `live_sending_off`, `signature_incomplete`.
