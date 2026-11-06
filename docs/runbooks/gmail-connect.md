@@ -195,12 +195,24 @@ address (a personal address works).
 
    - Put exactly one address in `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS`. With none, or more
      than one, nothing is sent.
-2. In the **Email sending** card, click **Turn on Live sending** and confirm.
+   - The app restarts. Check that it came back (`fly status` shows the machine `started` and
+     passing) before going on. The daily digest and admin sign-in emails keep going through Resend
+     during the test; only broker email is confined to your test inbox.
+2. Lift the central outreach pause, if it is on. In **Admin → Operations** (the **Operations**
+   page in the left sidebar, not the Deal Hunter Operations view), jump to **Automation**. In the
+   **CIM outreach** section, click **Resume all CIM outreach** and confirm. Leave **Resume
+   automation only** alone.
+   - While that pause is on, the **Email sending** card's readiness says **All CIM outreach is
+     paused.** and nothing sends.
+   - The `DEAL_HUNTER_CIM_OUTREACH_PAUSED` setting in `fly.toml` stays `true`. It keeps the
+     older send paths shut and doesn't affect the Gmail sender, so the button may still read
+     **Resume** afterwards.
+3. In the **Email sending** card, click **Turn on Live sending** and confirm.
    - The Live sending part says **Sending setup: controlled test (one allowed recipient)**.
    - Readiness should say **Ready to send.** If it doesn't, fix what it lists first. Right after
      the settings change it may say **Reply checking hasn't run recently**; that clears within
      5 minutes, once the first reply check has run.
-3. Make a dedicated test listing whose **only** broker email is your test inbox.
+4. Make a dedicated test listing whose **only** broker email is your test inbox.
    - Don't reuse a real listing. A listing's contacts are every broker email the app knows for
      it: from the Sheet, from the CRM, and any you type on the listing. A real listing that
      already has a broker email would then have two, and the contact rule only emails a listing
@@ -214,12 +226,14 @@ address (a personal address works).
         Leave **City** empty or use a city in that state.
       - **Broker Name:** your name. **Broker Email:** your test inbox, and no other email address
         anywhere in the row. Don't use a shared mailbox like `info@` or `sales@`.
-   2. After the next Sheet sync, find the listing in the Deal Hunter Inbox and open it. Under
+   2. After the next Sheet sync, find the listing in the Deal Hunter Inbox and open it.
+      While `DEAL_HUNTER_SHEET_SYNC_ENABLED` is off, new Sheet rows only arrive with the weekday
+      08:00 (Pacific) digest, so a row added after 08:00 shows up the next weekday morning. Under
       **Broker & Seller**, your test inbox is the only broker email.
-4. Click **Request SIM** on the test listing.
+5. Click **Request SIM** on the test listing.
    - If **Request SIM** isn't offered, the listing isn't ready yet (for example the sync hasn't
      picked it up). Wait for the next sync and check again.
-5. Wait for the first email.
+6. Wait for the first email.
    - The sender runs every 15 minutes, and sends only on weekdays between 08:00 and 17:00 in the
      listing's local time.
    - Check your test inbox: the email comes from the sending address, with your signature.
@@ -230,20 +244,20 @@ address (a personal address works).
      the **Campaign state** and, after a dot, why it is waiting. For example:
      - `Waiting On Eligibility · Contact Permission Missing`, or the Inbox asking you to choose a
        broker email when you click Request SIM: the listing has more than one broker email. Go
-       back to step 3 and make a listing with only your test inbox.
+       back to step 4 and make a listing with only your test inbox.
      - `Action Required · Timezone Missing` or `Timezone Ambiguous`: its State isn't exactly one
        of the six above.
 
      Also check the **Email sending** card's readiness and **Last runs** in Operations.
-6. Wait for the follow-up.
+7. Wait for the follow-up.
    - It is due 2 business days later at 08:00 in the listing's local time. There is no way to
      bring it forward: just wait for it.
    - Check your test inbox: the follow-up arrives **in the same thread** as the first email.
-7. Reply to that thread from your test inbox.
+8. Reply to that thread from your test inbox.
    - Within about 5 minutes, **Last runs** shows the reply check with `1 replies`, and the
      listing's campaign shows as responded.
    - No more follow-ups are sent. You can check again after the next follow-up's due date.
-8. Finish the test and switch to real sending:
+9. Finish the test and switch to real sending:
    1. Click **Turn off Live sending** and confirm.
    2. Change the sending setup to production and remove the test-only settings:
 

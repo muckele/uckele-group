@@ -190,7 +190,9 @@ export function getCimProviderDeliveryConfig(config) {
 
 export function getCimWebhookAuthority(config) {
   const profile = config?.dealHunter?.cimProvider;
-  if (profile?.mode === 'controlled-mailbox') {
+  // Gmail sends produce no Resend events, so the Gmail controlled test keeps the app's own
+  // webhook secret (digest delivery events), exactly as production Gmail does.
+  if (profile?.mode === 'controlled-mailbox' && profile.provider !== 'gmail') {
     return { providerProfile: profile.profile, secret: profile.emailWebhookSecret,
       requireSignedProviderEvent: true };
   }
@@ -386,8 +388,12 @@ export function getConfig() {
   const sqlitePath = process.env.SQLITE_PATH || path.join(rootDir, 'data', 'uckele-group.sqlite');
   const defaultDataDir = path.dirname(sqlitePath);
   const cimProvider = resolveCimProviderProfile();
+  // The Resend controlled harnesses run keyless: they blank the app's own delivery settings so
+  // nothing but the harness can send. The Gmail controlled test (runbook Part C step 5) runs on
+  // production, where the digest and admin sign-in links still need Resend; its broker email is
+  // confined by the CIM profile binding (one allowed recipient), not by blanking app delivery.
   const controlledMailbox = ['controlled-mailbox', 'controlled-mailbox-limited-smoke']
-    .includes(cimProvider.mode);
+    .includes(cimProvider.mode) && cimProvider.provider !== 'gmail';
 
   cachedConfig = {
     rootDir,
