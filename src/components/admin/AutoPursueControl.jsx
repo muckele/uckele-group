@@ -168,8 +168,13 @@ export default function AutoPursueControl({ onChanged, readOnly = false, status 
   const triggerRef = useRef(null);
   const returnFocusRef = useRef(false);
   const mode = status?.mode;
-  // A mode changed elsewhere makes an open panel's choice out of date: close it.
+  const changeRef = useRef('');
+  changeRef.current = change;
+  // A mode changed elsewhere makes an open panel's choice out of date: close it, unless a save
+  // is in flight (its own result closes the panel or shows the error).
   useEffect(() => {
+    if (inFlightRef.current) return;
+    if (changeRef.current) returnFocusRef.current = true;
     setChange('');
     setError('');
   }, [mode]);
