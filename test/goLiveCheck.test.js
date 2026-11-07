@@ -10,10 +10,15 @@ import Database from 'better-sqlite3';
 import {
   PRODUCTION_PROFILE,
   REMOVABLE_KEYS,
+  appReadKeys,
+  environmentProblems,
   goLiveAfterProblems,
   goLiveProblems,
   goLiveTargetEnv,
   goLiveUnsetKeys,
+  parseNames,
+  pendingRemovals,
+  profileLabel,
   sheetSourcesPlan,
 } from '../scripts/go-live-check.js';
 import { RUNBOOK_STAGES, flyTomlEnv, productionSecrets } from './productionBootEnv.js';
@@ -24,6 +29,7 @@ const FEED = 'https://docs.google.com/spreadsheets/d/example/export?format=csv';
 const TEST_SHEET = 'https://docs.google.com/spreadsheets/d/e/test-sheet/pub?output=csv';
 const STEP5 = RUNBOOK_STAGES['step 5 controlled test through Gmail'];
 const STEP6 = RUNBOOK_STAGES['step 6 production Gmail'];
+const WITH_TEST_SHEET = { DEAL_HUNTER_SHEET_CSV_URL: FEED, DEAL_HUNTER_SHEET_CSV_URLS: `${FEED},${TEST_SHEET}` };
 const GOOD_BOOT = { errors: [], cimMode: 'production-gmail', cimProvider: 'gmail', deliveryProvider: 'resend',
   sheetSourceCount: 1 };
 
@@ -94,15 +100,63 @@ test('the switch is refused outside the rollout: no profile, or a sender setting
     boot: GOOD_BOOT, liveSendingEnabled: false })), ['setting_off']);
 });
 
-test('after the switch, leftover test settings or the old profile are reported', () => {
-  assert.deepEqual(goLiveAfterProblems({ env: { ...STEP6 }, boot: GOOD_BOOT }), []);
-  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP5 }, boot: GOOD_BOOT })),
-    ['profile_not_production', 'test_setting_left', 'test_setting_left']);
-  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP6 }, boot: null })), ['boot_check_failed']);
+test('after the switch, leftover settings, the old profile, Live sending on or no Sheet are reported', () => {
+  const off = { boot: GOOD_BOOT, liveSendingEnabled: false };
+  assert.deepEqual(goLiveAfterProblems({ env: { ...STEP6 }, ...off }), []);
+  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP5 }, ...off })),
+    ['profile_not_production', 'setting_left', 'setting_left']);
+  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP6, ...WITH_TEST_SHEET }, ...off,
+    expectUnset: ['DEAL_HUNTER_SHEET_CSV_URLS'] })), ['setting_left']);
+  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP6 }, boot: GOOD_BOOT, liveSendingEnabled: true })),
+    ['live_sending_on']);
+  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP6 }, boot: GOOD_BOOT, liveSendingEnabled: null })),
+    ['live_sending_unknown']);
+  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP6 }, liveSendingEnabled: false,
+    boot: { ...GOOD_BOOT, sheetSourceCount: 0 } })), ['no_sheet_source']);
+  assert.deepEqual(codes(goLiveAfterProblems({ env: { ...STEP6 }, boot: null, liveSendingEnabled: false })),
+    ['boot_check_failed']);
+});
+
+test('a removal staged on Fly (on the machine, but neither a secret nor set by config) blocks the switch', () => {
+  const appKeys = new Set(['RESEND_API_KEY', 'DEAL_HUNTER_CIM_MAILBOX_PROVIDER', 'SQLITE_PATH']);
+  const env = { RESEND_API_KEY: 'x', DEAL_HUNTER_CIM_MAILBOX_PROVIDER: 'gmail', SQLITE_PATH: '/data/a', PATH: '/bin' };
+  assert.deepEqual(pendingRemovals(env, { secretNames: ['DEAL_HUNTER_CIM_MAILBOX_PROVIDER'], envNames: ['SQLITE_PATH'],
+    appKeys }), ['RESEND_API_KEY']);
+  // The switch's own removals, staged by an earlier failed run, are not counted.
+  assert.deepEqual(pendingRemovals(env, { secretNames: ['RESEND_API_KEY'], envNames: ['SQLITE_PATH'], appKeys,
+    plannedUnset: ['DEAL_HUNTER_CIM_MAILBOX_PROVIDER'] }), []);
+  assert.deepEqual(codes(goLiveProblems({ env: { ...STEP5 }, boot: GOOD_BOOT, liveSendingEnabled: false,
+    pending: ['RESEND_API_KEY'] })), ['removal_staged']);
+  assert.deepEqual(codes(goLiveProblems({ env: { ...STEP5 }, boot: GOOD_BOOT, liveSendingEnabled: false,
+    pending: null })), ['secret_names_missing']);
+});
+
+test('the app-read names come from server/config.js, and name lists drop anything that is not a name', () => {
+  const keys = appReadKeys();
+  for (const key of ['DEAL_HUNTER_CIM_PROVIDER_PROFILE', 'DEAL_HUNTER_CIM_MAILBOX_PROVIDER', 'RESEND_API_KEY']) {
+    assert.ok(keys.has(key), key);
+  }
+  assert.deepEqual(parseNames('A_1, b ,C;rm -rf,,D'), ['A_1', 'D']);
+});
+
+test('the profile is shown as a label, never its raw value', () => {
+  assert.equal(profileLabel({ DEAL_HUNTER_CIM_PROVIDER_PROFILE: 'controlled-mailbox-v1' }), 'controlled test');
+  assert.equal(profileLabel({ DEAL_HUNTER_CIM_PROVIDER_PROFILE: 'production-gmail-v1' }), 'production');
+  assert.equal(profileLabel({ DEAL_HUNTER_CIM_PROVIDER_PROFILE: 're_live_pasted_key' }), '(something else)');
+  assert.equal(profileLabel({}), '(none)');
+});
+
+test('the check must run with the production app settings', () => {
+  const env = { NODE_ENV: 'production', SQLITE_PATH: '/data/a.sqlite', FLY_APP_NAME: 'uckele-group' };
+  assert.deepEqual(environmentProblems(env, { app: 'uckele-group', sqliteExists: true }), []);
+  assert.deepEqual(codes(environmentProblems({ ...env, FLY_APP_NAME: 'other' }, { app: 'uckele-group', sqliteExists: true })),
+    ['wrong_app']);
+  assert.deepEqual(codes(environmentProblems({}, { app: '', sqliteExists: false })),
+    ['not_production', 'no_database', 'no_app_name']);
 });
 
 // End to end: the script as the server runs it, against the real config module and a database.
-function runScript(args, stageEnv, { liveSending = 0, withControls = true, extraEnv = {} } = {}) {
+function runScript(args, stageEnv, { liveSending = 0, withControls = true, extraEnv = {}, names = true } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-golive-'));
   try {
     const secrets = productionSecrets(dataDir);
@@ -116,22 +170,43 @@ function runScript(args, stageEnv, { liveSending = 0, withControls = true, extra
     db.close();
     const env = { PATH: process.env.PATH, HOME: process.env.HOME, ...flyTomlEnv(), ...secrets, ...stageEnv,
       ...extraEnv, NODE_ENV: 'production' };
-    const child = spawnSync(process.execPath, [scriptPath, ...args], { encoding: 'utf8', env, cwd: rootDir });
+    const fullArgs = [...args, '--app=uckele-group'];
+    if (names && args[0] === 'before') {
+      const configNames = Object.keys(flyTomlEnv());
+      fullArgs.push(`--env-names=${[...configNames, 'NODE_ENV'].join(',')}`,
+        `--secret-names=${Object.keys(env).filter((key) => !configNames.includes(key) && /^[A-Z]/.test(key)).join(',')}`);
+    }
+    const child = spawnSync(process.execPath, [scriptPath, ...fullArgs], { encoding: 'utf8', env, cwd: rootDir });
     return { ...child, lastLine: child.stdout.trim().split('\n').at(-1) };
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 }
 
-const WITH_TEST_SHEET = { DEAL_HUNTER_SHEET_CSV_URL: FEED, DEAL_HUNTER_SHEET_CSV_URLS: `${FEED},${TEST_SHEET}` };
 
 test('before: from the controlled test with Live sending off, the check passes and names what it removes', () => {
   const run = runScript(['before'], { ...STEP5, ...WITH_TEST_SHEET });
   assert.equal(run.status, 0, run.stderr);
-  assert.equal(run.lastLine, 'GO_LIVE_CHECK result=ok unset=DEAL_HUNTER_CIM_MAILBOX_PROVIDER,'
+  assert.equal(run.lastLine, 'GO_LIVE_CHECK result=ok from=controlled unset=DEAL_HUNTER_CIM_MAILBOX_PROVIDER,'
     + 'DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS,DEAL_HUNTER_SHEET_CSV_URLS');
   assert.match(run.stdout, /App startup check with the new settings: passes/);
   assert.match(run.stdout, /Live sending: off/);
+  assert.match(run.stdout, /Sending setup now: controlled test/);
+});
+
+test('before: a setting on the machine that Fly will not deploy blocks the switch', () => {
+  const run = runScript(['before'], { ...STEP5 }, { names: false, extraEnv: {} });
+  assert.match(run.stdout, /\[secret_names_missing\]/);
+  const staged = runScript(['before', '--secret-names=DEAL_HUNTER_CIM_PROVIDER_ENABLED',
+    `--env-names=${Object.keys(flyTomlEnv()).join(',')}`], { ...STEP5 }, { names: false });
+  assert.match(staged.lastLine, /^GO_LIVE_CHECK result=blocked/);
+  assert.match(staged.stdout, /\[removal_staged\]/);
+  assert.match(staged.stdout, /RESEND_API_KEY/);
+});
+
+test('before: from production with nothing left to remove, the check passes with from=production', () => {
+  const run = runScript(['before'], { ...STEP6 });
+  assert.equal(run.lastLine, 'GO_LIVE_CHECK result=ok from=production');
 });
 
 test('before: never prints a setting value', () => {
@@ -159,8 +234,10 @@ test('before: blocked when the new settings would stop the app from starting', (
 });
 
 test('after: passes on the step 6 settings and is blocked on the step 5 settings', () => {
-  const done = runScript(['after'], { ...STEP6 });
+  const done = runScript(['after', '--expect-unset=DEAL_HUNTER_SHEET_CSV_URLS'], { ...STEP6 });
   assert.equal(done.lastLine, 'GO_LIVE_CHECK result=ok');
+  const liveOn = runScript(['after'], { ...STEP6 }, { liveSending: 1 });
+  assert.match(liveOn.stdout, /\[live_sending_on\]/);
   const notDone = runScript(['after'], { ...STEP5 });
   assert.match(notDone.lastLine, /^GO_LIVE_CHECK result=blocked/);
   assert.match(notDone.stdout, /\[profile_not_production\]/);

@@ -108,3 +108,13 @@ test('production boots with the step 6 profile while the test-only settings are 
   assert.equal(booted.cimProvider.mode, 'production-gmail');
   assert.deepEqual(booted.cimProvider.allowedRecipients, []);
 });
+
+test('production boots after the go-live recovery command removes the profile', () => {
+  // scripts/go-live-production-gmail.sh tells the owner to unset the profile if the switch's
+  // deploy fails; with the test-only settings already gone, that must start the app.
+  const { DEAL_HUNTER_CIM_PROVIDER_PROFILE: _profile, ...withoutProfile } = RUNBOOK_STAGES['step 6 production Gmail'];
+  const booted = bootProductionConfig(withoutProfile);
+  assert.deepEqual(booted.errors, []);
+  assert.equal(booted.delivery.provider, 'resend');
+  assert.notEqual(booted.cimProvider.provider, 'gmail');
+});
