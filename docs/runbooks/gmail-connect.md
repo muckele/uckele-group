@@ -263,9 +263,40 @@ address (a personal address works).
    - No more follow-ups are sent. You can check again after the next follow-up's due date.
 9. Finish the test and switch to real sending:
    1. Click **Turn off Live sending** and confirm.
-   2. Change the sending setup to production and remove the test-only settings. Run the two
-      commands **in this order**: removing `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` while the profile
-      is still `controlled-mailbox-v1` stops the app from starting.
+   2. Change the sending setup to production and remove the test-only settings with the
+      go-live script. From the project folder, run:
+
+      ```
+      bash scripts/go-live-production-gmail.sh
+      ```
+
+      - You need `fly auth login` done, and the server must be running a release that includes
+        the script (it tells you if not). You can run `--check` any time to confirm both; while
+        Live sending is still on it ends with **Stopped**, which is expected.
+      - It first checks, on the server, that the app would start with the new settings and that
+        Live sending is off. It also refuses if Fly holds secret changes that were staged but
+        never applied, because the switch would apply those too. If anything is wrong, it stops
+        and changes nothing. To run only that check, add `--check`.
+      - Then it asks you to type `GO LIVE`, checks again, and sets
+        `DEAL_HUNTER_CIM_PROVIDER_PROFILE=production-gmail-v1` and removes
+        `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` and `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS`. If the
+        test listing Sheet was added as a second Sheet source (`DEAL_HUNTER_SHEET_CSV_URLS`), it
+        removes that too, and the deal feed stays. To leave that setting alone, add
+        `--keep-sheet-sources`. All the changes are applied together, so the app restarts once.
+      - It waits for the app to come back and checks the switch landed. It never turns Live
+        sending on.
+      - It prints setting names and the sending setup's label, never a setting's value.
+      - If applying the changes fails and the app doesn't come back, the script prints the one
+        command that starts it again with broker email off
+        (`fly secrets unset DEAL_HUNTER_CIM_PROVIDER_PROFILE`). Don't set the profile back to
+        `controlled-mailbox-v1` on its own: the test-only settings are already gone, and the app
+        won't start that way.
+
+      Without the script, run these two commands **in this order** instead. Removing
+      `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` while the profile is still `controlled-mailbox-v1`
+      stops the app from starting. If the test listing Sheet was added as a second Sheet source,
+      also remove `DEAL_HUNTER_SHEET_CSV_URLS` in the second command; the deal feed in
+      `DEAL_HUNTER_SHEET_CSV_URL` stays.
 
       ```
       fly secrets set DEAL_HUNTER_CIM_PROVIDER_PROFILE=production-gmail-v1
