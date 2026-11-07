@@ -263,9 +263,29 @@ address (a personal address works).
    - No more follow-ups are sent. You can check again after the next follow-up's due date.
 9. Finish the test and switch to real sending:
    1. Click **Turn off Live sending** and confirm.
-   2. Change the sending setup to production and remove the test-only settings. Run the two
-      commands **in this order**: removing `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` while the profile
-      is still `controlled-mailbox-v1` stops the app from starting.
+   2. Change the sending setup to production and remove the test-only settings with the
+      go-live script. From the project folder, run:
+
+      ```
+      bash scripts/go-live-production-gmail.sh
+      ```
+
+      - It first checks, on the server, that the app would start with the new settings and that
+        Live sending is off. If anything is wrong, it stops and changes nothing. To run only that
+        check, add `--check`.
+      - Then it asks you to type `GO LIVE`. It sets
+        `DEAL_HUNTER_CIM_PROVIDER_PROFILE=production-gmail-v1` and removes
+        `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` and `DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS`. If the
+        test listing Sheet was added as a second Sheet source (`DEAL_HUNTER_SHEET_CSV_URLS`), it
+        removes that too, and the deal feed stays. All the changes are applied together, so the
+        app restarts once.
+      - It waits for the app to come back and checks the switch landed. It never turns Live
+        sending on.
+      - It prints setting names only, never their values.
+
+      Without the script, run these two commands **in this order** instead. Removing
+      `DEAL_HUNTER_CIM_MAILBOX_PROVIDER` while the profile is still `controlled-mailbox-v1`
+      stops the app from starting.
 
       ```
       fly secrets set DEAL_HUNTER_CIM_PROVIDER_PROFILE=production-gmail-v1
