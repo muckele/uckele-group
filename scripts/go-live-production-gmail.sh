@@ -58,7 +58,7 @@ healthy() { "${GO_LIVE_CURL:-curl}" -fsS --max-time 10 "$HEALTH_URL" >/dev/null 
 # The names fly.toml [env] and the Dockerfile set: Fly deploys these alongside the secrets.
 # Read from this checkout, so run it from an up-to-date main. A staged removal of a name that is
 # both an [env] key and a secret is not caught; the fly.toml value applies instead, and for those
-# seven names it is the safe one (outreach and automation paused, follow-ups off, /data paths).
+# seven names it is outreach and automation paused, follow-ups off, and the app's /data paths.
 config_env_names() {
   {
     awk '/^[[:space:]]*\[/ { inenv = ($0 ~ /^[[:space:]]*\[env\][[:space:]]*$/); next }
@@ -187,6 +187,13 @@ if [[ "$CHECK_RESULT" != "$PLANNED" ]]; then
   echo "Something changed since the first check. Nothing changed; run this script again."; exit 1
 fi
 
+# Only remove names Fly still holds: after an earlier run's removal landed, unsetting the name
+# again could fail every re-run. The after-check still expects every planned name gone.
+TO_UNSET=()
+for name in "${UNSET[@]+"${UNSET[@]}"}"; do
+  if [[ ",$SECRET_NAMES," == *",$name,"* ]]; then TO_UNSET+=("$name"); fi
+done
+
 still_staged_note() {
   echo "The production sending setup may still be staged on Fly, and would take effect at the"
   echo "next deploy (the app starts fine with it). Run this script again now to finish the switch,"
@@ -223,8 +230,8 @@ if ! "$FLY" secrets set --stage -a "$APP" "$PROFILE_KEY=production-gmail-v1" </d
   echo "Staging the sending setup failed."
   restore_staged_profile; exit 1
 fi
-if [[ ${#UNSET[@]} -gt 0 ]]; then
-  if ! "$FLY" secrets unset --stage -a "$APP" "${UNSET[@]}" </dev/null; then
+if [[ ${#TO_UNSET[@]} -gt 0 ]]; then
+  if ! "$FLY" secrets unset --stage -a "$APP" "${TO_UNSET[@]}" </dev/null; then
     echo "Staging the removals failed."
     restore_staged_profile; exit 1
   fi

@@ -259,6 +259,22 @@ test('--keep-sheet-sources is passed to the server check', () => {
   assert.match(result.calls.find((call) => call.startsWith('ssh ')), / --keep-sheet-sources/);
 });
 
+test('a re-run only removes names Fly still holds, and still expects every planned name gone', () => {
+  const partlyRemoved = JSON.stringify([
+    { Name: 'RESEND_API_KEY', Status: 'Deployed' },
+    { Name: 'DEAL_HUNTER_CIM_PROVIDER_PROFILE', Status: 'Staged' },
+    { Name: 'DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS', Status: 'Deployed' },
+  ]);
+  const result = run({ secrets: partlyRemoved });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.secrets, [
+    'secrets set --stage -a uckele-group DEAL_HUNTER_CIM_PROVIDER_PROFILE=production-gmail-v1',
+    'secrets unset --stage -a uckele-group DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS',
+    'secrets deploy -a uckele-group',
+  ]);
+  assert.match(result.calls.at(-2) + result.calls.at(-1), /--expect-unset=DEAL_HUNTER_CIM_MAILBOX_PROVIDER,DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS,DEAL_HUNTER_SHEET_CSV_URLS/);
+});
+
 test('a re-run after the switch finished changes nothing', () => {
   const result = run({ before: 'GO_LIVE_CHECK result=ok from=production' });
   assert.equal(result.status, 0, result.stdout + result.stderr);
