@@ -5,6 +5,7 @@ import OpportunityDrawer, { PassForm, safeListingUrl } from './OpportunityDrawer
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
 import BrokerRepliesBlock, { useBrokerReplies } from './BrokerReplies.jsx';
 import { AutoPursueModeBadge, CriteriaLine, NearMissConfirmDialog, NotAutomaticReason, isNearMiss } from './AcquisitionCriteria.jsx';
+import AutoPursueControl from './AutoPursueControl.jsx';
 
 const emptySummary = { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 };
 const summaryItems = [
@@ -1308,6 +1309,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           <div><div className="flex flex-wrap items-center gap-2"><h3 className="text-lg font-semibold text-ink">{heading}</h3>{item.id === 'auto-pursue' ? <AutoPursueModeBadge status={autoPursueStatus} /> : null}</div><p className="text-xs text-ink/58">{item.total} {item.total === 1 ? 'opportunity' : 'opportunities'}{preview ? ` · ${item.counts?.due || 0} due (${item.counts?.overdue || 0} overdue) · ${item.counts?.ownerPriority || 0} owner priorities (${item.counts?.urgent || 0} urgent)` : ''}</p></div>
           <div className="flex flex-wrap gap-2">{preview ? <><button className={buttonClass} onClick={() => selectArea('due-actions')} type="button">View all due ({item.counts?.due || 0})</button><button className={buttonClass} onClick={() => selectArea('owner-priorities')} type="button">View all priorities ({item.counts?.ownerPriority || 0})</button></> : area === 'inbox' ? (item.id === 'new-important' ? <button className={buttonClass} onClick={() => selectArea('new-important')} type="button">View all New & Important</button> : null) : <button className={buttonClass} onClick={() => selectArea('inbox')} type="button">Back to Inbox</button>}</div>
         </div>
+        {item.id === 'auto-pursue' ? <AutoPursueControl onChanged={() => setAutoPursueReloads((count) => count + 1)} readOnly={readOnly} status={autoPursueStatus} /> : null}
         {item.id === 'auto-pursue' && autoPursueStatus?.todayPursued?.length ? <div className="border-b border-line/80 px-4 py-3">
           <p className="text-xs font-semibold text-ink/70">SIM requested automatically today</p>
           <ul aria-label="SIM requested automatically today" className="mt-2 space-y-1">{autoPursueStatus.todayPursued.map((entry) => <li className="flex flex-wrap items-center justify-between gap-2 text-sm text-ink" key={entry.opportunityId}><span>{entry.name}</span>{autoStop.stoppedIds.includes(entry.opportunityId) ? <span className="text-xs font-semibold text-ink/58">Stopped</span> : !readOnly ? <button aria-label={`Stop SIM request to ${entry.name}`} className={`${buttonClass} text-red-700`} disabled={Boolean(autoStop.pendingId)} onClick={() => stopAutoPursued(entry)} type="button">{autoStop.pendingId === entry.opportunityId ? 'Stopping…' : 'Stop SIM request'}</button> : null}</li>)}</ul>

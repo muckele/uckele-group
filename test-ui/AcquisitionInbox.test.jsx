@@ -3224,6 +3224,181 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       expect(within(auto).queryByRole('button', { name: /^Stop SIM request/ })).not.toBeInTheDocument();
     });
   });
+
+  describe('Automatic Pursue mode control', () => {
+    const runAt = '2026-11-09T15:31:00.000Z';
+    const offRun = (overrides = {}) => ({
+      id: 'run-1', runKey: 'auto-pursue:2026-11-09:off:0', businessDate: '2026-11-09', mode: 'off',
+      status: 'completed', commands: 0, reason: null, createdAt: runAt, completedAt: runAt,
+      items: [
+        { opportunityId: 'a', outcome: 'would-pursue', reason: 'mode_off' },
+        { opportunityId: 'b', outcome: 'would-pursue', reason: 'mode_off' },
+        { opportunityId: 'c', outcome: 'blocked', reason: 'recipient_not_single' },
+        { opportunityId: 'd', outcome: 'blocked', reason: 'generic_mailbox' },
+        { opportunityId: 'e', outcome: 'blocked', reason: 'recipient_not_single' },
+        { opportunityId: 'f', outcome: 'skipped', reason: 'blocked_earlier_today' },
+      ],
+      ...overrides,
+    });
+    const warmup = (overrides = {}) => ({ totalDecisions: 7, autoDecisions: 3, autoUnchangedRate: 1, ready: false, ...overrides });
+    function stubModeFetch({ status = autoStatus({ mode: 'off', dailyCap: 0, todayCommands: 0, warmup: warmup() }),
+      statusAfter = null, writes = [], statusCalls = [], modeResult } = {}) {
+      const fallback = stubCriteriaFetch();
+      const fetchMock = vi.fn(async (input, options = {}) => {
+        const url = String(input);
+        if (url.endsWith('/auto-pursue/mode')) {
+          writes.push({ url, method: options.method, body: JSON.parse(options.body) });
+          return modeResult || jsonResponse({ success: true, ok: true, activation: { mode: JSON.parse(options.body).mode } });
+        }
+        if (url.endsWith('/auto-pursue')) {
+          statusCalls.push(url);
+          return jsonResponse(writes.length && statusAfter ? statusAfter : status);
+        }
+        return fallback(input, options);
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      return fetchMock;
+    }
+
+    test('summarizes the last automatic check in plain words', async () => {
+      stubModeFetch({ status: autoStatus({ mode: 'off', dailyCap: 0, todayCommands: 0, warmup: warmup(), latestRun: offRun() }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: would Pursue 2, not automatic 3.')).toBeVisible();
+      const reasons = within(auto).getByRole('list', { name: 'Why deals were not automatic' });
+      expect(within(reasons).getAllByRole('listitem').map((item) => item.textContent))
+        .toEqual(['no single verified broker: 2', 'only a generic mailbox: 1']);
+      expect(auto.textContent).not.toMatch(/recipient_not_single|generic_mailbox|blocked_earlier_today|mode_off/);
+    });
+
+    test('counts requests, not would-Pursue, for a mode that records them', async () => {
+      const run = offRun({ mode: 'canary', items: [{ opportunityId: 'a', outcome: 'pursued', enrollmentState: 'campaign-created' }] });
+      stubModeFetch({ status: autoStatus({ warmup: warmup({ ready: true }), latestRun: run }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: requested 1, not automatic 0.')).toBeVisible();
+      expect(within(auto).queryByRole('list', { name: 'Why deals were not automatic' })).not.toBeInTheDocument();
+    });
+
+    test.each([
+      [null, 'No automatic check has run yet. Checks run after the weekday 7:30 AM PT Sheet sync.'],
+      [{ reason: 'fingerprints_unavailable', items: [] }, 'Last check Nov 9, 7:31 AM PT could not confirm deals against a fresh Sheet refresh, so no deals were checked.'],
+      [{ status: 'failed', reason: 'inbox_unavailable', items: [] }, 'Last check Nov 9, 7:31 AM PT did not finish. The next weekday check will try again.'],
+    ])('explains a missing or incomplete check (%#)', async (overrides, text) => {
+      stubModeFetch({ status: autoStatus({ mode: 'off', warmup: warmup(), latestRun: overrides ? offRun(overrides) : null }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText(text)).toBeVisible();
+    });
+
+    test('shows warm-up progress toward Test and On', async () => {
+      stubModeFetch();
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Warm-up before Test or On: 7 of 25 decisions · 3 of 10 top-match decisions · 100% matched (95% needed).')).toBeVisible();
+    });
+
+    test('leaves out the match rate until there is a top-match decision, and says when warm-up is done', async () => {
+      stubModeFetch({ status: autoStatus({ mode: 'off', warmup: warmup({ totalDecisions: 2, autoDecisions: 0, autoUnchangedRate: 0 }) }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Warm-up before Test or On: 2 of 25 decisions · 0 of 10 top-match decisions.')).toBeVisible();
+      cleanup();
+      stubModeFetch({ status: autoStatus({ mode: 'shadow', warmup: warmup({ totalDecisions: 30, autoDecisions: 12, autoUnchangedRate: 1, ready: true }) }) });
+      renderInbox({ initialView: 'inbox' });
+      const again = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(again).findByText('Warm-up complete.')).toBeVisible();
+    });
+
+    test('switches to Shadow only after the exact typed confirmation', async () => {
+      const writes = [];
+      const statusCalls = [];
+      stubModeFetch({ writes, statusCalls, statusAfter: autoStatus({ mode: 'shadow', dailyCap: 0, todayCommands: 0, warmup: warmup() }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(within(auto).queryByRole('button', { name: /Test|On$/ })).not.toBeInTheDocument();
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Switch to Shadow' }));
+      const panel = within(auto).getByRole('group', { name: 'Confirm Shadow mode' });
+      expect(panel).toHaveTextContent('never records a Pursue or sends email');
+      const confirm = within(panel).getByRole('button', { name: 'Confirm Shadow' });
+      expect(confirm).toBeDisabled();
+      const phrase = within(panel).getByRole('textbox', { name: 'Type ACTIVATE AUTO PURSUE SHADOW to confirm' });
+      fireEvent.change(phrase, { target: { value: 'activate auto pursue shadow' } });
+      expect(confirm).toBeDisabled();
+      fireEvent.change(phrase, { target: { value: 'ACTIVATE AUTO PURSUE SHADOW' } });
+      fireEvent.change(within(panel).getByRole('textbox', { name: 'Reason (optional)' }), { target: { value: 'Rehearse before canary' } });
+      expect(confirm).toBeEnabled();
+      fireEvent.click(confirm);
+      await waitFor(() => expect(within(auto).queryByRole('group', { name: 'Confirm Shadow mode' })).not.toBeInTheDocument());
+      expect(writes).toEqual([{ url: '/api/admin/deal-hunter/auto-pursue/mode', method: 'POST',
+        body: { mode: 'shadow', confirmation: 'ACTIVATE AUTO PURSUE SHADOW', reason: 'Rehearse before canary' } }]);
+      expect(await within(auto).findByText('Shadow')).toBeVisible();
+      expect(statusCalls.length).toBeGreaterThanOrEqual(2);
+      expect(within(auto).getByRole('button', { name: 'Turn off Automatic Pursue' })).toBeEnabled();
+    });
+
+    test('turns off with its own confirmation phrase', async () => {
+      const writes = [];
+      stubModeFetch({ writes, status: autoStatus({ mode: 'shadow', dailyCap: 0, todayCommands: 0, warmup: warmup() }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Turn off Automatic Pursue' }));
+      const panel = within(auto).getByRole('group', { name: 'Confirm Off mode' });
+      fireEvent.change(within(panel).getByRole('textbox', { name: 'Type SET AUTO PURSUE OFF to confirm' }), { target: { value: 'SET AUTO PURSUE OFF' } });
+      fireEvent.click(within(panel).getByRole('button', { name: 'Confirm Off' }));
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(writes[0].body).toEqual({ mode: 'off', confirmation: 'SET AUTO PURSUE OFF', reason: '' });
+    });
+
+    test('offers Turn off from Test or On, set elsewhere', async () => {
+      stubModeFetch({ status: autoStatus({ mode: 'active', dailyCap: 3, todayCommands: 0, warmup: warmup({ ready: true }) }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByRole('button', { name: 'Turn off Automatic Pursue' })).toBeEnabled();
+      expect(within(auto).queryByRole('button', { name: 'Switch to Shadow' })).not.toBeInTheDocument();
+    });
+
+    test('keeps the panel open and shows the server error when the change is refused', async () => {
+      stubModeFetch({ modeResult: jsonResponse({ success: false, error: 'Type ACTIVATE AUTO PURSUE SHADOW to confirm.' }, { ok: false, status: 400 }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Switch to Shadow' }));
+      const panel = within(auto).getByRole('group', { name: 'Confirm Shadow mode' });
+      fireEvent.change(within(panel).getByRole('textbox', { name: 'Type ACTIVATE AUTO PURSUE SHADOW to confirm' }), { target: { value: 'ACTIVATE AUTO PURSUE SHADOW' } });
+      fireEvent.click(within(panel).getByRole('button', { name: 'Confirm Shadow' }));
+      expect(await within(panel).findByRole('alert')).toHaveTextContent('Type ACTIVATE AUTO PURSUE SHADOW to confirm.');
+      expect(within(panel).getByRole('button', { name: 'Confirm Shadow' })).toBeEnabled();
+    });
+
+    test('Cancel closes the panel without a write', async () => {
+      const writes = [];
+      stubModeFetch({ writes });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Switch to Shadow' }));
+      fireEvent.click(within(auto).getByRole('button', { name: 'Cancel' }));
+      expect(within(auto).queryByRole('group', { name: 'Confirm Shadow mode' })).not.toBeInTheDocument();
+      expect(writes).toEqual([]);
+    });
+
+    test('viewers see the summary but no mode buttons', async () => {
+      stubModeFetch({ status: autoStatus({ mode: 'off', warmup: warmup(), latestRun: offRun() }) });
+      renderInbox({ initialView: 'inbox', readOnly: true });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: would Pursue 2, not automatic 3.')).toBeVisible();
+      expect(within(auto).queryByRole('button', { name: 'Switch to Shadow' })).not.toBeInTheDocument();
+      expect(within(auto).queryByRole('button', { name: 'Turn off Automatic Pursue' })).not.toBeInTheDocument();
+    });
+
+    test('shows no control when the status cannot be read', async () => {
+      stubCriteriaFetch({ status: null });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => String(url).includes('/auto-pursue'))).toBe(true));
+      expect(within(auto).queryByRole('button', { name: 'Switch to Shadow' })).not.toBeInTheDocument();
+      expect(within(auto).queryByText(/Last check|No automatic check/)).not.toBeInTheDocument();
+    });
+  });
 });
 
 describe('Broker replies in Needs Your Action', () => {
