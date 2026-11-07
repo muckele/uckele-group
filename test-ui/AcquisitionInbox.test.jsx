@@ -3264,10 +3264,10 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       stubModeFetch({ status: autoStatus({ mode: 'off', dailyCap: 0, todayCommands: 0, warmup: warmup(), latestRun: offRun() }) });
       renderInbox({ initialView: 'inbox' });
       const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
-      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: would Pursue 2, not automatic 3.')).toBeVisible();
+      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: would Pursue 2, not automatic 3, held back 1.')).toBeVisible();
       const reasons = within(auto).getByRole('list', { name: 'Why deals were not automatic' });
       expect(within(reasons).getAllByRole('listitem').map((item) => item.textContent))
-        .toEqual(['no single verified broker: 2', 'only a generic mailbox: 1']);
+        .toEqual(['no single verified broker: 2', 'blocked earlier today: 1', 'only a generic mailbox: 1']);
       expect(auto.textContent).not.toMatch(/recipient_not_single|generic_mailbox|blocked_earlier_today|mode_off/);
     });
 
@@ -3282,7 +3282,7 @@ describe('Criteria-grouped Acquisition Inbox', () => {
 
     test.each([
       [null, 'No automatic check has run yet. Checks run after the weekday 7:30 AM PT Sheet sync.'],
-      [{ reason: 'fingerprints_unavailable', items: [] }, 'Last check Nov 9, 7:31 AM PT could not confirm deals against a fresh Sheet refresh, so no deals were checked.'],
+      [{ mode: 'shadow', reason: 'fingerprints_unavailable', items: [] }, 'Last check Nov 9, 7:31 AM PT could not confirm deals against a fresh Sheet refresh, so no deals were checked.'],
       [{ status: 'failed', reason: 'inbox_unavailable', items: [] }, 'Last check Nov 9, 7:31 AM PT did not finish. The next weekday check will try again.'],
     ])('explains a missing or incomplete check (%#)', async (overrides, text) => {
       stubModeFetch({ status: autoStatus({ mode: 'off', warmup: warmup(), latestRun: overrides ? offRun(overrides) : null }) });
@@ -3381,11 +3381,108 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       expect(writes).toEqual([]);
     });
 
+
+    test('says a check is running, and flags one that never finished', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-09T15:40:00.000Z'));
+      try {
+        stubModeFetch({ status: autoStatus({ mode: 'shadow', warmup: warmup(),
+          latestRun: offRun({ mode: 'shadow', status: 'running', completedAt: null, items: [] }) }) });
+        renderInbox({ initialView: 'inbox' });
+        const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+        expect(await within(auto).findByText('A check is running now (started Nov 9, 7:31 AM PT).')).toBeVisible();
+        expect(auto.textContent).not.toMatch(/would Pursue 0/);
+        cleanup();
+        vi.setSystemTime(new Date('2026-11-09T17:00:00.000Z'));
+        stubModeFetch({ status: autoStatus({ mode: 'shadow', warmup: warmup(),
+          latestRun: offRun({ mode: 'shadow', status: 'running', completedAt: null, items: [] }) }) });
+        renderInbox({ initialView: 'inbox' });
+        const again = await screen.findByRole('region', { name: 'Pursuing automatically' });
+        expect(await within(again).findByText('A check started Nov 9, 7:31 AM PT and did not record a result. The next weekday check will try again.')).toBeVisible();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    test.each([
+      ['warmup_not_ready', 'warm-up is not complete'],
+      ['daily_cap_reached', 'the daily limit was reached'],
+    ])('shows held-back deals and why a %s run stopped early', async (code, phrase) => {
+      const run = offRun({ mode: 'canary', reason: code, items: [
+        { opportunityId: 'a', outcome: 'skipped', reason: code },
+        { opportunityId: 'b', outcome: 'skipped', reason: code },
+        { opportunityId: 'c', outcome: 'blocked', reason: 'generic_mailbox' },
+      ] });
+      stubModeFetch({ status: autoStatus({ warmup: warmup(), latestRun: run }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: requested 0, not automatic 1, held back 2.')).toBeVisible();
+      expect(within(auto).getByText(`Stopped early: ${phrase}.`)).toBeVisible();
+      expect(within(within(auto).getByRole('list', { name: 'Why deals were not automatic' })).getByText(`${phrase}: 2`)).toBeVisible();
+      expect(auto.textContent).not.toContain(code);
+    });
+
+    test('never rounds the warm-up match rate up to the bar', async () => {
+      stubModeFetch({ status: autoStatus({ mode: 'off', warmup: warmup({ totalDecisions: 25, autoDecisions: 19, autoUnchangedRate: 18 / 19 }) }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Warm-up before Test or On: 25 of 25 decisions · 19 of 10 top-match decisions · 94% matched (95% needed).')).toBeVisible();
+    });
+
+    test('words lapsed warm-up differently once Test or On is set', async () => {
+      stubModeFetch({ status: autoStatus({ mode: 'canary', warmup: warmup() }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      expect(await within(auto).findByText('Warm-up no longer met: 7 of 25 decisions · 3 of 10 top-match decisions · 100% matched (95% needed).')).toBeVisible();
+    });
+
+    test('a double click sends one mode change', async () => {
+      const writes = [];
+      let release;
+      const gate = new Promise((resolve) => { release = resolve; });
+      stubModeFetch({ writes, modeResult: gate.then(() => jsonResponse({ success: true, ok: true })) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Switch to Shadow' }));
+      const panel = within(auto).getByRole('group', { name: 'Confirm Shadow mode' });
+      fireEvent.change(within(panel).getByRole('textbox', { name: 'Type ACTIVATE AUTO PURSUE SHADOW to confirm' }), { target: { value: 'ACTIVATE AUTO PURSUE SHADOW' } });
+      const confirm = within(panel).getByRole('button', { name: 'Confirm Shadow' });
+      fireEvent.click(confirm);
+      fireEvent.click(confirm);
+      await waitFor(() => expect(writes).toHaveLength(1));
+      await act(async () => { release(); await gate; });
+      await waitFor(() => expect(within(auto).queryByRole('group', { name: 'Confirm Shadow mode' })).not.toBeInTheDocument());
+      expect(writes).toHaveLength(1);
+    });
+
+    test('turning off from On sends mode off', async () => {
+      const writes = [];
+      stubModeFetch({ writes, status: autoStatus({ mode: 'active', dailyCap: 3, todayCommands: 1, warmup: warmup({ ready: true }) }) });
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Turn off Automatic Pursue' }));
+      const panel = within(auto).getByRole('group', { name: 'Confirm Off mode' });
+      fireEvent.change(within(panel).getByRole('textbox', { name: 'Type SET AUTO PURSUE OFF to confirm' }), { target: { value: 'SET AUTO PURSUE OFF' } });
+      fireEvent.click(within(panel).getByRole('button', { name: 'Confirm Off' }));
+      await waitFor(() => expect(writes).toHaveLength(1));
+      expect(writes[0].body.mode).toBe('off');
+    });
+
+    test('moves focus into the panel and back to the button on Cancel', async () => {
+      stubModeFetch();
+      renderInbox({ initialView: 'inbox' });
+      const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
+      fireEvent.click(await within(auto).findByRole('button', { name: 'Switch to Shadow' }));
+      expect(within(auto).getByRole('textbox', { name: 'Type ACTIVATE AUTO PURSUE SHADOW to confirm' })).toHaveFocus();
+      fireEvent.click(within(auto).getByRole('button', { name: 'Cancel' }));
+      await waitFor(() => expect(within(auto).getByRole('button', { name: 'Switch to Shadow' })).toHaveFocus());
+    });
+
     test('viewers see the summary but no mode buttons', async () => {
       stubModeFetch({ status: autoStatus({ mode: 'off', warmup: warmup(), latestRun: offRun() }) });
       renderInbox({ initialView: 'inbox', readOnly: true });
       const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
-      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: would Pursue 2, not automatic 3.')).toBeVisible();
+      expect(await within(auto).findByText('Last check Nov 9, 7:31 AM PT: would Pursue 2, not automatic 3, held back 1.')).toBeVisible();
       expect(within(auto).queryByRole('button', { name: 'Switch to Shadow' })).not.toBeInTheDocument();
       expect(within(auto).queryByRole('button', { name: 'Turn off Automatic Pursue' })).not.toBeInTheDocument();
     });
@@ -3395,6 +3492,8 @@ describe('Criteria-grouped Acquisition Inbox', () => {
       renderInbox({ initialView: 'inbox' });
       const auto = await screen.findByRole('region', { name: 'Pursuing automatically' });
       await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => String(url).includes('/auto-pursue'))).toBe(true));
+      const statusCall = globalThis.fetch.mock.results.find((_, index) => String(globalThis.fetch.mock.calls[index][0]).includes('/auto-pursue'));
+      await act(async () => { const response = await statusCall.value; await response.json(); await Promise.resolve(); });
       expect(within(auto).queryByRole('button', { name: 'Switch to Shadow' })).not.toBeInTheDocument();
       expect(within(auto).queryByText(/Last check|No automatic check/)).not.toBeInTheDocument();
     });

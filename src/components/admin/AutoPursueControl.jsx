@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { blockerReason } from './AcquisitionCriteria.jsx';
 
 // The owner's Automatic Pursue switch in the Acquisition Inbox (spec 2026-11-02 best-first deal
@@ -21,6 +21,30 @@ const modeChanges = {
 };
 
 const warmupTargets = { decisions: 25, autoDecisions: 10, unchangedRate: 95 };
+const staleRunMs = 60 * 60 * 1000;
+
+// Why a deal the runner did not block was still held back (outcome skipped or error).
+const heldBackLabels = {
+  blocked_earlier_today: 'blocked earlier today',
+  already_recorded: 'already requested today',
+  stale_revision: 'the deal changed during the check',
+  run_stopped: 'the check stopped early',
+  warmup_not_ready: 'warm-up is not complete',
+  warmup_unavailable: 'warm-up could not be checked',
+  daily_cap_reached: 'the daily limit was reached',
+  mode_changed: 'the mode changed during the check',
+  business_date_changed: 'the business day ended during the check',
+  decision_count_unavailable: "today's count could not be checked",
+  runner_storage_unavailable: 'the check could not read its records',
+  command_error: 'a request could not be recorded',
+};
+
+function heldBackLabel(code) {
+  const text = String(code || '');
+  if (heldBackLabels[text]) return heldBackLabels[text];
+  if (text.startsWith('command_rejected_')) return 'a request could not be recorded';
+  return blockerReason(text);
+}
 
 function count(value) {
   const parsed = Math.trunc(Number(value));
@@ -43,16 +67,20 @@ export function summarizeAutoPursueRun(run) {
   const reasons = new Map();
   let picked = 0;
   let blocked = 0;
+  let heldBack = 0;
+  const note = (label) => reasons.set(label, (reasons.get(label) || 0) + 1);
   for (const item of items) {
     if (item?.outcome === (counted ? 'pursued' : 'would-pursue')) picked += 1;
-    if (item?.outcome === 'blocked') {
+    else if (item?.outcome === 'blocked') {
       blocked += 1;
-      const label = blockerReason(item.reason);
-      reasons.set(label, (reasons.get(label) || 0) + 1);
+      note(blockerReason(item.reason));
+    } else if (item?.outcome === 'skipped' || item?.outcome === 'error') {
+      heldBack += 1;
+      note(heldBackLabel(item.reason));
     }
   }
   const sorted = [...reasons.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  return { counted, picked, blocked, reasons: sorted };
+  return { counted, picked, blocked, heldBack, reasons: sorted };
 }
 
 function LastRun({ run }) {
@@ -61,6 +89,13 @@ function LastRun({ run }) {
   }
   const when = formatRunTime(run.createdAt);
   const prefix = when ? `Last check ${when}` : 'Last check';
+  if (!run.completedAt) {
+    const startedAt = Date.parse(run.createdAt);
+    if (Number.isFinite(startedAt) && Date.now() - startedAt > staleRunMs) {
+      return <p className="text-xs leading-5 text-amber-800">{when ? `A check started ${when}` : 'A check started'} and did not record a result. The next weekday check will try again.</p>;
+    }
+    return <p className="text-xs leading-5 text-ink/62">A check is running now{when ? ` (started ${when})` : ''}.</p>;
+  }
   if (run.status === 'failed') {
     return <p className="text-xs leading-5 text-amber-800">{prefix} did not finish. The next weekday check will try again.</p>;
   }
@@ -70,7 +105,8 @@ function LastRun({ run }) {
   const summary = summarizeAutoPursueRun(run);
   return (
     <div>
-      <p className="text-xs leading-5 text-ink/70">{prefix}: {summary.counted ? 'requested' : 'would Pursue'} {summary.picked}, not automatic {summary.blocked}.</p>
+      <p className="text-xs leading-5 text-ink/70">{prefix}: {summary.counted ? 'requested' : 'would Pursue'} {summary.picked}, not automatic {summary.blocked}{summary.heldBack ? `, held back ${summary.heldBack}` : ''}.</p>
+      {run.reason ? <p className="text-xs leading-5 text-amber-800">Stopped early: {heldBackLabel(run.reason)}.</p> : null}
       {summary.reasons.length ? (
         <ul aria-label="Why deals were not automatic" className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-ink/58">
           {summary.reasons.map(([label, total]) => <li key={label}>{label}: {total}</li>)}
@@ -80,7 +116,7 @@ function LastRun({ run }) {
   );
 }
 
-function WarmupLine({ warmup }) {
+function WarmupLine({ mode, warmup }) {
   if (!warmup || typeof warmup !== 'object') return null;
   if (warmup.ready === true) return <p className="text-xs leading-5 text-ink/62">Warm-up complete.</p>;
   const autoDecisions = count(warmup.autoDecisions);
@@ -90,14 +126,20 @@ function WarmupLine({ warmup }) {
   ];
   const rate = Number(warmup.autoUnchangedRate);
   if (autoDecisions > 0 && Number.isFinite(rate)) {
-    parts.push(`${Math.round(Math.max(0, Math.min(rate, 1)) * 100)}% matched (${warmupTargets.unchangedRate}% needed)`);
+    // Floor, not round: the server needs at least 0.95, so 18 of 19 (94.7%) must not read as 95%.
+    parts.push(`${Math.floor(Math.max(0, Math.min(rate, 1)) * 100)}% matched (${warmupTargets.unchangedRate}% needed)`);
   }
-  return <p className="text-xs leading-5 text-ink/62">Warm-up before Test or On: {parts.join(' · ')}.</p>;
+  const lead = mode === 'canary' || mode === 'active' ? 'Warm-up no longer met' : 'Warm-up before Test or On';
+  return <p className="text-xs leading-5 text-ink/62">{lead}: {parts.join(' · ')}.</p>;
 }
 
 function ConfirmPanel({ change, onCancel, onConfirm, pending, error }) {
   const [phrase, setPhrase] = useState('');
   const [reason, setReason] = useState('');
+  const phraseRef = useRef(null);
+  useEffect(() => {
+    phraseRef.current?.focus();
+  }, []);
   const settings = modeChanges[change];
   const phraseId = `auto-pursue-phrase-${change}`;
   const reasonId = `auto-pursue-reason-${change}`;
@@ -106,7 +148,7 @@ function ConfirmPanel({ change, onCancel, onConfirm, pending, error }) {
     <div aria-label={`Confirm ${settings.label} mode`} className="mt-3 rounded-xl border border-line bg-fog/60 p-3" role="group">
       <p className="text-sm leading-6 text-ink">{settings.explanation}</p>
       <label className="mt-3 block text-xs font-semibold text-ink/70" htmlFor={phraseId}>Type {settings.phrase} to confirm</label>
-      <input autoComplete="off" className="mt-1 w-full rounded-lg border border-line bg-white px-3 py-2 text-sm" disabled={pending} id={phraseId} onChange={(event) => setPhrase(event.target.value)} spellCheck={false} type="text" value={phrase} />
+      <input autoComplete="off" className="mt-1 w-full rounded-lg border border-line bg-white px-3 py-2 text-sm" disabled={pending} id={phraseId} onChange={(event) => setPhrase(event.target.value)} ref={phraseRef} spellCheck={false} type="text" value={phrase} />
       <label className="mt-3 block text-xs font-semibold text-ink/70" htmlFor={reasonId}>Reason (optional)</label>
       <input className="mt-1 w-full rounded-lg border border-line bg-white px-3 py-2 text-sm" disabled={pending} id={reasonId} maxLength={500} onChange={(event) => setReason(event.target.value)} type="text" value={reason} />
       {error ? <p className="mt-2 text-xs font-semibold text-red-800" role="alert">{error}</p> : null}
@@ -123,6 +165,20 @@ export default function AutoPursueControl({ onChanged, readOnly = false, status 
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
   const inFlightRef = useRef(false);
+  const triggerRef = useRef(null);
+  const returnFocusRef = useRef(false);
+  const mode = status?.mode;
+  // A mode changed elsewhere makes an open panel's choice out of date: close it.
+  useEffect(() => {
+    setChange('');
+    setError('');
+  }, [mode]);
+  useEffect(() => {
+    if (!change && returnFocusRef.current) {
+      returnFocusRef.current = false;
+      triggerRef.current?.focus();
+    }
+  }, [change]);
   if (!status || typeof status !== 'object' || !status.mode) return null;
   const target = status.mode === 'off' ? 'shadow' : 'off';
   const buttonLabel = target === 'shadow' ? 'Switch to Shadow' : 'Turn off Automatic Pursue';
@@ -145,6 +201,7 @@ export default function AutoPursueControl({ onChanged, readOnly = false, status 
         result = null;
       }
       if (!response.ok || !result?.success) throw new Error(result?.error || failure);
+      returnFocusRef.current = true;
       setChange('');
       onChanged?.();
     } catch (changeError) {
@@ -160,14 +217,14 @@ export default function AutoPursueControl({ onChanged, readOnly = false, status 
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 space-y-1">
           <LastRun run={status.latestRun} />
-          <WarmupLine warmup={status.warmup} />
+          <WarmupLine mode={status.mode} warmup={status.warmup} />
         </div>
         {!readOnly && !change ? (
-          <button className="inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss" onClick={() => { setError(''); setChange(target); }} type="button">{buttonLabel}</button>
+          <button className="inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss" onClick={() => { setError(''); setChange(target); }} ref={triggerRef} type="button">{buttonLabel}</button>
         ) : null}
       </div>
       {!readOnly && change ? (
-        <ConfirmPanel change={change} error={error} key={change} onCancel={() => { setChange(''); setError(''); }} onConfirm={confirm} pending={pending} />
+        <ConfirmPanel change={change} error={error} key={change} onCancel={() => { returnFocusRef.current = true; setChange(''); setError(''); }} onConfirm={confirm} pending={pending} />
       ) : null}
     </div>
   );
