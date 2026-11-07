@@ -56,6 +56,9 @@ done
 healthy() { "${GO_LIVE_CURL:-curl}" -fsS --max-time 10 "$HEALTH_URL" >/dev/null 2>&1; }
 
 # The names fly.toml [env] and the Dockerfile set: Fly deploys these alongside the secrets.
+# Read from this checkout, so run it from an up-to-date main. A staged removal of a name that is
+# both an [env] key and a secret is not caught; the fly.toml value applies instead, and for those
+# seven names it is the safe one (outreach and automation paused, follow-ups off, /data paths).
 config_env_names() {
   {
     awk '/^[[:space:]]*\[/ { inenv = ($0 ~ /^[[:space:]]*\[env\][[:space:]]*$/); next }
@@ -111,7 +114,7 @@ check_before() {
     echo "  Couldn't read the secret list from Fly."; CHECK_RESULT=""; return
   fi
   if [[ -n "$NOT_DEPLOYED" ]]; then
-    echo "  Fly has staged secret changes that aren't applied yet: $NOT_DEPLOYED"
+    echo "  Fly doesn't report these secrets as deployed (staged, partly deployed, or unknown): $NOT_DEPLOYED"
     echo "  The switch would apply them too, unchecked. Ask your engineer."
     CHECK_RESULT=""; return
   fi
@@ -184,16 +187,33 @@ if [[ "$CHECK_RESULT" != "$PLANNED" ]]; then
   echo "Something changed since the first check. Nothing changed; run this script again."; exit 1
 fi
 
+still_staged_note() {
+  echo "The production sending setup may still be staged on Fly, and would take effect at the"
+  echo "next deploy (the app starts fine with it). Run this script again now to finish the switch,"
+  echo "or ask your engineer."
+}
+
 # Puts the staged profile back to what is running, so a failed switch leaves nothing that the
-# next deploy would apply by surprise.
+# next deploy would apply by surprise. The controlled profile goes back only when Fly confirms
+# every planned removal is still a secret: the controlled profile without
+# DEAL_HUNTER_CIM_MAILBOX_PROVIDER stops the app from starting (2026-11-06), while the
+# production profile starts with or without the test-only settings.
 restore_staged_profile() {
-  local original=controlled-mailbox-v1
+  local original=controlled-mailbox-v1 name
   [[ "$FROM" == "production" ]] && original=production-gmail-v1
+  if [[ "$original" == "controlled-mailbox-v1" && ${#UNSET[@]} -gt 0 ]]; then
+    if ! read_secret_statuses; then still_staged_note; return; fi
+    for name in "${UNSET[@]}"; do
+      if [[ ",$SECRET_NAMES," != *",$name,"* ]]; then
+        echo "$name was already removed on Fly, so the controlled test setup can't be put back."
+        still_staged_note; return
+      fi
+    done
+  fi
   if "$FLY" secrets set --stage -a "$APP" "$PROFILE_KEY=$original" </dev/null; then
     echo "Put the staged sending setup back to what is running. The app is unchanged."
   else
-    echo "The production sending setup is STILL STAGED on Fly and would take effect at the next"
-    echo "deploy. Run this script again now to finish the switch, or ask your engineer."
+    still_staged_note
   fi
 }
 

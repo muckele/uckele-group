@@ -31,7 +31,13 @@ if [[ "$1" == "ssh" ]]; then
   exit "\${FAKE_SSH_EXIT:-0}"
 fi
 if [[ "$1" == "secrets" && "$2" == "$FAKE_FAIL" ]]; then exit 1; fi
-if [[ "$1" == "secrets" && "$2" == "list" ]]; then printf '%s\\n' "$FAKE_SECRETS"; fi
+if [[ "$1" == "secrets" && "$2" == "list" ]]; then
+  if [[ -n "$FAKE_SECRETS_AFTER_UNSET" ]] && grep -q "^secrets unset" "$FAKE_LOG"; then
+    printf '%s\\n' "$FAKE_SECRETS_AFTER_UNSET"
+  else
+    printf '%s\\n' "$FAKE_SECRETS"
+  fi
+fi
 exit 0
 `;
 // FAKE_HEALTH: "up", "down", or "down-after-deploy".
@@ -45,10 +51,12 @@ const DEPLOYED = JSON.stringify([
   { Name: 'RESEND_API_KEY', Digest: 'abc123', Status: 'Deployed' },
   { Name: 'DEAL_HUNTER_CIM_PROVIDER_PROFILE', Digest: 'def456', Status: 'Deployed' },
   { Name: 'DEAL_HUNTER_CIM_MAILBOX_PROVIDER', Digest: '789aaa', Status: 'Deployed' },
+  { Name: 'DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS', Digest: '789aab', Status: 'Deployed' },
+  { Name: 'DEAL_HUNTER_SHEET_CSV_URLS', Digest: '789aac', Status: 'Deployed' },
 ], null, 2);
 
 function run({ args = [], input = 'GO LIVE\n', before = OK_BEFORE, after = 'GO_LIVE_CHECK result=ok',
-  fail = '', health = 'up', secrets = DEPLOYED, sshExit = '0', before2 = '' } = {}) {
+  fail = '', health = 'up', secrets = DEPLOYED, sshExit = '0', before2 = '', secretsAfterUnset = '' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-golive-sh-'));
   try {
     const fly = path.join(dir, 'fly');
@@ -63,7 +71,7 @@ function run({ args = [], input = 'GO LIVE\n', before = OK_BEFORE, after = 'GO_L
       env: { PATH: process.env.PATH, HOME: process.env.HOME, GO_LIVE_FLY: fly, GO_LIVE_CURL: curl,
         GO_LIVE_WAIT_SECONDS: '1', FAKE_LOG: log, FAKE_BEFORE: before, FAKE_AFTER: after, FAKE_FAIL: fail,
         FAKE_HEALTH: health, FAKE_SECRETS: secrets, FAKE_SSH_EXIT: sshExit,
-        FAKE_BEFORE_2: before2 },
+        FAKE_BEFORE_2: before2, FAKE_SECRETS_AFTER_UNSET: secretsAfterUnset },
     });
     const calls = fs.readFileSync(log, 'utf8').split('\n').filter(Boolean);
     return { ...child, calls, secrets: calls.filter((call) => call.startsWith('secrets ') && !call.startsWith('secrets list')) };
@@ -85,7 +93,7 @@ test('a passing check and GO LIVE stage every change, deploy once, then verify',
   assert.equal(sshCalls.length, 3);
   // The check runs before the prompt and again after GO LIVE, with the names Fly will deploy.
   for (const call of sshCalls.slice(0, 2)) {
-    assert.match(call, /go-live-check\.js before --app=uckele-group --secret-names=RESEND_API_KEY,DEAL_HUNTER_CIM_PROVIDER_PROFILE,DEAL_HUNTER_CIM_MAILBOX_PROVIDER --env-names=\S*SQLITE_PATH/);
+    assert.match(call, /go-live-check\.js before --app=uckele-group --secret-names=RESEND_API_KEY,DEAL_HUNTER_CIM_PROVIDER_PROFILE,DEAL_HUNTER_CIM_MAILBOX_PROVIDER,DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS,DEAL_HUNTER_SHEET_CSV_URLS --env-names=\S*SQLITE_PATH/);
     assert.match(call, /--env-names=\S*NODE_ENV/);
     assert.doesNotMatch(call, /abc123|keep-sheet/);
   }
@@ -153,12 +161,35 @@ test('a failed removal step puts the staged profile back and never deploys', () 
   assert.match(result.stdout, /The app is unchanged/);
 });
 
-test('when even the restore fails, the script says the production profile is still staged', () => {
+test('when even the restore fails, the script says the production profile may still be staged', () => {
   const result = run({ fail: 'set' });
   assert.notEqual(result.status, 0);
   assert.equal(result.secrets.some((call) => call.startsWith('secrets deploy')), false);
-  assert.match(result.stdout, /STILL STAGED/);
+  assert.match(result.stdout, /may still be staged/);
   assert.doesNotMatch(result.stdout, /The app is unchanged/);
+});
+
+test('a removal that landed before the step failed keeps the production profile staged, never the controlled one', () => {
+  // The controlled profile without DEAL_HUNTER_CIM_MAILBOX_PROVIDER would stop the app starting.
+  const partlyRemoved = JSON.stringify([
+    { Name: 'RESEND_API_KEY', Status: 'Deployed' },
+    { Name: 'DEAL_HUNTER_CIM_PROVIDER_PROFILE', Status: 'Staged' },
+    { Name: 'DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS', Status: 'Deployed' },
+    { Name: 'DEAL_HUNTER_SHEET_CSV_URLS', Status: 'Deployed' },
+  ]);
+  const result = run({ fail: 'unset', secretsAfterUnset: partlyRemoved });
+  assert.notEqual(result.status, 0);
+  assert.equal(result.secrets.some((call) => call.includes('=controlled-mailbox-v1')), false);
+  assert.equal(result.secrets.some((call) => call.startsWith('secrets deploy')), false);
+  assert.match(result.stdout, /DEAL_HUNTER_CIM_MAILBOX_PROVIDER was already removed on Fly/);
+  assert.match(result.stdout, /may still be staged/);
+});
+
+test('an unreadable secret list after a failed removal keeps the production profile staged', () => {
+  const result = run({ fail: 'unset', secretsAfterUnset: 'not json' });
+  assert.notEqual(result.status, 0);
+  assert.equal(result.secrets.some((call) => call.includes('=controlled-mailbox-v1')), false);
+  assert.match(result.stdout, /may still be staged/);
 });
 
 test('a failed deploy prints the recovery that starts the app, not the controlled profile', () => {
@@ -186,7 +217,7 @@ test('staged secret changes on Fly stop the script before any change', () => {
   assert.notEqual(result.status, 0);
   assert.deepEqual(result.secrets, []);
   assert.equal(result.calls.some((call) => call.startsWith('ssh ')), false);
-  assert.match(result.stdout, /staged secret changes that aren't applied yet: RESEND_API_KEY ADMIN_EMAIL/);
+  assert.match(result.stdout, /doesn't report these secrets as deployed .*: RESEND_API_KEY ADMIN_EMAIL/);
   assert.doesNotMatch(result.stdout, /abc123/);
 });
 

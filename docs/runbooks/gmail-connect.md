@@ -271,8 +271,8 @@ address (a personal address works).
       ```
 
       - You need `fly auth login` done, and the server must be running a release that includes
-        the script (it tells you if not). Running `--check` once before the test ends confirms
-        both.
+        the script (it tells you if not). You can run `--check` any time to confirm both; while
+        Live sending is still on it ends with **Stopped**, which is expected.
       - It first checks, on the server, that the app would start with the new settings and that
         Live sending is off. It also refuses if Fly holds secret changes that were staged but
         never applied, because the switch would apply those too. If anything is wrong, it stops
