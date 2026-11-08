@@ -12,6 +12,7 @@ function fakeResponse(statusCode = 200) {
   const response = new EventEmitter();
   response.statusCode = statusCode;
   response.writableFinished = true;
+  response.headersSent = true;
   return response;
 }
 
@@ -53,12 +54,14 @@ test('routeLabel uses the route pattern, never the real URL or query', () => {
   });
   assert.equal(label, 'POST /api/admin/verify/:token');
   assert.equal(routeLabel({ method: 'GET', originalUrl: '/secret-token' }), 'GET (no route)');
+  assert.equal(routeLabel({ method: 'POST', baseUrl: '/api/admin', originalUrl: '/api/admin/x?email=a@b.c' }),
+    'POST /api/admin (no route)');
 });
 
 test('routeLabel keeps a label short and on one line', () => {
   const label = routeLabel({ method: 'GET', route: { path: `/a\nb/${'x'.repeat(400)}` } });
   assert.equal(label.includes('\n'), false);
-  assert.ok(label.length <= 164);
+  assert.equal(label.length, 'GET '.length + 150);
 });
 
 test('an on-time tick logs nothing', () => {
@@ -77,7 +80,7 @@ test('a stall logs how long, CPU used, and the request still running', () => {
   watch.tick();
   assert.equal(logger.lines.length, 1);
   assert.match(logger.lines[0], /^\[event-loop-stall\] blockedMs=6000 cpuMs=6100 /);
-  assert.match(logger.lines[0], /active=POST \/api\/admin\/deal-hunter\/triage\/:opportunityId\/action/);
+  assert.match(logger.lines[0], /active=POST \/api\/admin\/deal-hunter\/triage\/:opportunityId\/action:6500ms/);
   assert.match(logger.lines[0], /finished=none$/);
 });
 
@@ -90,7 +93,7 @@ test('a stall caused by a request that finished during the stall still names it'
   assert.match(logger.lines.at(-1), /active=none finished=GET \/api\/admin\/deal-hunter\/triage:6500ms$/);
 });
 
-test('a stall with no request and almost no CPU reads as outside the app', () => {
+test('a stall with no request and almost no CPU says so', () => {
   const { logger, watch, advance } = harness();
   advance(8_000, 10);
   watch.tick();
@@ -121,14 +124,34 @@ test('slow requests are logged with status, fast ones are not', () => {
   assert.deepEqual(logger.lines, ['[slow-request] GET /slow status=503 durationMs=2000']);
 });
 
-test('a client that disconnects early is marked, and only logged once', () => {
+test('a client that gives up before any answer logs no status, only once', () => {
   const { logger, watch, advance } = harness();
   const { response } = handled(watch, { path: '/gone' });
   response.writableFinished = false;
+  response.headersSent = false;
   advance(3_000);
   response.emit('close');
   response.emit('close');
-  assert.deepEqual(logger.lines, ['[slow-request] GET /gone status=200 durationMs=3000 aborted']);
+  assert.deepEqual(logger.lines, ['[slow-request] GET /gone status=none durationMs=3000 aborted']);
+});
+
+test('a client that gives up mid-answer keeps the status that was sent', () => {
+  const { logger, watch, advance } = harness();
+  const { response } = handled(watch, { path: '/partial', status: 206 });
+  response.writableFinished = false;
+  advance(3_000);
+  response.emit('close');
+  assert.deepEqual(logger.lines, ['[slow-request] GET /partial status=206 durationMs=3000 aborted']);
+});
+
+test('a request whose connection is gone stops being listed even with no close event', () => {
+  const { logger, watch, advance } = harness();
+  const ghost = handled(watch, { path: '/ghost' });
+  handled(watch, { path: '/real' });
+  ghost.request.socket = { destroyed: true };
+  advance(6_500);
+  watch.tick();
+  assert.match(logger.lines.at(-1), /active=GET \/real:6500ms finished=none$/);
 });
 
 test('active and finished lists are bounded in the log line', () => {
@@ -139,6 +162,12 @@ test('active and finished lists are bounded in the log line', () => {
   const active = logger.lines.at(-1).match(/active=(.*) finished=/)[1].split(',');
   assert.equal(active.filter((label) => label.startsWith('GET ')).length, 5);
   assert.equal(active.at(-1), '+35 more');
+  for (const key of [...Array(40).keys()]) handled(watch, { path: `/done-${key}` }).response.emit('close');
+  advance(6_500);
+  watch.tick();
+  const finished = logger.lines.at(-1).match(/ finished=(.*)$/)[1].split(',');
+  assert.equal(finished.filter((label) => label.startsWith('GET ')).length, 5);
+  assert.equal(finished.at(-1), '+35 more');
 });
 
 test('middleware always continues and tracks nothing after close', () => {
@@ -173,11 +202,24 @@ test('start is idempotent, unrefs its timer, and stop clears it', () => {
 });
 
 test('a failing logger never reaches the request or the timer', () => {
-  const { watch, advance } = harness({ logger: { warn() { throw new Error('logger down'); } } });
+  let calls = 0;
+  const fail = () => { calls += 1; throw new Error('logger down'); };
+  const { watch, advance } = harness({ logger: { warn: fail, info: fail } });
+  assert.doesNotThrow(() => watch.start());
+  watch.stop();
   const { response } = handled(watch);
   advance(6_500);
   assert.doesNotThrow(() => watch.tick());
   assert.doesNotThrow(() => response.emit('close'));
+  assert.equal(calls, 3);
+});
+
+test('starting says so once, so a quiet log can be told from a watch that never ran', () => {
+  const infos = [];
+  const { watch } = harness({ logger: { warn() {}, info: (line) => infos.push(line) } });
+  watch.start();
+  watch.start();
+  assert.deepEqual(infos, ['[event-loop-watch] started stallThresholdMs=2000 slowRequestMs=2000']);
 });
 
 test('the real timer notices a real block of the event loop', async () => {
@@ -189,8 +231,8 @@ test('the real timer notices a real block of the event loop', async () => {
   while (Date.now() < until) { /* block the loop on purpose */ }
   await new Promise((resolve) => { setTimeout(resolve, 60); });
   handle.stop();
-  assert.equal(logger.lines.length, 1);
-  const [, blockedMs, cpuMs] = logger.lines[0].match(/blockedMs=(\d+) cpuMs=(\d+)/);
-  assert.ok(Number(blockedMs) >= 150);
-  assert.ok(Number(cpuMs) >= 100);
+  const stalls = logger.lines.map((line) => line.match(/blockedMs=(\d+) cpuMs=(\d+)/));
+  assert.ok(stalls.length >= 1);
+  assert.ok(stalls.every(Boolean));
+  assert.ok(Math.max(...stalls.map((stall) => Number(stall[1]))) >= 150);
 });

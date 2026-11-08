@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import { request as httpRequest } from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -1468,6 +1469,43 @@ test('the request watch sees real requests by route pattern, never the real URL 
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^\[slow-request\] GET \/api\/ready status=200 durationMs=\d+$/);
   assert.equal(lines[0].includes('owner@example.test'), false);
+});
+
+test('the request watch also sees requests ended by early guards, without their URL', async () => {
+  const lines = [];
+  const requestWatch = createEventLoopWatch({ logger: { warn: (line) => lines.push(line) }, slowRequestMs: 0 });
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/admin/not-a-real-route/secret-token?email=owner@example.test`, {
+      method: 'POST', headers: { Origin: 'https://attacker.example', 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(response.status, 403);
+    await response.arrayBuffer();
+  }, createApp({ requestWatch }));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[slow-request\] POST \/api\/admin \(no route\) status=403 durationMs=\d+$/);
+});
+
+test('a dropped pipelined request does not stay listed as running', async () => {
+  const lines = [];
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const requestWatch = createEventLoopWatch({ logger: { warn: (line) => lines.push(line) },
+    slowRequestMs: 60_000, stallThresholdMs: 0, tickMs: 0 });
+  const app = createApp({ requestWatch, readinessCheck: async () => { await held; return { ok: true, checks: {} }; } });
+  await withServer(async (origin) => {
+    const { hostname, port } = new URL(origin);
+    const socket = net.connect(Number(port), hostname);
+    await new Promise((resolve) => { socket.once('connect', resolve); });
+    const pipelined = `GET /api/ready HTTP/1.1\r\nHost: ${hostname}\r\n\r\n`;
+    socket.write(pipelined + pipelined + pipelined);
+    await new Promise((resolve) => { setTimeout(resolve, 50); });
+    socket.destroy();
+    await new Promise((resolve) => { setTimeout(resolve, 50); });
+    release();
+    await new Promise((resolve) => { setTimeout(resolve, 50); });
+    requestWatch.tick();
+    assert.match(lines.at(-1), /active=none /);
+  }, app);
 });
 
 test('a failed readiness check names the failed checks in the log and still answers 503', async () => {
