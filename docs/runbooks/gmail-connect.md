@@ -236,7 +236,7 @@ address (a personal address works).
       **Broker & Seller**, your test inbox is the only broker email.
 5. Click **Request SIM** on the test listing.
    - If **Request SIM** isn't offered, either a campaign is already running for this listing (its
-     **Pursue CIM canary** card shows it, and nothing more is needed) or the listing isn't ready yet
+     **Pursue CIM canary** card shows its status, and another request isn't needed) or the listing isn't ready yet
      (for example the sync hasn't picked it up). If it isn't ready, wait for the next sync and
      check again.
 6. Wait for the first email.

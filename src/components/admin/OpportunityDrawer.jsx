@@ -344,6 +344,9 @@ export default function OpportunityDrawer({
   // A running campaign already owns this listing, so another request would do nothing. Recovery that
   // needs Request SIM, such as setting a timezone, happens before a campaign exists.
   const campaignOwnsListing = Boolean(cimRelease?.campaign && cimRelease.actions?.canStop);
+  useEffect(() => {
+    if (campaignOwnsListing) setSimConfirmOpen(false);
+  }, [campaignOwnsListing]);
   // The workflow's CIM status tracks the older manual request path and stays "not requested" for a
   // campaign. Expiry is only projected into the status until the sender next updates the campaign.
   const cimWorkflowLabel = cimRelease?.campaign

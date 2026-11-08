@@ -413,6 +413,22 @@ describe('Opportunity drawer', () => {
 
     rerender(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detail} onAction={vi.fn()} onClose={vi.fn()} />);
     expect(screen.queryByRole('group', { name: 'Confirm Request SIM' })).toBeNull();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({ actions: { canStop: false } })} detail={detail}
+      onAction={vi.fn()} onClose={vi.fn()} />);
+    expect(screen.queryByRole('group', { name: 'Confirm Request SIM' })).toBeNull();
+  });
+
+  test('names the pause Gmail sending obeys, and says when its setting cannot be read', () => {
+    const { rerender } = render(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      pause: { paused: false, source: '', updatedAt: '' },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText('Gmail sending pause').nextElementSibling).toHaveTextContent(/^Not paused$/);
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      pause: { paused: true, source: 'settings-unavailable', updatedAt: '' },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText('Gmail sending pause').nextElementSibling).toHaveTextContent('Paused · Settings Unavailable');
   });
 
   test('shows the campaign in the Workflow box instead of the older request status', () => {
