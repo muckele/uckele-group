@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 import { signPayload } from '../server/utils/security.js';
 import { CRM_SUBMISSION_SUPERSEDED } from '../server/services/crmSubmissionSupersession.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
+import { createEventLoopWatch } from '../server/utils/eventLoopWatch.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-http-app-'));
 process.env.ADMIN_SESSION_SECRET = 'http-app-session-secret-for-tests';
@@ -1454,6 +1455,43 @@ test('readiness checks storage and the document vault', async () => {
       },
     });
   });
+});
+
+test('the request watch sees real requests by route pattern, never the real URL or query', async () => {
+  const lines = [];
+  const requestWatch = createEventLoopWatch({ logger: { warn: (line) => lines.push(line) }, slowRequestMs: 0 });
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/ready?email=owner@example.test`);
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+  }, createApp({ requestWatch }));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[slow-request\] GET \/api\/ready status=200 durationMs=\d+$/);
+  assert.equal(lines[0].includes('owner@example.test'), false);
+});
+
+test('a failed readiness check names the failed checks in the log and still answers 503', async () => {
+  const originalWarn = console.warn;
+  const lines = [];
+  console.warn = (line) => lines.push(line);
+  try {
+    await withServer(async (origin) => {
+      const response = await fetch(`${origin}/api/ready`);
+      assert.equal(response.status, 503);
+      assert.deepEqual((await response.json()).checks, {
+        configuration: 'ok', storage: 'failed', documentVault: 'failed',
+      });
+    }, createApp({
+      readinessCheck: async () => ({
+        ok: false,
+        checks: { configuration: 'ok', storage: 'failed', documentVault: 'failed' },
+      }),
+    }));
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.deepEqual(lines.filter((line) => String(line).startsWith('[ready]')),
+    ['[ready] not ready failed=storage,documentVault']);
 });
 
 test('secure upload token is rejected before parsing the JSON payload', async () => {

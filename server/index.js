@@ -13,6 +13,7 @@ import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler
 import { startBackupScheduler } from './services/backups.js';
 import { cleanupExpiredAuthRecords, startAuthCleanupScheduler } from './services/auth.js';
 import { startInboundCommunicationIngestionScheduler } from './services/communications.js';
+import { eventLoopWatch } from './utils/eventLoopWatch.js';
 
 const config = getConfig();
 const host = process.env.HOST || '0.0.0.0';
@@ -29,6 +30,7 @@ if (cleanupSummary.reviewed > 0) {
 const server = app.listen(config.server.port, host, () => {
   console.log(`Uckele Group backend listening on ${host}:${config.server.port}`);
   schedulers = [
+    eventLoopWatch.start(),
     startDealHunterDailyEmailScheduler(),
     startDealHunterSheetSyncScheduler(),
     startPursueCimSenderScheduler(),
