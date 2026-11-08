@@ -14,8 +14,7 @@ function logCheckError(check, error) {
   console.warn(`[ready] check failed check=${check} code=${String(error?.code || 'unknown').slice(0, 40)}`);
 }
 
-export async function checkReadiness() {
-  const config = getConfig();
+export async function checkReadiness({ config = getConfig(), storage: injectedStorage } = {}) {
   const checks = {
     configuration: 'ok',
     storage: 'ok',
@@ -24,7 +23,7 @@ export async function checkReadiness() {
   };
 
   try {
-    const storage = getStorage();
+    const storage = injectedStorage || getStorage();
     if (storage.checkHealth) {
       await storage.checkHealth();
     } else {
