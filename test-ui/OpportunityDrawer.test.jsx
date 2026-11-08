@@ -381,6 +381,41 @@ describe('Opportunity drawer', () => {
     expect(mutation).not.toHaveBeenCalled();
   });
 
+  test('hides Request SIM while a campaign owns the listing, and leaves the other decisions', () => {
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()} onAction={vi.fn()}
+      onCimReleaseStop={vi.fn()} onClose={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Stop CIM campaign' })).toBeVisible();
+  });
+
+  test.each([
+    ['no release has loaded', null],
+    ['no campaign exists yet', { campaign: null, actions: { canStop: false } }],
+    ['the campaign has finished', { actions: { canStop: false } }],
+    ['the enrollment needs another request', { enrollment: { state: 'action-required', reasonCode: 'timezone-missing' } }],
+  ])('keeps Request SIM when %s', (_name, overrides) => {
+    render(<OpportunityDrawer cimRelease={overrides ? cimReleaseFixture(overrides) : null} detail={detailFixture()}
+      onAction={vi.fn()} onClose={vi.fn()} />);
+
+    expect(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeVisible();
+  });
+
+  test('shows the campaign in the Workflow box instead of the older request status', () => {
+    const { rerender } = render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText(/CIM: Campaign Initial Pending/)).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      campaign: { ...cimReleaseFixture().campaign, state: 'stopped' }, actions: { canStop: false },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText(/CIM: Campaign Stopped/)).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={null} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.queryByText(/CIM: Campaign/)).toBeNull();
+  });
+
   test('renders only persisted canary release evidence and one explicit stop control', () => {
     const onCimReleaseStop = vi.fn();
     render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()}

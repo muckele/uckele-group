@@ -72,3 +72,37 @@ test('release expiry projection never overrides provider ambiguity or durable te
     now: '2026-10-23T19:00:07.000Z', getPauseStatus: async () => ({ paused: true }) });
   assert.equal(ambiguous.status.code, 'provider_ambiguous');
 });
+
+async function reportPauseWith(getDealHunterCimSafetySettings) {
+  const campaign = { id: 'campaign-pause', opportunity_id: 'opportunity-pause',
+    conversation_id: 'conversation-pause', state: 'initial-pending', reason_code: null,
+    local_expiry_at: null, row_version: 1, terminal_revision: 0, generation: 1,
+    policy_version: 'deal-hunter-cim-autopilot-v1', recipient_authority_id: 'recipient-pause',
+    recipient_fingerprint: 'a'.repeat(64) };
+  const report = await getPursueCimReleaseReport({
+    storage: { ...storageForCampaign(campaign), getDealHunterCimSafetySettings },
+    opportunityId: campaign.opportunity_id, now: '2026-10-23T19:00:00.000Z' });
+  return report.pause;
+}
+
+test('release pause reports what the Gmail sender obeys: the saved control, not the fly.toml setting', async () => {
+  const previous = process.env.DEAL_HUNTER_CIM_OUTREACH_PAUSED;
+  process.env.DEAL_HUNTER_CIM_OUTREACH_PAUSED = 'true';
+  try {
+    assert.deepEqual(await reportPauseWith(async () => ({ outreach_paused: 0, updated_at: '2026-10-23T18:00:00.000Z' })),
+      { paused: false, source: '', updatedAt: '2026-10-23T18:00:00.000Z' });
+  } finally {
+    if (previous === undefined) delete process.env.DEAL_HUNTER_CIM_OUTREACH_PAUSED;
+    else process.env.DEAL_HUNTER_CIM_OUTREACH_PAUSED = previous;
+  }
+});
+
+test('release pause shows a saved pause as paused from the Operations control', async () => {
+  assert.deepEqual(await reportPauseWith(async () => ({ outreach_paused: 1, updated_at: '2026-10-23T18:00:00.000Z' })),
+    { paused: true, source: 'operations-control', updatedAt: '2026-10-23T18:00:00.000Z' });
+});
+
+test('release pause fails closed when the saved control is missing or unreadable, as the sender does', async () => {
+  assert.equal((await reportPauseWith(async () => null)).paused, true);
+  assert.equal((await reportPauseWith(async () => { throw new Error('storage down'); })).paused, true);
+});

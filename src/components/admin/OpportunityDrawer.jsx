@@ -114,9 +114,9 @@ export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit
   );
 }
 
-function DetailActions({ name, onAction, onPass, onRequestSim, pending }) {
+function DetailActions({ name, onAction, onPass, onRequestSim, pending, showRequestSim = true }) {
   if (!onAction) return null;
-  return <div className="flex flex-wrap gap-2"><button aria-label={`Request SIM ${name}`} className={primaryButton} disabled={pending} onClick={onRequestSim} type="button">Request SIM</button><button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
+  return <div className="flex flex-wrap gap-2">{showRequestSim ? <button aria-label={`Request SIM ${name}`} className={primaryButton} disabled={pending} onClick={onRequestSim} type="button">Request SIM</button> : null}<button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
 }
 
 function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
@@ -341,6 +341,14 @@ export default function OpportunityDrawer({
   const linkedCrmId = detail?.crmSummary?.submission?.id;
   const safeUrls = [...new Set((detail?.listingUrls || []).map(safeListingUrl).filter(Boolean))];
   const actionable = Boolean(onAction && opportunity && !opportunity.dismissed && !readOnly);
+  // A running campaign already owns this listing, so another request would do nothing. An enrollment
+  // that needs action is the exception: Request SIM is how it continues, for example after a timezone is set.
+  const campaignOwnsListing = Boolean(cimRelease?.campaign && cimRelease.actions?.canStop
+    && cimRelease.enrollment?.state !== 'action-required');
+  // The workflow's CIM status tracks the older manual request path and stays "not requested" for a campaign.
+  const cimWorkflowLabel = cimRelease?.campaign
+    ? `Campaign ${formatLabel(cimRelease.campaign.state)}`
+    : formatLabel(opportunity?.workflow?.cimStatus || 'not-requested');
   const strengths = (detail?.score?.summary?.strengths || []).filter(hasValue);
   const concerns = (detail?.score?.summary?.concerns || []).filter(hasValue);
   const earnings = earningsPresentation(opportunity?.financials);
@@ -419,7 +427,7 @@ export default function OpportunityDrawer({
             <Section title="Overview">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[
                 ['Fit', opportunity.fitScore], ['Confidence', formatLabel(opportunity.confidence)], ['Operator state', formatLabel(opportunity.operatorPriority || 'normal')], ['Machine state', formatLabel(opportunity.scoreStatus)],
-                ['Completeness', `${opportunity.completenessScore}%`], ['Review', `${reviewState} · ${changedState}`], ['Workflow', `CRM: ${formatLabel(opportunity.workflow?.crmStatus || 'not-started')} · CIM: ${formatLabel(opportunity.workflow?.cimStatus || 'not-requested')}`],
+                ['Completeness', `${opportunity.completenessScore}%`], ['Review', `${reviewState} · ${changedState}`], ['Workflow', `CRM: ${formatLabel(opportunity.workflow?.crmStatus || 'not-started')} · CIM: ${cimWorkflowLabel}`],
                 ['Evidence', `${opportunity.missingEvidenceCount} missing evidence · ${opportunity.contradictionCount} contradiction${opportunity.contradictionCount === 1 ? '' : 's'}`],
               ].map(([label, value]) => <div className="rounded-xl bg-fog/70 p-3" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
               {opportunity.observationFreshness ? <p className="mt-3 text-xs text-ink/55">Observed {formatDate(opportunity.observationFreshness)}{opportunity.scoredAt ? ` · Scored ${formatDate(opportunity.scoredAt)}` : ''}{opportunity.rulesVersion ? ` · ${opportunity.rulesVersion}` : ''}</p> : null}
@@ -433,8 +441,8 @@ export default function OpportunityDrawer({
                   : <button className={secondaryButton} disabled={pending || actionsBlocked} onClick={() => setRestoreOpen(true)} type="button">Restore opportunity</button>}
               </div> : null}
               <div className="mt-4"><PursueNextAction brokerMaterials={detail.brokerMaterials} cimRelease={cimRelease} linkedCrmId={linkedCrmId} opportunity={opportunity} pursueCimReleaseAvailable={detail.pursueCimReleaseAvailable} /></div>
-              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} onRequestSim={() => (isNearMiss(opportunity) ? setSimConfirmOpen(true) : onAction('pursue'))} pending={pending || actionsBlocked} /></div>
-              {simConfirmOpen && actionable && isNearMiss(opportunity) ? <NearMissConfirmPanel onCancel={() => setSimConfirmOpen(false)} onConfirm={() => { setSimConfirmOpen(false); onAction('pursue'); }} pending={pending || actionsBlocked} row={opportunity} /> : null}
+              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} onRequestSim={() => (isNearMiss(opportunity) ? setSimConfirmOpen(true) : onAction('pursue'))} pending={pending || actionsBlocked} showRequestSim={!campaignOwnsListing} /></div>
+              {simConfirmOpen && actionable && !campaignOwnsListing && isNearMiss(opportunity) ? <NearMissConfirmPanel onCancel={() => setSimConfirmOpen(false)} onConfirm={() => { setSimConfirmOpen(false); onAction('pursue'); }} pending={pending || actionsBlocked} row={opportunity} /> : null}
               {pursueChoice?.options?.length > 1 && actionable ? <div aria-label="Choose Pursue recipient" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
                 <p className="text-sm font-semibold text-amber-950">Choose the authoritative broker recipient to continue Pursue</p>
                 <p className="mt-1 text-xs text-amber-900">The choice is checked against current contact authority before a campaign can be created.</p>
