@@ -97,9 +97,11 @@ function projectRun(row, countNames) {
 export async function readCentralPause(storage) {
   try {
     const settings = await storage.getDealHunterCimSafetySettings?.();
-    return { paused: !settings || Boolean(settings.outreach_paused), updatedAt: settings?.updated_at || '' };
+    if (!settings) return { paused: true, source: 'settings-unavailable', updatedAt: '' };
+    const paused = Boolean(settings.outreach_paused);
+    return { paused, source: paused ? 'operations-control' : '', updatedAt: settings.updated_at || '' };
   } catch {
-    return { paused: true, updatedAt: '' };
+    return { paused: true, source: 'settings-unavailable', updatedAt: '' };
   }
 }
 

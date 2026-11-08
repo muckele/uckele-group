@@ -7,8 +7,7 @@ const terminalCampaignStates = new Set([
 
 async function defaultGetPauseStatus({ storage }) {
   const { readCentralPause } = await import('./pursueEmailSending.js');
-  const { paused, updatedAt } = await readCentralPause(storage);
-  return { paused, source: paused ? 'operations-control' : '', updatedAt };
+  return readCentralPause(storage);
 }
 
 function boundedText(value, maximum = 400) {

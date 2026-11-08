@@ -103,6 +103,7 @@ test('release pause shows a saved pause as paused from the Operations control', 
 });
 
 test('release pause fails closed when the saved control is missing or unreadable, as the sender does', async () => {
-  assert.equal((await reportPauseWith(async () => null)).paused, true);
-  assert.equal((await reportPauseWith(async () => { throw new Error('storage down'); })).paused, true);
+  const unavailable = { paused: true, source: 'settings-unavailable', updatedAt: '' };
+  assert.deepEqual(await reportPauseWith(async () => null), unavailable);
+  assert.deepEqual(await reportPauseWith(async () => { throw new Error('storage down'); }), unavailable);
 });

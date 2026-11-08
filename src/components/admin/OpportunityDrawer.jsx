@@ -287,7 +287,7 @@ function CimReleaseCard({ error = '', loading = false, onStop, onTimezoneSet, op
           <div><dt className="font-semibold text-sky-950">Campaign</dt><dd className="break-all text-sky-900">{release.campaign?.id || 'Not allocated'}{release.campaign ? ` · generation ${release.campaign.generation}` : ''}</dd></div>
           <div><dt className="font-semibold text-sky-950">Campaign state</dt><dd className="text-sky-900">{formatLabel(release.campaign?.state || release.enrollment?.state || release.status?.code)}{release.status?.reason ? ` · ${formatLabel(release.status.reason)}` : ''}</dd></div>
           <div><dt className="font-semibold text-sky-950">Timezone authority</dt><dd className="text-sky-900">{release.timezoneAuthority?.ianaTimezone || formatLabel(release.timezoneAuthority?.state || 'unavailable')}{release.timezoneAuthority?.revision !== null && release.timezoneAuthority?.revision !== undefined ? ` · revision ${release.timezoneAuthority.revision}` : ''}</dd></div>
-          <div><dt className="font-semibold text-sky-950">Outreach pause</dt><dd className="text-sky-900">{release.pause?.paused ? 'Paused' : 'Not paused'}{release.pause?.source ? ` · ${formatLabel(release.pause.source)}` : ''}</dd></div>
+          <div><dt className="font-semibold text-sky-950">Gmail sending pause</dt><dd className="text-sky-900">{release.pause?.paused ? 'Paused' : 'Not paused'}{release.pause?.source ? ` · ${formatLabel(release.pause.source)}` : ''}</dd></div>
           {release.activation ? <div><dt className="font-semibold text-sky-950">Permission activation</dt><dd className="break-all text-sky-900">{release.activation.id} · {formatLabel(release.activation.mode)}{release.activation.expiresAt ? ` · expires ${formatDate(release.activation.expiresAt)}` : ''}</dd></div> : null}
           {transmission ? <div><dt className="font-semibold text-sky-950">Live authorization</dt><dd className="break-all text-sky-900">{release.liveAuthorization ? `${formatLabel(release.liveAuthorization.status)}${release.liveAuthorization.expiresAt ? ` · expires ${formatExactInstant(release.liveAuthorization.expiresAt)}` : ''}` : 'Not issued'}</dd></div> : null}
           {release.recipientAuthority ? <div><dt className="font-semibold text-sky-950">Recipient authority</dt><dd className="break-all text-sky-900">{release.recipientAuthority.address || 'Persisted with transmission'} · revision {release.recipientAuthority.permissionRevision ?? 'unavailable'}</dd></div> : null}
@@ -341,13 +341,13 @@ export default function OpportunityDrawer({
   const linkedCrmId = detail?.crmSummary?.submission?.id;
   const safeUrls = [...new Set((detail?.listingUrls || []).map(safeListingUrl).filter(Boolean))];
   const actionable = Boolean(onAction && opportunity && !opportunity.dismissed && !readOnly);
-  // A running campaign already owns this listing, so another request would do nothing. An enrollment
-  // that needs action is the exception: Request SIM is how it continues, for example after a timezone is set.
-  const campaignOwnsListing = Boolean(cimRelease?.campaign && cimRelease.actions?.canStop
-    && cimRelease.enrollment?.state !== 'action-required');
-  // The workflow's CIM status tracks the older manual request path and stays "not requested" for a campaign.
+  // A running campaign already owns this listing, so another request would do nothing. Recovery that
+  // needs Request SIM, such as setting a timezone, happens before a campaign exists.
+  const campaignOwnsListing = Boolean(cimRelease?.campaign && cimRelease.actions?.canStop);
+  // The workflow's CIM status tracks the older manual request path and stays "not requested" for a
+  // campaign. Expiry is only projected into the status until the sender next updates the campaign.
   const cimWorkflowLabel = cimRelease?.campaign
-    ? `Campaign ${formatLabel(cimRelease.campaign.state)}`
+    ? `Campaign ${formatLabel(cimRelease.status?.code === 'expired' ? 'expired' : cimRelease.campaign.state)}`
     : formatLabel(opportunity?.workflow?.cimStatus || 'not-requested');
   const strengths = (detail?.score?.summary?.strengths || []).filter(hasValue);
   const concerns = (detail?.score?.summary?.concerns || []).filter(hasValue);

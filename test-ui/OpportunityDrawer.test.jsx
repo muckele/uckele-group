@@ -395,12 +395,24 @@ describe('Opportunity drawer', () => {
     ['no release has loaded', null],
     ['no campaign exists yet', { campaign: null, actions: { canStop: false } }],
     ['the campaign has finished', { actions: { canStop: false } }],
-    ['the enrollment needs another request', { enrollment: { state: 'action-required', reasonCode: 'timezone-missing' } }],
+    ['recovery needs another request', { campaign: null, actions: { canStop: false },
+      enrollment: { state: 'action-required', reasonCode: 'timezone-missing' } }],
   ])('keeps Request SIM when %s', (_name, overrides) => {
     render(<OpportunityDrawer cimRelease={overrides ? cimReleaseFixture(overrides) : null} detail={detailFixture()}
       onAction={vi.fn()} onClose={vi.fn()} />);
 
     expect(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeVisible();
+  });
+
+  test('closes an open near-miss confirmation if a campaign turns out to own the listing', () => {
+    const base = detailFixture();
+    const detail = { ...base, opportunity: { ...base.opportunity, criteriaGroup: 'near-miss' } };
+    const { rerender } = render(<OpportunityDrawer cimRelease={null} detail={detail} onAction={vi.fn()} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
+    expect(screen.getByRole('group', { name: 'Confirm Request SIM' })).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detail} onAction={vi.fn()} onClose={vi.fn()} />);
+    expect(screen.queryByRole('group', { name: 'Confirm Request SIM' })).toBeNull();
   });
 
   test('shows the campaign in the Workflow box instead of the older request status', () => {
@@ -411,6 +423,12 @@ describe('Opportunity drawer', () => {
       campaign: { ...cimReleaseFixture().campaign, state: 'stopped' }, actions: { canStop: false },
     })} detail={detailFixture()} onClose={vi.fn()} />);
     expect(screen.getByText(/CIM: Campaign Stopped/)).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      status: { code: 'expired', reason: '', actionRequired: false },
+      campaign: { ...cimReleaseFixture().campaign, state: 'active-follow-up' }, actions: { canStop: false },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText(/CIM: Campaign Expired/)).toBeVisible();
 
     rerender(<OpportunityDrawer cimRelease={null} detail={detailFixture()} onClose={vi.fn()} />);
     expect(screen.queryByText(/CIM: Campaign/)).toBeNull();
