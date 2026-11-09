@@ -151,6 +151,8 @@ function cimSafetyDigest(...parts) {
 // `safetyCounts`, when given, must be a Map scoped to one transaction. It holds
 // each safety run's stored event count, read once with COUNT(*) and then kept
 // current as this function inserts, so the cap does not recount the run per call.
+// The count stays exact only while this function is the sole writer of
+// deal_hunter_cim_safety_events inside that transaction.
 // `prepare`, when given, returns statements cached for that same transaction.
 function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
   sourceRecordId, eventType: classification, evidenceDigest, acceptedAt }, safetyCounts = null,

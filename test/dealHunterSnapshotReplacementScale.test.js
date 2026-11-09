@@ -192,12 +192,11 @@ test('a 3,000-record complete Sheet replaced again with one changed record does 
   // 700 ms alone but 1,330 ms under the parallel `npm test` load. These counts
   // are exact under any load. The old save compiled 18,017 statements (the fix:
   // 23), ran the safety-run COUNT(*) once per event (3,000 times), and started a
-  // Map#values() scan of every current observation once per record. The time
-  // bound is only a coarse guard.
+  // Map#values() scan of every current observation once per record. Wall time
+  // is not asserted, so a slow CI runner cannot fail this test.
   assert.equal(safetyCountRuns, 1, 'the safety cap counts the run once per transaction');
   assert.ok(compiled.length < 100, `the save compiled ${compiled.length} statements`);
   assert.ok(mapValueScans < 100, `the save started ${mapValueScans} Map#values() scans`);
-  assert.ok(elapsedMs < 5000, `second replacement took ${elapsedMs.toFixed(0)} ms`);
 });
 
 test('a source record observed under two opportunities keeps the first current key\'s latest row', async (t) => {
