@@ -9,8 +9,12 @@ async function checkDocumentVault(config) {
   await fs.access(config.secureDocuments.storageDir, fsConstants.R_OK | fsConstants.W_OK);
 }
 
-export async function checkReadiness() {
-  const config = getConfig();
+// The error code only (SQLITE_BUSY, ENOSPC): messages can carry paths, and the response stays unchanged.
+function logCheckError(check, error) {
+  console.warn(`[ready] check failed check=${check} code=${String(error?.code || 'unknown').slice(0, 40)}`);
+}
+
+export async function checkReadiness({ config = getConfig(), storage: injectedStorage } = {}) {
   const checks = {
     configuration: 'ok',
     storage: 'ok',
@@ -19,7 +23,7 @@ export async function checkReadiness() {
   };
 
   try {
-    const storage = getStorage();
+    const storage = injectedStorage || getStorage();
     if (storage.checkHealth) {
       await storage.checkHealth();
     } else {
@@ -27,14 +31,16 @@ export async function checkReadiness() {
     }
     const stage2Storage = await storage.checkCimStage2Storage?.();
     if (!stage2Storage?.ok) checks.cimStage2Storage = 'failed';
-  } catch {
+  } catch (error) {
+    logCheckError('storage', error);
     checks.storage = 'failed';
     checks.cimStage2Storage = 'failed';
   }
 
   try {
     await checkDocumentVault(config);
-  } catch {
+  } catch (error) {
+    logCheckError('documentVault', error);
     checks.documentVault = 'failed';
   }
 

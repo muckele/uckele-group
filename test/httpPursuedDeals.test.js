@@ -324,8 +324,8 @@ test('GET /api/admin/deal-hunter/pursuing', async (t) => {
       } finally {
         storage.readPursueCimProjection = original;
       }
-      assert.equal(warnings.length >= 1, true);
-      assert.deepEqual(warnings.at(-1)[1], { opportunityId: 'opp-nda', cause: 'Error' });
+      assert.deepEqual(warnings.find((warning) => warning[1]?.opportunityId === 'opp-nda')?.[1],
+        { opportunityId: 'opp-nda', cause: 'Error' });
     });
 
     await t.test('with Gmail disconnected the link falls back to the configured sender', async () => {

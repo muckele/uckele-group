@@ -38,6 +38,7 @@ import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
 import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
+import { eventLoopWatch } from './utils/eventLoopWatch.js';
 import {
   identityHeldReviewWarning,
   previewOpportunityScoreRefresh,
@@ -605,6 +606,8 @@ export function createApp({
   sourceAuthorityRevalidator = revalidateRequiredSourceAuthority,
   gmailFetcher = (...args) => globalThis.fetch(...args),
   diskStats = (directory) => fs.promises.statfs(directory),
+  requestWatch = eventLoopWatch,
+  readinessCheck = checkReadiness,
 } = {}) {
   const config = getConfig();
   const app = express();
@@ -620,6 +623,7 @@ export function createApp({
   const setSecurityHeaders = securityHeaders(config);
 
   app.disable('x-powered-by');
+  app.use(requestWatch.middleware);
   app.use((request, response, next) => {
     const providedId = String(request.headers['x-request-id'] || '').trim();
     request.id = /^[A-Za-z0-9._-]{1,100}$/.test(providedId) ? providedId : randomUUID();
@@ -858,7 +862,11 @@ export function createApp({
   app.get(
     '/api/ready',
     asyncRoute(async (_request, response) => {
-      const readiness = await checkReadiness();
+      const readiness = await readinessCheck();
+      if (!readiness.ok) {
+        const failed = Object.keys(readiness.checks).filter((name) => readiness.checks[name] !== 'ok');
+        console.warn(`[ready] not ready failed=${failed.join(',')}`);
+      }
       response.status(readiness.ok ? 200 : 503).json(readiness);
     }),
   );
