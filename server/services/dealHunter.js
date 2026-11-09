@@ -2814,23 +2814,30 @@ function uniqueStrings(values = []) {
   return [...new Set(values.map((value) => normalizeText(value, 1000)).filter(Boolean))];
 }
 
-function tokenSet(value = '') {
-  return new Set(normalizeComparableText(value).split(' ').filter((token) => token.length > 1));
+// Takes text already passed through normalizeComparableText.
+function comparableTokenSet(comparableText) {
+  return new Set(comparableText.split(' ').filter((token) => token.length > 1));
 }
 
-function tokenSimilarity(left = '', right = '') {
-  const leftTokens = tokenSet(left);
-  const rightTokens = tokenSet(right);
+// The overlap is an integer count, so it is the same whichever set is walked.
+function tokenOverlap(leftTokens, rightTokens) {
+  const [smaller, larger] = leftTokens.size <= rightTokens.size ? [leftTokens, rightTokens] : [rightTokens, leftTokens];
+  let overlap = 0;
+  for (const token of smaller) {
+    if (larger.has(token)) overlap += 1;
+  }
+  return overlap;
+}
+
+function tokenSetSimilarity(leftTokens, rightTokens) {
   if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
-  const overlap = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  const overlap = tokenOverlap(leftTokens, rightTokens);
   return overlap / (leftTokens.size + rightTokens.size - overlap);
 }
 
-function tokenContainment(left = '', right = '') {
-  const leftTokens = tokenSet(left);
-  const rightTokens = tokenSet(right);
+function tokenSetContainment(leftTokens, rightTokens) {
   if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
-  const overlap = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  const overlap = tokenOverlap(leftTokens, rightTokens);
   return overlap / Math.min(leftTokens.size, rightTokens.size);
 }
 
@@ -2987,31 +2994,33 @@ function financialMatchEvidence(left, right) {
 }
 
 function geographicEvidence(left, right) {
-  const leftState = normalizeIdentityPart(left.state, 40);
-  const rightState = normalizeIdentityPart(right.state, 40);
-  const leftCountry = normalizeIdentityPart(left.country, 40);
-  const rightCountry = normalizeIdentityPart(right.country, 40);
-  const stateConflict = Boolean(leftState && rightState && leftState !== rightState);
-  const countryConflict = Boolean(leftCountry && rightCountry && leftCountry !== rightCountry);
-  const stateMatch = Boolean(leftState && rightState && leftState === rightState);
-  const leftCity = normalizeIdentityPart(left.city, 80);
-  const rightCity = normalizeIdentityPart(right.city, 80);
-  const leftCounty = normalizeIdentityPart(left.county, 120);
-  const rightCounty = normalizeIdentityPart(right.county, 120);
+  const stateConflict = Boolean(left.state && right.state && left.state !== right.state);
+  const countryConflict = Boolean(left.country && right.country && left.country !== right.country);
+  const stateMatch = Boolean(left.state && right.state && left.state === right.state);
   const locationMatch = Boolean(
-    (leftCity && rightCity && leftCity === rightCity)
-    || (leftCounty && rightCounty && leftCounty === rightCounty),
+    (left.city && right.city && left.city === right.city)
+    || (left.county && right.county && left.county === right.county),
   );
   return { hardConflict: stateConflict || countryConflict, stateMatch, locationMatch };
 }
 
-function stableMarketplaceConflict(leftAliases, rightAliases) {
-  for (const namespace of ['costar:', 'dealstream:', 'businessbroker:']) {
-    const left = leftAliases.filter((alias) => alias.startsWith(namespace));
-    const right = rightAliases.filter((alias) => alias.startsWith(namespace));
+const stableMarketplaceNamespaces = ['costar:', 'dealstream:', 'businessbroker:'];
+
+function marketplaceAliasesByNamespace(aliases) {
+  return stableMarketplaceNamespaces.map((namespace) => aliases.filter((alias) => alias.startsWith(namespace)));
+}
+
+function marketplaceAliasesConflict(leftByNamespace, rightByNamespace) {
+  for (let index = 0; index < stableMarketplaceNamespaces.length; index += 1) {
+    const left = leftByNamespace[index];
+    const right = rightByNamespace[index];
     if (left.length > 0 && right.length > 0 && !left.some((alias) => right.includes(alias))) return true;
   }
   return false;
+}
+
+function stableMarketplaceConflict(leftAliases, rightAliases) {
+  return marketplaceAliasesConflict(marketplaceAliasesByNamespace(leftAliases), marketplaceAliasesByNamespace(rightAliases));
 }
 
 function stableSourceConflict(left, right) {
@@ -3021,21 +3030,53 @@ function stableSourceConflict(left, right) {
   return Boolean(leftIdentity && rightIdentity && leftIdentity !== rightIdentity);
 }
 
+// Everything syndicatedMatchDecision derives from one side alone. dedupeDeals
+// builds this once per record instead of once per candidate pair.
+function syndicatedMatchFeatures(deal) {
+  const aliases = dealIdentityAliases(deal);
+  const name = normalizeComparableText(deal.name);
+  const description = normalizeComparableText(deal.description);
+  return {
+    deal,
+    aliases,
+    aliasSet: new Set(aliases),
+    marketplaceAliases: marketplaceAliasesByNamespace(aliases),
+    name,
+    nameTokens: comparableTokenSet(name),
+    descriptionLength: description.length,
+    descriptionTokens: comparableTokenSet(description),
+    geography: {
+      state: normalizeIdentityPart(deal.state, 40),
+      country: normalizeIdentityPart(deal.country, 40),
+      city: normalizeIdentityPart(deal.city, 80),
+      county: normalizeIdentityPart(deal.county, 120),
+    },
+    sourceId: deal.sourceId,
+    sourceIdentity: sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId),
+  };
+}
+
 function syndicatedMatchDecision(left, right) {
-  const leftAliases = dealIdentityAliases(left);
-  const rightAliases = dealIdentityAliases(right);
-  const sharedAliases = leftAliases.filter((alias) => rightAliases.includes(alias));
-  const geography = geographicEvidence(left, right);
-  const financials = financialMatchEvidence(left, right);
-  const titleSimilarity = tokenSimilarity(left.name, right.name);
-  const titleContainment = tokenContainment(left.name, right.name);
-  const descriptionSimilarity = tokenSimilarity(left.description, right.description);
-  const descriptionLongEnough = normalizeComparableText(left.description).length >= 120
-    && normalizeComparableText(right.description).length >= 120;
-  const exactTitle = normalizeComparableText(left.name) !== ''
-    && normalizeComparableText(left.name) === normalizeComparableText(right.name);
-  const marketplaceConflict = stableMarketplaceConflict(leftAliases, rightAliases);
-  const sourceConflict = stableSourceConflict(left, right);
+  return syndicatedMatchDecisionFromFeatures(syndicatedMatchFeatures(left), syndicatedMatchFeatures(right));
+}
+
+function syndicatedMatchDecisionFromFeatures(leftFeatures, rightFeatures) {
+  const sharedAliases = leftFeatures.aliases.filter((alias) => rightFeatures.aliasSet.has(alias));
+  const geography = geographicEvidence(leftFeatures.geography, rightFeatures.geography);
+  const financials = financialMatchEvidence(leftFeatures.deal, rightFeatures.deal);
+  const titleSimilarity = tokenSetSimilarity(leftFeatures.nameTokens, rightFeatures.nameTokens);
+  const titleContainment = tokenSetContainment(leftFeatures.nameTokens, rightFeatures.nameTokens);
+  const descriptionSimilarity = tokenSetSimilarity(leftFeatures.descriptionTokens, rightFeatures.descriptionTokens);
+  const descriptionLongEnough = leftFeatures.descriptionLength >= 120 && rightFeatures.descriptionLength >= 120;
+  const exactTitle = leftFeatures.name !== '' && leftFeatures.name === rightFeatures.name;
+  const marketplaceConflict = marketplaceAliasesConflict(leftFeatures.marketplaceAliases, rightFeatures.marketplaceAliases);
+  const sourceConflict = Boolean(
+    leftFeatures.sourceId
+    && leftFeatures.sourceId === rightFeatures.sourceId
+    && leftFeatures.sourceIdentity
+    && rightFeatures.sourceIdentity
+    && leftFeatures.sourceIdentity !== rightFeatures.sourceIdentity,
+  );
   const hardConflict = geography.hardConflict || sourceConflict || financials.conflicts.length >= 2;
   const evidence = {
     sharedAliases,
@@ -3218,6 +3259,21 @@ export function dedupeDeals(deals) {
   const indicesByBlock = new Map();
   const maximumBlockSize = 200;
   const maximumCandidateComparisons = 500;
+  // Keyed by object identity and scoped to this call. Nothing in this
+  // function mutates a record after it is first compared: merges build a new
+  // object, and the canonical match record is a copy made once.
+  const featuresByRecord = new WeakMap();
+  const matchFeatures = (record) => {
+    if (record === null || (typeof record !== 'object' && typeof record !== 'function')) {
+      return syndicatedMatchFeatures(record);
+    }
+    let features = featuresByRecord.get(record);
+    if (!features) {
+      features = syndicatedMatchFeatures(record);
+      featuresByRecord.set(record, features);
+    }
+    return features;
+  };
 
   const indexDeal = (deal, index) => {
     for (const key of candidateBlockKeys(deal)) {
@@ -3245,7 +3301,10 @@ export function dedupeDeals(deals) {
     const matches = [...candidateIndices]
       .map((index) => ({
         index,
-        decision: syndicatedMatchDecision(deduped[index]._canonicalMatchRecord || deduped[index], deal),
+        decision: syndicatedMatchDecisionFromFeatures(
+          matchFeatures(deduped[index]._canonicalMatchRecord || deduped[index]),
+          matchFeatures(deal),
+        ),
       }))
       .filter(({ decision }) => decision.automatic)
       .sort((left, right) => right.decision.confidence - left.decision.confidence || left.index - right.index);
