@@ -104,6 +104,8 @@ async function replaceSnapshot(storage, runId, records, collector = storage) {
   return result;
 }
 
+const safetyCountSql = /SELECT COUNT\(\*\) AS n FROM deal_hunter_cim_safety_events/;
+
 function profitClaim(value) {
   return { rawHeader: 'Annual Profit', rawValue: String(value), metric: 'sde', currency: 'USD', period: 'annual' };
 }
@@ -129,30 +131,49 @@ test('a 3,000-record complete Sheet replaced again with one changed record does 
 
   const second = first.slice();
   second[1499] = scaleRecord(1500, 777777);
-  // Measure only the storage save, not the collector's checks around it:
-  // its wall time, and every SQL statement it compiles.
+  // Measure only the storage save, not the collector's checks around it: its
+  // wall time, every SQL statement it compiles, every safety-run COUNT(*) it
+  // executes, and every Map#values() iteration it starts.
   let elapsedMs = null;
   const compiled = [];
+  let safetyCountRuns = 0;
+  let mapValueScans = 0;
+  const probe = new Database(':memory:');
+  const statementPrototype = Object.getPrototypeOf(probe.prepare('SELECT 1'));
+  probe.close();
   const timedStorage = {
     ...storage,
     async replaceAdmittedCompleteGoogleSheetSourceSnapshot(value) {
       const originalPrepare = Database.prototype.prepare;
+      const originalGet = statementPrototype.get;
+      const originalValues = Map.prototype.values;
       Database.prototype.prepare = function countedPrepare(sql) {
         compiled.push(sql);
         return originalPrepare.call(this, sql);
+      };
+      statementPrototype.get = function countedGet(...parameters) {
+        if (safetyCountSql.test(this.source)) safetyCountRuns += 1;
+        return originalGet.apply(this, parameters);
+      };
+      Map.prototype.values = function countedValues() {
+        mapValueScans += 1;
+        return originalValues.call(this);
       };
       const started = performance.now();
       try {
         return await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(value);
       } finally {
         elapsedMs = performance.now() - started;
+        Map.prototype.values = originalValues;
+        statementPrototype.get = originalGet;
         Database.prototype.prepare = originalPrepare;
       }
     },
   };
   const result = await replaceSnapshot(storage, 'scale-run-2', second, timedStorage);
   t.diagnostic(`second replacement of ${recordCount} records: ${elapsedMs.toFixed(0)} ms, `
-    + `${compiled.length} statements compiled`);
+    + `${compiled.length} statements compiled, ${safetyCountRuns} safety COUNT(*) runs, `
+    + `${mapValueScans} Map#values() scans`);
 
   assert.equal(result.safetyEventsEmitted, recordCount);
   const db = new Database(storage.testSqlitePath, { readonly: true });
@@ -168,12 +189,14 @@ test('a 3,000-record complete Sheet replaced again with one changed record does 
   }]);
   // Wall time alone cannot separate the two: measured locally (Node 22, Apple
   // silicon) the old save took about 1,300 ms alone and the fixed one about
-  // 700 ms alone but 1,330 ms under the parallel `npm test` load. Statement
-  // compiles are exact: the old save compiled 18,017 (the fix: 23), including one
-  // safety-run COUNT(*) per event. The time bound is only a coarse guard.
-  assert.equal(compiled.filter((sql) => /SELECT COUNT\(\*\) AS n FROM deal_hunter_cim_safety_events/.test(sql)).length, 1,
-    'the safety cap counts the run once per transaction');
+  // 700 ms alone but 1,330 ms under the parallel `npm test` load. These counts
+  // are exact under any load. The old save compiled 18,017 statements (the fix:
+  // 23), ran the safety-run COUNT(*) once per event (3,000 times), and started a
+  // Map#values() scan of every current observation once per record. The time
+  // bound is only a coarse guard.
+  assert.equal(safetyCountRuns, 1, 'the safety cap counts the run once per transaction');
   assert.ok(compiled.length < 100, `the save compiled ${compiled.length} statements`);
+  assert.ok(mapValueScans < 100, `the save started ${mapValueScans} Map#values() scans`);
   assert.ok(elapsedMs < 5000, `second replacement took ${elapsedMs.toFixed(0)} ms`);
 });
 
@@ -233,30 +256,40 @@ test('a source record observed under two opportunities keeps the first current k
   ]);
 });
 
-async function safetyCapFixture(t, preseeded) {
-  // Run 2 writes two unchanged-record events and then one removed-record
-  // event, on top of `preseeded` rows already stored under its safety run.
-  const storage = withStorage(t);
-  for (const index of [1, 2, 3]) await seedOpportunity(storage, `cap-opp-${index}`);
-  const records = [1, 2, 3].map((index) => sheetRecord(`cap-opp-${index}`, `sheet-row:${index}`, [
+function capRecords(indexes) {
+  return indexes.map((index) => sheetRecord(`cap-opp-${index}`, `sheet-row:${index}`, [
     ['business_name', `Cap Business ${index}`],
   ]));
-  await replaceSnapshot(storage, 'cap-run-1', records);
-  const safetyRunId = sourceSafetyRunId(sourceId, 'cap-run-2');
+}
+
+// Stores `preseeded` extra rows under `runId`'s safety run, as rows from an
+// earlier attempt would be, and returns a counter for that safety run.
+function preseedSafetyEvents(t, storage, runId, preseeded) {
+  const safetyRunId = sourceSafetyRunId(sourceId, runId);
   const db = new Database(storage.testSqlitePath);
   t.after(() => db.close());
   const insert = db.prepare(`INSERT INTO deal_hunter_cim_safety_events (
       id, safety_run_id, opportunity_id, source_type, source_run_id, canonical_revision,
       identity_exception_revision, event_type, evidence_id, status, created_at, updated_at
-    ) VALUES (?, ?, 'cap-opp-1', 'sheet-import', 'cap-run-2', 0, 0, ?, ?, 'pending', ?, ?)`);
+    ) VALUES (?, ?, 'cap-opp-1', 'sheet-import', ?, 0, 0, ?, ?, 'pending', ?, ?)`);
   db.transaction(() => {
     for (let index = 0; index < preseeded; index += 1) {
-      insert.run(`cap-preseeded-${index}`, safetyRunId, `earlier-attempt-${index}`, `evidence-${index}`,
+      insert.run(`cap-preseeded-${index}`, safetyRunId, runId, `earlier-attempt-${index}`, `evidence-${index}`,
         observedAt, observedAt);
     }
   })();
-  const count = () => db.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_safety_events WHERE safety_run_id = ?')
+  return () => db.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_safety_events WHERE safety_run_id = ?')
     .get(safetyRunId).n;
+}
+
+async function safetyCapFixture(t, preseeded) {
+  // Run 2 writes two unchanged-record events and then one removed-record
+  // event, on top of `preseeded` rows already stored under its safety run.
+  const storage = withStorage(t);
+  for (const index of [1, 2, 3]) await seedOpportunity(storage, `cap-opp-${index}`);
+  const records = capRecords([1, 2, 3]);
+  await replaceSnapshot(storage, 'cap-run-1', records);
+  const count = preseedSafetyEvents(t, storage, 'cap-run-2', preseeded);
   return { storage, records: records.slice(0, 2), count };
 }
 
@@ -268,8 +301,9 @@ test('the admitted safety cap allows exactly 10,000 events in one run, counting 
 });
 
 test('the admitted safety cap throws when the removal event would be event 10,001', async (t) => {
-  // Break caught: a per-call-site counter would miss the two record events
-  // written earlier in the same transaction.
+  // Break caught: a counter that is not advanced after each insert, or a cap
+  // compared with `>` instead of `>=`, lets the removal event through as the
+  // 10,001st after the two record events written earlier in this transaction.
   const { storage, records, count } = await safetyCapFixture(t, 9998);
   await assert.rejects(replaceSnapshot(storage, 'cap-run-2', records),
     /^Error: Admitted safety run exceeds its bounded reader\.$/);
@@ -279,6 +313,36 @@ test('the admitted safety cap throws when the removal event would be event 10,00
 test('the admitted safety cap throws when a record event would be event 10,001', async (t) => {
   const { storage, records, count } = await safetyCapFixture(t, 9999);
   await assert.rejects(replaceSnapshot(storage, 'cap-run-2', records),
+    /^Error: Admitted safety run exceeds its bounded reader\.$/);
+  assert.equal(count(), 9999);
+});
+
+async function rerunCapFixture(t) {
+  // Run 1 is accepted, then run 2, then run 1's ID is used again on a new
+  // generation. Its three unchanged records find their events from the first
+  // attempt and return early as `prior`, writing nothing. With 9,996 earlier
+  // rows plus those three, the safety run holds 9,999 events before the rerun.
+  const storage = withStorage(t);
+  for (const index of [1, 2, 3, 4, 5]) await seedOpportunity(storage, `cap-opp-${index}`);
+  await replaceSnapshot(storage, 'cap-run-1', capRecords([1, 2, 3]));
+  await replaceSnapshot(storage, 'cap-run-2', capRecords([1, 2, 3]));
+  const count = preseedSafetyEvents(t, storage, 'cap-run-1', 9996);
+  assert.equal(count(), 9999);
+  return { storage, count };
+}
+
+test('safety events found from an earlier attempt of the run do not advance the cap', async (t) => {
+  // Break caught: counting a `prior` hit as a write would put the rerun at
+  // 10,002 before its one new record, and refuse a run that stays at 10,000.
+  const { storage, count } = await rerunCapFixture(t);
+  const result = await replaceSnapshot(storage, 'cap-run-1', capRecords([1, 2, 3, 4]));
+  assert.equal(count(), 10000);
+  assert.equal(result.safetyEventsEmitted, 10000);
+});
+
+test('a rerun with earlier-attempt events still throws at event 10,001', async (t) => {
+  const { storage, count } = await rerunCapFixture(t);
+  await assert.rejects(replaceSnapshot(storage, 'cap-run-1', capRecords([1, 2, 3, 4, 5])),
     /^Error: Admitted safety run exceeds its bounded reader\.$/);
   assert.equal(count(), 9999);
 });

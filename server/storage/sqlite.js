@@ -203,12 +203,25 @@ function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
   return { id, safetyRunId, emitted: true };
 }
 
+// Building an Intl.DateTimeFormat is costly and the formatter is stateless, so
+// each one is built once per exact set of constructor arguments.
+const dateTimeFormats = new Map();
+function cachedDateTimeFormat(locale, options) {
+  const key = JSON.stringify([locale, options]);
+  let format = dateTimeFormats.get(key);
+  if (!format) {
+    format = new Intl.DateTimeFormat(locale, options);
+    dateTimeFormats.set(key, format);
+  }
+  return format;
+}
+
 function acceptedPublicationClaim(claim, acceptedAt) {
   if (!claim || claim.meaning !== 'listing_publication') {
     return { state: 'unknown', date: null, instant: null };
   }
   const raw = String(claim.rawValue || '').trim();
-  const acceptedDate = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+  const acceptedDate = Object.fromEntries(cachedDateTimeFormat('en-US', {
     timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
   }).formatToParts(new Date(acceptedAt)).map((part) => [part.type, part.value]));
   const today = `${acceptedDate.year}-${acceptedDate.month}-${acceptedDate.day}`;
@@ -14472,15 +14485,6 @@ ${cimCapacityConsumeTriggerSql}
             const key = `${row.source_record_id}\u0000${row.field}`;
             currentByRecord.set(key, row);
           }
-          // Each record's first current row, in currentByRecord's own order: the
-          // first-inserted key's latest value. That is exactly the row
-          // `[...currentByRecord.values()].find(...)` returned per record.
-          const firstCurrentByRecordId = new Map();
-          for (const row of currentByRecord.values()) {
-            if (!firstCurrentByRecordId.has(row.source_record_id)) {
-              firstCurrentByRecordId.set(row.source_record_id, row);
-            }
-          }
           if (value.unresolved.length > 0) {
             for (const item of value.unresolved) {
               const exception = prepare(`SELECT id FROM deal_hunter_identity_exceptions
@@ -14567,6 +14571,15 @@ ${cimCapacityConsumeTriggerSql}
             return database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
               WHERE source_id = ? ORDER BY observed_at DESC, id ASC`).all(value.source_id)
               .map(normalizeDealHunterOpportunitySourceObservationRow);
+          }
+          // Each record's first current row, in currentByRecord's own order: the
+          // first-inserted key's latest value. That is exactly the row
+          // `[...currentByRecord.values()].find(...)` returned per record.
+          const firstCurrentByRecordId = new Map();
+          for (const row of currentByRecord.values()) {
+            if (!firstCurrentByRecordId.has(row.source_record_id)) {
+              firstCurrentByRecordId.set(row.source_record_id, row);
+            }
           }
           const insertEvidence = database.prepare(`INSERT INTO deal_hunter_freshness_evidence (
             id, source_id, source_name, source_record_id, run_id, generation, record_digest,
