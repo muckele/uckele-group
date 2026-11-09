@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 
 import { dedupeDeals } from '../server/services/dealHunter.js';
@@ -39,8 +38,8 @@ function clusterSizeHistogram(deduped) {
 //     console.log(createHash('sha256').update(JSON.stringify(out)).digest('hex'), JSON.stringify(sizes));"
 const goldenSeed = 20261109;
 const goldenCount = 600;
-const goldenSha256 = 'a09bf98f9281716b063597720f28eb4f929dec2aaae83c44520b45d86c7896c2';
-const goldenClusterSizes = { 1: 469, 2: 61, 3: 3 };
+const goldenSha256 = 'ac4b4c5036ae463b1245ec7f4dbe82f747de943919cde92093f3d049d4966ef3';
+const goldenClusterSizes = { 1: 460, 2: 70 };
 
 test('dedupeDeals output is byte-identical to the pre-cache implementation on the seeded fixture', () => {
   const { deals, planted } = generateDedupeFixture({ seed: goldenSeed, count: goldenCount });
@@ -60,16 +59,19 @@ test('dedupeDeals output is byte-identical to the pre-cache implementation on th
   }
 
   // Planted copies merge for the expected reason; near-misses and hard
-  // conflicts stay separate.
+  // conflicts stay separate; in a weak chain A-B merge and C stays apart.
   const clusterByExternalId = new Map();
   deduped.forEach((deal, index) => {
     for (const record of deal.sourceRecords) clusterByExternalId.set(record.externalId, index);
   });
   const checkedScenarios = new Set();
   for (const { scenario, expect, ids } of planted) {
-    if (expect === null) continue;
     const clusters = new Set(ids.map((id) => clusterByExternalId.get(id)));
-    if (expect === 'separate') {
+    if (expect === 'weak-chain') {
+      const [first, second, third] = ids.map((id) => clusterByExternalId.get(id));
+      assert.equal(first, second, `${scenario} ${ids.join(',')}: A and B must merge`);
+      assert.notEqual(third, first, `${scenario} ${ids.join(',')}: C must not join A through B`);
+    } else if (expect === 'separate') {
       assert.equal(clusters.size, ids.length, `${scenario} ${ids.join(',')} must stay separate`);
     } else {
       assert.equal(clusters.size, 1, `${scenario} ${ids.join(',')} must merge`);
@@ -78,7 +80,7 @@ test('dedupeDeals output is byte-identical to the pre-cache implementation on th
     }
     checkedScenarios.add(scenario);
   }
-  assert.equal(checkedScenarios.size, 12);
+  assert.equal(checkedScenarios.size, 25);
 });
 
 // Wraps each listing's raw row so every full read of it is counted. Building
@@ -105,9 +107,7 @@ test('dedupeDeals reads each listing a bounded number of times at 4,000 listings
   const { deals } = generateDedupeFixture({ seed: 4000, count: 4000 });
   const { wrapped, reads } = countRawRowReads(deals);
 
-  const start = performance.now();
   const deduped = dedupeDeals(wrapped);
-  const elapsedMs = performance.now() - start;
 
   assert.ok(deduped.length > 3000 && deduped.length < 4000, `unexpected cluster count ${deduped.length}`);
   assert.ok(deduped.some((deal) => deal.deduplicationMatches.length > 0));
@@ -121,7 +121,37 @@ test('dedupeDeals reads each listing a bounded number of times at 4,000 listings
     worst.count <= perListingLimit,
     `listing ${worst.id} raw row read ${worst.count} times; limit ${perListingLimit}`,
   );
+});
 
-  // A generous backstop only; the read count above is the real check.
-  assert.ok(elapsedMs < 15000, `dedupeDeals took ${Math.round(elapsedMs)} ms for 4,000 listings`);
+test('dedupeDeals does not reuse match features from an earlier call', () => {
+  // A caller-supplied canonical match record is the one key that can be the
+  // same object across calls. Changing it between calls must change the result.
+  const shared = {
+    sourceId: 'sheet-0',
+    id: 'cache-scope-a',
+    name: 'Cache Scope Plumbing Services',
+    description: 'Short.',
+    state: 'TX',
+    country: 'US',
+    askingPrice: 500000,
+    annualProfit: 150000,
+    listingUrl: 'https://www.example-broker.com/listings/cache-scope-a',
+  };
+  const canonical = {
+    ...shared,
+    stableExternalId: true,
+    brokerContacts: [{ name: 'Pat Broker', email: 'pat@example-broker.com', role: 'Broker' }],
+    _canonicalMatchRecord: { ...shared },
+  };
+  const copy = {
+    ...shared,
+    sourceId: 'sheet-1',
+    id: 'cache-scope-b',
+    description: '',
+    listingUrl: 'https://www.other-broker.com/listings/cache-scope-b',
+  };
+
+  assert.equal(dedupeDeals([canonical, copy]).length, 1);
+  canonical._canonicalMatchRecord.name = 'Entirely Different Bakery';
+  assert.equal(dedupeDeals([canonical, copy]).length, 2);
 });

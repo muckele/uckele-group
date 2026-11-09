@@ -108,9 +108,9 @@ export function generateDedupeFixture({ seed = 20261109, count = 600 } = {}) {
       industry: pick(nameTrades),
       description: chance(0.75) ? longDescription() : shortDescription(),
       city: pick(cities[state]),
-      county: '',
+      county: chance(0.3) ? `${pick(cities[state])} County` : '',
       state,
-      country: 'US',
+      country: pick(['US', 'US', 'US', 'USA', 'United States', 'Canada']),
       location: '',
       askingPrice: chance(0.9) ? pick(askingPrices) : null,
       annualProfit: chance(0.85) ? pick(profits) : null,
@@ -316,14 +316,31 @@ export function generateDedupeFixture({ seed = 20261109, count = 600 } = {}) {
         }));
       },
     },
-    // A three-way syndication where the third copy only matches the second.
+    // A-B and B-C match but A-C does not. A ranks first (stable ID, long
+    // description), B merges into A, and C shares only B's listing URL. C must
+    // be compared with A's own record, not the merged one that carries B's
+    // aliases, so it stays separate.
     weakChain: {
-      expect: null,
+      expect: 'weak-chain',
       build(deals) {
         const name = uniqueName();
-        const base = baseDeal({ name, description: shortDescription(), ...fullFinancials() });
-        const second = syndicate(base, { annualRevenue: nearby(base.annualRevenue, 0.02) });
-        const third = syndicate(second, { name: `${name} Business`, annualRevenue: nearby(second.annualRevenue, 0.025) });
+        const base = baseDeal({
+          name,
+          description: longDescription(),
+          stableExternalId: true,
+          listingUrl: listingUrl('bizquest'),
+          ...fullFinancials(),
+        });
+        const second = syndicate(base, { description: shortDescription() });
+        const third = syndicate(second, {
+          sourceId: 'weak-chain-feed',
+          name: uniqueName(),
+          description: '',
+          brokerEmail: '',
+          brokerName: '',
+          annualRevenue: null,
+          listingUrl: second.listingUrl,
+        });
         deals.push(base, second, third);
       },
     },
@@ -332,17 +349,92 @@ export function generateDedupeFixture({ seed = 20261109, count = 600 } = {}) {
 
   const deals = [];
   const planted = [];
+  const plant = (scenario, expect, members) => {
+    deals.push(...members);
+    planted.push({ scenario, expect, ids: members.map((deal) => deal.id) });
+  };
+
+  // Edge cases for the per-listing match features: description length at the
+  // 120-character boundary before and after normalization, non-US and
+  // conflicting countries, county-only location matches (including counties
+  // past 80 characters), blank names, and pairs sharing several aliases in
+  // different orders.
+  const textOfLength = (length, offset) => {
+    const tokens = [];
+    let text = '';
+    for (let index = offset; ; index += 1) {
+      const word = descriptionWords[index % descriptionWords.length].toLowerCase();
+      if (text.length + 1 + word.length > length) break;
+      tokens.push(word);
+      text = tokens.join(' ');
+    }
+    return text + 'q'.repeat(length - text.length);
+  };
+  const edgePair = (scenario, expect, baseOverrides, copyOverrides = {}) => {
+    const base = baseDeal({ name: uniqueName(), ...fullFinancials(), ...baseOverrides });
+    plant(scenario, expect, [base, syndicate(base, copyOverrides)]);
+  };
+  const t120 = textOfLength(120, 3);
+  const t119 = textOfLength(119, 11);
+  const t110 = textOfLength(110, 19);
+  // Raw length well past 120, but punctuation and repeated spaces normalize
+  // away to the 110-character text.
+  const t110Padded = `  ${t110.split(' ').join(' ,  ')} !!! `;
+  edgePair('description120', 'title-description-location-financials', {
+    description: t120, annualProfit: null, annualRevenue: null,
+  });
+  edgePair('description119', 'exact-title-location-financials', {
+    description: t119, annualRevenue: null,
+  });
+  edgePair('description120AfterNormalizing', 'title-description-location-financials', {
+    description: `${t120.toUpperCase().split(' ').join(' -- ')}.`, annualProfit: null, annualRevenue: null,
+  }, { description: t120 });
+  edgePair('descriptionShortAfterNormalizing', 'exact-title-location-financials', {
+    description: t110Padded, annualRevenue: null,
+  });
+  edgePair('nonUsCountry', 'exact-title-location-financials', {
+    state: 'ON', city: 'Toronto', country: 'Canada', description: shortDescription(),
+  }, { country: 'canada', description: '' });
+  edgePair('countryConflict', 'separate', {
+    state: 'TX', city: 'Austin', country: 'US', description: shortDescription(),
+  }, { country: 'Mexico', description: '' });
+  // 102 characters: past the 80-character city cap, inside the 120-character county cap.
+  const longCounty = `Greater ${'Northwestern '.repeat(5)}Consolidated Municipal County`;
+  edgePair('longCountyMatch', 'exact-title-location-financials', {
+    state: '', city: '', county: longCounty, description: shortDescription(),
+  }, { description: '' });
+  edgePair('longCountyDiffersAfter80', 'separate', {
+    state: '', city: '', county: `${longCounty} North`, description: shortDescription(),
+  }, { county: `${longCounty} South`, description: '' });
+  edgePair('countyOnlyMatch', 'exact-title-location-financials', {
+    state: '', city: 'Springfield', county: 'Sangamon County', description: shortDescription(),
+  }, { city: 'Chatham', description: '' });
+  edgePair('blankNames', 'separate', {
+    name: '', state: 'NV', city: 'Reno', askingPrice: 777000, annualProfit: 211000, description: '',
+  }, { name: '  --  ', description: shortDescription() });
+  {
+    const base = baseDeal({
+      name: null, state: 'NV', city: 'Reno', ...fullFinancials(), askingPrice: 333000, annualProfit: 99000, description: '',
+    });
+    const copy = syndicate(base, { description: '' });
+    delete copy.name;
+    delete copy.raw['Business Name'];
+    plant('missingNames', 'separate', [base, copy]);
+  }
+  edgePair('sharedAliasesInDifferentOrder', 'shared-durable-identity', {
+    identityAliases: ['legacy:alpha-edge', 'legacy:beta-edge', 'legacy:gamma-edge'],
+  }, {
+    name: uniqueName(),
+    identityAliases: ['legacy:gamma-edge', 'legacy:beta-edge', 'legacy:alpha-edge'],
+  });
+
   let scenarioIndex = 0;
   while (deals.length < count) {
     if (chance(0.25)) {
       const scenario = scenarioNames[scenarioIndex % scenarioNames.length];
-      const firstIndex = deals.length;
-      scenarios[scenario].build(deals);
-      planted.push({
-        scenario,
-        expect: scenarios[scenario].expect,
-        ids: deals.slice(firstIndex).map((deal) => deal.id),
-      });
+      const members = [];
+      scenarios[scenario].build(members);
+      plant(scenario, scenarios[scenario].expect, members);
       scenarioIndex += 1;
     } else {
       deals.push(baseDeal());
