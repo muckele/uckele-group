@@ -381,6 +381,75 @@ describe('Opportunity drawer', () => {
     expect(mutation).not.toHaveBeenCalled();
   });
 
+  test('hides Request SIM while a campaign owns the listing, and leaves the other decisions', () => {
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()} onAction={vi.fn()}
+      onCimReleaseStop={vi.fn()} onClose={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Stop CIM campaign' })).toBeVisible();
+  });
+
+  test.each([
+    ['no release has loaded', null],
+    ['no campaign exists yet', { campaign: null, actions: { canStop: false } }],
+    ['the campaign has finished', { actions: { canStop: false } }],
+    ['recovery needs another request', { campaign: null, actions: { canStop: false },
+      enrollment: { state: 'action-required', reasonCode: 'timezone-missing' } }],
+  ])('keeps Request SIM when %s', (_name, overrides) => {
+    render(<OpportunityDrawer cimRelease={overrides ? cimReleaseFixture(overrides) : null} detail={detailFixture()}
+      onAction={vi.fn()} onClose={vi.fn()} />);
+
+    expect(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeVisible();
+  });
+
+  test('closes an open near-miss confirmation if a campaign turns out to own the listing', () => {
+    const base = detailFixture();
+    const detail = { ...base, opportunity: { ...base.opportunity, criteriaGroup: 'near-miss' } };
+    const { rerender } = render(<OpportunityDrawer cimRelease={null} detail={detail} onAction={vi.fn()} onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
+    expect(screen.getByRole('group', { name: 'Confirm Request SIM' })).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detail} onAction={vi.fn()} onClose={vi.fn()} />);
+    expect(screen.queryByRole('group', { name: 'Confirm Request SIM' })).toBeNull();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({ actions: { canStop: false } })} detail={detail}
+      onAction={vi.fn()} onClose={vi.fn()} />);
+    expect(screen.queryByRole('group', { name: 'Confirm Request SIM' })).toBeNull();
+  });
+
+  test('names the pause Gmail sending obeys, and says when its setting cannot be read', () => {
+    const { rerender } = render(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      pause: { paused: false, source: '', updatedAt: '' },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText('Gmail sending pause').nextElementSibling).toHaveTextContent(/^Not paused$/);
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      pause: { paused: true, source: 'settings-unavailable', updatedAt: '' },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText('Gmail sending pause').nextElementSibling).toHaveTextContent('Paused · Settings Unavailable');
+  });
+
+  test('shows the campaign in the Workflow box instead of the older request status', () => {
+    const { rerender } = render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText(/CIM: Campaign Initial Pending/)).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      campaign: { ...cimReleaseFixture().campaign, state: 'stopped' }, actions: { canStop: false },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText(/CIM: Campaign Stopped/)).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      status: { code: 'expired', reason: '', actionRequired: false },
+      campaign: { ...cimReleaseFixture().campaign, state: 'active-follow-up' }, actions: { canStop: false },
+    })} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.getByText(/CIM: Campaign Expired/)).toBeVisible();
+
+    rerender(<OpportunityDrawer cimRelease={null} detail={detailFixture()} onClose={vi.fn()} />);
+    expect(screen.queryByText(/CIM: Campaign/)).toBeNull();
+  });
+
   test('renders only persisted canary release evidence and one explicit stop control', () => {
     const onCimReleaseStop = vi.fn();
     render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()}

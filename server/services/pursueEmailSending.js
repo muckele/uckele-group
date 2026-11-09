@@ -91,13 +91,22 @@ function projectRun(row, countNames) {
 }
 
 /** The durable CIM outreach pause, read as the final gate reads it: no setting is paused. */
-async function centralPauseOn(storage) {
+// The pause Gmail sending obeys: the control saved in Operations. DEAL_HUNTER_CIM_OUTREACH_PAUSED in
+// fly.toml keeps the older send paths shut and isn't consulted here. Missing or unreadable reads as
+// paused, matching the final check in pursueCimSqliteTransitions.js.
+export async function readCentralPause(storage) {
   try {
     const settings = await storage.getDealHunterCimSafetySettings?.();
-    return !settings || Boolean(settings.outreach_paused);
+    if (!settings) return { paused: true, source: 'settings-unavailable', updatedAt: '' };
+    const paused = Boolean(settings.outreach_paused);
+    return { paused, source: paused ? 'operations-control' : '', updatedAt: settings.updated_at || '' };
   } catch {
-    return true;
+    return { paused: true, source: 'settings-unavailable', updatedAt: '' };
   }
+}
+
+async function centralPauseOn(storage) {
+  return (await readCentralPause(storage)).paused;
 }
 
 async function latestRun(storage, jobName, countNames) {

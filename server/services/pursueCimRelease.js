@@ -5,9 +5,9 @@ const terminalCampaignStates = new Set([
   'responded', 'materials-received', 'stopped', 'expired',
 ]);
 
-async function defaultGetPauseStatus(args) {
-  const { getCimOutreachPauseStatus } = await import('./cimOpportunityIdentity.js');
-  return getCimOutreachPauseStatus(args);
+async function defaultGetPauseStatus({ storage }) {
+  const { readCentralPause } = await import('./pursueEmailSending.js');
+  return readCentralPause(storage);
 }
 
 function boundedText(value, maximum = 400) {
