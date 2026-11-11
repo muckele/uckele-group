@@ -14,6 +14,7 @@
 // evidence and safety events) is re-stamped at the controlled instant, as production would
 // have written it.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -36,6 +37,7 @@ process.on('exit', () => fs.rmSync(tempDir, { recursive: true, force: true }));
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
 const { buildOpportunitySourceObservationSnapshot } = await import(
   '../server/services/dealHunterOpportunityFacts.js');
+const { parseSheetCsvDeals } = await import('../server/services/dealHunter.js');
 const { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } = await import(
   '../server/services/dealHunterSourceSnapshotAdmission.js');
 const {
@@ -301,3 +303,136 @@ for (const [label, monday] of [
     assert.equal(touch.state, 'accepted');
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// The main Sheet has no ID column, so its rows are parsed with positional row ids, and listings
+// are added above each other every day. A row is keyed by its listing link, so a listing
+// inserted above the campaign's listing neither changes nor removes the campaign's record.
+// ---------------------------------------------------------------------------------------------
+
+const INSERTED_OPPORTUNITY = 'opp-inserted';
+const POSITIONAL_LISTINGS = Object.freeze({
+  [OPPORTUNITY]: [NAME, 'Plumbing', 'Jordan Lee', BROKER_EMAIL],
+  [OTHER_OPPORTUNITY]: [OTHER_NAME, 'Roofing', 'Pat Doe', OTHER_BROKER_EMAIL],
+  [INSERTED_OPPORTUNITY]: ['Cedar Landscaping', 'Landscaping', 'Sam Roe', 'sam.roe@thirdbroker.test'],
+});
+
+/** The Sheet as the collector parses it: no ID column, one row per listing in `order`. */
+function positionalSheet(order) {
+  const csv = ['Business Name,Listing URL,City,State,Industry,Broker Name,Broker Email',
+    ...order.map((opportunityId) => {
+      const [name, industry, brokerName, brokerEmail] = POSITIONAL_LISTINGS[opportunityId];
+      return [name, `https://broker.example/${opportunityId}`, 'Sacramento', 'CA', industry, brokerName,
+        brokerEmail].join(',');
+    })].join('\n');
+  return parseSheetCsvDeals(csv).deals.map((deal, index) => ({ opportunityId: order[index], deal }));
+}
+
+/** A record keyed as origin/main keyed a row without an ID column: by its position. */
+function positionalRecord(snapshot, deal) {
+  const recordId = `sheet-row:${deal.sourceRowId}`;
+  return { ...snapshot, source_record_id: recordId, observations: snapshot.observations.map((observation) => ({
+    ...observation, source_record_id: recordId,
+    id: `source-observation:${createHash('sha256').update([observation.opportunity_id, observation.source_id,
+      recordId, observation.field].join('\u0000')).digest('hex')}`,
+  })) };
+}
+
+/** `dailySheetSync` over the positional Sheet; `scheme: 'old'` writes origin/main's record ids. */
+async function positionalSheetSync(world, { runId, order, scheme = 'new' }) {
+  const { storage } = world;
+  const at = world.clock.peek().toISOString();
+  const rows = positionalSheet(order);
+  const records = rows.map(({ opportunityId, deal }) => {
+    const snapshot = buildOpportunitySourceObservationSnapshot({ opportunityId, deal, now: at });
+    return scheme === 'old' ? positionalRecord(snapshot, deal) : snapshot;
+  });
+  // The admission checks the collected rows' identities; without a URL a row resolves to its
+  // position, which is exactly origin/main's identity for every row of this Sheet.
+  const deals = rows.map(({ deal }) => (scheme === 'old' ? { ...deal, listingUrl: '' } : deal));
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId });
+  const result = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill',
+    sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+      sourceRowCount: deals.length, rowCount: deals.length, coverageLimitReached: false }, deals },
+    records, run });
+  assert.equal(result.reconciled, true, JSON.stringify(result));
+  await stampAcceptance(world, runId, at);
+  return result;
+}
+
+const removalsFor = (world, runId, opportunityId) => world.all(`SELECT event_type
+  FROM deal_hunter_cim_safety_events WHERE source_run_id = ? AND opportunity_id = ?
+    AND event_type LIKE 'source-record-removed#%'`, runId, opportunityId);
+
+async function positionalCampaign(t, { scheme = 'new' } = {}) {
+  const world = await createWorld(t, createSqliteBackend, { start: pacific(SATURDAY, '06:30') });
+  world.mailProvider.rewriteMessageIds();
+  await ownerTurnsSendingOn(world);
+  await seedDeal(world, { opportunityId: OPPORTUNITY, name: NAME, fitScore: 82, criteriaGroup: 'review' });
+  await seedDeal(world, { opportunityId: OTHER_OPPORTUNITY, name: OTHER_NAME, fitScore: 60,
+    criteriaGroup: 'review', brokerEmail: OTHER_BROKER_EMAIL });
+  await seedDeal(world, { opportunityId: INSERTED_OPPORTUNITY, name: 'Cedar Landscaping', fitScore: 55,
+    criteriaGroup: 'review', brokerEmail: 'sam.roe@thirdbroker.test' });
+  world.clock.set(pacific(SATURDAY, '08:00'));
+  await positionalSheetSync(world, { runId: 'sheet-sync-saturday', order: [OPPORTUNITY, OTHER_OPPORTUNITY],
+    scheme });
+
+  world.clock.set(pacific(SATURDAY, '20:26'));
+  const command = await ownerRequestsSim(world, OPPORTUNITY);
+  assert.equal(command.enrollment.state, 'campaign-created', JSON.stringify(command.enrollment));
+  const campaign = await world.campaignFor(OPPORTUNITY);
+  assert.deepEqual(await world.scheduled(campaign), [['initial', pacific(MONDAY, '08:00')]]);
+  return { world, campaign };
+}
+
+test('a listing inserted above the campaign\'s listing on a Sheet without IDs leaves the campaign sendable', async (t) => {
+  const { world, campaign } = await positionalCampaign(t);
+  const atCreation = await sourceRows(world);
+
+  // Sunday a new listing lands at the top; Monday the Sheet is re-ordered as well.
+  world.clock.set(pacific(SUNDAY, '08:00'));
+  await positionalSheetSync(world, { runId: 'sheet-sync-sunday',
+    order: [INSERTED_OPPORTUNITY, OPPORTUNITY, OTHER_OPPORTUNITY] });
+  world.clock.set(pacific(MONDAY, '08:00'));
+  await positionalSheetSync(world, { runId: 'sheet-sync-monday',
+    order: [OTHER_OPPORTUNITY, INSERTED_OPPORTUNITY, OPPORTUNITY] });
+
+  const afterSyncs = await sourceRows(world);
+  assert.deepEqual(afterSyncs.map(({ id, field, value }) => [id, field, value]),
+    atCreation.map(({ id, field, value }) => [id, field, value]), 'the same record, rows and values');
+  for (const runId of ['sheet-sync-sunday', 'sheet-sync-monday']) {
+    assert.deepEqual(await removalsFor(world, runId, OPPORTUNITY), [], runId);
+  }
+
+  const run = await sendAt(world, pacific(MONDAY, '08:05'));
+  assert.equal(run.sentInitial, 1, JSON.stringify(run));
+  assert.deepEqual(run.skipped, {}, JSON.stringify(run));
+  assert.equal(world.mailProvider.sent[0].to, BROKER_EMAIL);
+  const [touch] = await world.touches(campaign.id);
+  assert.deepEqual([touch.kind, touch.state], ['initial', 'accepted']);
+});
+
+test('the one-time switch from positional Sheet record ids holds a campaign created before it, once', async (t) => {
+  // Expected and accepted at deploy: the first refresh renames every positional record to its
+  // listing id. That removes the old association, and the campaign's recipient fingerprint, which
+  // hashes each source row's id and record id, no longer matches, so the send is held.
+  const { world } = await positionalCampaign(t, { scheme: 'old' });
+  assert.deepEqual([...new Set((await world.all(`SELECT source_record_id
+    FROM deal_hunter_opportunity_source_observations WHERE opportunity_id = ?`, OPPORTUNITY))
+    .map((row) => row.source_record_id))], ['sheet-row:1']);
+
+  world.clock.set(pacific(SUNDAY, '08:00'));
+  await positionalSheetSync(world, { runId: 'sheet-sync-switch', order: [OPPORTUNITY, OTHER_OPPORTUNITY] });
+  assert.equal((await removalsFor(world, 'sheet-sync-switch', OPPORTUNITY)).length, 1);
+  world.clock.set(pacific(MONDAY, '08:00'));
+  await positionalSheetSync(world, { runId: 'sheet-sync-monday',
+    order: [INSERTED_OPPORTUNITY, OTHER_OPPORTUNITY, OPPORTUNITY] });
+  assert.deepEqual(await removalsFor(world, 'sheet-sync-monday', OPPORTUNITY), [],
+    'after the switch, moving rows removes nothing');
+
+  const run = await sendAt(world, pacific(MONDAY, '08:05'));
+  assert.deepEqual([run.sentInitial, run.sentFollowUps], [0, 0], JSON.stringify(run));
+  assert.deepEqual(run.skipped, { authority_changed: 1 }, JSON.stringify(run));
+  assert.deepEqual(world.mailProvider.attempts, []);
+});
