@@ -2081,6 +2081,19 @@ async function fetchBytes(url, {
   }
 }
 
+// Numbers each row by how many rows up to and including it share its listing link, in sheet
+// order, so two rows with one link get distinct observation record ids
+// (`getOpportunitySourceObservationRecordId`). Rows with a stable external id are keyed by it.
+function withSourceListingOccurrences(deals = []) {
+  const seen = new Map();
+  return deals.map((deal) => {
+    if (!deal.listingUrl || deal.stableExternalId) return deal;
+    const occurrence = (seen.get(deal.listingUrl) || 0) + 1;
+    seen.set(deal.listingUrl, occurrence);
+    return { ...deal, sourceListingOccurrence: occurrence };
+  });
+}
+
 function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = new Map()) {
   const safeListingUrls = listingUrlsByRow instanceof Map ? listingUrlsByRow : new Map();
   return {
@@ -2091,12 +2104,12 @@ function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = ne
       fetched: true,
       rowCount: rows.length,
     },
-    deals: rows.map((row, index) => normalizeDealRecord(
+    deals: withSourceListingOccurrences(rows.map((row, index) => normalizeDealRecord(
       safeListingUrls.get(index)
         ? { ...normalizeDailyDealUpdateRow(row), 'Original Broker Listing URL': safeListingUrls.get(index) }
         : normalizeDailyDealUpdateRow(row),
       { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) },
-    )),
+    ))),
   };
 }
 
@@ -2884,7 +2897,7 @@ function sourceRecord(deal = {}) {
 function sourceObservationDeal(deal = {}) {
   const fields = [
     'sourceId', 'sourceName', 'sourceRowId', 'id', 'stableExternalId', 'idFromSourceRowPosition',
-    'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+    'sourceListingOccurrence', 'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
     'annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple', 'netMargin', 'yearsEstablished',
     'remoteFlag', 'franchiseFlag', 'fiveYearsFlag', 'brokerName', 'brokerCompany', 'brokerContact', 'brokerPhone',
     'brokerEmail', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated', 'freshnessEvidence', 'freshnessRun',

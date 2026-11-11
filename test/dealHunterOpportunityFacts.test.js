@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,6 +16,7 @@ import * as opportunityFactsModule from '../server/services/dealHunterOpportunit
 import {
   getEffectiveOpportunityFacts,
   buildOpportunitySourceObservationSnapshot,
+  getOpportunitySourceObservationRecordId,
   opportunityFactFields,
   opportunityFactCrmSnapshotFields,
   opportunitySourceObservationFields,
@@ -1561,9 +1563,9 @@ test('source observations normalize the bounded Deal Hunter field set and reject
   );
 });
 
-test('a no-explicit-ID Sheet observation snapshot keeps its source record identity when the listing URL is corrected', () => {
-  // Break caught: a corrected Sheet URL forks a new observation record even
-  // though the source row remains the same supported no-ID Sheet record.
+test('a no-explicit-ID Sheet observation snapshot is keyed by its listing URL, not its row position', () => {
+  // The Sheet's rows move above each other every day: a moved row is the same record, with the
+  // same observation ids. A corrected listing URL is a different listing link, so a new record.
   const sourceDeal = {
     sourceId: 'sheet-0',
     sourceName: 'SMB Deal Hunter Google Sheet',
@@ -1575,19 +1577,26 @@ test('a no-explicit-ID Sheet observation snapshot keeps its source record identi
     listingUrl: 'https://broker.example/original-listing',
     annualProfit: 450000,
   };
+  const listingId = (url) => `listing:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
   const first = buildOpportunitySourceObservationSnapshot({ opportunityId, deal: sourceDeal, now: '2026-08-30T12:30:00.000Z' });
+  const moved = buildOpportunitySourceObservationSnapshot({
+    opportunityId, deal: { ...sourceDeal, sourceRowId: '7', id: '7' }, now: '2026-08-30T13:30:00.000Z',
+  });
   const corrected = buildOpportunitySourceObservationSnapshot({
     opportunityId,
     deal: { ...sourceDeal, listingUrl: 'https://broker.example/corrected-listing' },
     now: '2026-08-30T13:30:00.000Z',
   });
 
-  assert.equal(first.source_record_id, 'sheet-row:42');
-  assert.equal(corrected.source_record_id, first.source_record_id);
-  assert.deepEqual(
-    corrected.observations.map((observation) => observation.id),
-    first.observations.map((observation) => observation.id),
-  );
+  assert.equal(first.source_record_id, listingId('https://broker.example/original-listing'));
+  assert.equal(moved.source_record_id, first.source_record_id);
+  assert.deepEqual(moved.observations.map((observation) => observation.id),
+    first.observations.map((observation) => observation.id));
+  assert.equal(corrected.source_record_id, listingId('https://broker.example/corrected-listing'));
+  assert.equal(getOpportunitySourceObservationRecordId({ ...sourceDeal, sourceListingOccurrence: 2 }),
+    `${first.source_record_id}#2`, 'a second row with the same link in sheet order');
+  assert.equal(getOpportunitySourceObservationRecordId({ ...sourceDeal, listingUrl: '' }), 'sheet-row:42',
+    'a row without a link keeps its position');
 });
 
 test('SQLite source-observation snapshot replacement rolls back entirely when one incoming field write fails', async (t) => {

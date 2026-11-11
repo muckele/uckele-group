@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -223,6 +224,8 @@ process.env.DEAL_HUNTER_AIRTABLE_BASE_ID = 'appTest';
 process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID = 'tblTest';
 process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID = 'viwTest';
 
+const sheetListingRecordId = (url) => `listing:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
+
 const originalFetch = globalThis.fetch;
 const { importDealOsExport, parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');
 
@@ -237,10 +240,11 @@ test('an admitted complete Sheet with an identity exception retains evidence and
     'DEFER-1,Resolved Shop,https://example.test/defer-1,2026-09-22',
     'DEFER-2,Ambiguous Shop,https://example.test/defer-2,2026-09-22',
   ].join('\n')).deals;
-  const positionDeal = { ...resolvedDeal, id: '', stableExternalId: false,
+  // Rows without a listing link keep positional record ids, so a move renames them.
+  const positionDeal = { ...resolvedDeal, id: '', stableExternalId: false, listingUrl: '',
     idFromSourceRowPosition: true, sourceRowId: '2' };
   const movedPositionDeal = { ...positionDeal, sourceRowId: '5' };
-  const ambiguousPositionDeal = { ...ambiguousDeal, id: '', stableExternalId: false,
+  const ambiguousPositionDeal = { ...ambiguousDeal, id: '', stableExternalId: false, listingUrl: '',
     idFromSourceRowPosition: true, sourceRowId: '3' };
   const movedAmbiguousDeal = { ...ambiguousPositionDeal, sourceRowId: '6' };
   await storage.upsertDealHunterOpportunity({
@@ -1456,10 +1460,9 @@ test('a Sheet with distinct Broker Contact and Broker Phone values retains both 
   );
 });
 
-test('a no-explicit-ID Sheet row keeps one source observation snapshot when its listing URL is corrected', async (t) => {
-  // Break caught: the supported positional Sheet record shape uses a mutable
-  // listing URL as its observation identity and forks observations after the
-  // existing canonical resolver has identified the same opportunity.
+test('a corrected listing URL on a no-ID Sheet row replaces its record in the next complete refresh', async (t) => {
+  // A Sheet row without an ID column is keyed by its listing link, so a corrected link is a new
+  // source record. The complete refresh removes the old one: one current Sheet record, never two.
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-sheet-url-correction-'));
   const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
   t.after(() => {
@@ -1486,28 +1489,32 @@ test('a no-explicit-ID Sheet row keeps one source observation snapshot when its 
     status: 'active',
     metadata: {},
   });
-  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(
-    buildOpportunitySourceObservationSnapshot({ opportunityId, deal: firstDeal, now: '2026-08-30T12:30:00.000Z' }),
-  );
-  const firstObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
-  const firstListing = firstObservations.find((observation) => observation.field === 'listing_url');
-  assert.equal(firstListing.source_record_id, 'sheet-row:1');
+  const observationsAfter = async (runId, deal, now) => {
+    const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId });
+    const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage, reviewMode: 'full-backfill', run,
+      sourceResult: { source: { id: 'sheet-0', required: true, fetched: true, sourceRowCount: 1, rowCount: 1,
+        coverageLimitReached: false }, deals: [deal] },
+      records: [buildOpportunitySourceObservationSnapshot({ opportunityId, deal, now })] });
+    assert.equal(accepted.reconciled, true);
+    return storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  };
+  const firstObservations = await observationsAfter('url-original', firstDeal, '2026-08-30T12:30:00.000Z');
+  assert.deepEqual([...new Set(firstObservations.map((observation) => observation.source_record_id))],
+    [sheetListingRecordId('https://broker.example/no-id-original')]);
 
-  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(
-    buildOpportunitySourceObservationSnapshot({ opportunityId, deal: correctedDeal, now: '2026-08-30T13:30:00.000Z' }),
-  );
-  const refreshedObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
-  const refreshedListing = refreshedObservations.find((observation) => observation.field === 'listing_url');
-  assert.equal(refreshedListing.source_record_id, 'sheet-row:1');
-  assert.equal(refreshedListing.id, firstListing.id);
-  assert.equal(refreshedListing.value, 'https://broker.example/no-id-corrected');
+  const refreshedObservations = await observationsAfter('url-corrected', correctedDeal, '2026-08-30T13:30:00.000Z');
+  assert.deepEqual([...new Set(refreshedObservations.map((observation) => observation.source_record_id))],
+    [sheetListingRecordId('https://broker.example/no-id-corrected')]);
+  assert.equal(refreshedObservations.find((observation) => observation.field === 'listing_url').value,
+    'https://broker.example/no-id-corrected');
   assert.equal(refreshedObservations.length, firstObservations.length);
 });
 
-test('a complete Sheet refresh removes the stale positional observation when a listing moves to a new row', async (t) => {
+test('a complete Sheet refresh keeps one current observation when a listing moves to a new row', async (t) => {
   // Break caught: a complete Sheet refresh treats a position-derived source
   // record as independently current after the same listing moves rows, so the
   // old value remains authoritative and conflicts with the refreshed value.
+  // A no-ID row is now keyed by its listing link, so the moved row is the same record.
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-sheet-row-movement-'));
   const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
   t.after(() => {
@@ -1555,7 +1562,7 @@ test('a complete Sheet refresh removes the stale positional observation when a l
   assert.deepEqual(
     firstObservations.filter((observation) => observation.source_id === 'sheet-0' && observation.field === 'annual_profit')
       .map((observation) => [observation.source_record_id, observation.value]),
-    [['sheet-row:1', '450000']],
+    [[sheetListingRecordId(moverListingUrl), '450000']],
   );
 
   sourceCsv = [
@@ -1573,7 +1580,7 @@ test('a complete Sheet refresh removes the stale positional observation when a l
   assert.deepEqual(
     refreshedObservations.filter((observation) => observation.source_id === 'sheet-0' && observation.field === 'annual_profit')
       .map((observation) => [observation.source_record_id, observation.value]),
-    [['sheet-row:2', '475000']],
+    [[sheetListingRecordId(moverListingUrl), '475000']],
     'only the moved Sheet row contributes the refreshed profit',
   );
   assert.equal(refreshedObservations.length, firstObservations.length, 'the complete refresh does not grow durable current observations');
@@ -1587,7 +1594,7 @@ test('a complete Sheet refresh removes the stale positional observation when a l
   assert.equal(detail.ok, true);
   const sheetGroups = detail.sourceObservations.filter((source) => source.sourceId === 'sheet-0');
   assert.equal(sheetGroups.length, 1, 'only one current Sheet source record remains in the authoritative detail projection');
-  assert.equal(sheetGroups[0].sourceRecordId, 'sheet-row:2');
+  assert.equal(sheetGroups[0].sourceRecordId, sheetListingRecordId(moverListingUrl));
   const profitConflict = sheetGroups[0].conflicts.find((conflict) => conflict.field === 'annual_profit');
   assert.ok(profitConflict, 'the current Sheet and Deal OS values remain visibly attributable as a real cross-source conflict');
   assert.equal(
