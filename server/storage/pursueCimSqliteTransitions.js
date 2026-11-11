@@ -2674,10 +2674,13 @@ export function createPursueCimSqliteTransitions(database, {
     },
     /**
      * Read-only evidence the final gate dates a campaign's source truth by: the acceptance time
-     * of the named accepted evidence, and this opportunity's admitted source-record removals.
+     * of the named accepted evidence, and this opportunity's admitted source-record removals
+     * accepted after `removedAfter` (the campaign's creation).
      */
-    async readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds = [] } = {}) {
+    async readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds = [],
+      removedAfter } = {}) {
       const id = requiredText(opportunityId, 'opportunityId', 200);
+      const after = canonicalInstant(removedAfter);
       if (!Array.isArray(evidenceIds) || evidenceIds.length > 500
         || evidenceIds.some((value) => typeof value !== 'string' || !value || value.length > 240)) {
         throw new Error('Invalid CIM source evidence identities');
@@ -2689,7 +2692,8 @@ export function createPursueCimSqliteTransitions(database, {
       const removals = database.prepare(`SELECT id, source_type, source_run_id, created_at
         FROM deal_hunter_cim_safety_events
         WHERE opportunity_id = ? AND event_type LIKE 'source-record-removed#%'
-        ORDER BY created_at DESC, id LIMIT 1001`).all(id);
+          AND julianday(created_at) > julianday(?)
+        ORDER BY created_at DESC, id LIMIT 1001`).all(id, after);
       if (removals.length > 1000) throw new Error('CIM source removals exceed the bounded read.');
       return { evidence, removals };
     },

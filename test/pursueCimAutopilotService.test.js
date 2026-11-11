@@ -493,9 +493,15 @@ test('P2 pending safety consumption cannot hide a changed campaign material revi
     'campaign-source-authority-unproven']);
 });
 
-/** A P2 storage stub: one active campaign created at 12:00, its source rows and evidence. */
+/**
+ * A P2 storage stub: one active campaign on op-lag created at 12:00, its source rows and
+ * evidence. `removals` are admitted removal events (op-lag unless they name another
+ * opportunity); the stub answers like storage, for the asked opportunity after `removedAfter`.
+ */
 function p2CampaignStorage({ sourceRows, sourceStates, evidence = [], removals = [] }) {
+  const reads = [];
   return {
+    reads,
     async getCurrentDealHunterOpportunity() { return { opportunity_id: 'op-lag', status: 'active',
       material_revision: 1, discovery_revision: 1 }; },
     async listDealHunterOpportunitySourceObservations() { return sourceRows; },
@@ -503,7 +509,12 @@ function p2CampaignStorage({ sourceRows, sourceStates, evidence = [], removals =
     async listDealHunterSourceFreshnessStates() { return sourceStates; },
     async readPursueCimProjection() { return { campaign: { state: 'initial-pending',
       created_at: '2026-09-28T12:00:00.000Z', material_revision: 1, discovery_revision: 1 } }; },
-    async readCimCampaignSourceChangeEvidence() { return { evidence, removals }; },
+    async readCimCampaignSourceChangeEvidence(input) {
+      reads.push(input);
+      return { evidence: evidence.filter((item) => input.evidenceIds.includes(item.id)),
+        removals: removals.filter((item) => (item.opportunity_id ?? 'op-lag') === input.opportunityId
+          && Date.parse(item.created_at) > Date.parse(input.removedAfter)) };
+    },
   };
 }
 
@@ -564,6 +575,41 @@ test('P2 source rows the gate cannot date block the campaign as unproven', async
     storage.readCimCampaignSourceChangeEvidence = async () => { throw new Error('unavailable'); };
     assert.deepEqual((await read(storage)).blockers, ['campaign-source-authority-unproven']);
   });
+});
+
+test('P2 a row without accepted evidence is dated by its own accepted_at: after the campaign it blocks as changed', async () => {
+  const storage = p2CampaignStorage({
+    sourceRows: [{ source_id: 'sheet-0', source_record_id: 'external:LAG', field: 'name',
+      value: 'Legacy row', accepted_at: '2026-09-28T12:01:00.000Z' }],
+    sourceStates: [{ source_id: 'sheet-0', accepted_run_id: 'r', accepted_at: '2026-09-28T11:00:00.000Z',
+      projection_state: 'accepted' }],
+  });
+  const authority = await readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.deepEqual(authority.blockers, ['campaign-source-authority-changed']);
+});
+
+test('P2 another deal\'s record removed or changed after the campaign leaves this campaign unblocked', async () => {
+  // Same Sheet, same run after the campaign: op-other's record was removed (an admitted removal
+  // event for op-other) and another of its records changed (its newer evidence is op-other's
+  // row, not this one's). This campaign's own rows keep evidence from before the campaign.
+  const storage = p2CampaignStorage({
+    sourceRows: [{ source_id: 'sheet-0', source_record_id: 'external:LAG', field: 'name',
+      value: 'Same name', accepted_at: '2026-09-29T08:00:00.000Z',
+      accepted_evidence_id: 'evidence-before-campaign' }],
+    sourceStates: [{ source_id: 'sheet-0', accepted_run_id: 'run-after-campaign',
+      accepted_at: '2026-09-29T08:00:00.000Z', projection_state: 'accepted' }],
+    evidence: [{ id: 'evidence-before-campaign', accepted_at: '2026-09-28T11:00:00.000Z' },
+      { id: 'evidence-other-changed', accepted_at: '2026-09-29T08:00:00.000Z' }],
+    removals: [{ id: 'removal-other', opportunity_id: 'op-other', source_type: 'sheet-import',
+      source_run_id: 'run-after-campaign', created_at: '2026-09-29T08:00:00.000Z' }],
+  });
+  const authority = await readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.deepEqual(authority.blockers, []);
+  // The read is per opportunity and since the campaign's creation.
+  assert.deepEqual(storage.reads, [{ opportunityId: 'op-lag',
+    evidenceIds: ['evidence-before-campaign'], removedAfter: '2026-09-28T12:00:00.000Z' }]);
 });
 
 // The Sheet record was removed by a run accepted after the campaign: the admitted import wrote a

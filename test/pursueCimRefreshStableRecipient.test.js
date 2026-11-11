@@ -53,6 +53,9 @@ const WEDNESDAY = '2030-01-09';
 const OPPORTUNITY = 'opp-refresh';
 const NAME = 'Acme Plumbing';
 const NEW_BROKER_EMAIL = 'casey.new@brokerfirm.test';
+const OTHER_OPPORTUNITY = 'opp-other';
+const OTHER_NAME = 'Harbor Roofing';
+const OTHER_BROKER_EMAIL = 'pat.doe@otherbroker.test';
 
 function createSqliteBackend(t) {
   const directory = fs.mkdtempSync(path.join(tempDir, 'world-'));
@@ -81,8 +84,8 @@ async function stampAcceptance(world, runId, at) {
     AND name IN (${IMMUTABLE_ACCEPTANCE_TRIGGERS.map(() => '?').join(', ')})`,
   ...IMMUTABLE_ACCEPTANCE_TRIGGERS);
   assert.equal(triggers.length, IMMUTABLE_ACCEPTANCE_TRIGGERS.length);
-  for (const { name } of triggers) await world.run(`DROP TRIGGER ${name}`);
   try {
+    for (const { name } of triggers) await world.run(`DROP TRIGGER ${name}`);
     await world.run(`UPDATE deal_hunter_opportunity_source_observations SET accepted_at = ?
       WHERE accepted_run_id = ?`, at, runId);
     await world.run(`UPDATE deal_hunter_source_freshness_state SET accepted_at = ?
@@ -92,19 +95,31 @@ async function stampAcceptance(world, runId, at) {
     await world.run(`UPDATE deal_hunter_cim_safety_events SET created_at = ?, updated_at = ?
       WHERE source_run_id = ?`, at, at, runId);
   } finally {
-    for (const { sql } of triggers) await world.run(sql);
+    // Restore whichever triggers are missing, so a failure can never leave one dropped.
+    const present = new Set((await world.all(`SELECT name FROM sqlite_master WHERE type = 'trigger'
+      AND name IN (${IMMUTABLE_ACCEPTANCE_TRIGGERS.map(() => '?').join(', ')})`,
+    ...IMMUTABLE_ACCEPTANCE_TRIGGERS)).map((row) => row.name));
+    for (const { name, sql } of triggers) if (!present.has(name)) await world.run(sql);
   }
 }
 
-function sheetDeals({ brokerEmail = BROKER_EMAIL, industry = 'Plumbing', withSecondRow = true } = {}) {
+/** The Sheet's rows, each with the canonical opportunity it resolves to. */
+function sheetDeals({ brokerEmail = BROKER_EMAIL, industry = 'Plumbing', withSecondRow = true,
+  withOther = true, otherIndustry = 'Roofing' } = {}) {
   const common = { sourceId: 'sheet-0', sourceName: 'SMB Deal Hunter Google Sheet',
     stableExternalId: true, name: NAME, location: 'Sacramento, CA', state: 'CA' };
   return [
-    { ...common, id: `listing-${OPPORTUNITY}`, listingUrl: `https://broker.example/${OPPORTUNITY}`,
-      industry, brokerName: 'Jordan Lee', brokerEmail },
+    { opportunityId: OPPORTUNITY, deal: { ...common, id: `listing-${OPPORTUNITY}`,
+      listingUrl: `https://broker.example/${OPPORTUNITY}`, industry, brokerName: 'Jordan Lee',
+      brokerEmail } },
     // The same business listed a second time on the Sheet, without a broker contact.
-    ...(withSecondRow ? [{ ...common, id: `listing-${OPPORTUNITY}-repost`,
-      listingUrl: `https://broker.example/${OPPORTUNITY}-repost`, industry }] : []),
+    ...(withSecondRow ? [{ opportunityId: OPPORTUNITY, deal: { ...common,
+      id: `listing-${OPPORTUNITY}-repost`, listingUrl: `https://broker.example/${OPPORTUNITY}-repost`,
+      industry } }] : []),
+    // Another deal on the same Sheet, with its own broker; no campaign.
+    ...(withOther ? [{ opportunityId: OTHER_OPPORTUNITY, deal: { ...common, name: OTHER_NAME,
+      id: `listing-${OTHER_OPPORTUNITY}`, listingUrl: `https://broker.example/${OTHER_OPPORTUNITY}`,
+      industry: otherIndustry, brokerName: 'Pat Doe', brokerEmail: OTHER_BROKER_EMAIL } }] : []),
   ];
 }
 
@@ -117,9 +132,10 @@ function sheetDeals({ brokerEmail = BROKER_EMAIL, industry = 'Plumbing', withSec
 async function dailySheetSync(world, { runId, ...sheet }) {
   const { storage } = world;
   const at = world.clock.peek().toISOString();
-  const deals = sheetDeals(sheet);
-  const records = deals.map((deal) => buildOpportunitySourceObservationSnapshot({
-    opportunityId: OPPORTUNITY, deal, now: at }));
+  const rows = sheetDeals(sheet);
+  const deals = rows.map(({ deal }) => deal);
+  const records = rows.map(({ opportunityId, deal }) => buildOpportunitySourceObservationSnapshot({
+    opportunityId, deal, now: at }));
   const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId });
   const result = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
     reviewMode: 'full-backfill',
@@ -145,6 +161,8 @@ async function campaignThenDailySyncs(t, { monday = {} } = {}) {
   world.mailProvider.rewriteMessageIds();
   await ownerTurnsSendingOn(world);
   await seedDeal(world, { opportunityId: OPPORTUNITY, name: NAME, fitScore: 82, criteriaGroup: 'review' });
+  await seedDeal(world, { opportunityId: OTHER_OPPORTUNITY, name: OTHER_NAME, fitScore: 60,
+    criteriaGroup: 'review', brokerEmail: OTHER_BROKER_EMAIL });
   world.clock.set(pacific(SATURDAY, '08:00'));
   await dailySheetSync(world, { runId: 'sheet-sync-saturday' });
 
@@ -268,3 +286,18 @@ test('a daily Sheet sync that removes one of the deal\'s Sheet records stops the
   const [touch] = await world.touches(campaign.id);
   assert.notEqual(touch.state, 'accepted');
 });
+
+for (const [label, monday] of [
+  ['removes another deal\'s Sheet record', { withOther: false }],
+  ['changes another deal\'s Sheet record', { otherIndustry: 'Roofing and Siding' }],
+]) {
+  test(`a daily Sheet sync that ${label} after Request SIM leaves this campaign sendable`, async (t) => {
+    const { world, campaign } = await campaignThenDailySyncs(t, { monday });
+    const run = await sendAt(world, pacific(MONDAY, '08:05'));
+    assert.equal(run.sentInitial, 1, JSON.stringify(run));
+    assert.deepEqual(run.skipped, {}, JSON.stringify(run));
+    assert.equal(world.mailProvider.sent[0].to, BROKER_EMAIL);
+    const [touch] = await world.touches(campaign.id);
+    assert.equal(touch.state, 'accepted');
+  });
+}

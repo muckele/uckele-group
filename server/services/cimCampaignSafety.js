@@ -100,7 +100,11 @@ export async function runCimCampaignSafety({ storage, safetyRunId, mode = 'shado
  *   is unproven (the stricter of the two choices: an unprovable row blocks);
  * - a removed source record is an admitted `source-record-removed` safety event for this
  *   opportunity accepted after creation. The admitted import writes those whatever their
- *   consumption status, so they are import truth; consumer outcomes are never read.
+ *   consumption status, so they are import truth; consumer outcomes are never read. Only
+ *   this opportunity's removals after creation are read: another deal's change or removal
+ *   never blocks this campaign.
+ * Deal OS is treated as additive: Deal OS emits no removal events, so a later Deal OS export
+ * that drops a listing does not block (owner decision parked, 2026-11-11 review M2).
  * Unreadable evidence is unproven, never unchanged.
  */
 async function campaignSourceChange({ storage, opportunityId, sourceRows, campaignCreatedAt }) {
@@ -112,7 +116,8 @@ async function campaignSourceChange({ storage, opportunityId, sourceRows, campai
     .filter((value) => typeof value === 'string' && value))];
   let read;
   try {
-    read = await storage.readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds });
+    read = await storage.readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds,
+      removedAfter: new Date(campaignCreatedAt).toISOString() });
   } catch {
     read = null;
   }

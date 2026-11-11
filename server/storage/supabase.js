@@ -1723,9 +1723,12 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     // Read-only evidence the final gate dates a campaign's source truth by (SQLite parity).
-    async readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds = [] } = {}) {
+    async readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds = [],
+      removedAfter } = {}) {
       const id = String(opportunityId || '');
-      if (!id || id.length > 200 || id.trim() !== id || !Array.isArray(evidenceIds)
+      const after = Date.parse(removedAfter ?? '');
+      if (!id || id.length > 200 || id.trim() !== id || !Number.isFinite(after)
+        || !Array.isArray(evidenceIds)
         || evidenceIds.length > 500
         || evidenceIds.some((value) => typeof value !== 'string' || !value || value.length > 240)) {
         throw new Error('Invalid CIM source evidence identities');
@@ -1741,6 +1744,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const { data: removals, error } = await client.from('deal_hunter_cim_safety_events')
         .select('id, source_type, source_run_id, created_at').eq('opportunity_id', id)
         .like('event_type', 'source-record-removed#%')
+        .gt('created_at', new Date(after).toISOString())
         .order('created_at', { ascending: false }).order('id').limit(1001);
       if (error) throw error;
       if (!Array.isArray(removals) || removals.length > 1000) {
