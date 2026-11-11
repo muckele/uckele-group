@@ -45,7 +45,7 @@ import { SENDER, SENDER_SETTINGS, gmailConfig } from './pursueCimGmailGateFixtur
 
 const RealDate = globalThis.Date;
 const OWNER = 'owner@uckele.test';
-const BROKER_EMAIL = 'jordan.lee@brokerfirm.test';
+export const BROKER_EMAIL = 'jordan.lee@brokerfirm.test';
 const CIPHERTEXT = 'v1.aXYtYnl0ZXM=.dGFnLWJ5dGVz.Y2lwaGVydGV4dA==';
 const SCOPES = ['https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/gmail.readonly'];
@@ -166,7 +166,7 @@ export async function createWorld(t, createBackend, { start, config: initialConf
 }
 
 /** The owner's one-time setup (spec §10 steps 3, 4 and 6), through the Operations card's service. */
-async function ownerTurnsSendingOn(world) {
+export async function ownerTurnsSendingOn(world) {
   const { storage, clock } = world;
   await setCimOutreachPaused({ paused: false, actor: OWNER, reason: 'end-to-end', storage });
   // Connect Gmail: the OAuth callback stores this row. The mailbox itself is the fake provider.

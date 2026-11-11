@@ -119,9 +119,13 @@ export function startPursueCimSenderScheduler({
         logger.error(`[pursue-cim-sender] failed slot=${slot} code=${error}`);
       } else {
         const metadata = runMetadata(result, '');
+        // The sanitized skip codes, so a touch that is skipped on every run shows in the logs.
+        const skipped = Object.entries(metadata.skipped).filter(([, value]) => value > 0)
+          .map(([reason, value]) => `${reason}:${value}`).join(',');
         logger.log(`[pursue-cim-sender] slot=${slot} sent=${metadata.sentInitial}`
           + ` followUps=${metadata.sentFollowUps} expired=${metadata.expired}`
-          + `${metadata.stoppedFor ? ` stoppedFor=${metadata.stoppedFor}` : ''}`);
+          + `${metadata.stoppedFor ? ` stoppedFor=${metadata.stoppedFor}` : ''}`
+          + `${skipped ? ` skipped=${skipped}` : ''}`);
       }
     } catch (cause) {
       logger.error(`[pursue-cim-sender] run not recorded slot=${slot} code=${errorCode(cause)}`);

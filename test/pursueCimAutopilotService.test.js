@@ -493,47 +493,146 @@ test('P2 pending safety consumption cannot hide a changed campaign material revi
     'campaign-source-authority-unproven']);
 });
 
-test('P2 consumer lag blocks a newly accepted source run when campaign revisions stay unchanged', async () => {
-  const storage = {
+/**
+ * A P2 storage stub: one active campaign on op-lag created at 12:00, its source rows and
+ * evidence. `removals` are admitted removal events (op-lag unless they name another
+ * opportunity); the stub answers like storage, for the asked opportunity after `removedAfter`.
+ */
+function p2CampaignStorage({ sourceRows, sourceStates, evidence = [], removals = [] }) {
+  const reads = [];
+  return {
+    reads,
     async getCurrentDealHunterOpportunity() { return { opportunity_id: 'op-lag', status: 'active',
       material_revision: 1, discovery_revision: 1 }; },
-    async listDealHunterOpportunitySourceObservations() { return [{ source_id: 'sheet-0',
-      source_record_id: 'external:LAG', field: 'name', value: 'Changed broker name',
-      accepted_at: '2026-09-28T12:01:00.000Z' }]; },
+    async listDealHunterOpportunitySourceObservations() { return sourceRows; },
     async listDealHunterIdentityExceptions() { return []; },
-    async listDealHunterSourceFreshnessStates() { return [{ source_id: 'sheet-0',
-      accepted_run_id: 'run-after-campaign', accepted_at: '2026-09-28T12:01:00.000Z',
-      projection_state: 'accepted' }]; },
+    async listDealHunterSourceFreshnessStates() { return sourceStates; },
     async readPursueCimProjection() { return { campaign: { state: 'initial-pending',
       created_at: '2026-09-28T12:00:00.000Z', material_revision: 1, discovery_revision: 1 } }; },
+    async readCimCampaignSourceChangeEvidence(input) {
+      reads.push(input);
+      return { evidence: evidence.filter((item) => input.evidenceIds.includes(item.id)),
+        removals: removals.filter((item) => (item.opportunity_id ?? 'op-lag') === input.opportunityId
+          && Date.parse(item.created_at) > Date.parse(input.removedAfter)) };
+    },
   };
+}
+
+// Ruling 2026-11-11: a run accepted after the campaign blocks it when that run changed the
+// record (its accepted evidence is newer than the campaign), whatever the consumer has done.
+test('P2 consumer lag blocks a newly accepted source run that changed the record when campaign revisions stay unchanged', async () => {
+  const storage = p2CampaignStorage({
+    sourceRows: [{ source_id: 'sheet-0', source_record_id: 'external:LAG', field: 'name',
+      value: 'Changed broker name', accepted_at: '2026-09-28T12:01:00.000Z',
+      accepted_evidence_id: 'evidence-run-after-campaign' }],
+    sourceStates: [{ source_id: 'sheet-0', accepted_run_id: 'run-after-campaign',
+      accepted_at: '2026-09-28T12:01:00.000Z', projection_state: 'accepted' }],
+    evidence: [{ id: 'evidence-run-after-campaign', accepted_at: '2026-09-28T12:01:00.000Z' }],
+  });
   const authority = await readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
     readSourceHealth: async () => ({ healthy: true, issues: [] }) });
   assert.equal(authority.blocked, true);
   assert.ok(authority.blockers.includes('campaign-source-authority-changed'));
 });
 
+test('P2 an unchanged source run accepted after the campaign does not block it', async () => {
+  // The refresh rewrote the row's and the source's accepted_at; the record's accepted evidence
+  // is still the run before the campaign, and nothing was removed.
+  const storage = p2CampaignStorage({
+    sourceRows: [{ source_id: 'sheet-0', source_record_id: 'external:LAG', field: 'name',
+      value: 'Same name', accepted_at: '2026-09-29T08:00:00.000Z',
+      accepted_evidence_id: 'evidence-before-campaign' }],
+    sourceStates: [{ source_id: 'sheet-0', accepted_run_id: 'unchanged-run-after-campaign',
+      accepted_at: '2026-09-29T08:00:00.000Z', projection_state: 'accepted' }],
+    evidence: [{ id: 'evidence-before-campaign', accepted_at: '2026-09-28T11:00:00.000Z' }],
+    removals: [{ id: 'removal-before-campaign', created_at: '2026-09-28T11:30:00.000Z' }],
+  });
+  const authority = await readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.deepEqual(authority.blockers, []);
+  assert.equal(authority.blocked, false);
+});
+
+test('P2 source rows the gate cannot date block the campaign as unproven', async (t) => {
+  const row = { source_id: 'sheet-0', source_record_id: 'external:LAG', field: 'name', value: 'x',
+    accepted_at: '2026-09-28T11:00:00.000Z' };
+  const states = [{ source_id: 'sheet-0', accepted_run_id: 'r', accepted_at: '2026-09-28T11:00:00.000Z',
+    projection_state: 'accepted' }];
+  const read = (storage) => readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  await t.test('accepted evidence that cannot be found', async () => {
+    const authority = await read(p2CampaignStorage({ sourceRows: [{ ...row,
+      accepted_evidence_id: 'missing' }], sourceStates: states }));
+    assert.deepEqual(authority.blockers, ['campaign-source-authority-unproven']);
+  });
+  await t.test('a row with neither evidence nor accepted_at', async () => {
+    const authority = await read(p2CampaignStorage({ sourceRows: [row,
+      { ...row, field: 'industry', accepted_at: undefined }], sourceStates: states }));
+    assert.deepEqual(authority.blockers, ['campaign-source-authority-unproven']);
+  });
+  await t.test('an unreadable evidence store', async () => {
+    const storage = p2CampaignStorage({ sourceRows: [row], sourceStates: states });
+    storage.readCimCampaignSourceChangeEvidence = async () => { throw new Error('unavailable'); };
+    assert.deepEqual((await read(storage)).blockers, ['campaign-source-authority-unproven']);
+  });
+});
+
+test('P2 a row without accepted evidence is dated by its own accepted_at: after the campaign it blocks as changed', async () => {
+  const storage = p2CampaignStorage({
+    sourceRows: [{ source_id: 'sheet-0', source_record_id: 'external:LAG', field: 'name',
+      value: 'Legacy row', accepted_at: '2026-09-28T12:01:00.000Z' }],
+    sourceStates: [{ source_id: 'sheet-0', accepted_run_id: 'r', accepted_at: '2026-09-28T11:00:00.000Z',
+      projection_state: 'accepted' }],
+  });
+  const authority = await readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.deepEqual(authority.blockers, ['campaign-source-authority-changed']);
+});
+
+test('P2 another deal\'s record removed or changed after the campaign leaves this campaign unblocked', async () => {
+  // Same Sheet, same run after the campaign: op-other's record was removed (an admitted removal
+  // event for op-other) and another of its records changed (its newer evidence is op-other's
+  // row, not this one's). This campaign's own rows keep evidence from before the campaign.
+  const storage = p2CampaignStorage({
+    sourceRows: [{ source_id: 'sheet-0', source_record_id: 'external:LAG', field: 'name',
+      value: 'Same name', accepted_at: '2026-09-29T08:00:00.000Z',
+      accepted_evidence_id: 'evidence-before-campaign' }],
+    sourceStates: [{ source_id: 'sheet-0', accepted_run_id: 'run-after-campaign',
+      accepted_at: '2026-09-29T08:00:00.000Z', projection_state: 'accepted' }],
+    evidence: [{ id: 'evidence-before-campaign', accepted_at: '2026-09-28T11:00:00.000Z' },
+      { id: 'evidence-other-changed', accepted_at: '2026-09-29T08:00:00.000Z' }],
+    removals: [{ id: 'removal-other', opportunity_id: 'op-other', source_type: 'sheet-import',
+      source_run_id: 'run-after-campaign', created_at: '2026-09-29T08:00:00.000Z' }],
+  });
+  const authority = await readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.deepEqual(authority.blockers, []);
+  // The read is per opportunity and since the campaign's creation.
+  assert.deepEqual(storage.reads, [{ opportunityId: 'op-lag',
+    evidenceIds: ['evidence-before-campaign'], removedAfter: '2026-09-28T12:00:00.000Z' }]);
+});
+
+// The Sheet record was removed by a run accepted after the campaign: the admitted import wrote a
+// source-record-removed safety event, which blocks even though the Deal OS rows left are older.
 test('P2 current authority sees a required Sheet removal even when only Deal OS rows remain', async () => {
-  const storage = {
-    async getCurrentDealHunterOpportunity() { return { opportunity_id: 'op-lag', status: 'active',
-      material_revision: 1, discovery_revision: 1 }; },
-    async listDealHunterOpportunitySourceObservations() { return [{ source_id: 'deal-os-export',
-      source_record_id: 'external:OLD', field: 'name', value: 'Prior name',
-      accepted_at: '2026-09-28T11:59:00.000Z' }]; },
-    async listDealHunterIdentityExceptions() { return []; },
-    async listDealHunterSourceFreshnessStates() { return [
+  const storage = p2CampaignStorage({
+    sourceRows: [{ source_id: 'deal-os-export', source_record_id: 'external:OLD', field: 'name',
+      value: 'Prior name', accepted_at: '2026-09-28T11:59:00.000Z',
+      accepted_evidence_id: 'deal-os-evidence' }],
+    sourceStates: [
       { source_id: 'sheet-0', accepted_run_id: 'sheet-removal',
         accepted_at: '2026-09-28T12:01:00.000Z', projection_state: 'accepted' },
       { source_id: 'deal-os-export', accepted_run_id: 'old-os',
         accepted_at: '2026-09-28T11:59:00.000Z', projection_state: 'accepted' },
-    ]; },
-    async readPursueCimProjection() { return { campaign: { state: 'initial-pending',
-      created_at: '2026-09-28T12:00:00.000Z', material_revision: 1, discovery_revision: 1 } }; },
-  };
+    ],
+    evidence: [{ id: 'deal-os-evidence', accepted_at: '2026-09-28T11:59:00.000Z' }],
+    removals: [{ id: 'sheet-removal-event', source_type: 'sheet-import',
+      source_run_id: 'sheet-removal', created_at: '2026-09-28T12:01:00.000Z' }],
+  });
   const authority = await readCimCurrentAuthority({ storage, opportunityId: 'op-lag',
     readSourceHealth: async () => ({ healthy: true, issues: [] }) });
   assert.equal(authority.blocked, true);
-  assert.ok(authority.blockers.includes('campaign-source-authority-changed'));
+  assert.deepEqual(authority.blockers, ['campaign-source-authority-changed']);
 });
 
 test('P0 scenarios 2 and 12: August no-URL listing retains its fingerprint when the URL arrives', async (t) => {

@@ -115,6 +115,23 @@ test('one Job history row per run carries the counts and no secrets or bodies', 
   assert.equal(JSON.stringify(job).includes('Hi Jordan'), false);
 });
 
+test('the run log line names the sanitized skip codes, and only when there are any', async (t) => {
+  const h = harness(t);
+  const results = [
+    summary({ skipped: { authority_changed: 2, outside_send_window: 1, 'Bad Code!': 4, quiet: 0 } }),
+    summary({ skipped: {} }),
+  ];
+  const scheduler = h.start({ run: async () => results.shift() });
+  await scheduler.tick();
+  h.set('2030-10-28T15:15:30.000Z');
+  await scheduler.tick();
+  assert.deepEqual(h.logs.filter((line) => line.includes(' slot=')), [
+    '[pursue-cim-sender] slot=2030-10-28T15:00:00.000Z sent=2 followUps=1 expired=1'
+      + ' skipped=authority_changed:2,outside_send_window:1',
+    '[pursue-cim-sender] slot=2030-10-28T15:15:00.000Z sent=2 followUps=1 expired=1',
+  ]);
+});
+
 test('a run that throws is recorded failed by code only', async (t) => {
   const h = harness(t);
   const scheduler = h.start({ run: async () => {
