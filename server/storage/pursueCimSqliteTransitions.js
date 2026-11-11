@@ -2672,6 +2672,27 @@ export function createPursueCimSqliteTransitions(database, {
       if (events.length > 10000) throw new Error('CIM safety run exceeds the bounded read.');
       return events;
     },
+    /**
+     * Read-only evidence the final gate dates a campaign's source truth by: the acceptance time
+     * of the named accepted evidence, and this opportunity's admitted source-record removals.
+     */
+    async readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds = [] } = {}) {
+      const id = requiredText(opportunityId, 'opportunityId', 200);
+      if (!Array.isArray(evidenceIds) || evidenceIds.length > 500
+        || evidenceIds.some((value) => typeof value !== 'string' || !value || value.length > 240)) {
+        throw new Error('Invalid CIM source evidence identities');
+      }
+      const ids = [...new Set(evidenceIds)];
+      const evidence = ids.length ? database.prepare(`SELECT id, accepted_at
+        FROM deal_hunter_freshness_evidence WHERE id IN (${ids.map(() => '?').join(', ')})`)
+        .all(...ids) : [];
+      const removals = database.prepare(`SELECT id, source_type, source_run_id, created_at
+        FROM deal_hunter_cim_safety_events
+        WHERE opportunity_id = ? AND event_type LIKE 'source-record-removed#%'
+        ORDER BY created_at DESC, id LIMIT 1001`).all(id);
+      if (removals.length > 1000) throw new Error('CIM source removals exceed the bounded read.');
+      return { evidence, removals };
+    },
     async appendCimSafetyEvents(run) {
       const safetyRunId = requiredText(run.safetyRunId, 'safetyRunId');
       const sourceType = requiredText(run.sourceType, 'sourceType', 120);

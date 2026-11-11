@@ -87,6 +87,56 @@ export async function runCimCampaignSafety({ storage, safetyRunId, mode = 'shado
   return summarize(after);
 }
 
+/**
+ * Whether the campaign's source truth changed after the campaign was created.
+ *
+ * Ruling (2026-11-11): the gate reads source truth directly so consumer lag cannot authorize a
+ * send (plan 2026-09-25, Package 2), and it blocks when the source *changed* after creation.
+ * An unchanged daily refresh is not a change: it rewrites every row's `accepted_at` and the
+ * source state's `accepted_at`, so those are not read here. Instead:
+ * - a row with accepted evidence is dated by that evidence's `accepted_at`, which an unchanged
+ *   record keeps from the run that last changed it;
+ * - a row without accepted evidence is dated by its own `accepted_at`, and a row with neither
+ *   is unproven (the stricter of the two choices: an unprovable row blocks);
+ * - a removed source record is an admitted `source-record-removed` safety event for this
+ *   opportunity accepted after creation. The admitted import writes those whatever their
+ *   consumption status, so they are import truth; consumer outcomes are never read.
+ * Unreadable evidence is unproven, never unchanged.
+ */
+async function campaignSourceChange({ storage, opportunityId, sourceRows, campaignCreatedAt }) {
+  if (typeof storage?.readCimCampaignSourceChangeEvidence !== 'function') {
+    return { unproven: true, changed: sourceRows.some((row) =>
+      Date.parse(row.accepted_at || '') > campaignCreatedAt) };
+  }
+  const evidenceIds = [...new Set(sourceRows.map((row) => row.accepted_evidence_id)
+    .filter((value) => typeof value === 'string' && value))];
+  let read;
+  try {
+    read = await storage.readCimCampaignSourceChangeEvidence({ opportunityId, evidenceIds });
+  } catch {
+    read = null;
+  }
+  if (!Array.isArray(read?.evidence) || !Array.isArray(read?.removals)) {
+    return { unproven: true, changed: false };
+  }
+  const evidenceAcceptedAt = new Map(read.evidence.map((item) => [item.id,
+    Date.parse(item.accepted_at || '')]));
+  let unproven = false;
+  let changed = false;
+  for (const row of sourceRows) {
+    const at = row.accepted_evidence_id
+      ? evidenceAcceptedAt.get(row.accepted_evidence_id) : Date.parse(row.accepted_at || '');
+    if (!Number.isFinite(at)) unproven = true;
+    else if (at > campaignCreatedAt) changed = true;
+  }
+  for (const removal of read.removals) {
+    const at = Date.parse(removal.created_at || '');
+    if (!Number.isFinite(at)) unproven = true;
+    else if (at > campaignCreatedAt) changed = true;
+  }
+  return { unproven, changed };
+}
+
 /** Current source and identity truth for the later final gate; no safety-consumer state is consulted. */
 export async function readCimCurrentAuthority({ storage, opportunityId,
   readSourceHealth = getSourceHealth } = {}) {
@@ -132,8 +182,11 @@ export async function readCimCurrentAuthority({ storage, opportunityId,
       .filter(Number.isFinite);
     if (!Number.isFinite(campaignCreatedAt) || acceptedAt.length === 0) {
       blockers.push('campaign-source-authority-unproven');
-    } else if (acceptedAt.some((value) => value > campaignCreatedAt)) {
-      blockers.push('campaign-source-authority-changed');
+    } else {
+      const change = await campaignSourceChange({ storage, opportunityId: id, sourceRows,
+        campaignCreatedAt });
+      if (change.unproven) blockers.push('campaign-source-authority-unproven');
+      if (change.changed) blockers.push('campaign-source-authority-changed');
     }
   }
   if (sourceHealth?.healthy !== true) blockers.push('source-health-unavailable');
