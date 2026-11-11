@@ -224,7 +224,8 @@ process.env.DEAL_HUNTER_AIRTABLE_BASE_ID = 'appTest';
 process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID = 'tblTest';
 process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID = 'viwTest';
 
-const sheetListingRecordId = (url) => `listing:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
+const sheetListingRecordId = (url) => `listing:${createHash('sha256')
+  .update(url.replace(/^https:\/\//, '')).digest('hex').slice(0, 40)}`;
 
 const originalFetch = globalThis.fetch;
 const { importDealOsExport, parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');

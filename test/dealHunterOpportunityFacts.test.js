@@ -1577,7 +1577,8 @@ test('a no-explicit-ID Sheet observation snapshot is keyed by its listing URL, n
     listingUrl: 'https://broker.example/original-listing',
     annualProfit: 450000,
   };
-  const listingId = (url) => `listing:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
+  const listingId = (url) => `listing:${createHash('sha256')
+    .update(url.replace(/^https:\/\//, '')).digest('hex').slice(0, 40)}`;
   const first = buildOpportunitySourceObservationSnapshot({ opportunityId, deal: sourceDeal, now: '2026-08-30T12:30:00.000Z' });
   const moved = buildOpportunitySourceObservationSnapshot({
     opportunityId, deal: { ...sourceDeal, sourceRowId: '7', id: '7' }, now: '2026-08-30T13:30:00.000Z',

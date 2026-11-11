@@ -34,14 +34,19 @@ const { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } = await import(
 const originalFetch = globalThis.fetch;
 let sourceCsv = '';
 let sourceWorkbook = null;
+let sourceWorkbookStatus = 200;
 
 beforeEach(() => {
   sourceCsv = '';
   sourceWorkbook = zipSync({});
+  sourceWorkbookStatus = 200;
   globalThis.fetch = async (url) => {
     const value = String(url);
     if (value.includes('/gviz/tq')) return new Response(sourceCsv, { status: 200 });
-    if (value.includes('/export?')) return new Response(sourceWorkbook, { status: 200 });
+    if (value.includes('/export?')) {
+      return sourceWorkbookStatus === 200 ? new Response(sourceWorkbook, { status: 200 })
+        : new Response('Internal error', { status: sourceWorkbookStatus });
+    }
     return new Response('not found', { status: 404 });
   };
 });
@@ -72,7 +77,23 @@ function row(listing, overrides = {}) {
 }
 
 const sheet = (...rows) => [HEADER, ...rows].join('\n');
-const listingRecordId = (url) => `listing:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
+const listingRecordId = (url) => `listing:${createHash('sha256')
+  .update(url.replace(/^https:\/\//, '')).digest('hex').slice(0, 40)}`;
+
+/** An xlsx export whose column B holds each row's "View Listing" hyperlink. */
+function viewListingWorkbook(rows) {
+  const cells = rows.map(({ name, url }, index) => {
+    const at = index + 2;
+    return `<row r="${at}"><c r="A${at}" t="inlineStr"><is><t>${name}</t></is></c>`
+      + `<c r="B${at}" t="str"><f>HYPERLINK(&quot;${url}&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c></row>`;
+  }).join('');
+  return zipSync({ 'xl/worksheets/sheet1.xml': strToU8([
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>',
+    '<row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>View Listing</t></is></c></row>',
+    cells, '</sheetData></worksheet>',
+  ].join('')) });
+}
 
 function createWorld(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-sheet-listing-ids-'));
@@ -178,33 +199,99 @@ test('two rows sharing a listing URL get distinct ids that stay put when a third
   assert.equal(countOf(safetyEvents(world.db, runId), 'source-record-removed'), 0);
 });
 
+test('a Sheet record id ignores cosmetic URL drift but never merges different listings', () => {
+  // Keyed by the listing identity the canonical aliases use: `www.`, host and path case, a
+  // trailing slash and tracking parameters never rename a record.
+  const base = 'https://broker.example/listings/harbor-hvac';
+  const idOf = (url) => getOpportunitySourceObservationRecordId(
+    parseSheetCsvDeals(sheet(row(LISTINGS.hvac, { url }))).deals[0]);
+  for (const variant of [
+    'https://www.broker.example/listings/harbor-hvac',
+    'https://Broker.Example/listings/harbor-hvac/',
+    'http://broker.example/listings/harbor-hvac',
+    'https://broker.example/listings/harbor-hvac?utm_source=sheet&fbclid=abc',
+  ]) assert.equal(idOf(variant), listingRecordId(base), variant);
+  assert.notEqual(idOf('https://broker.example/listings/harbor-hvac-2'), listingRecordId(base));
+  assert.notEqual(idOf('https://broker.example/listings/harbor-hvac?id=2'), listingRecordId(base));
+  assert.notEqual(idOf('https://other-broker.example/listings/harbor-hvac'), listingRecordId(base));
+
+  // Two cosmetic variants of one link in one collection are one listing posted twice: distinct ids.
+  const deals = parseSheetCsvDeals(sheet(row(LISTINGS.hvac), row(LISTINGS.roofing),
+    row(LISTINGS.hvac, { url: 'https://www.broker.example/listings/harbor-hvac/?utm_medium=email' }))).deals;
+  assert.deepEqual(deals.map(getOpportunitySourceObservationRecordId), [listingRecordId(base),
+    listingRecordId(LISTINGS.roofing.url), `${listingRecordId(base)}#2`]);
+});
+
 test('a View Listing hyperlink recovered from the workbook keys the record', async (t) => {
   const world = createWorld(t);
-  const workbook = (rows) => {
-    const cells = rows.map(({ name, url }, index) => {
-      const at = index + 2;
-      return `<row r="${at}"><c r="A${at}" t="inlineStr"><is><t>${name}</t></is></c>`
-        + `<c r="B${at}" t="str"><f>HYPERLINK(&quot;${url}&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c></row>`;
-    }).join('');
-    return zipSync({ 'xl/worksheets/sheet1.xml': strToU8([
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>',
-      '<row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>View Listing</t></is></c></row>',
-      cells, '</sheetData></worksheet>',
-    ].join('')) });
-  };
   const alpha = { name: 'Alpha HVAC', url: 'https://broker.example/alpha' };
   const beta = { name: 'Beta Plumbing', url: 'https://broker.example/beta' };
-  sourceWorkbook = workbook([alpha]);
+  sourceWorkbook = viewListingWorkbook([alpha]);
   await dailySync(world, ['Name,View Listing', 'Alpha HVAC,View Listing'].join('\n'));
   const before = sheetRecords(world.db);
   assert.equal(before[alpha.url].recordId, listingRecordId(alpha.url));
 
-  sourceWorkbook = workbook([beta, alpha]);
+  sourceWorkbook = viewListingWorkbook([beta, alpha]);
   const runId = await dailySync(world, ['Name,View Listing', 'Beta Plumbing,View Listing', 'Alpha HVAC,View Listing'].join('\n'));
   assert.deepEqual(sheetRecords(world.db)[alpha.url], before[alpha.url]);
   assert.deepEqual(changedRecords(world.db, runId), [listingRecordId(beta.url)]);
   assert.equal(countOf(safetyEvents(world.db, runId), 'source-record-removed'), 0);
+});
+
+const RICH = 'Established operator with trained staff and documented processes and a diversified customer '
+  + 'base and steady repeat demand across the region.';
+const viewListingSheet = (...names) => ['Name,View Listing,City,State,Annual Profit,Annual Revenue,Asking Price,Description,Broker Name,Broker Email',
+  ...names.map((name, index) => [name, 'View Listing', 'Sacramento', 'CA', 400000 + index * 1000, 1200000, 900000,
+    `${name} company. ${RICH}`, `Broker ${index}`, `broker${index}@brokerage${index}.test`].join(','))].join('\n');
+
+test('a workbook outage defers a Sheet whose links exist only as workbook hyperlinks', async (t) => {
+  const world = createWorld(t);
+  const alpha = { name: 'Alpha HVAC', url: 'https://broker.example/alpha' };
+  sourceWorkbook = viewListingWorkbook([alpha]);
+  const runId = await dailySync(world, viewListingSheet(alpha.name));
+  const before = sheetRecords(world.db);
+
+  sourceWorkbookStatus = 500;
+  sourceCsv = viewListingSheet(alpha.name);
+  const result = await refreshOpportunityScores({ storage: world.storage, reviewMode: 'full-backfill', actor: 'outage' });
+  assert.equal(result.ok, false);
+  const source = result.review.sources.find((item) => item.id === 'sheet-0');
+  assert.deepEqual([source.fetched, source.listingUrlSourceUnavailable, source.listingUrlExpectedCount,
+    source.listingUrlCount], [true, true, 1, 0]);
+  assert.match(source.error, /workbook could not be read, so 1 listing link could not be recovered; the Sheet is deferred/);
+  assert.deepEqual(sheetRecords(world.db), before);
+  assert.equal(world.db.prepare(`SELECT accepted_run_id FROM deal_hunter_source_freshness_state
+    WHERE source_id = 'sheet-0'`).get().accepted_run_id, runId);
+});
+
+test('a workbook outage does not defer a Sheet whose rows carry their links in the CSV', async (t) => {
+  const world = createWorld(t);
+  sourceWorkbookStatus = 500;
+  sourceCsv = sheet(row(LISTINGS.hvac), row(LISTINGS.roofing));
+  const result = await refreshOpportunityScores({ storage: world.storage, reviewMode: 'full-backfill', actor: 'outage' });
+  assert.equal(result.ok, true, JSON.stringify(result.error));
+  const source = result.review.sources.find((item) => item.id === 'sheet-0');
+  assert.deepEqual([source.listingUrlSourceUnavailable, Boolean(source.error), Boolean(source.listingUrlWarning)],
+    [false, false, true]);
+  assert.equal(sheetRecords(world.db)[LISTINGS.hvac.url].recordId, listingRecordId(LISTINGS.hvac.url));
+});
+
+test('a row whose hyperlink cannot be aligned keeps its position while the workbook loaded', async (t) => {
+  // The workbook loaded but holds no hyperlink for Beta: an isolated row, not an outage. It keeps
+  // the positional fallback and the Sheet is admitted.
+  const world = createWorld(t);
+  const alpha = { name: 'Alpha HVAC', url: 'https://broker.example/alpha' };
+  sourceWorkbook = viewListingWorkbook([alpha]);
+  sourceCsv = viewListingSheet(alpha.name, 'Beta Plumbing');
+  const result = await refreshOpportunityScores({ storage: world.storage, reviewMode: 'full-backfill', actor: 'align' });
+  assert.equal(result.ok, true, JSON.stringify(result.error));
+  const source = result.review.sources.find((item) => item.id === 'sheet-0');
+  assert.deepEqual([source.listingUrlSourceUnavailable, Boolean(source.error), source.listingUrlUnresolvedCount],
+    [false, false, 1]);
+  assert.match(source.listingUrlWarning, /1 imported CSV row displays a View Listing label/);
+  assert.deepEqual(world.db.prepare(`SELECT DISTINCT source_record_id FROM deal_hunter_opportunity_source_observations
+    WHERE source_id = 'sheet-0' ORDER BY source_record_id`).all().map((item) => item.source_record_id),
+  [listingRecordId(alpha.url), 'sheet-row:2']);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -280,9 +367,10 @@ async function admittedSync({ storage }, csv, { runId, scheme = 'new', at, defer
 }
 
 test('a Sheet row without a listing URL falls back to its sheet position', async (t) => {
-  // The full review cannot resolve a row with no link to a canonical opportunity (it holds the
-  // run, as before this change), so the record is admitted as the daily sync admits it once
-  // its identity resolves.
+  // Whether the full review resolves a row with no link depends on its content (a full
+  // fingerprint resolves; this short row does not, and the review holds the run, as on
+  // origin/main), so the record is admitted as the daily sync admits it once its identity
+  // resolves.
   const world = createWorld(t);
   const csv = sheet(row(LISTINGS.hvac), row(LISTINGS.roofing, { url: '' }));
   const [linked, unlinked] = parseSheetCsvDeals(csv).deals;

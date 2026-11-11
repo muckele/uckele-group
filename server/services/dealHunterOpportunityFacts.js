@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { financialFactFields, normalizeFinancialFact, parseFinancialFact } from '../../shared/opportunityFinancialFacts.js';
+import { normalizeDealHunterListingIdentity } from './dealHunterListingIdentity.js';
 
 export const opportunityFactCrmSnapshotFields = Object.freeze([
   'seller_name',
@@ -256,7 +257,12 @@ function sourceObservationRecordId(deal = {}) {
   if (sourceId && deal.stableExternalId && externalId) return `external:${externalId}`;
   const listingUrl = String(deal.listingUrl || '').trim();
   if (sourceId && listingUrl) {
-    const listingId = `listing:${sourceObservationDigest(listingUrl).slice(0, 40)}`;
+    // A Sheet row's link is keyed by the listing identity the canonical aliases use, so cosmetic
+    // drift (`www.`, case, trailing slash, tracking parameters) never renames the record. Other
+    // sources keep the URL string they have always been keyed by: Deal OS records are written
+    // per record and never removed source-wide, so re-keying them would strand the old ones.
+    const keyedUrl = deal.idFromSourceRowPosition ? normalizeDealHunterListingIdentity(listingUrl) || listingUrl : listingUrl;
+    const listingId = `listing:${sourceObservationDigest(keyedUrl).slice(0, 40)}`;
     const occurrence = Number(deal.sourceListingOccurrence);
     return Number.isSafeInteger(occurrence) && occurrence > 1 ? `${listingId}#${occurrence}` : listingId;
   }

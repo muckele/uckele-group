@@ -171,6 +171,7 @@ function verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, r
   if (
     !source.fetched
     || source.error
+    || source.listingUrlSourceUnavailable
     || source.coverageLimitReached
     || !Number.isInteger(sourceRowCount)
     || !Number.isInteger(rowCount)
