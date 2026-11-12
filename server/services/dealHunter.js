@@ -2081,6 +2081,21 @@ async function fetchBytes(url, {
   }
 }
 
+// Numbers each row by how many rows up to and including it share its listing link (by listing
+// identity: `www.`, case, trailing slash and tracking parameters aside), in sheet order, so two
+// rows with one link get distinct observation record ids
+// (`getOpportunitySourceObservationRecordId`). Rows with a stable external id are keyed by it.
+function withSourceListingOccurrences(deals = []) {
+  const seen = new Map();
+  return deals.map((deal) => {
+    const identity = normalizeListingIdentity(deal.listingUrl);
+    if (!identity || deal.stableExternalId) return deal;
+    const occurrence = (seen.get(identity) || 0) + 1;
+    seen.set(identity, occurrence);
+    return { ...deal, sourceListingOccurrence: occurrence };
+  });
+}
+
 function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = new Map()) {
   const safeListingUrls = listingUrlsByRow instanceof Map ? listingUrlsByRow : new Map();
   return {
@@ -2091,12 +2106,12 @@ function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = ne
       fetched: true,
       rowCount: rows.length,
     },
-    deals: rows.map((row, index) => normalizeDealRecord(
+    deals: withSourceListingOccurrences(rows.map((row, index) => normalizeDealRecord(
       safeListingUrls.get(index)
         ? { ...normalizeDailyDealUpdateRow(row), 'Original Broker Listing URL': safeListingUrls.get(index) }
         : normalizeDailyDealUpdateRow(row),
       { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) },
-    )),
+    ))),
   };
 }
 
@@ -2152,6 +2167,15 @@ async function fetchSheetCsvDeals(url, sourceIndex, config) {
   const listingUrlCount = listingUrlHealth.filter(({ expected, resolved }) => expected && resolved).length;
   const listingUrlUnresolvedCount = listingUrlHealth.filter(({ expected, resolved }) => expected && !resolved).length;
 
+  // The workbook itself could not be downloaded or read, and rows that carry their listing link
+  // only as a hyperlink lost it. Their record ids are keyed by that link, so admitting the Sheet
+  // would re-key each of them to its position today and back tomorrow: every record changed and
+  // removed twice, and every Pursue campaign on them held. The Sheet is deferred for the day
+  // instead, as when the CSV itself fails. A row that merely fails to align with its hyperlink
+  // while the workbook loaded keeps its positional fallback and does not defer the Sheet.
+  const workbookFailure = workbookUrl ? workbookResult.error : '';
+  const listingUrlSourceUnavailable = Boolean(workbookFailure) && listingUrlExpectedCount > listingUrlCount;
+
   if (workbookUrl && !workbookResult.error && hasUnresolvedListingLabels && listingUrlUnresolvedCount > 0) {
     const count = listingUrlUnresolvedCount;
     workbookResult.error = `${count} imported CSV row${count === 1 ? '' : 's'} display${count === 1 ? 's' : ''} a View Listing label, but no safe hyperlink could be recovered for ${count === 1 ? 'it' : 'them'}.`;
@@ -2169,6 +2193,12 @@ async function fetchSheetCsvDeals(url, sourceIndex, config) {
       listingUrlUnresolvedCount,
       unmatchedWorkbookListingUrlCount: Number(workbookResult.unmatchedListingUrlCount || 0),
       listingUrlWarning: workbookResult.error,
+      listingUrlSourceUnavailable,
+      ...(listingUrlSourceUnavailable ? {
+        error: `The Google Sheet workbook could not be read, so ${listingUrlExpectedCount - listingUrlCount} `
+          + `listing link${listingUrlExpectedCount - listingUrlCount === 1 ? '' : 's'} could not be recovered; `
+          + `the Sheet is deferred until the next run. ${workbookFailure}`.trim(),
+      } : {}),
     },
   };
 }
@@ -2884,7 +2914,7 @@ function sourceRecord(deal = {}) {
 function sourceObservationDeal(deal = {}) {
   const fields = [
     'sourceId', 'sourceName', 'sourceRowId', 'id', 'stableExternalId', 'idFromSourceRowPosition',
-    'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+    'sourceListingOccurrence', 'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
     'annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple', 'netMargin', 'yearsEstablished',
     'remoteFlag', 'franchiseFlag', 'fiveYearsFlag', 'brokerName', 'brokerCompany', 'brokerContact', 'brokerPhone',
     'brokerEmail', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated', 'freshnessEvidence', 'freshnessRun',
@@ -5889,6 +5919,7 @@ function buildCompleteSheetObservationScopes(sourceResults = [], reviewMode = 'd
     if (
       !source.fetched
       || source.error
+      || source.listingUrlSourceUnavailable
       || source.coverageLimitReached
       || !Number.isInteger(sourceRowCount)
       || !Number.isInteger(rowCount)

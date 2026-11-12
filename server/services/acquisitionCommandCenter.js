@@ -1793,6 +1793,11 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
     } else if (rowCount === 0) {
       tone = required ? 'danger' : 'warning';
       sourceIssues.push('Source returned zero rows.');
+    } else if (source.listingUrlSourceUnavailable) {
+      // The Sheet's rows arrived but its workbook, the only home of their listing links, did
+      // not; the Sheet is deferred for the run (dealHunter.js `fetchSheetCsvDeals`).
+      tone = required ? 'danger' : 'warning';
+      sourceIssues.push(source.error || 'The Google Sheet workbook could not be read; the Sheet is deferred.');
     } else if (previousRowCount > 0 && rowCount < previousRowCount * sourceHealthWarningDropRatio) {
       tone = 'warning';
       sourceIssues.push(`Row count dropped from ${previousRowCount} to ${rowCount}.`);
@@ -1805,7 +1810,7 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
         title: `${source.name || 'Deal source'} needs attention`,
         message,
         affectsHealth: required,
-        sourceUnavailable: !source.fetched || rowCount === 0,
+        sourceUnavailable: !source.fetched || rowCount === 0 || Boolean(source.listingUrlSourceUnavailable),
       });
     }
 
