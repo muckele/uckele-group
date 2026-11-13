@@ -157,3 +157,18 @@ test('our Gmail signature inlined in a reply is not a stop request; the broker\'
   assert.equal(classify(message({ bodyPrefix: 'Sure.\n\nIf you would rather I not reach out about future listings, just reply "stop".' }),
     { signatureText }), 'reply');
 });
+
+test('our signature is removed only as a whole block, never a single line the broker wrote', () => {
+  const signatureText = 'Pat Example\nPresident, Example Holdings LLC\n\nReply STOP to opt out';
+  // The broker writes, as their own reply, a line identical to one signature line.
+  assert.equal(classify(message({ bodyPrefix: 'Reply STOP to opt out' }), { signatureText }), 'stop');
+  assert.equal(classify(message({ bodyPrefix: 'Thanks.\nreply   stop to OPT out\nPresident, Example Holdings LLC' }),
+    { signatureText }), 'stop');
+  // The full signature block, inlined (blank lines and spacing differ), is removed.
+  const inlined = 'Sounds good, NDA attached.\n\nBest,\nPat Example\n  President,  Example Holdings LLC\n\n\nreply stop to opt out\n';
+  assert.equal(classify(message({ bodyPrefix: inlined }), { signatureText }), 'reply');
+  // A stop line of the broker's own next to the full block still counts.
+  assert.equal(classify(message({ bodyPrefix: `Please stop.\n${inlined}` }), { signatureText }), 'stop');
+  // A one-line signature is never removed.
+  assert.equal(classify(message({ bodyPrefix: 'Unsubscribe' }), { signatureText: 'Unsubscribe' }), 'stop');
+});
