@@ -8,6 +8,7 @@ import {
   validateSaveGmailConnection, validateSetPursueSendControl, normalizeGmailReplyMessageRow,
   normalizeGmailSentIdentityRow, validateGmailReplyMessage, validateGmailReplyMessageLookup,
   validateGmailSentIdentityLookup, validateGmailPendingReplyLookup,
+  normalizeGmailSignatureRow, validateGmailSignatureRefresh,
 } from './gmailSendStorageContract.js';
 import {
   normalizePursuitBundle, normalizePursuitDocumentRow, normalizePursuitStageEventRow, PURSUIT_SIM_INTAKE_CONFLICTS,
@@ -4246,6 +4247,23 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) throw error;
       if (typeof data !== 'boolean') throw new Error('Malformed Gmail checkpoint result');
       return data;
+    },
+
+    async getGmailSignature() {
+      const { data, error } = await client.from('deal_hunter_gmail_signatures')
+        .select('*').eq('id', 'current').maybeSingle();
+      if (error) throw error;
+      return normalizeGmailSignatureRow(data);
+    },
+
+    /** Stores a refreshed snapshot, or records a failed attempt and keeps the snapshot. */
+    async recordGmailSignatureRefresh(command = {}) {
+      const { data, error } = await client.rpc('deal_hunter_gmail_record_signature_refresh_v1', {
+        p_command: validateGmailSignatureRefresh(command),
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object') throw new Error('Malformed Gmail signature result');
+      return normalizeGmailSignatureRow(data);
     },
 
     async getPursueSendControls() {
