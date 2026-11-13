@@ -12,6 +12,7 @@ import {
   getBackupStatus,
   listBackupBundles,
   restoreBackupBundle,
+  runClaimedBackup,
   startBackupScheduler,
   verifyBackupBundle,
 } from '../server/services/backups.js';
@@ -1119,4 +1120,179 @@ test('the backup scheduler warms verification records in the background at start
   warmUp.callback();
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(warmed, [config]);
+});
+
+const backupJobKey = 'sqlite-application-backup:2026-11-13';
+// 03:30 in America/Los_Angeles on 2026-11-13, when the daily backup first runs.
+const backupDayStart = Date.parse('2026-11-13T11:30:00.000Z');
+
+function backupAt(minutesAfterStart) {
+  return new Date(backupDayStart + minutesAfterStart * 60_000);
+}
+
+function backupBundleNames(config) {
+  return fs.existsSync(config.backup.directory)
+    ? fs.readdirSync(config.backup.directory).filter((name) => name.startsWith('backup-')).sort()
+    : [];
+}
+
+// The process is killed mid-backup: nothing after the copy runs, so the claim stays pending.
+function killedMidBackupStorage(storage) {
+  return {
+    ...storage,
+    async createApplicationBackup() {
+      throw new Error('simulated OOM kill');
+    },
+    async completeScheduledJob() {
+      return null;
+    },
+  };
+}
+
+function countingBackupStorage(storage) {
+  const counted = {
+    ...storage,
+    backups: 0,
+    async createApplicationBackup(destination) {
+      counted.backups += 1;
+      return storage.createApplicationBackup(destination);
+    },
+  };
+  return counted;
+}
+
+test('a backup that keeps getting killed is reclaimed at most until attempt 3, then gives up for the day', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-crash-loop-');
+  const killed = killedMidBackupStorage(storage);
+  const counting = countingBackupStorage(storage);
+  const errors = [];
+  t.mock.method(console, 'error', (message) => errors.push(String(message)));
+
+  await assert.rejects(runClaimedBackup({ storage: killed, config, now: backupAt(0) }), /simulated OOM kill/);
+  assert.equal((await storage.getScheduledJob(backupJobKey)).attempt_count, 1);
+
+  const meanwhile = await runClaimedBackup({ storage: counting, config, now: backupAt(15) });
+  assert.equal(meanwhile.inProgress, true, 'a fresh pending claim is not taken over');
+  assert.equal(counting.backups, 0);
+
+  await assert.rejects(runClaimedBackup({ storage: killed, config, now: backupAt(121) }), /simulated OOM kill/);
+  assert.equal((await storage.getScheduledJob(backupJobKey)).attempt_count, 2);
+  await assert.rejects(runClaimedBackup({ storage: killed, config, now: backupAt(242) }), /simulated OOM kill/);
+  assert.equal((await storage.getScheduledJob(backupJobKey)).attempt_count, 3);
+
+  const gaveUp = await runClaimedBackup({ storage: counting, config, now: backupAt(363) });
+  assert.equal(gaveUp.gaveUp, true);
+  assert.equal(counting.backups, 0, 'the fourth claim does not start another backup');
+  assert.deepEqual(backupBundleNames(config), []);
+  const job = await storage.getScheduledJob(backupJobKey);
+  assert.equal(job.status, 'failed');
+  assert.equal(job.metadata.gaveUp, true);
+  assert.equal(job.metadata.attempts, 3);
+  assert.equal(job.metadata.dateKey, '2026-11-13');
+  assert.equal(Object.hasOwn(job.metadata, 'nextRetryAt'), false);
+  assert.match(job.last_error, /gave up after 3 attempts today.*may have crashed/i);
+  assert.ok(errors.some((message) => message.startsWith('[backup:scheduler]') && /gave up after 3 attempts today.*may have crashed/i.test(message)));
+
+  const later = await runClaimedBackup({ storage: counting, config, now: backupAt(480) });
+  assert.notEqual(later.gaveUp, true);
+  assert.equal(later.backup, undefined);
+  assert.equal(counting.backups, 0, 'nothing is claimed or backed up again that day');
+  assert.equal((await storage.getScheduledJob(backupJobKey)).attempt_count, 4);
+});
+
+test('a backup that throws is retried only once its nextRetryAt has passed', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-thrown-retry-');
+  const failing = { ...storage, async createApplicationBackup() { throw new Error('disk full'); } };
+  const counting = countingBackupStorage(storage);
+
+  await assert.rejects(runClaimedBackup({ storage: failing, config, now: backupAt(0) }), /disk full/);
+  const failed = await storage.getScheduledJob(backupJobKey);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.last_error, 'disk full');
+  assert.equal(failed.metadata.nextRetryAt, backupAt(60).toISOString());
+  assert.notEqual(failed.metadata.gaveUp, true);
+
+  const tooSoon = await runClaimedBackup({ storage: counting, config, now: backupAt(15) });
+  assert.equal(tooSoon.backup, undefined);
+  assert.equal(counting.backups, 0, 'the next 15-minute tick does not retry');
+  assert.equal((await storage.getScheduledJob(backupJobKey)).attempt_count, 1);
+
+  const retried = await runClaimedBackup({ storage: counting, config, now: backupAt(61) });
+  assert.ok(retried.backup);
+  assert.equal(counting.backups, 1);
+  const completed = await storage.getScheduledJob(backupJobKey);
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.attempt_count, 2);
+});
+
+test('a third thrown backup failure gives up for the day without scheduling another retry', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-thrown-give-up-');
+  const failing = { ...storage, async createApplicationBackup() { throw new Error('disk full'); } };
+  const counting = countingBackupStorage(storage);
+  const errors = [];
+  t.mock.method(console, 'error', (message) => errors.push(String(message)));
+
+  await assert.rejects(runClaimedBackup({ storage: failing, config, now: backupAt(0) }), /disk full/);
+  await assert.rejects(runClaimedBackup({ storage: failing, config, now: backupAt(61) }), /disk full/);
+  assert.equal((await storage.getScheduledJob(backupJobKey)).metadata.nextRetryAt, backupAt(121).toISOString());
+  await assert.rejects(runClaimedBackup({ storage: failing, config, now: backupAt(122) }), /disk full/);
+  const third = await storage.getScheduledJob(backupJobKey);
+  assert.equal(third.attempt_count, 3);
+  assert.equal(third.metadata.gaveUp, true);
+  assert.equal(Object.hasOwn(third.metadata, 'nextRetryAt'), false);
+  assert.ok(errors.some((message) => message.startsWith('[backup:scheduler]') && /gave up/i.test(message)));
+
+  await runClaimedBackup({ storage: counting, config, now: backupAt(600) });
+  assert.equal(counting.backups, 0);
+  assert.equal((await storage.getScheduledJob(backupJobKey)).attempt_count, 3);
+});
+
+test('a dead incarnation\'s incomplete backup is removed when the next backup starts, even if recent', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-dead-marker-');
+  const deadIncomplete = path.join(config.backup.directory, 'backup-2026-11-13T11-30-00-000Z-deadbeef.incomplete');
+  const unmarkedIncomplete = path.join(config.backup.directory, 'backup-2026-11-13T11-30-00-000Z-0a0a0a0a.incomplete');
+  fs.mkdirSync(deadIncomplete, { recursive: true });
+  fs.mkdirSync(unmarkedIncomplete, { recursive: true });
+  fs.writeFileSync(path.join(deadIncomplete, 'database.sqlite'), Buffer.alloc(4096));
+  // Same PID as this process (containers restart node as the same PID) but another incarnation.
+  fs.writeFileSync(path.join(deadIncomplete, '.active.json'), JSON.stringify({
+    pid: process.pid,
+    instanceId: 'some-other-instance',
+    startedAt: new Date().toISOString(),
+  }));
+
+  const warnings = [];
+  t.mock.method(console, 'warn', (message) => warnings.push(String(message)));
+  const seenAtCopy = [];
+  const failing = {
+    ...storage,
+    async createApplicationBackup() {
+      seenAtCopy.push({ dead: fs.existsSync(deadIncomplete), unmarked: fs.existsSync(unmarkedIncomplete) });
+      throw new Error('copy failed');
+    },
+  };
+  await assert.rejects(createBackupBundle({ storage: failing, config }), /copy failed/);
+
+  assert.deepEqual(seenAtCopy, [{ dead: false, unmarked: true }], 'cleanup runs before the new backup copies anything');
+  assert.equal(fs.existsSync(deadIncomplete), false);
+  assert.equal(fs.existsSync(unmarkedIncomplete), true, 'a recent unmarked bundle keeps its 24-hour grace');
+  assert.ok(warnings.some((message) => message.includes(path.basename(deadIncomplete))));
+});
+
+test('inspecting a current-format backup creates no sidecars and does not touch the snapshot file', async (t) => {
+  const { config, storage } = backupSetup(t, 'ug-backup-inspect-in-place-');
+  await seedVaultDocument(storage, config);
+  const backup = await createBackupBundle({ storage, config });
+  const databasePath = backupDatabasePath(backup);
+  assert.deepEqual(sqliteHeaderBytes(databasePath), [1, 1]);
+  const identity = (stat) => [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String);
+  const before = identity(fs.lstatSync(databasePath, { bigint: true }));
+  const listing = fs.readdirSync(backup.path).sort();
+
+  assert.equal((await verifyBackupBundle(backup.path)).ok, true);
+  assert.equal((await listBackupBundles(config))[0].state, 'valid');
+
+  assert.deepEqual(sqliteSidecars(databasePath), []);
+  assert.deepEqual(fs.readdirSync(backup.path).sort(), listing);
+  assert.deepEqual(identity(fs.lstatSync(databasePath, { bigint: true })), before);
 });

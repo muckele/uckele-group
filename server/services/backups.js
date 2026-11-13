@@ -22,6 +22,12 @@ const hashReadBufferBytes = 1024 * 1024;
 // rollback-journal mode, 2/2 for WAL mode.
 const sqliteJournalHeaderOffset = 18;
 const activeBackupPaths = new Set();
+// Identifies this process incarnation in active-backup markers. In a container node restarts with
+// the same PID every time, so a PID alone cannot tell a live backup from a killed one.
+const backupInstanceId = randomUUID();
+const maxBackupAttemptsPerDay = 3;
+const backupRetryDelayMs = 60 * 60 * 1000;
+const staleBackupClaimMs = 2 * 60 * 60 * 1000;
 // Recorded verification results live beside the bundles, outside any bundle directory, so recording
 // never changes a bundle's own files or its modification time.
 const verificationRecordDirectoryName = '.verification-cache';
@@ -170,21 +176,27 @@ async function loadManifest(bundlePath) {
   return JSON.parse(await fs.readFile(path.join(bundlePath, manifestFileName), 'utf8'));
 }
 
-async function isActiveBackupPath(bundlePath) {
-  if (activeBackupPaths.has(path.resolve(bundlePath))) return true;
+// 'active' when a running backup may still own the path, 'dead' when its readable marker shows the
+// owning process is gone, and 'unmarked' when there is no readable marker to judge by.
+async function backupPathActivity(bundlePath) {
+  if (activeBackupPaths.has(path.resolve(bundlePath))) return 'active';
   let marker;
   try {
     marker = JSON.parse(await fs.readFile(path.join(bundlePath, activeMarkerFileName), 'utf8'));
   } catch (error) {
-    if (error.code === 'ENOENT' || error instanceof SyntaxError) return false;
-    return true;
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) return 'unmarked';
+    return 'active';
   }
-  if (!Number.isInteger(marker?.pid) || marker.pid < 1) return false;
+  if (!Number.isInteger(marker?.pid) || marker.pid < 1) return 'dead';
+  // Same PID, different incarnation: a previous run of this container that was killed.
+  if (marker.pid === process.pid && typeof marker.instanceId === 'string' && marker.instanceId !== backupInstanceId) {
+    return 'dead';
+  }
   try {
     process.kill(marker.pid, 0);
-    return true;
+    return 'active';
   } catch (error) {
-    return error.code !== 'ESRCH';
+    return error.code === 'ESRCH' ? 'dead' : 'active';
   }
 }
 
@@ -807,21 +819,54 @@ export function warmBackupVerificationRecords(config = getConfig(), options = {}
     .then(() => undefined);
 }
 
+// Lists `.incomplete` working directories without verifying any finished bundle, so it is cheap
+// enough to run before every backup.
+async function listIncompleteBackupBundles(config) {
+  let entries;
+  try {
+    entries = await fs.readdir(config.backup.directory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const bundles = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('backup-') || !entry.name.endsWith('.incomplete')) continue;
+    const bundlePath = path.join(config.backup.directory, entry.name);
+    try {
+      bundles.push({ path: bundlePath, state: 'incomplete', modifiedAt: (await fs.stat(bundlePath)).mtimeMs });
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  return bundles;
+}
+
+// Removes incomplete and invalid bundles left behind after the 24-hour grace period, and at once any
+// incomplete bundle whose marker shows its backup process is dead (a killed run skips its own
+// cleanup). Without an inspected listing only incomplete bundles are considered.
+async function removeAbandonedBackupBundles(config, now = new Date(), inspected = null) {
+  const candidates = inspected || await listIncompleteBackupBundles(config);
+  const abandonedCutoff = now.getTime() - abandonedBundleGraceMs;
+  const removed = [];
+  for (const bundle of candidates) {
+    if (!['incomplete', 'invalid'].includes(bundle.state)) continue;
+    const activity = await backupPathActivity(bundle.path);
+    if (activity === 'active') continue;
+    const provenDead = bundle.state === 'incomplete' && activity === 'dead';
+    if (!provenDead && bundle.modifiedAt >= abandonedCutoff) continue;
+    await fs.rm(bundle.path, { recursive: true, force: true });
+    removed.push(bundle.path);
+  }
+  return removed;
+}
+
 export async function enforceBackupRetention(config = getConfig(), now = new Date()) {
   const root = config.backup.directory;
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const inspected = await inspectBackupDirectory(config);
   const bundles = inspected.filter((bundle) => ['valid', 'degraded'].includes(bundle.state));
-  const abandonedCutoff = now.getTime() - abandonedBundleGraceMs;
-  const removed = [];
-
-  for (const bundle of inspected) {
-    if (!['incomplete', 'invalid'].includes(bundle.state)) continue;
-    if (bundle.modifiedAt >= abandonedCutoff) continue;
-    if (await isActiveBackupPath(bundle.path)) continue;
-    await fs.rm(bundle.path, { recursive: true, force: true });
-    removed.push(bundle.path);
-  }
+  const removed = await removeAbandonedBackupBundles(config, now, inspected);
 
   const cutoff = now.getTime() - config.backup.retentionDays * 24 * 60 * 60 * 1000;
   for (const [index, bundle] of bundles.entries()) {
@@ -844,6 +889,12 @@ export async function createBackupBundle({
   }
 
   await fs.mkdir(config.backup.directory, { recursive: true, mode: 0o700 });
+  try {
+    const removed = await removeAbandonedBackupBundles(config, now);
+    if (removed.length > 0) console.warn(`[backup] removed ${removed.length} abandoned backup working ${removed.length === 1 ? 'directory' : 'directories'}: ${removed.map((bundlePath) => path.basename(bundlePath)).join(', ')}`);
+  } catch (error) {
+    console.error(`[backup] could not remove abandoned backup work before backing up: ${error.message}`);
+  }
   const id = randomUUID();
   const finalPath = path.join(config.backup.directory, `backup-${backupStamp(now)}-${id.slice(0, 8)}`);
   const workingPath = `${finalPath}.incomplete`;
@@ -851,7 +902,11 @@ export async function createBackupBundle({
   activeBackupPaths.add(path.resolve(workingPath));
 
   try {
-    await secureWriteJson(path.join(workingPath, activeMarkerFileName), { pid: process.pid, startedAt: new Date().toISOString() });
+    await secureWriteJson(path.join(workingPath, activeMarkerFileName), {
+      pid: process.pid,
+      instanceId: backupInstanceId,
+      startedAt: new Date().toISOString(),
+    });
     const databasePath = path.join(workingPath, databaseFileName);
     await storage.createApplicationBackup(databasePath);
     await fs.chmod(databasePath, 0o600);
@@ -1283,6 +1338,15 @@ function zonedDateAndMinutes(now, timezone) {
   return { dateKey: `${parts.year}-${parts.month}-${parts.day}`, minutes: hour * 60 + Number(parts.minute) };
 }
 
+function backupAttemptNumber(run) {
+  const attempt = Number(run?.attempt_count);
+  return Number.isFinite(attempt) && attempt >= 1 ? Math.floor(attempt) : 1;
+}
+
+// A run killed mid-backup (for example by the out-of-memory killer) leaves its claim pending, and
+// it is reclaimed once stale. A run that throws records when it may be retried. Either way the
+// backup is attempted at most maxBackupAttemptsPerDay times per day, so a backup that brings the
+// app down cannot keep doing so all day.
 export async function runClaimedBackup({ storage = getStorage(), config = getConfig(), now = new Date(), triggeredBy = 'scheduler' } = {}) {
   const { dateKey } = zonedDateAndMinutes(now, config.backup.timezone);
   const jobKey = `${backupJobName}:${dateKey}`;
@@ -1291,10 +1355,24 @@ export async function runClaimedBackup({ storage = getStorage(), config = getCon
     jobName: backupJobName,
     triggeredBy,
     nowIso: now.toISOString(),
-    staleBefore: new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString(),
+    staleBefore: new Date(now.getTime() - staleBackupClaimMs).toISOString(),
+    // Not the legacy claim mode: a failed run without a nextRetryAt is never reclaimed.
+    retryDueAt: now.toISOString(),
     metadata: { dateKey },
   });
   if (!claim.claimed) return { alreadyRun: claim.run?.status === 'completed', inProgress: claim.run?.status === 'pending', jobRun: claim.run };
+  const attempt = backupAttemptNumber(claim.run);
+  if (attempt > maxBackupAttemptsPerDay) {
+    const attempts = attempt - 1;
+    const message = `Backup gave up after ${attempts} attempts today; the last attempt did not record a result and may have crashed (for example, run out of memory). No further backup will be attempted until tomorrow.`;
+    console.error(`[backup:scheduler] ${message} (${jobKey})`);
+    const jobRun = await storage.completeScheduledJob(jobKey, {
+      status: 'failed',
+      last_error: message,
+      metadata: { dateKey, gaveUp: true, attempts },
+    });
+    return { gaveUp: true, jobRun };
+  }
   try {
     const backup = await createBackupBundle({ storage, config, now });
     const jobRun = await storage.completeScheduledJob(jobKey, {
@@ -1308,7 +1386,14 @@ export async function runClaimedBackup({ storage = getStorage(), config = getCon
     });
     return { backup, jobRun };
   } catch (error) {
-    await storage.completeScheduledJob(jobKey, { status: 'failed', last_error: error.message, metadata: { dateKey } }).catch(() => {});
+    const gaveUp = attempt >= maxBackupAttemptsPerDay;
+    const metadata = gaveUp
+      ? { dateKey, gaveUp: true, attempts: attempt }
+      : { dateKey, nextRetryAt: new Date(now.getTime() + backupRetryDelayMs).toISOString() };
+    if (gaveUp) {
+      console.error(`[backup:scheduler] Backup gave up after ${attempt} failed attempts today; no further backup will be attempted until tomorrow (${jobKey}).`);
+    }
+    await storage.completeScheduledJob(jobKey, { status: 'failed', last_error: error.message, metadata }).catch(() => {});
     throw error;
   }
 }
