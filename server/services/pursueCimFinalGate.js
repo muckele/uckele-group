@@ -14,6 +14,7 @@ import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { CIM_CAMPAIGN_POLICY_VERSION } from './cimCampaignPolicy.js';
 import { isContactRuleCampaign } from './pursueCimContactPolicy.js';
+import { pursueCimWordingTagValue } from './pursueCimTemplates.js';
 import {
   PURSUE_CIM_READINESS_REASONS,
   readPursueCimProviderReadiness,
@@ -127,6 +128,8 @@ function normalizeGmailProviderReadiness(readiness, { providerProfile, now, gene
     providerProfile: text(readiness.providerProfile ?? providerProfile, 120),
     reasons: [...ordered, ...reasons.filter((reason) => !ordered.includes(reason))],
     signatureComplete: readiness.signatureComplete === true,
+    wordingDigest: typeof readiness.wordingDigest === 'string' && /^[0-9a-f]{64}$/.test(readiness.wordingDigest)
+      ? readiness.wordingDigest : null,
     evidenceRevision: text(readiness.evidenceRevision, 240),
     generatedAt,
     expiresAt,
@@ -425,6 +428,16 @@ export async function authorizePreparedCimTransmission({
   const readiness = readinessInput?.authorityDigest && typeof readinessInput.ready === 'boolean'
     ? readinessInput
     : normalizeCimProviderReadiness(readinessInput, { providerProfile, now: gateInstant });
+  // A Pursue Gmail email carries the wording digest it was rendered under (the cim_wording tag).
+  // It is sent only under that same, currently approved wording; otherwise the sender releases
+  // it to be prepared again with the current Gmail signature.
+  const pursueGmailPayload = cimProviderUsesGmail(config)
+    && [PURSUE_INITIAL_PAYLOAD_VERSION, PURSUE_FOLLOW_UP_PAYLOAD_VERSION]
+      .includes(context.transmission.payload_version);
+  if (pursueGmailPayload && readiness.provider === 'gmail' && readiness.ready === true) {
+    const renderedUnder = pursueCimWordingTagValue(context.communication?.tags);
+    if (!renderedUnder || renderedUnder !== readiness.wordingDigest) return failure('wording_changed');
+  }
   const members = [];
   for (const member of context.members) {
     const opportunityId = member.opportunity?.opportunity_id ?? member.membership?.opportunity_id;

@@ -220,7 +220,7 @@ export function seedCampaign(database, suffix, recipientFingerprint, { followUp,
  * `kind`: 'initial' or 'follow-up'. `basis`: 'activation' (the fl04b chain) or 'rule'.
  */
 export async function createGmailGateFixture(t, suffix, { kind = 'initial', basis = 'activation',
-  controls = true } = {}) {
+  controls = true, wordingTag } = {}) {
   const followUp = kind === 'follow-up';
   const sqlitePath = temporaryPath(t, `gmail-gate-${suffix}`);
   const storage = createSqliteStorage({ storage: { sqlitePath },
@@ -265,7 +265,9 @@ export async function createGmailGateFixture(t, suffix, { kind = 'initial', basi
     fromAddress: SENDER, toAddresses: [BROKER], ccAddresses: [], bccAddresses: [],
     replyToAddress: SENDER, subject: rendered.subject, bodyText: rendered.text,
     bodyHtmlSanitized: rendered.html,
+    // The wording digest it was rendered under, as the production preparation records it.
     tags: [`cim_touch_id=${ids.touchId}`,
+      `cim_wording=${wordingTag ?? pursueCimWordingDigest(SENDER_SETTINGS, fixtureSignature())}`,
       ...(followUp ? [`cim_in_reply_to=${cimRfcMessageId(`initial-${suffix}`, SENDER)}`] : [])],
   };
   const prepared = followUp

@@ -111,6 +111,8 @@ export async function readPursueCimProviderReadiness({
     ready: ordered.length === 0,
     reasons: ordered,
     signatureComplete,
+    // The current wording digest: the final gate refuses a prepared email rendered under another.
+    wordingDigest,
     evidenceRevision,
     generatedAt,
     expiresAt: new Date(Date.parse(generatedAt) + PURSUE_CIM_READINESS_EVIDENCE_TTL_MS).toISOString(),

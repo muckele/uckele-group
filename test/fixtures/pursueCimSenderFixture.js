@@ -74,9 +74,10 @@ function temporaryPath(t, prefix) {
  * @param {string} [options.providerProfile]  the profile Live sending records its chain under
  * @param {boolean} [options.replyPollerRuns]  record a completed reply-poller run before each
  *   `run()` (default true), as the 5-minute reply poller scheduler does in production
+ * @param {boolean} [options.gmailConnected]  store the owner's Gmail connection (default true)
  */
 export async function createSenderFixture(t, { start, campaigns, config: configOverride,
-  providerProfile, replyPollerRuns = true } = {}) {
+  providerProfile, replyPollerRuns = true, gmailConnected = true } = {}) {
   const clock = controlledClock(start);
   const sqlitePath = temporaryPath(t, 'pursue-sender');
   const storage = createSqliteStorage({ storage: { sqlitePath },
@@ -98,6 +99,12 @@ export async function createSenderFixture(t, { start, campaigns, config: configO
   }
   database.prepare(`INSERT INTO deal_hunter_cim_safety_settings (id, updated_at, outreach_paused,
     updated_by, metadata) VALUES ('global', ?, 0, 'fixture-owner', '{}')`).run(start);
+  // The owner's Gmail connection (the mailbox itself is the fake provider). The sender reads the
+  // Gmail signature at the start of every slot only while Gmail is connected.
+  if (gmailConnected) await storage.saveGmailConnection({ emailAddress: SENDER,
+    refreshTokenCiphertext: 'v1.aXYtYnl0ZXM=.dGFnLWJ5dGVz.Y2lwaGVydGV4dA==',
+    grantedScopes: ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly'],
+    historyCheckpoint: '0', connectedBy: 'fixture-owner', now: start });
   await enableSendControls(storage, { now: start });
   const capabilities = await syncPursueGmailCapabilities({ storage, enabled: true,
     actor: 'fixture-owner', now: start, ...(providerProfile ? { providerProfile } : {}) });

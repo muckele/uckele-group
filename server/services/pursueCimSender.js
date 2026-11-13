@@ -33,7 +33,7 @@ import {
 import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
 import { applyPendingPursueCimReplies, readPursueReplyPollerHold } from './pursueCimReplyPoller.js';
 import { pursueCimWordingDigest, pursueCimWordingTagValue } from './pursueCimTemplates.js';
-import { readUsablePursueSignature, refreshPursueEmailSignature } from './pursueEmailSignature.js';
+import { refreshPursueEmailSignature, usablePursueSignature } from './pursueEmailSignature.js';
 
 export const PURSUE_CIM_SENDER_ACTOR = 'pursue-cim-sender';
 export const PURSUE_CIM_SENDER_QUOTA_JOB_NAME = 'pursue-cim-sender-quota';
@@ -296,6 +296,9 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   const summary = { sentInitial: 0, sentFollowUps: 0, expired: 0, reconciled: 0, released: 0,
     skipped: {}, failed: 0, ambiguous: 0 };
   const skip = (reason) => { summary.skipped[reason] = (summary.skipped[reason] || 0) + 1; };
+  // Set once this run released prepared emails for a wording change: the lapsed rows listed
+  // before that release are skipped under their own code (they are prepared again below).
+  let wordingReleased = false;
   const stop = (stoppedFor, reason) => {
     if (reason) skip(reason);
     summary.stoppedFor = stoppedFor;
@@ -314,10 +317,13 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
 
   // 0. The owner's Gmail signature, once per slot, before anything is prepared or sent. A
   // changed signature changes the wording digest, so readiness then reports
-  // wording_not_approved. A failure keeps the stored signature and the run goes on.
-  const signatureRefresh = await refreshPursueEmailSignature({ storage, config: resolvedConfig,
-    now: instant(), mailProvider: provider, source: PURSUE_CIM_SENDER_ACTOR });
-  if (!signatureRefresh.ok) skip('signature_refresh_failed');
+  // wording_not_approved. A failure keeps the stored signature and the run goes on. Without a
+  // Gmail connection there is nothing to read (and readiness stops the run anyway).
+  if (await gmailConnected()) {
+    const signatureRefresh = await refreshPursueEmailSignature({ storage, config: resolvedConfig,
+      now: instant(), mailProvider: provider, source: PURSUE_CIM_SENDER_ACTOR });
+    if (!signatureRefresh.ok) skip('signature_refresh_failed');
+  }
 
   // 1. Readiness.
   const readiness = await readProviderReadiness({ storage, now: instant() });
@@ -407,6 +413,14 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   if (followUps) return followUps;
   return summary;
 
+  async function gmailConnected() {
+    try {
+      return Boolean(await storage.getGmailConnection());
+    } catch {
+      return false;
+    }
+  }
+
   async function currentChain() {
     const rows = typeof storage.listCurrentCimCapabilityActivations === 'function'
       ? await storage.listCurrentCimCapabilityActivations() : [];
@@ -475,20 +489,30 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   }
 
   /**
-   * True when the prepared email was rendered under the current wording digest (templates,
-   * sender name and the stored Gmail signature). An email prepared before the signature or
-   * the wording changed is never sent: every prepared, never-authorized email is released to be
-   * prepared again (the Live-sending-off release, Ruling N), and this touch is skipped.
+   * Whether the prepared email was rendered under the current wording digest (templates,
+   * sender name and the stored Gmail signature): 'current', 'changed' or 'unavailable'.
+   * - 'changed' (the tag is missing, malformed or another digest): the email is never sent.
+   *   Every prepared, never-authorized email is released to be prepared again (the
+   *   Live-sending-off release, Ruling N), and this touch is skipped.
+   * - 'unavailable' (the stored signature cannot be read or is not usable right now): this
+   *   touch is skipped and nothing is released, so a passing storage error causes no churn.
+   * The final gate refuses a mismatch too (wording_changed); this is the recovery.
    */
-  async function preparedWordingCurrent(transmission) {
+  async function preparedWordingState(transmission) {
     const communication = await storage.getCrmCommunication(transmission.communication_id);
     const prepared = pursueCimWordingTagValue(communication?.metadata?.tags);
-    const signature = await readUsablePursueSignature({ storage, config: resolvedConfig });
-    const current = signature ? pursueCimWordingDigest(resolvedConfig?.dealHunter?.sender, signature) : null;
-    if (prepared && current && prepared === current) return true;
+    let signature;
+    try {
+      signature = usablePursueSignature(await storage.getGmailSignature(), resolvedConfig);
+    } catch {
+      return 'unavailable';
+    }
+    if (!signature) return 'unavailable';
+    if (prepared === pursueCimWordingDigest(resolvedConfig?.dealHunter?.sender, signature)) return 'current';
     await storage.releasePreparedCimTransmissions({ reasonCode: PURSUE_WORDING_CHANGED_RELEASE,
       actor, now: instant().toISOString() });
-    return false;
+    wordingReleased = true;
+    return 'changed';
   }
 
   /** Authorizes, gates and sends one prepared transmission. Returns a stop summary or null. */
@@ -497,8 +521,9 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
     const capability = followUp ? 'fl04c-followup' : 'fl04b-initial';
     const writerPath = followUp ? 'pursue-cim-follow-up' : 'pursue-cim-initial';
     if (!(await liveSendingOn())) return stop('not_ready', 'live_sending_off');
-    if (!(await preparedWordingCurrent(transmission))) {
-      skip('wording_changed');
+    const wording = await preparedWordingState(transmission);
+    if (wording !== 'current') {
+      skip(wording === 'changed' ? 'wording_changed' : 'signature_unavailable');
       return null;
     }
     const { authorization, reason } = await issueAuthorization({ transmission, capability,
@@ -554,6 +579,10 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   }
 
   async function recoverLapsedPreparation(row) {
+    if (wordingReleased) {
+      skip('wording_changed_released');
+      return null;
+    }
     const followUp = row.kind !== 'initial';
     if (followUp && followUpHold) {
       skip(followUpHold);
