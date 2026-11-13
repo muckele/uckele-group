@@ -588,3 +588,64 @@ test('subject and display names with non-ASCII are RFC 2047 encoded; CR, LF, <, 
     'Café Größe — 東京 Holdings, Inc. Bcc: evil@attacker.com');
   assert.deepEqual(header(raw, 'Bcc'), []);
 });
+
+test('readSignature reads the configured send-as address with the access the app already has', async (t) => {
+  const storage = openStorage(t);
+  const config = makeConfig({ senderAddress: 'Owner+Deals@Domain.com' });
+  await connect(storage, config, { emailAddress: 'owner+deals@domain.com' });
+  const signature = '<div dir="ltr"><b>Pat Example</b></div>';
+  const google = fakeGoogle((call) => (call.url.pathname.includes('/settings/sendAs/')
+    ? json(200, { sendAsEmail: 'owner+deals@domain.com', displayName: 'Pat', signature, isPrimary: true })
+    : undefined));
+  const result = await provider({ storage, config, google }).readSignature();
+  assert.deepEqual(result, { ok: true, sendAsEmail: 'owner+deals@domain.com', html: signature });
+  const [call] = google.gmailCalls();
+  assert.equal(call.method, 'GET');
+  assert.equal(String(call.url), `${API}/settings/sendAs/Owner%2BDeals%40Domain.com`);
+  assert.equal(call.headers.Authorization, `Bearer ${ACCESS_TOKEN}`);
+  assert.ok(call.signal, 'the request has a timeout');
+});
+
+test('readSignature: a missing signature is an empty one', async (t) => {
+  const storage = openStorage(t);
+  const config = makeConfig();
+  await connect(storage, config);
+  const google = fakeGoogle(() => json(200, { sendAsEmail: 'owner@domain.com', isPrimary: true }));
+  assert.deepEqual(await provider({ storage, config, google }).readSignature(),
+    { ok: true, sendAsEmail: 'owner@domain.com', html: '' });
+});
+
+test('readSignature maps failures to codes without throwing or leaking secrets', async (t) => {
+  const storage = openStorage(t);
+  const config = makeConfig();
+  const cases = [
+    [() => json(401, { error: { code: 401, message: `bad ${ACCESS_TOKEN}` } }), 'gmail_token_invalid'],
+    [() => json(403, { error: { errors: [{ reason: 'insufficientPermissions' }] } }), 'gmail_access_denied'],
+    [() => json(403, { error: { errors: [{ reason: 'userRateLimitExceeded' }] } }), 'gmail_403_userRateLimitExceeded'],
+    [() => json(403, { error: { errors: [{ reason: 'forbidden' }] } }), 'gmail_403'],
+    [() => json(404, { error: { code: 404 } }), 'gmail_send_as_not_found'],
+    [() => json(500, { error: { code: 500 } }), 'gmail_500'],
+    [() => json(503, {}), 'gmail_503'],
+    [() => json(200, { sendAsEmail: 'owner@domain.com', signature: 42 }), 'gmail_response_invalid'],
+    [() => json(200, { sendAsEmail: 'someone-else@domain.com', signature: '' }), 'gmail_send_as_mismatch'],
+    [() => { const error = new Error('timed out'); error.name = 'TimeoutError'; throw error; }, 'gmail_timeout'],
+    [() => { throw new TypeError('fetch failed'); }, 'gmail_network_error'],
+  ];
+  assert.deepEqual(await provider({ storage, config, google: fakeGoogle() }).readSignature(),
+    { ok: false, code: 'gmail_not_connected' });
+  await connect(storage, config);
+  for (const [route, code] of cases) {
+    const result = await provider({ storage, config, google: fakeGoogle(route) }).readSignature();
+    assert.deepEqual(result, { ok: false, code }, code);
+    assertNoSecrets(result);
+  }
+  const refreshFails = await provider({ storage, config, google: fakeGoogle(undefined, { refresh: 'network' }) })
+    .readSignature();
+  assert.deepEqual(refreshFails, { ok: false, code: 'gmail_token_refresh_failed' });
+  const revoked = fakeGoogle(undefined, { refresh: 'invalid_grant' });
+  assert.deepEqual(await provider({ storage, config, google: revoked }).readSignature(),
+    { ok: false, code: 'gmail_token_invalid' });
+  assert.equal(revoked.gmailCalls().length, 0);
+  assert.deepEqual(await provider({ storage, config: makeConfig({ senderAddress: '' }), google: fakeGoogle() })
+    .readSignature(), { ok: false, code: 'gmail_not_connected' });
+});

@@ -54,6 +54,9 @@
  *     Throws a code-only error on failure, so the caller never advances its checkpoint.
  *   readMessageId({ messageId }) -> string (optional) the Message-ID header the provider gave
  *     an accepted message, which may differ from ours; throws a code-only error when unread.
+ *   readSignature() -> { ok: true, sendAsEmail, html } | { ok: false, code } (optional) the
+ *     owner's signature HTML for the configured send-as address, unsanitized ('' when there is
+ *     none); never throws. Pursue emails end with it after emailSignatureHtml.js sanitizes it.
  */
 export const CIM_MAIL_PROVIDER_METHODS = Object.freeze(['readiness', 'send', 'findSent', 'listThreadChanges']);
 export const CIM_SEND_OUTCOMES = Object.freeze(['accepted', 'definitive-failure', 'ambiguous', 'quota',
