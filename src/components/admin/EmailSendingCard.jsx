@@ -4,6 +4,7 @@ const STATUS_URL = '/api/admin/deal-hunter/email-sending';
 const CONTROLS_URL = '/api/admin/deal-hunter/email-sending/controls';
 const CONNECT_URL = '/api/admin/deal-hunter/gmail/connect';
 const DISCONNECT_URL = '/api/admin/deal-hunter/gmail/disconnect';
+const SIGNATURE_REFRESH_URL = '/api/admin/deal-hunter/email-sending/signature/refresh';
 
 // One plain sentence per readiness code (spec §4.4, Ruling F).
 export const READINESS_SENTENCES = Object.freeze({
@@ -14,7 +15,7 @@ export const READINESS_SENTENCES = Object.freeze({
   wording_not_approved: "The email wording isn't approved.",
   contact_rule_off: 'The contact rule is off.',
   live_sending_off: 'Live sending is off.',
-  signature_incomplete: 'Your name, title, phone, or mailing address is missing from settings.',
+  signature_incomplete: "Your Gmail signature hasn't been loaded yet, or it's empty. Refresh it from Gmail.",
   provider_not_gmail: "The server isn't set to send through Gmail yet (see the Gmail setup runbook).",
   live_sending_not_applied: 'Live sending needs to be re-applied — use Try again.',
   sender_off: 'The sender is switched off in server settings.',
@@ -33,6 +34,47 @@ const CONNECT_RESULTS = Object.freeze({
 });
 
 const RECONNECT_REASONS = new Set(['gmail_token_invalid', 'gmail_address_mismatch']);
+
+const NAME_MISSING = 'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings.';
+
+// What is missing when the signature is incomplete, from the card's signature status (the same
+// sentence the server gives when approving is refused).
+export function signatureIncompleteSentence(signature) {
+  if (!signature) return READINESS_SENTENCES.signature_incomplete;
+  if (signature.loaded && !signature.empty) return NAME_MISSING;
+  const sentence = signature.loaded
+    ? 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.'
+    : "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.";
+  return signature.senderNameSet === false
+    ? `${sentence} Your name for the From line (DEAL_HUNTER_SENDER_NAME) is also missing from settings.`
+    : sentence;
+}
+
+// Plain words for the code of a signature refresh that did not work.
+const SIGNATURE_ERRORS = Object.freeze({
+  gmail_not_connected: "Gmail isn't connected.",
+  gmail_token_invalid: 'Google access was revoked or expired — reconnect Gmail.',
+  gmail_token_refresh_failed: "Couldn't reach Google just now.",
+  gmail_timeout: "Couldn't reach Gmail just now.",
+  gmail_network_error: "Couldn't reach Gmail just now.",
+  gmail_access_denied: "Gmail didn't allow reading your signature settings — reconnect Gmail.",
+  gmail_send_as_not_found: "Gmail has no settings for the sending address.",
+  gmail_send_as_mismatch: "Gmail has no settings for the sending address.",
+  gmail_signature_too_large: 'Your Gmail signature is too large to use (over 64 KB). Shorten it in Gmail, then refresh.',
+});
+
+function signatureErrorSentence(code) {
+  return SIGNATURE_ERRORS[code] || "Gmail didn't return your signature just now. Try again in a few minutes.";
+}
+
+// The preview HTML in a sandboxed frame: no scripts, no same-origin access, and only https
+// images and inline styles may load.
+function previewDocument(html) {
+  return '<!doctype html><html><head><meta charset="utf-8">'
+    + '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src https:; style-src \'unsafe-inline\'">'
+    + '<style>body{margin:12px;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:1.45;color:#222}p{margin:0 0 12px}</style>'
+    + `</head><body>${html}</body></html>`;
+}
 
 const buttonBase = 'inline-flex min-h-9 items-center justify-center rounded-full border px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50';
 const primaryButton = `${buttonBase} border-moss bg-moss text-white hover:bg-pine`;
@@ -81,7 +123,7 @@ function confirmation(action, data) {
   switch (action.kind) {
     case 'wording':
       return { title: 'Approve this wording?', confirmLabel: 'Approve wording',
-        body: 'Every Pursue email will use the wording in the preview, with your signature. Any later change to the wording or your signature pauses sending until you approve it again.' };
+        body: 'Every Pursue email will use the wording in the preview, ending with your Gmail signature. Any later change to the wording or your Gmail signature pauses sending until you approve it again.' };
     case 'contact_rule':
       return action.enabled
         ? { title: 'Turn on the contact rule?', confirmLabel: 'Turn on contact rule',
@@ -173,6 +215,7 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
   const [pendingAction, setPendingAction] = useState(null);
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [redirectResult] = useState(() => connectResult(connectResultCode ?? undefined));
   const triggerRef = useRef(null);
   const activeRef = useRef(true);
@@ -219,7 +262,9 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
       const request = action.kind === 'disconnect'
         ? { url: DISCONNECT_URL, body: {} }
         : { url: CONTROLS_URL, body: { controlKey: action.kind === 'wording' ? 'wording_approval' : action.kind,
-          enabled: action.enabled, expectedRevision: action.expectedRevision, reason } };
+          enabled: action.enabled, expectedRevision: action.expectedRevision, reason,
+          // Approve exactly the wording (and Gmail signature) the preview showed.
+          ...(action.expectedWordingDigest ? { expectedWordingDigest: action.expectedWordingDigest } : {}) } };
       const response = await fetch(request.url, {
         method: 'POST',
         credentials: 'same-origin',
@@ -241,6 +286,34 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
     }
   }
 
+  async function refreshSignature() {
+    setRefreshing(true);
+    setNotice(null);
+    try {
+      const response = await fetch(SIGNATURE_REFRESH_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!activeRef.current) return;
+      if (!response.ok || !result.success || !result.emailSending) {
+        setNotice({ tone: 'warn', text: result.error || "Your Gmail signature wasn't refreshed. Try again." });
+        await load();
+        return;
+      }
+      setData(result.emailSending);
+      setNotice(result.refreshed
+        ? { tone: 'ok', text: 'Your Gmail signature was refreshed.' }
+        : { tone: 'warn', text: `Your Gmail signature wasn't refreshed. ${signatureErrorSentence(result.code)}` });
+    } catch {
+      if (activeRef.current) setNotice({ tone: 'warn', text: "Your Gmail signature wasn't refreshed. Try again." });
+    } finally {
+      if (activeRef.current) setRefreshing(false);
+    }
+  }
+
   async function confirm(reason) {
     const action = pendingAction;
     if (!action) return;
@@ -255,11 +328,14 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
   const readiness = data?.readiness || { ready: false, reasons: [] };
   const reasons = Array.isArray(readiness.reasons) ? readiness.reasons : [];
   const lastRuns = data?.lastRuns || {};
+  const signature = data?.signature || null;
   const wordingCurrent = Boolean(wording.approvedDigest) && wording.approvedDigest === wording.currentDigest;
   const wordingChanged = Boolean(wording.approvedDigest) && !wordingCurrent;
   const needsReconnect = gmail.connected && reasons.some((reason) => RECONNECT_REASONS.has(reason));
   const copy = pendingAction ? confirmation(pendingAction, data) : null;
-  const controlsDisabled = saving || loading;
+  const controlsDisabled = saving || loading || refreshing;
+  const sentenceFor = (reason) => (reason === 'signature_incomplete'
+    ? signatureIncompleteSentence(signature) : READINESS_SENTENCES[reason]);
 
   return (
     <section className="panel p-5 sm:p-7" aria-labelledby="email-sending-heading">
@@ -277,7 +353,7 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
       </div>
       {redirectResult ? <p className={`mt-4 rounded-xl border px-3 py-2 text-sm ${redirectResult.tone === 'ok' ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-amber-200 bg-amber-50 text-amber-900'}`} role="status">{redirectResult.text}</p> : null}
       {notice ? (
-        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900" role="status">
+        <div className={`mt-4 rounded-xl border px-3 py-2 text-sm ${notice.tone === 'ok' ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-amber-200 bg-amber-50 text-amber-900'}`} role="status">
           <p>{notice.text}</p>
         </div>
       ) : null}
@@ -306,6 +382,15 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
               </div>
             ) : null}
           </Row>
+          <Row label="Gmail signature">
+            {signature?.loaded ? (
+              <p>Loaded from Gmail {formatDate(signature.fetchedAt)}{signature.sendAsEmail ? <> for <strong className="break-all text-ink">{signature.sendAsEmail}</strong></> : null}.</p>
+            ) : <p className="font-semibold text-ink">Not loaded yet.</p>}
+            {signature?.loaded && signature.empty ? <p className="font-semibold text-amber-900">Your Gmail signature is empty. Add one in Gmail, then refresh it here.</p> : null}
+            {signature?.lastErrorCode ? <p className="text-amber-900">The last refresh on {formatDate(signature.lastAttemptAt)} didn't work: {signatureErrorSentence(signature.lastErrorCode)}{signature.loaded ? ' The signature loaded earlier is still used.' : ''}</p> : null}
+            <p className="text-xs text-ink/60">Pursue emails end with &ldquo;Best,&rdquo; and this signature. In Gmail, Settings → General → Signature defaults → &ldquo;For new emails use&rdquo; picks it. Check it in the preview below.</p>
+            {!readOnly ? <button className={secondaryButton} disabled={controlsDisabled || !gmail.connected} onClick={refreshSignature} type="button">{refreshing ? 'Refreshing…' : 'Refresh from Gmail'}</button> : null}
+          </Row>
           <Row label="Wording">
             {wordingCurrent ? <p>Approved by {wording.approvedBy || 'Not recorded'} on {formatDate(wording.approvedAt)}.</p> : null}
             {wordingChanged ? <p className="font-semibold text-amber-900">The wording or signature changed since it was approved on {formatDate(wording.approvedAt)}. Approve it again to resume sending.</p> : null}
@@ -313,8 +398,8 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
             <p className="break-all text-xs text-ink/60">Approved version {shortDigest(wording.approvedDigest)} · current version {shortDigest(wording.currentDigest)}</p>
             {!readOnly ? (
               <div>
-                <button aria-describedby={!wording.signatureComplete ? 'email-sending-signature-note' : undefined} className={primaryButton} disabled={controlsDisabled || !wording.signatureComplete || wordingCurrent} onClick={(event) => open({ kind: 'wording', enabled: true, expectedRevision: Number(wording.revision) || 0 }, event)} type="button">Approve wording</button>
-                {!wording.signatureComplete ? <p className="mt-2 text-xs text-amber-900" id="email-sending-signature-note">{READINESS_SENTENCES.signature_incomplete} Add it before approving.</p> : null}
+                <button aria-describedby={!wording.signatureComplete ? 'email-sending-signature-note' : undefined} className={primaryButton} disabled={controlsDisabled || !wording.signatureComplete || wordingCurrent} onClick={(event) => open({ kind: 'wording', enabled: true, expectedRevision: Number(wording.revision) || 0, expectedWordingDigest: wording.currentDigest || undefined }, event)} type="button">Approve wording</button>
+                {!wording.signatureComplete ? <p className="mt-2 text-xs text-amber-900" id="email-sending-signature-note">{signatureIncompleteSentence(signature)}</p> : null}
               </div>
             ) : null}
             {Array.isArray(wording.preview) && wording.preview.length > 0 ? (
@@ -326,6 +411,9 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
                       <p className="text-xs font-semibold uppercase tracking-[0.08em] text-ink/50">{index === 0 ? 'First email' : `Follow-up ${index}`}</p>
                       <p className="mt-1 text-sm font-semibold text-ink">{item.subject}</p>
                       <pre className="mt-2 whitespace-pre-wrap break-words font-sans text-xs leading-5 text-ink/75">{item.text}</pre>
+                      {item.html ? (
+                        <iframe className="mt-2 h-72 w-full rounded-lg border border-line bg-white" sandbox="" srcDoc={previewDocument(item.html)} title={`${index === 0 ? 'First email' : `Follow-up ${index}`} as brokers will see it`} />
+                      ) : null}
                     </li>
                   ))}
                 </ol>
@@ -354,7 +442,7 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
           <Row label="Readiness">
             {readiness.ready ? <p className="font-semibold text-emerald-800">Ready to send.</p> : (
               <ul aria-label="Why sending is paused" className="list-disc space-y-1 pl-5">
-                {reasons.map((reason) => <li key={reason}>{READINESS_SENTENCES[reason] || 'Sending is paused for a reason this page does not recognize yet.'}</li>)}
+                {reasons.map((reason) => <li key={reason}>{sentenceFor(reason) || 'Sending is paused for a reason this page does not recognize yet.'}</li>)}
               </ul>
             )}
           </Row>

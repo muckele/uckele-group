@@ -7,11 +7,21 @@ import EmailSendingCard from '../src/components/admin/EmailSendingCard.jsx';
 
 const statusUrl = '/api/admin/deal-hunter/email-sending';
 const controlsUrl = '/api/admin/deal-hunter/email-sending/controls';
+const refreshUrl = '/api/admin/deal-hunter/email-sending/signature/refresh';
+const signatureHtml = '<div dir="ltr"><b>Pat Example</b><br>President</div>';
 const digest = 'a'.repeat(64);
 
 function control(overrides = {}) {
   return { enabled: false, policyVersion: null, changedAt: null, changedBy: null, revision: 0, ...overrides };
 }
+
+function signatureStatus(overrides = {}) {
+  return { loaded: false, empty: false, fetchedAt: null, sendAsEmail: null, lastAttemptAt: null,
+    lastErrorCode: null, senderNameSet: true, ...overrides };
+}
+
+const loadedSignature = (overrides = {}) => signatureStatus({ loaded: true, fetchedAt: '2026-11-13T15:00:00.000Z',
+  sendAsEmail: 'owner@uckele.test', lastAttemptAt: '2026-11-13T15:00:00.000Z', ...overrides });
 
 function status(overrides = {}) {
   return {
@@ -24,10 +34,13 @@ function status(overrides = {}) {
       revision: 0,
       signatureComplete: true,
       preview: [
-        { variant: 'initial', subject: 'Inquiry about Sample Business', text: 'Hi Jordan,\n\nInitial body' },
-        { variant: 'gentle', subject: 'Re: Inquiry about Sample Business', text: 'Hi Jordan,\n\nFollow-up body' },
+        { variant: 'initial', subject: 'Inquiry about Sample Business', text: 'Hi Jordan,\n\nInitial body\n\nBest,\nPat Example',
+          html: `<p>Hi Jordan,</p>\n<p>Initial body</p>\n<p>Best,</p>\n<div>${signatureHtml}</div>` },
+        { variant: 'gentle', subject: 'Re: Inquiry about Sample Business', text: 'Hi Jordan,\n\nFollow-up body\n\nBest,\nPat Example',
+          html: `<p>Hi Jordan,</p>\n<p>Follow-up body</p>\n<p>Best,</p>\n<div>${signatureHtml}</div>` },
       ],
     },
+    signature: signatureStatus(),
     contactRule: control(),
     liveSending: control(),
     readiness: { ready: false, reasons: ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off'] },
@@ -40,10 +53,16 @@ function jsonResponse(body, init = {}) {
   return { ok: init.ok ?? true, status: init.status ?? 200, json: async () => body };
 }
 
-function stubFetch(initial, { onPost } = {}) {
+function stubFetch(initial, { onPost, onRefresh } = {}) {
   let current = initial;
   const fetchMock = vi.fn(async (url, options = {}) => {
     if (url === statusUrl) return jsonResponse({ success: true, emailSending: current });
+    if (url === refreshUrl && options.method === 'POST') {
+      const result = onRefresh ? onRefresh() : { refreshed: true, code: null };
+      if (result.next) current = result.next;
+      return result.response || jsonResponse({ success: true, refreshed: result.refreshed, code: result.code,
+        emailSending: current });
+    }
     if (url === controlsUrl && options.method === 'POST') {
       const result = onPost ? onPost(JSON.parse(options.body)) : null;
       if (result?.next) current = result.next;
@@ -128,7 +147,7 @@ describe('Email sending card', () => {
       "The email wording isn't approved.",
       'The contact rule is off.',
       'Live sending is off.',
-      'Your name, title, phone, or mailing address is missing from settings.',
+      "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.",
     ]);
     expect(screen.queryByText(/gmail_not_connected/)).not.toBeInTheDocument();
   });
@@ -156,7 +175,8 @@ describe('Email sending card', () => {
   });
 
   test.each([
-    ['Approve wording', 'Approve this wording?', { controlKey: 'wording_approval', enabled: true, expectedRevision: 3 }],
+    ['Approve wording', 'Approve this wording?', { controlKey: 'wording_approval', enabled: true, expectedRevision: 3,
+      expectedWordingDigest: digest }],
     ['Turn on contact rule', 'Turn on the contact rule?', { controlKey: 'contact_rule', enabled: true, expectedRevision: 4 }],
     ['Turn on Live sending', 'Turn on Live sending?', { controlKey: 'live_sending', enabled: true, expectedRevision: 5 }],
   ])('the confirm dialog gates %s', async (buttonName, dialogName, expected) => {
@@ -303,7 +323,74 @@ describe('Email sending card', () => {
 
     const approve = await screen.findByRole('button', { name: 'Approve wording' });
     expect(approve).toBeDisabled();
-    expect(approve).toHaveAccessibleDescription(/missing from settings/);
+    expect(approve).toHaveAccessibleDescription("Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.");
+  });
+
+  test.each([
+    [signatureStatus(), "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail."],
+    [loadedSignature({ empty: true }), 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.'],
+    [loadedSignature({ senderNameSet: false }), 'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings.'],
+    [signatureStatus({ senderNameSet: false }), "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail. Your name for the From line (DEAL_HUNTER_SENDER_NAME) is also missing from settings."],
+    [undefined, "Your Gmail signature hasn't been loaded yet, or it's empty. Refresh it from Gmail."],
+  ])('says in plain words what is missing from the signature (%#)', async (signature, sentence) => {
+    stubFetch(status({ signature, wording: { ...status().wording, signatureComplete: false },
+      readiness: { ready: false, reasons: ['signature_incomplete'] } }));
+    render(<EmailSendingCard />);
+    const list = await screen.findByRole('list', { name: 'Why sending is paused' });
+    expect(within(list).getByRole('listitem')).toHaveTextContent(sentence);
+    expect(screen.getByRole('button', { name: 'Approve wording' })).toHaveAccessibleDescription(sentence);
+  });
+
+  test('shows the Gmail signature status and refreshes it from Gmail', async () => {
+    const connected = { connected: true, emailAddress: 'owner@uckele.test', lastTokenOkAt: null, lastErrorCode: null };
+    const fetchMock = stubFetch(status({ gmail: connected }), { onRefresh: () => ({ refreshed: true, code: null,
+      next: status({ gmail: connected, signature: loadedSignature() }) }) });
+    render(<EmailSendingCard />);
+
+    expect(await screen.findByText('Not loaded yet.')).toBeVisible();
+    expect(screen.getByText(/Signature defaults/)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh from Gmail' }));
+    await waitFor(() => expect(posts(fetchMock)).toHaveLength(1));
+    expect(posts(fetchMock)[0][0]).toBe(refreshUrl);
+    expect(await screen.findByText('Your Gmail signature was refreshed.')).toBeVisible();
+    expect(screen.getByText(/Loaded from Gmail/)).toHaveTextContent('owner@uckele.test');
+    expect(screen.queryByText('Not loaded yet.')).not.toBeInTheDocument();
+  });
+
+  test('a refresh that did not work says why in plain words and keeps the loaded signature', async () => {
+    const connected = { connected: true, emailAddress: 'owner@uckele.test', lastTokenOkAt: null, lastErrorCode: null };
+    stubFetch(status({ gmail: connected, signature: loadedSignature() }), { onRefresh: () => ({ refreshed: false,
+      code: 'gmail_timeout', next: status({ gmail: connected,
+        signature: loadedSignature({ lastErrorCode: 'gmail_timeout', lastAttemptAt: '2026-11-13T16:00:00.000Z' }) }) }) });
+    render(<EmailSendingCard />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh from Gmail' }));
+    expect(await screen.findByText("Your Gmail signature wasn't refreshed. Couldn't reach Gmail just now.")).toBeVisible();
+    expect(screen.getByText(/The last refresh on .* didn't work: Couldn't reach Gmail just now\. The signature loaded earlier is still used\./))
+      .toBeVisible();
+    expect(screen.getByText(/Loaded from Gmail/)).toBeVisible();
+    expect(screen.queryByText(/gmail_timeout/)).not.toBeInTheDocument();
+  });
+
+  test('says when the Gmail signature is empty or too large, and Refresh waits for Gmail to be connected', async () => {
+    stubFetch(status({ signature: loadedSignature({ empty: true, lastErrorCode: 'gmail_signature_too_large' }) }));
+    render(<EmailSendingCard />);
+    expect(await screen.findByText('Your Gmail signature is empty. Add one in Gmail, then refresh it here.')).toBeVisible();
+    expect(screen.getByText(/too large to use \(over 64 KB\)/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Refresh from Gmail' })).toBeDisabled();
+  });
+
+  test('the preview shows each email as brokers will see it in a sandboxed frame', async () => {
+    stubFetch(status());
+    render(<EmailSendingCard />);
+    const frame = await screen.findByTitle('First email as brokers will see it');
+    expect(frame.tagName).toBe('IFRAME');
+    expect(frame).toHaveAttribute('sandbox', '');
+    const srcDoc = frame.getAttribute('srcdoc');
+    expect(srcDoc).toContain(signatureHtml);
+    expect(srcDoc).toContain("default-src 'none'; img-src https:");
+    expect(screen.getByTitle('Follow-up 1 as brokers will see it')).toHaveAttribute('sandbox', '');
+    expect(screen.getByText(/Follow-up body/)).toBeInTheDocument();
   });
 
   test('shows the wording preview and the approval date', async () => {
