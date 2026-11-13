@@ -245,14 +245,33 @@ Follow-ups are sent in the same Gmail thread with the subject `Re: <initial subj
 
 **The signature is the owner's Gmail signature.** The app reads it from Gmail with the access it already has: `GET https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs/{sendAsEmail}` (`users.settings.sendAs.get`, allowed by `gmail.readonly`; no scope is added), with `sendAsEmail` the configured `DEAL_HUNTER_GMAIL_SENDER_ADDRESS`. The `signature` field is HTML and may be empty or missing.
 - `gmailCimProvider.readSignature()` returns `{ ok: true, sendAsEmail, html }` or `{ ok: false, code }` (codes only: token codes, `gmail_access_denied`, `gmail_<status>` codes, `gmail_timeout`, `gmail_network_error`, `gmail_send_as_not_found`, `gmail_send_as_mismatch`, `gmail_response_invalid`).
-- `server/services/emailSignatureHtml.js` sanitizes it with a strict allow-list (formatting, table layout, `http(s)`/`mailto`/`tel` links, `https` images; no scripts, styles, event handlers, comments or unknown tags) and derives the plain text. Input over 64 KB is stored empty with `gmail_signature_too_large`.
+- `server/services/emailSignatureHtml.js` sanitizes it with a strict allow-list and derives the plain text.
+  - Kept: formatting, table layout, lists and indents, `http(s)`/`mailto`/`tel` links, `https` images, and an allow-list of CSS properties.
+  - Removed: scripts, style elements, event handlers, comments, positioning and CSS functions other than `rgb`/`hsl`.
+  - Other block-level tags become line breaks.
+  - In the plain text, an image becomes its alt text.
+  - Input or sanitized output over 64,000 characters is stored empty with `gmail_signature_too_large`.
+  - `EMAIL_SIGNATURE_RENDER_VERSION` is part of the wording digest, so a change to these rules pauses sending until re-approval.
 - One stored snapshot (`deal_hunter_gmail_signatures`): sanitized HTML, plain text, its SHA-256 digest, the send-as address and when it was fetched, plus the last refresh attempt and its error code.
 - It is refreshed when the owner clicks **Refresh from Gmail** on the Email sending card (`POST /api/admin/deal-hunter/email-sending/signature/refresh`), when Gmail is connected or reconnected (the OAuth callback), and once at the start of every sender run, before anything is prepared or sent. A refresh that fails keeps the stored snapshot, records the error code, logs one line and never stops the sender run (readiness still stops sends on token problems).
 - In Gmail, **Settings → General → Signature defaults → For new emails use** chooses the signature. The API returns one signature per send-as address and does not document which named signature that is, so the card's preview (the HTML in a sandboxed frame) is how the owner checks it.
 
-`DEAL_HUNTER_SENDER_NAME` stays the From display name. The send is refused with the readiness reason `signature_incomplete` when there is no signature snapshot for the configured address, the snapshot is empty after sanitizing, or the sender name is blank. Title, phone and postal address are not used.
+`DEAL_HUNTER_SENDER_NAME` stays the From display name.
 
-A prepared email carries the wording digest it was rendered under (the `cim_wording` tag). The sender sends a prepared email only while that digest is the current one; otherwise every prepared, never-authorized email is released (as when Live sending is turned off) and prepared again with the current signature.
+The send is refused with the readiness reason `signature_incomplete` in any of these cases:
+- there is no signature snapshot for the configured address;
+- the snapshot has no text after sanitizing (an image-only signature without alt text counts as empty, because the text/plain part would be unsigned);
+- the sender name is blank.
+
+Title, phone and postal address are not used. The sender skips the slot's refresh while Gmail is not connected. A refresh error is logged only when its code changes.
+
+A prepared email carries the wording digest it was rendered under (the `cim_wording` tag).
+- The final gate refuses a Pursue Gmail email whose tag is not the current approved digest, with `wording_changed`.
+- Before authorizing, the sender checks the same thing:
+  - On a mismatch or a missing tag, every prepared, never-authorized email is released (as when Live sending is turned off) and prepared again with the current signature. Lapsed rows listed before that release are skipped as `wording_changed_released`.
+  - When the stored signature cannot be read, the touch is skipped with `signature_unavailable` and nothing is released.
+
+The reply classifier ignores lines of the stored signature's text when it looks for stop words, as it does the old footer.
 
 ### 8.2 Drafts for owner review
 

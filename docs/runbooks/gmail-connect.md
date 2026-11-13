@@ -132,12 +132,32 @@ means only people in your Workspace can use it, and Google does not need to revi
 Do these one at a time. After each step, check the **Email sending** card in Operations
 (**Admin → Operations**, or **Deal Hunter → Operations**).
 
+### Upgrading an install that already sends (the Gmail signature release)
+
+If Pursue sending was already set up before the release that ends emails with your Gmail
+signature:
+- If the app stores data in Supabase, apply
+  `supabase/migrations/20261113120000_pursue_gmail_signature.sql` before starting the new
+  version. On SQLite the table is created at start.
+- After the deploy, **sending pauses**. The email versions changed (no footer, your Gmail
+  signature instead), so the approved wording no longer matches. The card says the wording
+  isn't approved, and the signature isn't loaded until Gmail is read.
+- To resume:
+  1. Check your Gmail signature (step 4.1).
+  2. Click **Refresh from Gmail** (the sender also reads it at its next run while Gmail is
+     connected).
+  3. Read the preview and click **Approve wording** (step 4).
+- Emails that were prepared before the deploy but never sent are prepared again with the new
+  wording. They are never sent with the old footer.
+- `DEAL_HUNTER_SENDER_TITLE` and `DEAL_HUNTER_SENDER_PHONE` are no longer used.
+
 ### 1. Deploy with everything off
 
 1. Merge and deploy the release.
-2. If the app stores data in Supabase, apply the migration
-   `supabase/migrations/20261103120000_gmail_send_runners.sql` before starting the new version.
-   On the default SQLite setup, the app creates its tables when it starts.
+2. If the app stores data in Supabase, apply the migrations
+   `supabase/migrations/20261103120000_gmail_send_runners.sql` and
+   `supabase/migrations/20261113120000_pursue_gmail_signature.sql` before starting the new
+   version. On the default SQLite setup, the app creates its tables when it starts.
 3. Open Operations. The **Email sending** card should show Gmail **Not connected**, wording
    **Not approved yet**, contact rule **Off**, Live sending **Off**.
 
@@ -171,6 +191,11 @@ Follow Part A and Part B above. Restart or redeploy so the app picks up the new 
    the signature you want brokers to see, then click **Save Changes** at the bottom.
    - Gmail gives the app one signature for the sending address. Google doesn't document which
      of your named signatures that is, so always check it in the preview (next step).
+   - The signature needs some text, such as your name. A signature that is only an image
+     leaves the plain-text part of each email unsigned, so the card refuses it. An image's alt
+     text counts as text.
+   - Lists, indents and headings are kept. Positioning and background images are removed.
+     Signatures over 64,000 characters can't be used.
    - Back in the card, click **Refresh from Gmail** under **Gmail signature**.
 2. In the card, open **Preview the emails**. Read the first email and each follow-up. Each one
    shows the plain text and, below it, the email as brokers will see it, ending with "Best,"
@@ -260,6 +285,12 @@ address (a personal address works).
    - Check your test inbox: the email comes from the sending address and ends with "Best," and
      your Gmail signature, with no footer.
    - **Last runs** in the card shows `1 initial email`.
+   - Check that your signature is stable. Note the card's **current version** under
+     **Wording**, wait for the next two sender runs (about 30 minutes), and reload the card.
+     - The current version must be unchanged, and the wording must still say approved.
+     - If it changes on every run (for example, Gmail returns a different image address each
+       time), sending would pause every run. Simplify the signature in Gmail (for example,
+       remove the image), refresh, approve again, and repeat this check.
    - In Gmail, open the sent test email (in **Sent**), click **⋮ → Show original**, and note the
      **Message-ID** line. Check that **From** shows your name and the sending address.
    - **First email not arriving?** Open the test listing. Its **Pursue CIM canary** card shows
@@ -369,6 +400,8 @@ and contact your engineer. Don't go on to step 6.
   were not fully updated, for example after a brief database error. Nothing extra is sent in
   this state. Click **Try again** under Live sending. It re-applies the current setting. If it
   keeps failing, turn Live sending off and contact your engineer.
+- **"The wording or your Gmail signature changed since the card loaded."** Your signature was
+  read from Gmail again after the card opened. Read the preview again and approve.
 - **"This setting changed since the card loaded."** Someone else (or another tab) changed it.
   The card reloads; check the new state and try again if you still want the change.
 
@@ -385,6 +418,7 @@ What each readiness sentence means:
 | Live sending is off. | Click **Turn on Live sending** when you're ready. |
 | Your Gmail signature hasn't been loaded yet. Refresh it from Gmail. | Click **Refresh from Gmail** under **Gmail signature** (Gmail must be connected). Then approve the wording. |
 | Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail. | Set a signature in Gmail (step 4), click **Refresh from Gmail**, then approve the wording. |
+| Your Gmail signature is only images, with no text. Add your name as text in Gmail, then refresh it from Gmail. | Add text (at least your name) to the Gmail signature, or alt text to the image, click **Refresh from Gmail**, then approve the wording. |
 | Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings. | Set `DEAL_HUNTER_SENDER_NAME` (Part B), then approve the wording. |
 | The server isn't set to send through Gmail yet (see the Gmail setup runbook). | Set `DEAL_HUNTER_CIM_PROVIDER_ENABLED=true` and the sending setup (`DEAL_HUNTER_CIM_PROVIDER_PROFILE`) from step 5 or step 6. |
 | Live sending needs to be re-applied — use Try again. | Click **Try again** under Live sending. |
