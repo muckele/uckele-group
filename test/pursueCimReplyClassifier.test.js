@@ -143,3 +143,17 @@ test('replies to a footer-less email that ends with the Gmail signature are stil
   assert.equal(classify(message({ bodyPrefix: `Sure, NDA attached.${quoted}` })), 'reply');
   assert.equal(classify(message({ bodyPrefix: 'Sure, NDA attached.' })), 'reply');
 });
+
+test('our Gmail signature inlined in a reply is not a stop request; the broker\'s own stop still is', () => {
+  const signatureText = 'Pat Example\nPresident\nTo unsubscribe from my updates, reply UNSUBSCRIBE\nDo not contact after hours';
+  // An inlined original with no quote markers, no "On ... wrote:" and no From: line.
+  const inlined = 'Sounds good, NDA attached.\n\nHi Jordan,\nBumping this up.\n\nBest,\nPat Example\nPresident\n'
+    + 'To unsubscribe from my updates,   reply UNSUBSCRIBE\ndo not contact after hours';
+  assert.equal(classify(message({ bodyPrefix: inlined })), 'stop', 'without the signature text it looks like a stop');
+  assert.equal(classify(message({ bodyPrefix: inlined }), { signatureText }), 'reply');
+  assert.equal(classify(message({ bodyPrefix: `Please stop.\n${inlined}` }), { signatureText }), 'stop');
+  assert.equal(classify(message({ bodyPrefix: 'STOP' }), { signatureText }), 'stop');
+  // The old footer is still removed too.
+  assert.equal(classify(message({ bodyPrefix: 'Sure.\n\nIf you would rather I not reach out about future listings, just reply "stop".' }),
+    { signatureText }), 'reply');
+});

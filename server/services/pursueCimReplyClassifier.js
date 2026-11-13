@@ -60,13 +60,26 @@ function isAutoReply(headers) {
   return AUTO_PRECEDENCE.has(headerText(headers.precedence).toLowerCase());
 }
 
-/** The reply's own words: the first 4096 chars, cut at quoted history, quote lines dropped. */
-function ownWords(bodyPrefix) {
+function comparableLine(line) {
+  return String(line).replace(/[\s\u00a0]+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * The reply's own words: the first 4096 chars, cut at quoted history, quote lines dropped, our
+ * old footer removed, and every line that is a line of our Gmail signature removed. Our emails
+ * end with that signature, so a reply that inlines the original without quote markers is not
+ * asking us to stop because the signature happens to say "unsubscribe" or "do not contact".
+ */
+function ownWords(bodyPrefix, signatureText) {
   if (typeof bodyPrefix !== 'string' || !bodyPrefix) return '';
   let text = bodyPrefix.slice(0, CIM_BODY_PREFIX_CHARS);
   const quote = QUOTE_START.exec(text);
   if (quote) text = text.slice(0, quote.index);
-  return text.split(/\r?\n/).filter((line) => !/^\s*>/.test(line)).join('\n')
+  const signatureLines = new Set((typeof signatureText === 'string' ? signatureText : '')
+    .split(/\r?\n/).map(comparableLine).filter((line) => line.length >= 2));
+  return text.split(/\r?\n/)
+    .filter((line) => !/^\s*>/.test(line) && !signatureLines.has(comparableLine(line)))
+    .join('\n')
     .replace(OUR_FOOTER, ' ');
 }
 
@@ -76,10 +89,11 @@ function ownWords(bodyPrefix) {
  * @param {string} input.connectedAddress the connected Gmail mailbox
  * @param {Iterable<string>} [input.knownMessageIds] RFC Message-IDs of our transmissions
  * @param {Iterable<string>} [input.knownProviderMessageIds] Gmail ids of our accepted sends
+ * @param {string} [input.signatureText] the plain text of our stored Gmail signature
  * @returns {'ours'|'owner'|'bounce'|'auto-reply'|'stop'|'reply'}
  */
 export function classifyPursueCimReply({ message, connectedAddress, knownMessageIds = [],
-  knownProviderMessageIds = [] } = {}) {
+  knownProviderMessageIds = [], signatureText = '' } = {}) {
   const headers = message?.headers && typeof message.headers === 'object' ? message.headers : {};
   const known = new Set(Array.from(knownMessageIds, normalizeRfcMessageId).filter(Boolean));
   const messageId = normalizeRfcMessageId(headers.messageId);
@@ -91,6 +105,6 @@ export function classifyPursueCimReply({ message, connectedAddress, knownMessage
   if (from && connected && from === connected) return 'owner';
   if (isBounce(from, headers.contentType)) return 'bounce';
   if (isAutoReply(headers)) return 'auto-reply';
-  if (STOP_WORDS.test(ownWords(message?.bodyPrefix))) return 'stop';
+  if (STOP_WORDS.test(ownWords(message?.bodyPrefix, signatureText))) return 'stop';
   return 'reply';
 }
