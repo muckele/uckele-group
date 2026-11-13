@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { financialFactFields, normalizeFinancialFact, parseFinancialFact } from '../../shared/opportunityFinancialFacts.js';
+import { normalizeDealHunterListingIdentity } from './dealHunterListingIdentity.js';
 
 export const opportunityFactCrmSnapshotFields = Object.freeze([
   'seller_name',
@@ -244,13 +245,28 @@ export function normalizeSourceFreshnessEvidence(evidence) {
   };
 }
 
+// A record is keyed by its stable external id; else by its listing link; else, for a Sheet row
+// with neither, by its position. The Sheet's rows move above each other every day, so a
+// position never identifies a listing for long (2026-11-11). A second row with the same listing
+// link in one collection is told apart by its 1-based occurrence in sheet order
+// (`sourceListingOccurrence`, set by the Sheet parser): the first keeps the plain id, so
+// adding or removing a repost never renames the original, and moving other rows renames neither.
 function sourceObservationRecordId(deal = {}) {
   const sourceId = String(deal.sourceId || '').trim();
   const externalId = String(deal.id || '').trim();
   if (sourceId && deal.stableExternalId && externalId) return `external:${externalId}`;
-  if (sourceId && deal.idFromSourceRowPosition && deal.sourceRowId) return `sheet-row:${String(deal.sourceRowId).trim()}`;
   const listingUrl = String(deal.listingUrl || '').trim();
-  if (sourceId && listingUrl) return `listing:${sourceObservationDigest(listingUrl).slice(0, 40)}`;
+  if (sourceId && listingUrl) {
+    // A Sheet row's link is keyed by the listing identity the canonical aliases use, so cosmetic
+    // drift (`www.`, case, trailing slash, tracking parameters) never renames the record. Other
+    // sources keep the URL string they have always been keyed by: Deal OS records are written
+    // per record and never removed source-wide, so re-keying them would strand the old ones.
+    const keyedUrl = deal.idFromSourceRowPosition ? normalizeDealHunterListingIdentity(listingUrl) || listingUrl : listingUrl;
+    const listingId = `listing:${sourceObservationDigest(keyedUrl).slice(0, 40)}`;
+    const occurrence = Number(deal.sourceListingOccurrence);
+    return Number.isSafeInteger(occurrence) && occurrence > 1 ? `${listingId}#${occurrence}` : listingId;
+  }
+  if (sourceId && deal.idFromSourceRowPosition && deal.sourceRowId) return `sheet-row:${String(deal.sourceRowId).trim()}`;
   return '';
 }
 

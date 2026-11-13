@@ -334,6 +334,53 @@ test('contact references are opaque, stable across ordering, canonical/provenanc
   assert.equal(Object.hasOwn(stale, 'preparationToken'), false);
 });
 
+test('recipient fingerprints follow the vouching record and address, never row timestamps', async () => {
+  const fingerprints = (authority) => Object.fromEntries(authority.recipientOptions.map((option) => [
+    option.email, [option.provenanceFingerprint, option.permissionProvenanceFingerprint,
+      option.contactAuthorityRevision]]));
+  const base = authorityStorage({
+    facts: [{ id: 'fact-email', opportunity_id: opportunityId, field: 'broker_email',
+      value: 'operator@example.test', verified: true, created_at: '2026-08-31T17:20:00.000Z',
+      updated_at: '2026-08-31T17:20:00.000Z' }],
+    submission: { ...authorityStorage().state.submission, broker_email: 'source-broker@example.test' },
+  });
+  const original = fingerprints(await loadBrokerMaterialsAuthority({ opportunityId, storage: base, now }));
+  assert.deepEqual(Object.keys(original).sort(), ['operator@example.test', 'source-broker@example.test']);
+
+  // The daily Sheet sync rewrites every source row's timestamps; a CRM or fact edit rewrites theirs.
+  const later = '2026-09-02T16:00:32.000Z';
+  const touched = authorityStorage({
+    sources: base.state.sources.map((row) => ({ ...row, updated_at: later, observed_at: later,
+      accepted_at: later, accepted_run_id: 'sheet-run-2' })),
+    submission: { ...base.state.submission, status: 'contacted', updated_at: later },
+    facts: base.state.facts.map((fact) => ({ ...fact, updated_at: later })),
+  });
+  assert.deepEqual(fingerprints(await loadBrokerMaterialsAuthority({ opportunityId, storage: touched, now })),
+    original);
+
+  // A changed address, or a different record vouching for it, still changes the option.
+  const sourceEmailChanged = fingerprints(await loadBrokerMaterialsAuthority({ opportunityId, now,
+    storage: authorityStorage({ ...base.state, sources: base.state.sources.map((row) => (
+      row.field === 'broker_email' ? { ...row, value: 'new-broker@example.test' } : row)) }) }));
+  assert.notDeepEqual(sourceEmailChanged['source-broker@example.test'],
+    original['source-broker@example.test']);
+  assert.ok(sourceEmailChanged['new-broker@example.test']);
+  const crmEmailChanged = fingerprints(await loadBrokerMaterialsAuthority({ opportunityId, now,
+    storage: authorityStorage({ ...base.state,
+      submission: { ...base.state.submission, broker_email: 'crm-new@example.test' } }) }));
+  assert.notDeepEqual(crmEmailChanged['source-broker@example.test'],
+    original['source-broker@example.test']);
+  const sourceRecordChanged = fingerprints(await loadBrokerMaterialsAuthority({ opportunityId, now,
+    storage: authorityStorage({ ...base.state, sources: base.state.sources.map((row) => (
+      { ...row, source_record_id: 'row-43' })) }) }));
+  assert.notDeepEqual(sourceRecordChanged['source-broker@example.test'],
+    original['source-broker@example.test']);
+  const factReplaced = fingerprints(await loadBrokerMaterialsAuthority({ opportunityId, now,
+    storage: authorityStorage({ ...base.state,
+      facts: base.state.facts.map((fact) => ({ ...fact, id: 'fact-email-2' })) }) }));
+  assert.notDeepEqual(factReplaced['operator@example.test'], original['operator@example.test']);
+});
+
 test('contact references expire before a later preparation even when contact authority is unchanged', async () => {
   const storage = authorityStorage();
   const issued = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });

@@ -245,12 +245,14 @@ function sourceContactCandidates(rows = []) {
     const brokerEmail = email(values.get('broker_email'));
     if (!validEmail(brokerEmail)) return [];
     const emailRow = groupRows.find((row) => text(row?.field, 80).toLowerCase() === 'broker_email') || groupRows[0];
+    // The identity names the record that vouches for the address, never when that record was
+    // last written: the daily Sheet sync rewrites every row's timestamps, and a campaign's
+    // recipient fingerprint must survive it. A changed address still changes the option.
     const identity = {
       sourceId: text(emailRow.source_id || emailRow.sourceId, 200),
       sourceRecordId: text(emailRow.source_record_id || emailRow.sourceRecordId, 200),
       field: 'broker_email',
       rowId: text(emailRow.id, 200),
-      updatedAt: currentTimestamp(emailRow),
     };
     return [{
       email: brokerEmail,
@@ -278,7 +280,7 @@ function crmContactCandidates(submission) {
     provenance: 'crm',
     provenanceLabel: 'Linked CRM',
     primary: Boolean(submission.broker_primary || submission.brokerPrimary || dealHunter.brokerPrimary || dealHunter.broker_primary),
-    identity: { submissionId: text(submission.id, 200), field: 'broker_email', updatedAt: currentTimestamp(submission) },
+    identity: { submissionId: text(submission.id, 200), field: 'broker_email' },
   }];
 }
 
@@ -297,7 +299,7 @@ function operatorContactCandidates(facts = []) {
     provenance: 'operator_verified',
     provenanceLabel: 'Verified operator fact',
     primary: false,
-    identity: { factId: text(current.id, 200), field: 'broker_email', updatedAt: currentTimestamp(current) },
+    identity: { factId: text(current.id, 200), field: 'broker_email' },
   }];
 }
 

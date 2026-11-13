@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import Database from 'better-sqlite3';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
@@ -16,7 +16,24 @@ const supportedBackupVersions = new Set([legacyBackupVersion, backupVersion]);
 const backupJobName = 'sqlite-application-backup';
 const abandonedBundleGraceMs = 24 * 60 * 60 * 1000;
 const sqliteSidecarSuffixes = ['-wal', '-shm', '-journal'];
+const sqliteHeaderSizeBytes = 100;
+const hashReadBufferBytes = 1024 * 1024;
+// Bytes 18 and 19 of the SQLite header are the file-format write and read versions: 1/1 for
+// rollback-journal mode, 2/2 for WAL mode.
+const sqliteJournalHeaderOffset = 18;
 const activeBackupPaths = new Set();
+// Identifies this process incarnation in active-backup markers. In a container node restarts with
+// the same PID every time, so a PID alone cannot tell a live backup from a killed one.
+const backupInstanceId = randomUUID();
+const maxBackupAttemptsPerDay = 3;
+const backupRetryDelayMs = 60 * 60 * 1000;
+const staleBackupClaimMs = 2 * 60 * 60 * 1000;
+// No backup runs this long: past it, a claim is reclaimed and its working directory is abandoned.
+const longestPossibleBackupMs = abandonedBundleGraceMs + staleBackupClaimMs;
+// Private copies made to inspect a snapshot SQLite must not open in place. They live on the backup
+// volume (never a possibly memory-backed /tmp) beside the bundles, and are swept when left behind.
+const inspectionCopyDirectoryName = '.inspection-copies';
+const activeInspectionCopies = new Set();
 // Recorded verification results live beside the bundles, outside any bundle directory, so recording
 // never changes a bundle's own files or its modification time.
 const verificationRecordDirectoryName = '.verification-cache';
@@ -134,14 +151,21 @@ function safeSegment(value, fallback = 'item') {
   return String(value || fallback).replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || fallback;
 }
 
+// Reads through one reusable buffer rather than a stream, whose per-chunk buffers pile up as
+// garbage and grow the process's memory with the size of the file being hashed.
 async function sha256File(filePath) {
   const hash = createHash('sha256');
-  await new Promise((resolve, reject) => {
-    const stream = createReadStream(filePath);
-    stream.on('data', (chunk) => hash.update(chunk));
-    stream.on('error', reject);
-    stream.on('end', resolve);
-  });
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(hashReadBufferBytes);
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
   return hash.digest('hex');
 }
 
@@ -158,18 +182,34 @@ async function loadManifest(bundlePath) {
   return JSON.parse(await fs.readFile(path.join(bundlePath, manifestFileName), 'utf8'));
 }
 
-async function isActiveBackupPath(bundlePath) {
-  if (activeBackupPaths.has(path.resolve(bundlePath))) return true;
+// 'active' when a running backup may still own the path, 'dead' when its readable marker shows the
+// owning process is gone, and 'unmarked' when there is no readable marker to judge by.
+async function backupPathActivity(bundlePath) {
+  if (activeBackupPaths.has(path.resolve(bundlePath))) return 'active';
   let marker;
   try {
     marker = JSON.parse(await fs.readFile(path.join(bundlePath, activeMarkerFileName), 'utf8'));
   } catch (error) {
-    if (error.code === 'ENOENT' || error instanceof SyntaxError) return false;
-    return true;
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) return 'unmarked';
+    return 'active';
   }
-  if (!Number.isInteger(marker?.pid) || marker.pid < 1) return false;
+  if (!Number.isInteger(marker?.pid) || marker.pid < 1) return 'dead';
+  const startedAtMs = Date.parse(marker.startedAt || '');
+  // Started longer ago than any backup can run: whatever process now holds that PID is not it.
+  if (Number.isFinite(startedAtMs) && Date.now() - startedAtMs > longestPossibleBackupMs) return 'dead';
+  if (marker.pid === process.pid) {
+    // Same PID, different incarnation: a previous run of this container that was killed.
+    if (typeof marker.instanceId === 'string') return marker.instanceId === backupInstanceId ? 'active' : 'dead';
+    // A marker written before instanceIds existed: ours only if it started after this process did.
+    if (!Number.isFinite(startedAtMs) || startedAtMs < performance.timeOrigin) return 'dead';
+    return 'active';
+  }
+  return processIsAlive(marker.pid) ? 'active' : 'dead';
+}
+
+function processIsAlive(pid) {
   try {
-    process.kill(marker.pid, 0);
+    process.kill(pid, 0);
     return true;
   } catch (error) {
     return error.code !== 'ESRCH';
@@ -208,71 +248,59 @@ function assertNoSqliteSidecars(sidecars) {
   }
 }
 
-function sqliteHeaderVersions(snapshotBytes) {
-  if (snapshotBytes.length < 20 || snapshotBytes.subarray(0, 16).toString('utf8') !== 'SQLite format 3\u0000') {
+function sqliteHeaderVersions(headerBytes) {
+  if (headerBytes.length < 20 || headerBytes.subarray(0, 16).toString('utf8') !== 'SQLite format 3\u0000') {
     throw new Error('Database snapshot is not a SQLite 3 database.');
   }
-  const writeVersion = snapshotBytes[18];
-  const readVersion = snapshotBytes[19];
+  const writeVersion = headerBytes[18];
+  const readVersion = headerBytes[19];
   if (!((writeVersion === 1 && readVersion === 1) || (writeVersion === 2 && readVersion === 2))) {
     throw new Error(`Database snapshot has invalid SQLite journal header bytes ${writeVersion}/${readVersion}.`);
   }
   return { writeVersion, readVersion };
 }
 
-async function readStableSqliteSnapshot(databasePath, {
-  expectedSizeBytes = null,
-  expectedSha256 = '',
-  allowLegacySidecars = false,
-} = {}) {
-  const sidecarsBefore = await existingSqliteSidecars(databasePath);
-  if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsBefore);
-  const before = await fs.lstat(databasePath, { bigint: true });
-  if (!before.isFile()) throw new Error('Database snapshot is not a regular file.');
-  if (expectedSizeBytes !== null && before.size !== BigInt(expectedSizeBytes)) {
-    throw new Error('Database snapshot size does not match the manifest.');
+// Only the 100-byte SQLite header is read; a database is never loaded into memory whole.
+async function readSqliteHeaderBytes(databasePath) {
+  const handle = await fs.open(databasePath, 'r');
+  try {
+    const header = Buffer.alloc(sqliteHeaderSizeBytes);
+    const { bytesRead } = await handle.read(header, 0, sqliteHeaderSizeBytes, 0);
+    return header.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
   }
+}
 
-  const snapshotBytes = await fs.readFile(databasePath);
+async function writeRollbackHeaderBytes(databasePath) {
+  const handle = await fs.open(databasePath, 'r+');
+  try {
+    await handle.write(Buffer.from([1, 1]), 0, 2, sqliteJournalHeaderOffset);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars }) {
   const [after, sidecarsAfter] = await Promise.all([
     fs.lstat(databasePath, { bigint: true }),
     existingSqliteSidecars(databasePath),
   ]);
   if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsAfter);
   if (sidecarsBefore.join('\u0000') !== sidecarsAfter.join('\u0000')) {
-    throw new Error('Database snapshot sidecars changed while loading immutable verification bytes.');
+    throw new Error('Database snapshot sidecars changed while it was being verified.');
   }
-  if (!sqliteFileIdentityMatches(before, after) || snapshotBytes.length !== Number(after.size)) {
-    throw new Error('Database snapshot changed while loading immutable verification bytes.');
+  if (!sqliteFileIdentityMatches(before, after)) {
+    throw new Error('Database snapshot changed while it was being verified.');
   }
-  const snapshotSha256 = sha256Bytes(snapshotBytes);
-  if (expectedSha256 && snapshotSha256 !== expectedSha256) {
-    throw new Error('Database snapshot checksum does not match the manifest.');
-  }
-  const header = sqliteHeaderVersions(snapshotBytes);
-  return {
-    bytes: snapshotBytes,
-    sha256: snapshotSha256,
-    sizeBytes: snapshotBytes.length,
-    sidecars: sidecarsAfter,
-    ...header,
-  };
+  return sidecarsAfter;
 }
 
-function openQueryOnlySnapshotDatabase(snapshotBytes, { allowLegacyWalHeader = false } = {}) {
-  const { writeVersion, readVersion } = sqliteHeaderVersions(snapshotBytes);
-  if (writeVersion !== 1 || readVersion !== 1) {
-    if (!allowLegacyWalHeader) {
-      throw new Error(`Current-format database snapshot must persist SQLite rollback header bytes 1/1; found ${writeVersion}/${readVersion}.`);
-    }
-  }
-
-  const inspectionBytes = Buffer.from(snapshotBytes);
-  if (writeVersion === 2 && readVersion === 2) {
-    inspectionBytes[18] = 1;
-    inspectionBytes[19] = 1;
-  }
-  const database = new Database(inspectionBytes);
+// Opens a rollback-format (header 1/1) database file on disk, read-only and query-only. A file
+// with a WAL header (2/2) is never opened on disk: even a read-only open creates -wal/-shm files.
+function openQueryOnlyDatabaseFile(databasePath) {
+  const database = new Database(databasePath, { readonly: true, fileMustExist: true });
   try {
     database.pragma('query_only = ON');
     if (Number(database.pragma('query_only', { simple: true })) !== 1) {
@@ -285,19 +313,131 @@ function openQueryOnlySnapshotDatabase(snapshotBytes, { allowLegacyWalHeader = f
   }
 }
 
-async function openImmutableBackupDatabase(databasePath, {
+function withQueryOnlyDatabaseFile(databasePath, inspect) {
+  const database = openQueryOnlyDatabaseFile(databasePath);
+  try {
+    return inspect(database);
+  } finally {
+    database.close();
+  }
+}
+
+// A snapshot with a WAL header (2/2), or one that has sidecars beside it, is inspected through a
+// private copy given rollback header bytes, so SQLite never opens the bundle's own file and never
+// creates or reads sidecars there. Copies are named <pid>.<instanceId>.<random> so a sweep can tell
+// which are left over from a killed process.
+async function withInspectionCopy(databasePath, copyRoot, inspect) {
+  // Resolved so the key matches the sweep's even when the backup directory is configured relative.
+  const root = path.resolve(copyRoot, inspectionCopyDirectoryName);
+  // Not recursive: a backup directory removed in the meantime must not be recreated.
+  await fs.mkdir(root, { mode: 0o700 }).catch((error) => {
+    if (error.code !== 'EEXIST') throw error;
+  });
+  await fs.chmod(root, 0o700);
+  const directory = path.join(root, `${process.pid}.${backupInstanceId}.${randomUUID()}`);
+  await fs.mkdir(directory, { mode: 0o700 });
+  activeInspectionCopies.add(directory);
+  try {
+    const copyPath = path.join(directory, databaseFileName);
+    await fs.copyFile(databasePath, copyPath);
+    await fs.chmod(copyPath, 0o600);
+    await writeRollbackHeaderBytes(copyPath);
+    return withQueryOnlyDatabaseFile(copyPath, inspect);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+    activeInspectionCopies.delete(directory);
+  }
+}
+
+function inspectionCopyIsAbandoned(name, modifiedAtMs) {
+  if (Date.now() - modifiedAtMs > abandonedRecordTemporaryMs) return true;
+  const [pidText, instanceId] = name.split('.');
+  const pid = Number(pidText);
+  if (!Number.isInteger(pid) || pid < 1 || !instanceId) return false;
+  if (pid === process.pid) return true;
+  return !processIsAlive(pid);
+}
+
+// Removes inspection copies left by a killed process (or a failed removal), keeping any still in
+// use by this process or possibly by another live one.
+async function sweepInspectionCopies(config) {
+  const root = path.resolve(config.backup.directory, inspectionCopyDirectoryName);
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const removed = [];
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (activeInspectionCopies.has(entryPath)) continue;
+    const stat = await fs.lstat(entryPath).catch(() => null);
+    if (!stat || !inspectionCopyIsAbandoned(entry.name, stat.mtimeMs)) continue;
+    await fs.rm(entryPath, { recursive: true, force: true });
+    removed.push(entryPath);
+  }
+  return removed;
+}
+
+async function sweepInspectionCopiesSafely(config) {
+  try {
+    const removed = await sweepInspectionCopies(config);
+    if (removed.length > 0) console.warn(`[backup] removed ${removed.length} leftover backup inspection ${removed.length === 1 ? 'copy' : 'copies'}`);
+  } catch (error) {
+    console.error(`[backup] could not remove leftover backup inspection copies: ${error.message}`);
+  }
+}
+
+// Hashes the snapshot by streaming, reads only its header, and runs `inspect` against a read-only
+// query-only connection. Memory use does not grow with the database size.
+//
+// The hash, the header read and the SQLite open are separate reads of the file by path. They are
+// tied together only by its lstat identity (device, inode, size, mtime, ctime) and sidecar list,
+// which must be the same before, immediately before the open, and after the whole inspection. That
+// catches a replaced file and any write that moves mtime or ctime. It assumes no other writer: a
+// same-size in-place write landing within the filesystem's timestamp granularity of the previous
+// one could go unseen, which needs a concurrent writer inside the backup directory.
+async function inspectStableSqliteSnapshot(databasePath, {
   expectedSizeBytes = null,
   expectedSha256 = '',
   allowLegacyWalHeader = false,
   allowLegacySidecars = false,
-} = {}) {
-  const snapshot = await readStableSqliteSnapshot(databasePath, {
-    expectedSizeBytes,
-    expectedSha256,
-    allowLegacySidecars,
-  });
-  const database = openQueryOnlySnapshotDatabase(snapshot.bytes, { allowLegacyWalHeader });
-  return { database, snapshot };
+  inspectionCopyRoot = path.dirname(path.dirname(databasePath)),
+} = {}, inspect = () => undefined) {
+  const sidecarsBefore = await existingSqliteSidecars(databasePath);
+  if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsBefore);
+  const before = await fs.lstat(databasePath, { bigint: true });
+  if (!before.isFile()) throw new Error('Database snapshot is not a regular file.');
+  if (expectedSizeBytes !== null && before.size !== BigInt(expectedSizeBytes)) {
+    throw new Error('Database snapshot size does not match the manifest.');
+  }
+
+  const snapshotSha256 = await sha256File(databasePath);
+  const headerBytes = await readSqliteHeaderBytes(databasePath);
+  await assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars });
+  if (expectedSha256 && snapshotSha256 !== expectedSha256) {
+    throw new Error('Database snapshot checksum does not match the manifest.');
+  }
+  const header = sqliteHeaderVersions(headerBytes);
+  const rollbackHeader = header.writeVersion === 1 && header.readVersion === 1;
+  if (!rollbackHeader && !allowLegacyWalHeader) {
+    throw new Error(`Current-format database snapshot must persist SQLite rollback header bytes 1/1; found ${header.writeVersion}/${header.readVersion}.`);
+  }
+
+  await assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars });
+  const result = rollbackHeader && sidecarsBefore.length === 0
+    ? withQueryOnlyDatabaseFile(databasePath, inspect)
+    : await withInspectionCopy(databasePath, inspectionCopyRoot, inspect);
+  const sidecars = await assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars });
+  return {
+    sha256: snapshotSha256,
+    sizeBytes: Number(before.size),
+    sidecars,
+    ...header,
+    result,
+  };
 }
 
 function assertSnapshotQuickCheck(database) {
@@ -305,62 +445,32 @@ function assertSnapshotQuickCheck(database) {
   if (integrity !== 'ok') throw new Error(`SQLite integrity verification failed: ${integrity}`);
 }
 
-async function secureAtomicReplace(filePath, bytes) {
-  const temporaryPath = path.join(
-    path.dirname(filePath),
-    `.${path.basename(filePath)}.${randomUUID()}.tmp`,
-  );
-  let handle = null;
-  try {
-    handle = await fs.open(temporaryPath, 'wx', 0o600);
-    await handle.writeFile(bytes);
-    await handle.sync();
-    await handle.close();
-    handle = null;
-    await fs.chmod(temporaryPath, 0o600);
-    await fs.rename(temporaryPath, filePath);
-    await fs.chmod(filePath, 0o600);
-  } finally {
-    if (handle) await handle.close().catch(() => {});
-    await fs.rm(temporaryPath, { force: true }).catch(() => {});
-  }
-}
-
+// The online-backup copy carries the live database's WAL header (2/2). It lives in this backup's
+// own working directory, so its header bytes are rewritten in place to rollback mode (1/1).
 async function normalizeCreatedBackupDatabase(databasePath) {
-  const created = await readStableSqliteSnapshot(databasePath);
-  const normalizedBytes = Buffer.from(created.bytes);
-  if (created.writeVersion === 2 && created.readVersion === 2) {
-    normalizedBytes[18] = 1;
-    normalizedBytes[19] = 1;
-  }
+  assertNoSqliteSidecars(await existingSqliteSidecars(databasePath));
+  const created = await fs.lstat(databasePath);
+  if (!created.isFile()) throw new Error('Database snapshot is not a regular file.');
+  const { writeVersion, readVersion } = sqliteHeaderVersions(await readSqliteHeaderBytes(databasePath));
+  if (writeVersion !== 1 || readVersion !== 1) await writeRollbackHeaderBytes(databasePath);
+  await fs.chmod(databasePath, 0o600);
 
-  const normalizedDatabase = openQueryOnlySnapshotDatabase(normalizedBytes);
-  try {
-    assertSnapshotQuickCheck(normalizedDatabase);
-  } finally {
-    normalizedDatabase.close();
-  }
-
-  if (created.writeVersion !== 1 || created.readVersion !== 1) {
-    await secureAtomicReplace(databasePath, normalizedBytes);
-  }
-  const persisted = await readStableSqliteSnapshot(databasePath, {
-    expectedSizeBytes: normalizedBytes.length,
-    expectedSha256: sha256Bytes(normalizedBytes),
+  // The secure-document rows are read in the same pass as quick_check, so they describe exactly
+  // the hashed bytes recorded in the manifest.
+  const persisted = await inspectStableSqliteSnapshot(databasePath, {}, (database) => {
+    assertSnapshotQuickCheck(database);
+    return readSecureDocumentRowsFromDatabase(database);
   });
   if (persisted.writeVersion !== 1 || persisted.readVersion !== 1) {
     throw new Error('Normalized database snapshot did not persist SQLite rollback header bytes 1/1.');
   }
-  return persisted;
-}
-
-async function readSecureDocumentRows(databasePath) {
-  const { database } = await openImmutableBackupDatabase(databasePath);
-  try {
-    return readSecureDocumentRowsFromDatabase(database);
-  } finally {
-    database.close();
-  }
+  return {
+    sha256: persisted.sha256,
+    sizeBytes: persisted.sizeBytes,
+    writeVersion: persisted.writeVersion,
+    readVersion: persisted.readVersion,
+    secureDocumentRows: persisted.result,
+  };
 }
 
 function readSecureDocumentRowsFromDatabase(database) {
@@ -428,8 +538,7 @@ async function placeSecureDocument(sourcePath, copiedPath, fileOps) {
   }
 }
 
-async function copySecureDocuments({ databasePath, documentsDirectory, destination, fileOps = defaultFileOps }) {
-  const rows = await readSecureDocumentRows(databasePath);
+async function copySecureDocuments({ rows, documentsDirectory, destination, fileOps = defaultFileOps }) {
   const manifestDocuments = [];
 
   for (const row of rows) {
@@ -782,9 +891,52 @@ async function inspectBackupDirectory(config, {
 
 // Verify and record every bundle that has no matching record yet, so the first Operations page
 // load after a deploy or restart does not have to wait for it. Callers run it in the background.
-export function warmBackupVerificationRecords(config = getConfig(), options = {}) {
-  return inspectBackupDirectory(config, { ...options, useRecordedVerification: true, verificationBudgetMs: Infinity })
-    .then(() => undefined);
+// It also sweeps inspection copies left by a process that was killed mid-verification.
+export async function warmBackupVerificationRecords(config = getConfig(), options = {}) {
+  await sweepInspectionCopiesSafely(config);
+  await inspectBackupDirectory(config, { ...options, useRecordedVerification: true, verificationBudgetMs: Infinity });
+}
+
+// Lists `.incomplete` working directories without verifying any finished bundle, so it is cheap
+// enough to run before every backup.
+async function listIncompleteBackupBundles(config) {
+  let entries;
+  try {
+    entries = await fs.readdir(config.backup.directory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const bundles = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('backup-') || !entry.name.endsWith('.incomplete')) continue;
+    const bundlePath = path.join(config.backup.directory, entry.name);
+    try {
+      bundles.push({ path: bundlePath, state: 'incomplete', modifiedAt: (await fs.stat(bundlePath)).mtimeMs });
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  return bundles;
+}
+
+// Removes incomplete and invalid bundles left behind after the 24-hour grace period, and at once any
+// incomplete bundle whose marker shows its backup process is dead (a killed run skips its own
+// cleanup). Without an inspected listing only incomplete bundles are considered.
+async function removeAbandonedBackupBundles(config, now = new Date(), inspected = null) {
+  const candidates = inspected || await listIncompleteBackupBundles(config);
+  const abandonedCutoff = now.getTime() - abandonedBundleGraceMs;
+  const removed = [];
+  for (const bundle of candidates) {
+    if (!['incomplete', 'invalid'].includes(bundle.state)) continue;
+    const activity = await backupPathActivity(bundle.path);
+    if (activity === 'active') continue;
+    const provenDead = bundle.state === 'incomplete' && activity === 'dead';
+    if (!provenDead && bundle.modifiedAt >= abandonedCutoff) continue;
+    await fs.rm(bundle.path, { recursive: true, force: true });
+    removed.push(bundle.path);
+  }
+  return removed;
 }
 
 export async function enforceBackupRetention(config = getConfig(), now = new Date()) {
@@ -792,16 +944,7 @@ export async function enforceBackupRetention(config = getConfig(), now = new Dat
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   const inspected = await inspectBackupDirectory(config);
   const bundles = inspected.filter((bundle) => ['valid', 'degraded'].includes(bundle.state));
-  const abandonedCutoff = now.getTime() - abandonedBundleGraceMs;
-  const removed = [];
-
-  for (const bundle of inspected) {
-    if (!['incomplete', 'invalid'].includes(bundle.state)) continue;
-    if (bundle.modifiedAt >= abandonedCutoff) continue;
-    if (await isActiveBackupPath(bundle.path)) continue;
-    await fs.rm(bundle.path, { recursive: true, force: true });
-    removed.push(bundle.path);
-  }
+  const removed = await removeAbandonedBackupBundles(config, now, inspected);
 
   const cutoff = now.getTime() - config.backup.retentionDays * 24 * 60 * 60 * 1000;
   for (const [index, bundle] of bundles.entries()) {
@@ -824,6 +967,13 @@ export async function createBackupBundle({
   }
 
   await fs.mkdir(config.backup.directory, { recursive: true, mode: 0o700 });
+  try {
+    const removed = await removeAbandonedBackupBundles(config, now);
+    if (removed.length > 0) console.warn(`[backup] removed ${removed.length} abandoned backup working ${removed.length === 1 ? 'directory' : 'directories'}: ${removed.map((bundlePath) => path.basename(bundlePath)).join(', ')}`);
+  } catch (error) {
+    console.error(`[backup] could not remove abandoned backup work before backing up: ${error.message}`);
+  }
+  await sweepInspectionCopiesSafely(config);
   const id = randomUUID();
   const finalPath = path.join(config.backup.directory, `backup-${backupStamp(now)}-${id.slice(0, 8)}`);
   const workingPath = `${finalPath}.incomplete`;
@@ -831,13 +981,17 @@ export async function createBackupBundle({
   activeBackupPaths.add(path.resolve(workingPath));
 
   try {
-    await secureWriteJson(path.join(workingPath, activeMarkerFileName), { pid: process.pid, startedAt: new Date().toISOString() });
+    await secureWriteJson(path.join(workingPath, activeMarkerFileName), {
+      pid: process.pid,
+      instanceId: backupInstanceId,
+      startedAt: new Date().toISOString(),
+    });
     const databasePath = path.join(workingPath, databaseFileName);
     await storage.createApplicationBackup(databasePath);
     await fs.chmod(databasePath, 0o600);
     const persistedDatabase = await normalizeCreatedBackupDatabase(databasePath);
     const documents = await copySecureDocuments({
-      databasePath,
+      rows: persistedDatabase.secureDocumentRows,
       documentsDirectory: config.secureDocuments.storageDir,
       destination: workingPath,
       fileOps,
@@ -874,7 +1028,12 @@ export async function createBackupBundle({
     }
     await fs.rm(path.join(workingPath, activeMarkerFileName), { force: true });
     await fs.rename(workingPath, finalPath);
-    await enforceBackupRetention(config, now);
+    // The bundle is complete and in place; a retention problem must not undo or fail the backup.
+    try {
+      await enforceBackupRetention(config, now);
+    } catch (error) {
+      console.error(`[backup] backup ${path.basename(finalPath)} succeeded, but backup retention failed: ${error.message}`);
+    }
     return { path: finalPath, manifest, documentsDegraded: verification.documentsDegraded };
   } catch (error) {
     await fs.rm(workingPath, { recursive: true, force: true });
@@ -931,22 +1090,21 @@ export async function verifyBackupBundle(bundlePath) {
     errors.push('Database snapshot resolves outside the backup bundle.');
   } else {
     try {
-      const { database, snapshot } = await openImmutableBackupDatabase(databasePath, {
+      const snapshot = await inspectStableSqliteSnapshot(databasePath, {
         expectedSizeBytes: manifest.database.sizeBytes,
         expectedSha256: manifest.database.sha256,
         allowLegacyWalHeader: isLegacy,
         allowLegacySidecars: isLegacy,
-      });
-      try {
+        inspectionCopyRoot: path.dirname(resolvedBundle),
+      }, (database) => {
         assertSnapshotQuickCheck(database);
-        const documentRows = readSecureDocumentRowsFromDatabase(database);
-        if (documentRows.length !== manifest.secureDocuments.count) errors.push('Secure-document row count does not match the manifest.');
-        const comparison = compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows);
-        errors.push(...comparison.errors);
-        for (const { id, reason, message } of comparison.documentErrors) addDocumentError(id, reason, message);
-      } finally {
-        database.close();
-      }
+        return readSecureDocumentRowsFromDatabase(database);
+      });
+      const documentRows = snapshot.result;
+      if (documentRows.length !== manifest.secureDocuments.count) errors.push('Secure-document row count does not match the manifest.');
+      const comparison = compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows);
+      errors.push(...comparison.errors);
+      for (const { id, reason, message } of comparison.documentErrors) addDocumentError(id, reason, message);
       if (isLegacy && snapshot.sidecars.length > 0) {
         legacyReasons.push(`Legacy backup contains unverified SQLite sidecars: ${snapshot.sidecars.join(', ')}.`);
       }
@@ -1265,6 +1423,15 @@ function zonedDateAndMinutes(now, timezone) {
   return { dateKey: `${parts.year}-${parts.month}-${parts.day}`, minutes: hour * 60 + Number(parts.minute) };
 }
 
+function backupAttemptNumber(run) {
+  const attempt = Number(run?.attempt_count);
+  return Number.isFinite(attempt) && attempt >= 1 ? Math.floor(attempt) : 1;
+}
+
+// A run killed mid-backup (for example by the out-of-memory killer) leaves its claim pending, and
+// it is reclaimed once stale. A run that throws records when it may be retried. Either way the
+// backup is attempted at most maxBackupAttemptsPerDay times per day, so a backup that brings the
+// app down cannot keep doing so all day.
 export async function runClaimedBackup({ storage = getStorage(), config = getConfig(), now = new Date(), triggeredBy = 'scheduler' } = {}) {
   const { dateKey } = zonedDateAndMinutes(now, config.backup.timezone);
   const jobKey = `${backupJobName}:${dateKey}`;
@@ -1273,10 +1440,24 @@ export async function runClaimedBackup({ storage = getStorage(), config = getCon
     jobName: backupJobName,
     triggeredBy,
     nowIso: now.toISOString(),
-    staleBefore: new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString(),
+    staleBefore: new Date(now.getTime() - staleBackupClaimMs).toISOString(),
+    // Not the legacy claim mode: a failed run without a nextRetryAt is never reclaimed.
+    retryDueAt: now.toISOString(),
     metadata: { dateKey },
   });
   if (!claim.claimed) return { alreadyRun: claim.run?.status === 'completed', inProgress: claim.run?.status === 'pending', jobRun: claim.run };
+  const attempt = backupAttemptNumber(claim.run);
+  if (attempt > maxBackupAttemptsPerDay) {
+    const attempts = attempt - 1;
+    const message = `Backup gave up after ${attempts} attempts today; the last attempt did not record a result and may have crashed (for example, run out of memory). No further backup will be attempted until tomorrow.`;
+    console.error(`[backup:scheduler] ${message} (${jobKey})`);
+    const jobRun = await storage.completeScheduledJob(jobKey, {
+      status: 'failed',
+      last_error: message,
+      metadata: { dateKey, gaveUp: true, attempts },
+    });
+    return { gaveUp: true, jobRun };
+  }
   try {
     const backup = await createBackupBundle({ storage, config, now });
     const jobRun = await storage.completeScheduledJob(jobKey, {
@@ -1290,7 +1471,14 @@ export async function runClaimedBackup({ storage = getStorage(), config = getCon
     });
     return { backup, jobRun };
   } catch (error) {
-    await storage.completeScheduledJob(jobKey, { status: 'failed', last_error: error.message, metadata: { dateKey } }).catch(() => {});
+    const gaveUp = attempt >= maxBackupAttemptsPerDay;
+    const metadata = gaveUp
+      ? { dateKey, gaveUp: true, attempts: attempt }
+      : { dateKey, nextRetryAt: new Date(now.getTime() + backupRetryDelayMs).toISOString() };
+    if (gaveUp) {
+      console.error(`[backup:scheduler] Backup gave up after ${attempt} failed attempts today; no further backup will be attempted until tomorrow (${jobKey}).`);
+    }
+    await storage.completeScheduledJob(jobKey, { status: 'failed', last_error: error.message, metadata }).catch(() => {});
     throw error;
   }
 }
