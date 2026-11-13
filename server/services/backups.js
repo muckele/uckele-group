@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
@@ -16,6 +16,11 @@ const supportedBackupVersions = new Set([legacyBackupVersion, backupVersion]);
 const backupJobName = 'sqlite-application-backup';
 const abandonedBundleGraceMs = 24 * 60 * 60 * 1000;
 const sqliteSidecarSuffixes = ['-wal', '-shm', '-journal'];
+const sqliteHeaderSizeBytes = 100;
+const hashReadBufferBytes = 1024 * 1024;
+// Bytes 18 and 19 of the SQLite header are the file-format write and read versions: 1/1 for
+// rollback-journal mode, 2/2 for WAL mode.
+const sqliteJournalHeaderOffset = 18;
 const activeBackupPaths = new Set();
 // Recorded verification results live beside the bundles, outside any bundle directory, so recording
 // never changes a bundle's own files or its modification time.
@@ -134,14 +139,21 @@ function safeSegment(value, fallback = 'item') {
   return String(value || fallback).replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || fallback;
 }
 
+// Reads through one reusable buffer rather than a stream, whose per-chunk buffers pile up as
+// garbage and grow the process's memory with the size of the file being hashed.
 async function sha256File(filePath) {
   const hash = createHash('sha256');
-  await new Promise((resolve, reject) => {
-    const stream = createReadStream(filePath);
-    stream.on('data', (chunk) => hash.update(chunk));
-    stream.on('error', reject);
-    stream.on('end', resolve);
-  });
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(hashReadBufferBytes);
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    await handle.close();
+  }
   return hash.digest('hex');
 }
 
@@ -208,71 +220,59 @@ function assertNoSqliteSidecars(sidecars) {
   }
 }
 
-function sqliteHeaderVersions(snapshotBytes) {
-  if (snapshotBytes.length < 20 || snapshotBytes.subarray(0, 16).toString('utf8') !== 'SQLite format 3\u0000') {
+function sqliteHeaderVersions(headerBytes) {
+  if (headerBytes.length < 20 || headerBytes.subarray(0, 16).toString('utf8') !== 'SQLite format 3\u0000') {
     throw new Error('Database snapshot is not a SQLite 3 database.');
   }
-  const writeVersion = snapshotBytes[18];
-  const readVersion = snapshotBytes[19];
+  const writeVersion = headerBytes[18];
+  const readVersion = headerBytes[19];
   if (!((writeVersion === 1 && readVersion === 1) || (writeVersion === 2 && readVersion === 2))) {
     throw new Error(`Database snapshot has invalid SQLite journal header bytes ${writeVersion}/${readVersion}.`);
   }
   return { writeVersion, readVersion };
 }
 
-async function readStableSqliteSnapshot(databasePath, {
-  expectedSizeBytes = null,
-  expectedSha256 = '',
-  allowLegacySidecars = false,
-} = {}) {
-  const sidecarsBefore = await existingSqliteSidecars(databasePath);
-  if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsBefore);
-  const before = await fs.lstat(databasePath, { bigint: true });
-  if (!before.isFile()) throw new Error('Database snapshot is not a regular file.');
-  if (expectedSizeBytes !== null && before.size !== BigInt(expectedSizeBytes)) {
-    throw new Error('Database snapshot size does not match the manifest.');
+// Only the 100-byte SQLite header is read; a database is never loaded into memory whole.
+async function readSqliteHeaderBytes(databasePath) {
+  const handle = await fs.open(databasePath, 'r');
+  try {
+    const header = Buffer.alloc(sqliteHeaderSizeBytes);
+    const { bytesRead } = await handle.read(header, 0, sqliteHeaderSizeBytes, 0);
+    return header.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
   }
+}
 
-  const snapshotBytes = await fs.readFile(databasePath);
+async function writeRollbackHeaderBytes(databasePath) {
+  const handle = await fs.open(databasePath, 'r+');
+  try {
+    await handle.write(Buffer.from([1, 1]), 0, 2, sqliteJournalHeaderOffset);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars }) {
   const [after, sidecarsAfter] = await Promise.all([
     fs.lstat(databasePath, { bigint: true }),
     existingSqliteSidecars(databasePath),
   ]);
   if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsAfter);
   if (sidecarsBefore.join('\u0000') !== sidecarsAfter.join('\u0000')) {
-    throw new Error('Database snapshot sidecars changed while loading immutable verification bytes.');
+    throw new Error('Database snapshot sidecars changed while it was being verified.');
   }
-  if (!sqliteFileIdentityMatches(before, after) || snapshotBytes.length !== Number(after.size)) {
-    throw new Error('Database snapshot changed while loading immutable verification bytes.');
+  if (!sqliteFileIdentityMatches(before, after)) {
+    throw new Error('Database snapshot changed while it was being verified.');
   }
-  const snapshotSha256 = sha256Bytes(snapshotBytes);
-  if (expectedSha256 && snapshotSha256 !== expectedSha256) {
-    throw new Error('Database snapshot checksum does not match the manifest.');
-  }
-  const header = sqliteHeaderVersions(snapshotBytes);
-  return {
-    bytes: snapshotBytes,
-    sha256: snapshotSha256,
-    sizeBytes: snapshotBytes.length,
-    sidecars: sidecarsAfter,
-    ...header,
-  };
+  return sidecarsAfter;
 }
 
-function openQueryOnlySnapshotDatabase(snapshotBytes, { allowLegacyWalHeader = false } = {}) {
-  const { writeVersion, readVersion } = sqliteHeaderVersions(snapshotBytes);
-  if (writeVersion !== 1 || readVersion !== 1) {
-    if (!allowLegacyWalHeader) {
-      throw new Error(`Current-format database snapshot must persist SQLite rollback header bytes 1/1; found ${writeVersion}/${readVersion}.`);
-    }
-  }
-
-  const inspectionBytes = Buffer.from(snapshotBytes);
-  if (writeVersion === 2 && readVersion === 2) {
-    inspectionBytes[18] = 1;
-    inspectionBytes[19] = 1;
-  }
-  const database = new Database(inspectionBytes);
+// Opens a rollback-format (header 1/1) database file on disk, read-only and query-only. A file
+// with a WAL header (2/2) is never opened on disk: even a read-only open creates -wal/-shm files.
+function openQueryOnlyDatabaseFile(databasePath) {
+  const database = new Database(databasePath, { readonly: true, fileMustExist: true });
   try {
     database.pragma('query_only = ON');
     if (Number(database.pragma('query_only', { simple: true })) !== 1) {
@@ -285,19 +285,71 @@ function openQueryOnlySnapshotDatabase(snapshotBytes, { allowLegacyWalHeader = f
   }
 }
 
-async function openImmutableBackupDatabase(databasePath, {
+function withQueryOnlyDatabaseFile(databasePath, inspect) {
+  const database = openQueryOnlyDatabaseFile(databasePath);
+  try {
+    return inspect(database);
+  } finally {
+    database.close();
+  }
+}
+
+// A legacy WAL-header snapshot is inspected through a private copy with rollback header bytes, so
+// the bundle's own file is never opened by SQLite and never gains sidecars.
+async function withLegacyInspectionCopy(databasePath, inspect) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'ug-backup-inspect-'));
+  try {
+    const copyPath = path.join(directory, databaseFileName);
+    await fs.copyFile(databasePath, copyPath);
+    await fs.chmod(copyPath, 0o600);
+    await writeRollbackHeaderBytes(copyPath);
+    return withQueryOnlyDatabaseFile(copyPath, inspect);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
+// Hashes the snapshot by streaming, reads only its header, and runs `inspect` against a read-only
+// query-only connection. Memory use does not grow with the database size. The file's identity
+// (device, inode, size, mtime, ctime) and its sidecar list must be the same before and after the
+// whole inspection, so the checksum and the inspected contents describe the same immutable bytes.
+async function inspectStableSqliteSnapshot(databasePath, {
   expectedSizeBytes = null,
   expectedSha256 = '',
   allowLegacyWalHeader = false,
   allowLegacySidecars = false,
-} = {}) {
-  const snapshot = await readStableSqliteSnapshot(databasePath, {
-    expectedSizeBytes,
-    expectedSha256,
-    allowLegacySidecars,
-  });
-  const database = openQueryOnlySnapshotDatabase(snapshot.bytes, { allowLegacyWalHeader });
-  return { database, snapshot };
+} = {}, inspect = () => undefined) {
+  const sidecarsBefore = await existingSqliteSidecars(databasePath);
+  if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsBefore);
+  const before = await fs.lstat(databasePath, { bigint: true });
+  if (!before.isFile()) throw new Error('Database snapshot is not a regular file.');
+  if (expectedSizeBytes !== null && before.size !== BigInt(expectedSizeBytes)) {
+    throw new Error('Database snapshot size does not match the manifest.');
+  }
+
+  const snapshotSha256 = await sha256File(databasePath);
+  const headerBytes = await readSqliteHeaderBytes(databasePath);
+  await assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars });
+  if (expectedSha256 && snapshotSha256 !== expectedSha256) {
+    throw new Error('Database snapshot checksum does not match the manifest.');
+  }
+  const header = sqliteHeaderVersions(headerBytes);
+  const rollbackHeader = header.writeVersion === 1 && header.readVersion === 1;
+  if (!rollbackHeader && !allowLegacyWalHeader) {
+    throw new Error(`Current-format database snapshot must persist SQLite rollback header bytes 1/1; found ${header.writeVersion}/${header.readVersion}.`);
+  }
+
+  const result = rollbackHeader
+    ? withQueryOnlyDatabaseFile(databasePath, inspect)
+    : await withLegacyInspectionCopy(databasePath, inspect);
+  const sidecars = await assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars });
+  return {
+    sha256: snapshotSha256,
+    sizeBytes: Number(before.size),
+    sidecars,
+    ...header,
+    result,
+  };
 }
 
 function assertSnapshotQuickCheck(database) {
@@ -305,62 +357,30 @@ function assertSnapshotQuickCheck(database) {
   if (integrity !== 'ok') throw new Error(`SQLite integrity verification failed: ${integrity}`);
 }
 
-async function secureAtomicReplace(filePath, bytes) {
-  const temporaryPath = path.join(
-    path.dirname(filePath),
-    `.${path.basename(filePath)}.${randomUUID()}.tmp`,
-  );
-  let handle = null;
-  try {
-    handle = await fs.open(temporaryPath, 'wx', 0o600);
-    await handle.writeFile(bytes);
-    await handle.sync();
-    await handle.close();
-    handle = null;
-    await fs.chmod(temporaryPath, 0o600);
-    await fs.rename(temporaryPath, filePath);
-    await fs.chmod(filePath, 0o600);
-  } finally {
-    if (handle) await handle.close().catch(() => {});
-    await fs.rm(temporaryPath, { force: true }).catch(() => {});
-  }
-}
-
+// The online-backup copy carries the live database's WAL header (2/2). It lives in this backup's
+// own working directory, so its header bytes are rewritten in place to rollback mode (1/1).
 async function normalizeCreatedBackupDatabase(databasePath) {
-  const created = await readStableSqliteSnapshot(databasePath);
-  const normalizedBytes = Buffer.from(created.bytes);
-  if (created.writeVersion === 2 && created.readVersion === 2) {
-    normalizedBytes[18] = 1;
-    normalizedBytes[19] = 1;
-  }
+  assertNoSqliteSidecars(await existingSqliteSidecars(databasePath));
+  const created = await fs.lstat(databasePath);
+  if (!created.isFile()) throw new Error('Database snapshot is not a regular file.');
+  const { writeVersion, readVersion } = sqliteHeaderVersions(await readSqliteHeaderBytes(databasePath));
+  if (writeVersion !== 1 || readVersion !== 1) await writeRollbackHeaderBytes(databasePath);
+  await fs.chmod(databasePath, 0o600);
 
-  const normalizedDatabase = openQueryOnlySnapshotDatabase(normalizedBytes);
-  try {
-    assertSnapshotQuickCheck(normalizedDatabase);
-  } finally {
-    normalizedDatabase.close();
-  }
-
-  if (created.writeVersion !== 1 || created.readVersion !== 1) {
-    await secureAtomicReplace(databasePath, normalizedBytes);
-  }
-  const persisted = await readStableSqliteSnapshot(databasePath, {
-    expectedSizeBytes: normalizedBytes.length,
-    expectedSha256: sha256Bytes(normalizedBytes),
-  });
+  const persisted = await inspectStableSqliteSnapshot(databasePath, {}, assertSnapshotQuickCheck);
   if (persisted.writeVersion !== 1 || persisted.readVersion !== 1) {
     throw new Error('Normalized database snapshot did not persist SQLite rollback header bytes 1/1.');
   }
-  return persisted;
+  return {
+    sha256: persisted.sha256,
+    sizeBytes: persisted.sizeBytes,
+    writeVersion: persisted.writeVersion,
+    readVersion: persisted.readVersion,
+  };
 }
 
 async function readSecureDocumentRows(databasePath) {
-  const { database } = await openImmutableBackupDatabase(databasePath);
-  try {
-    return readSecureDocumentRowsFromDatabase(database);
-  } finally {
-    database.close();
-  }
+  return (await inspectStableSqliteSnapshot(databasePath, {}, readSecureDocumentRowsFromDatabase)).result;
 }
 
 function readSecureDocumentRowsFromDatabase(database) {
@@ -931,22 +951,20 @@ export async function verifyBackupBundle(bundlePath) {
     errors.push('Database snapshot resolves outside the backup bundle.');
   } else {
     try {
-      const { database, snapshot } = await openImmutableBackupDatabase(databasePath, {
+      const snapshot = await inspectStableSqliteSnapshot(databasePath, {
         expectedSizeBytes: manifest.database.sizeBytes,
         expectedSha256: manifest.database.sha256,
         allowLegacyWalHeader: isLegacy,
         allowLegacySidecars: isLegacy,
-      });
-      try {
+      }, (database) => {
         assertSnapshotQuickCheck(database);
-        const documentRows = readSecureDocumentRowsFromDatabase(database);
-        if (documentRows.length !== manifest.secureDocuments.count) errors.push('Secure-document row count does not match the manifest.');
-        const comparison = compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows);
-        errors.push(...comparison.errors);
-        for (const { id, reason, message } of comparison.documentErrors) addDocumentError(id, reason, message);
-      } finally {
-        database.close();
-      }
+        return readSecureDocumentRowsFromDatabase(database);
+      });
+      const documentRows = snapshot.result;
+      if (documentRows.length !== manifest.secureDocuments.count) errors.push('Secure-document row count does not match the manifest.');
+      const comparison = compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows);
+      errors.push(...comparison.errors);
+      for (const { id, reason, message } of comparison.documentErrors) addDocumentError(id, reason, message);
       if (isLegacy && snapshot.sidecars.length > 0) {
         legacyReasons.push(`Legacy backup contains unverified SQLite sidecars: ${snapshot.sidecars.join(', ')}.`);
       }
