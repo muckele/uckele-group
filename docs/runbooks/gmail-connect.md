@@ -51,7 +51,8 @@ means only people in your Workspace can use it, and Google does not need to revi
 
    4. Click **Update**, then **Save**.
    - `gmail.send` lets the app send the Pursue emails. `gmail.readonly` lets it see replies in
-     those threads so it can stop follow-ups. The app never deletes or changes your mail.
+     those threads so it can stop follow-ups, and read your Gmail signature so the emails end
+     with it. The app never deletes or changes your mail or your settings.
 6. Create the client.
    1. Open **Clients** (older screens: **APIs & Services → Credentials → Create credentials →
       OAuth client ID**).
@@ -91,10 +92,7 @@ means only people in your Workspace can use it, and Google does not need to revi
      GOOGLE_OAUTH_CLIENT_SECRET=... \
      DEAL_HUNTER_GMAIL_SENDER_ADDRESS=mathew@uckelegroup.com \
      DEAL_HUNTER_GMAIL_TOKEN_KEY=... \
-     DEAL_HUNTER_SENDER_NAME="Mathew Uckele" \
-     DEAL_HUNTER_SENDER_TITLE="Owner" \
-     DEAL_HUNTER_SENDER_PHONE="..." \
-     DEAL_HUNTER_CIM_AUTOMATION_PHYSICAL_POSTAL_ADDRESS="..."
+     DEAL_HUNTER_SENDER_NAME="Mathew Uckele"
    ```
 
    What each one is:
@@ -106,11 +104,15 @@ means only people in your Workspace can use it, and Google does not need to revi
    | `GOOGLE_OAUTH_CLIENT_SECRET` | The Client secret from Part A. |
    | `DEAL_HUNTER_GMAIL_SENDER_ADDRESS` | The only mailbox allowed to connect. Emails go out from this address. |
    | `DEAL_HUNTER_GMAIL_TOKEN_KEY` | The key from step 1. |
-   | `DEAL_HUNTER_SENDER_NAME`, `DEAL_HUNTER_SENDER_TITLE`, `DEAL_HUNTER_SENDER_PHONE` | Your signature. |
-   | `DEAL_HUNTER_CIM_AUTOMATION_PHYSICAL_POSTAL_ADDRESS` | The mailing address in the email footer. If it is not set, `EMAIL_BRAND_MAILING_ADDRESS` is used. |
+   | `DEAL_HUNTER_SENDER_NAME` | Your name, shown as the From name on Pursue emails. |
 
-   - Sending stays paused, and **Approve wording** stays greyed out, until the name, title,
-     phone and mailing address are all set.
+   - Pursue emails have no footer. They end with "Best," and your **Gmail signature**, which the
+     app reads from Gmail (step 3). Title, phone and mailing address are not settings any more:
+     put whatever you want brokers to see in your Gmail signature.
+   - Sending stays paused, and **Approve wording** stays greyed out, until your name is set and
+     your Gmail signature is loaded and not empty.
+   - `DEAL_HUNTER_SENDER_TITLE` and `DEAL_HUNTER_SENDER_PHONE` are no longer used; you can remove
+     them with `fly secrets unset`.
 3. Leave these **off** for now. You turn them on in Part C, step 5 (the controlled test), and
    they stay on for step 6:
 
@@ -150,8 +152,9 @@ Follow Part A and Part B above. Restart or redeploy so the app picks up the new 
 2. Google asks you to choose an account. Choose the sending address.
 3. Google lists the two permissions (send email, read email). Click **Allow**.
 4. You come back to Deal Hunter → Operations with a message at the top of the card:
-   - **Gmail is connected.** You're done with this step. The card shows the address and the
-     time of the last check.
+   - **Gmail is connected.** The card shows the address and the time of the last check, and
+     **Gmail signature** shows "Loaded from Gmail" with the time it was read. If it says
+     "Not loaded yet" or that the last refresh didn't work, click **Refresh from Gmail**.
    - **That Google account isn't the configured sending address.** You picked a different
      account. Click **Connect Gmail** again and pick the sending address.
    - **Google didn't grant permission to both send and read email.** Click **Connect Gmail**
@@ -161,13 +164,25 @@ Follow Part A and Part B above. Restart or redeploy so the app picks up the new 
    - **Gmail couldn't be connected.** A setting from Part B is missing or wrong (most often the
      redirect URI or `PUBLIC_SITE_URL`). Check them and try again.
 
-### 4. Approve the wording, then turn on the contact rule
+### 4. Choose your Gmail signature, approve the wording, then turn on the contact rule
 
-1. In the card, open **Preview the emails**. Read the first email and each follow-up.
-2. Click **Approve wording**, read the confirmation, and click **Approve wording** again.
-   - If you later change your signature settings, the card says the wording changed, and
-     sending pauses until you approve again.
-3. Click **Turn on contact rule** and confirm.
+1. Choose the signature the emails end with. In Gmail, open **Settings (gear) → See all
+   settings → General → Signature**. Under **Signature defaults**, set **For new emails use** to
+   the signature you want brokers to see, then click **Save Changes** at the bottom.
+   - Gmail gives the app one signature for the sending address. Google doesn't document which
+     of your named signatures that is, so always check it in the preview (next step).
+   - Back in the card, click **Refresh from Gmail** under **Gmail signature**.
+2. In the card, open **Preview the emails**. Read the first email and each follow-up. Each one
+   shows the plain text and, below it, the email as brokers will see it, ending with "Best,"
+   and your Gmail signature (logo and links included). There is no footer.
+3. Click **Approve wording**, read the confirmation, and click **Approve wording** again.
+   - The app reads your signature from Gmail again at the start of every sender run (every 15
+     minutes), when you reconnect Gmail, and when you click **Refresh from Gmail**. If it
+     changed, the card says the wording changed and sending pauses until you approve again.
+     An email already prepared with the old signature is prepared again, never sent.
+   - If Gmail can't be reached, the signature loaded earlier keeps being used and the card says
+     the last refresh didn't work.
+4. Click **Turn on contact rule** and confirm.
    - While it is on, the app may email a listing's broker once about that listing without
      asking you about each broker. Generic mailboxes (like `info@`), suppressed addresses and
      brokers already contacted about the listing are skipped.
@@ -242,7 +257,8 @@ address (a personal address works).
 6. Wait for the first email.
    - The sender runs every 15 minutes, and sends only on weekdays between 08:00 and 17:00 in the
      listing's local time.
-   - Check your test inbox: the email comes from the sending address, with your signature.
+   - Check your test inbox: the email comes from the sending address and ends with "Best," and
+     your Gmail signature, with no footer.
    - **Last runs** in the card shows `1 initial email`.
    - In Gmail, open the sent test email (in **Sent**), click **⋮ → Show original**, and note the
      **Message-ID** line. Check that **From** shows your name and the sending address.
@@ -367,7 +383,9 @@ What each readiness sentence means:
 | The email wording isn't approved. | Review the preview and click **Approve wording**. |
 | The contact rule is off. | Click **Turn on contact rule**. |
 | Live sending is off. | Click **Turn on Live sending** when you're ready. |
-| Your name, title, phone, or mailing address is missing from settings. | Set the signature settings from Part B, then approve the wording again. |
+| Your Gmail signature hasn't been loaded yet. Refresh it from Gmail. | Click **Refresh from Gmail** under **Gmail signature** (Gmail must be connected). Then approve the wording. |
+| Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail. | Set a signature in Gmail (step 4), click **Refresh from Gmail**, then approve the wording. |
+| Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings. | Set `DEAL_HUNTER_SENDER_NAME` (Part B), then approve the wording. |
 | The server isn't set to send through Gmail yet (see the Gmail setup runbook). | Set `DEAL_HUNTER_CIM_PROVIDER_ENABLED=true` and the sending setup (`DEAL_HUNTER_CIM_PROVIDER_PROFILE`) from step 5 or step 6. |
 | Live sending needs to be re-applied — use Try again. | Click **Try again** under Live sending. |
 | The sender is switched off in server settings. | Set `DEAL_HUNTER_PURSUE_SENDER_ENABLED=true` (step 5 or step 6). |

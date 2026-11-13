@@ -98,7 +98,8 @@ The table is mirrored in `supabase/schema.sql` and a migration, with service-rol
   send({ transmissionId, to, from, subject, text, html, threadId?, inReplyTo?, references? })
       -> { outcome: 'accepted'|'definitive-failure'|'ambiguous'|'quota', messageId?, threadId?, rfcMessageId, code },
   findSent({ rfcMessageId }) -> { found, messageId?, threadId? },
-  listThreadChanges({ checkpoint, threadIds }) -> { messages[], nextCheckpoint, checkpointExpired } }
+  listThreadChanges({ checkpoint, threadIds }) -> { messages[], nextCheckpoint, checkpointExpired },
+  readSignature() -> { ok: true, sendAsEmail, html } | { ok: false, code } }   // optional; §8.1
 ```
 
 There are two implementations:
@@ -233,26 +234,29 @@ When the rule is off, the existing per-recipient path is unchanged and still wor
 ### 8.1 Templates
 
 Templates live in `server/services/pursueCimTemplates.js`:
-- the initial email is `pursue-cim-initial-v3`;
-- the follow-ups are `pursue-cim-follow-up-v2`, with variants A, B, C, D and Final.
+- the initial email is `pursue-cim-initial-v4`;
+- the follow-ups are `pursue-cim-follow-up-v3`, with variants A, B, C, D and Final.
 
-v2 (2026-11-05) replaced the v1 body copy with the owner's operator-voice wording. Initial v3 (2026-11-06) uses the owner's own buyer-profile draft: four labeled sections, each label on its own line, with a $350K-$1.25M SDE/EBITDA range. The follow-ups stay v2. The subject, greeting, signature and footer are unchanged throughout, so threading and reply classification are unaffected.
+v2 (2026-11-05) replaced the v1 body copy with the owner's operator-voice wording. Initial v3 (2026-11-06) uses the owner's own buyer-profile draft: four labeled sections, each label on its own line, with a $350K-$1.25M SDE/EBITDA range. Initial v4 and follow-up v3 (2026-11-13, owner decision) drop the footer completely (no "stop" line, no postal address) and end every email with `Best,` and the owner's Gmail signature instead of app-rendered name/title/phone lines. The subject, greeting and body copy are unchanged, so threading is unaffected. Replies saying "stop" are still detected and honored exactly as before; the reply classifier keeps recognizing the old footer, which threads sent before v4 still quote.
 
 Follow-up *n* (n ≥ 1) uses variant `['A','B','C','D'][(n-1) % 4]`. The last follow-up uses **Final** instead. "Last" means `calculateNextCimSlot` would land at or after the campaign's expiry.
 
 Follow-ups are sent in the same Gmail thread with the subject `Re: <initial subject>`.
 
-The signature fields come from settings:
-- `DEAL_HUNTER_SENDER_NAME`
-- `DEAL_HUNTER_SENDER_TITLE`
-- `DEAL_HUNTER_SENDER_PHONE`
-- the existing `physicalPostalAddress`
+**The signature is the owner's Gmail signature.** The app reads it from Gmail with the access it already has: `GET https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs/{sendAsEmail}` (`users.settings.sendAs.get`, allowed by `gmail.readonly`; no scope is added), with `sendAsEmail` the configured `DEAL_HUNTER_GMAIL_SENDER_ADDRESS`. The `signature` field is HTML and may be empty or missing.
+- `gmailCimProvider.readSignature()` returns `{ ok: true, sendAsEmail, html }` or `{ ok: false, code }` (codes only: token codes, `gmail_access_denied`, `gmail_<status>` codes, `gmail_timeout`, `gmail_network_error`, `gmail_send_as_not_found`, `gmail_send_as_mismatch`, `gmail_response_invalid`).
+- `server/services/emailSignatureHtml.js` sanitizes it with a strict allow-list (formatting, table layout, `http(s)`/`mailto`/`tel` links, `https` images; no scripts, styles, event handlers, comments or unknown tags) and derives the plain text. Input over 64 KB is stored empty with `gmail_signature_too_large`.
+- One stored snapshot (`deal_hunter_gmail_signatures`): sanitized HTML, plain text, its SHA-256 digest, the send-as address and when it was fetched, plus the last refresh attempt and its error code.
+- It is refreshed when the owner clicks **Refresh from Gmail** on the Email sending card (`POST /api/admin/deal-hunter/email-sending/signature/refresh`), when Gmail is connected or reconnected (the OAuth callback), and once at the start of every sender run, before anything is prepared or sent. A refresh that fails keeps the stored snapshot, records the error code, logs one line and never stops the sender run (readiness still stops sends on token problems).
+- In Gmail, **Settings → General → Signature defaults → For new emails use** chooses the signature. The API returns one signature per send-as address and does not document which named signature that is, so the card's preview (the HTML in a sandboxed frame) is how the owner checks it.
 
-The send is refused with the readiness reason `signature_incomplete` if any of these is blank.
+`DEAL_HUNTER_SENDER_NAME` stays the From display name. The send is refused with the readiness reason `signature_incomplete` when there is no signature snapshot for the configured address, the snapshot is empty after sanitizing, or the sender name is blank. Title, phone and postal address are not used.
+
+A prepared email carries the wording digest it was rendered under (the `cim_wording` tag). The sender sends a prepared email only while that digest is the current one; otherwise every prepared, never-authorized email is released (as when Live sending is turned off) and prepared again with the current signature.
 
 ### 8.2 Drafts for owner review
 
-Placeholders: `{business}`, `{greeting}` (`Hi {broker first name},`, or `Hi there,` when there's no name), `{name}`, `{title}`, `{phone}`, `{postal}`.
+Placeholders: `{business}`, `{greeting}` (`Hi {broker first name},`, or `Hi there,` when there's no name), `{gmail signature}` (the stored Gmail signature: its plain text in the text part, its sanitized HTML in a `<div>` in the HTML part).
 
 **Initial.** Subject: `CIM / NDA request for {business}`
 
@@ -275,9 +279,7 @@ Placeholders: `{business}`, `{greeting}` (`Hi {broker first name},`, or `Hi ther
 > If this sounds aligned, I'd welcome the opportunity to review the CIM and discuss next steps.
 >
 > Best,
-> {name}
-> {title}, Uckele Group
-> {phone}
+> {gmail signature}
 
 **Follow-up A**
 > {greeting}
@@ -304,16 +306,13 @@ Placeholders: `{business}`, `{greeting}` (`Hi {broker first name},`, or `Hi ther
 >
 > Last note from me on {business}. If it comes back to market, I'd still like a look.
 
-Every follow-up ends with the same signature as the initial email. Every email, initial and follow-up, ends with this footer:
-
-> If you would rather I not reach out about future listings, just reply "stop".
-> {postal}
+Every follow-up ends the same way as the initial email: `Best,` and the Gmail signature. There is no footer.
 
 ### 8.3 Owner approval
 
-The Operations card shows every template rendered for a sample deal, with an **Approve wording** button. Approval records the SHA-256 digest of the template set: the template text and the version, without the per-deal values. It also records who approved and when.
+The Operations card shows every template rendered for a sample deal (plain text, and the HTML in a sandboxed frame so the owner sees the signature as brokers will), with an **Approve wording** button. Approval records the SHA-256 digest of the template set: the template text and the versions, the sender name and the stored signature's digest, without the per-deal values. It also records who approved and when.
 
-Readiness requires the current digest to equal the approved digest. Any change to the template text, or to the signature fields, produces a new digest and pauses sending (`wording_not_approved`) until the owner approves again.
+Readiness requires the current digest to equal the approved digest. Any change to the template text, the sender name or the Gmail signature produces a new digest and pauses sending (`wording_not_approved`) until the owner approves again.
 
 ## 9. Operations "Email sending" card
 
