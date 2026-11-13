@@ -42,9 +42,12 @@ const NAME_MISSING = 'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is m
 export function signatureIncompleteSentence(signature) {
   if (!signature) return READINESS_SENTENCES.signature_incomplete;
   if (signature.loaded && !signature.empty) return NAME_MISSING;
-  const sentence = signature.loaded
-    ? 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.'
-    : "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.";
+  let sentence = "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.";
+  if (signature.loaded) {
+    sentence = signature.imageOnly
+      ? 'Your Gmail signature is only images, with no text. Add your name as text in Gmail, then refresh it from Gmail.'
+      : 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.';
+  }
   return signature.senderNameSet === false
     ? `${sentence} Your name for the From line (DEAL_HUNTER_SENDER_NAME) is also missing from settings.`
     : sentence;
@@ -58,9 +61,13 @@ const SIGNATURE_ERRORS = Object.freeze({
   gmail_timeout: "Couldn't reach Gmail just now.",
   gmail_network_error: "Couldn't reach Gmail just now.",
   gmail_access_denied: "Gmail didn't allow reading your signature settings — reconnect Gmail.",
+  gmail_429: 'Gmail asked the app to slow down. It will try again at the next sender run.',
+  gmail_403_rate_limit_exceeded: 'Gmail asked the app to slow down. It will try again at the next sender run.',
+  gmail_403_user_rate_limit_exceeded: 'Gmail asked the app to slow down. It will try again at the next sender run.',
+  gmail_403_daily_limit_exceeded: "Gmail's daily limit was reached. It will try again tomorrow.",
   gmail_send_as_not_found: "Gmail has no settings for the sending address.",
   gmail_send_as_mismatch: "Gmail has no settings for the sending address.",
-  gmail_signature_too_large: 'Your Gmail signature is too large to use (over 64 KB). Shorten it in Gmail, then refresh.',
+  gmail_signature_too_large: 'Your Gmail signature is too large to use (over 64,000 characters). Shorten it in Gmail, then refresh.',
 });
 
 function signatureErrorSentence(code) {
@@ -386,7 +393,9 @@ export default function EmailSendingCard({ readOnly = false, connectResultCode }
             {signature?.loaded ? (
               <p>Loaded from Gmail {formatDate(signature.fetchedAt)}{signature.sendAsEmail ? <> for <strong className="break-all text-ink">{signature.sendAsEmail}</strong></> : null}.</p>
             ) : <p className="font-semibold text-ink">Not loaded yet.</p>}
-            {signature?.loaded && signature.empty ? <p className="font-semibold text-amber-900">Your Gmail signature is empty. Add one in Gmail, then refresh it here.</p> : null}
+            {signature?.loaded && signature.empty ? <p className="font-semibold text-amber-900">{signature.imageOnly
+              ? 'Your Gmail signature is only images, with no text, so the plain-text part of each email would be unsigned. Add your name as text in Gmail, then refresh it here.'
+              : 'Your Gmail signature is empty. Add one in Gmail, then refresh it here.'}</p> : null}
             {signature?.lastErrorCode ? <p className="text-amber-900">The last refresh on {formatDate(signature.lastAttemptAt)} didn't work: {signatureErrorSentence(signature.lastErrorCode)}{signature.loaded ? ' The signature loaded earlier is still used.' : ''}</p> : null}
             <p className="text-xs text-ink/60">Pursue emails end with &ldquo;Best,&rdquo; and this signature. In Gmail, Settings → General → Signature defaults → &ldquo;For new emails use&rdquo; picks it. Check it in the preview below.</p>
             {!readOnly ? <button className={secondaryButton} disabled={controlsDisabled || !gmail.connected} onClick={refreshSignature} type="button">{refreshing ? 'Refreshing…' : 'Refresh from Gmail'}</button> : null}

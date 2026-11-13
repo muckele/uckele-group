@@ -7,7 +7,12 @@
 // sending (wording_not_approved) until the owner approves the wording again. A failed refresh
 // keeps the stored snapshot and records only an error code.
 import { sha256 } from '../utils/security.js';
-import { sanitizeEmailSignatureHtml, signatureHasContent, signatureHtmlToText } from './emailSignatureHtml.js';
+import {
+  sanitizeEmailSignatureHtml,
+  signatureHasContent,
+  signatureHtmlToText,
+  signatureIsImageOnly,
+} from './emailSignatureHtml.js';
 import { createGmailCimProvider } from './gmailCimProvider.js';
 
 const CODE = /^[a-z][a-z0-9_]{0,79}$/;
@@ -38,7 +43,8 @@ export async function readPursueEmailSignature(storage) {
 
 /**
  * The snapshot Pursue emails may end with: loaded, read for the configured sender address, and
- * not empty after sanitizing. Returns `{ html, text, digest }` or null.
+ * with text after sanitizing (an image's alt text counts). Returns `{ html, text, digest }` or
+ * null.
  */
 export function usablePursueSignature(snapshot, config) {
   const sender = configuredSender(config);
@@ -66,6 +72,7 @@ export function pursueSignatureView(snapshot, config) {
   return {
     loaded: forSender,
     empty: forSender && usablePursueSignature(snapshot, config) === null,
+    imageOnly: forSender && signatureIsImageOnly(snapshot.html),
     fetchedAt: forSender ? snapshot.fetchedAt ?? null : null,
     sendAsEmail: forSender ? snapshot.sendAsEmail : null,
     lastAttemptAt: snapshot?.lastAttemptAt ?? null,
@@ -78,7 +85,8 @@ export function pursueSignatureView(snapshot, config) {
  * `{ ok: true, code, changed, signature }` (code is null, or `gmail_signature_too_large` when the
  * signature was stored empty) or `{ ok: false, code, signature }`, where `signature` is the
  * stored snapshot afterwards. A failure keeps the stored snapshot, records the code and logs one
- * line (codes only, never a token or a Google response).
+ * line (codes only, never a token or a Google response) when the code differs from the stored
+ * last error code, so a mailbox that keeps failing the same way does not fill the logs.
  */
 export async function refreshPursueEmailSignature({ storage, config, now = new Date(), mailProvider,
   fetcher, logger = console, source = 'unknown' } = {}) {
@@ -90,7 +98,9 @@ export async function refreshPursueEmailSignature({ storage, config, now = new D
     } catch {
       // The failure is still logged and returned; the stored snapshot is unchanged either way.
     }
-    logger?.warn?.('[pursue-signature] Gmail signature refresh failed', { code, source });
+    if (previous?.lastErrorCode !== code) {
+      logger?.warn?.('[pursue-signature] Gmail signature refresh failed', { code, source });
+    }
     return { ok: false, code, signature: await readPursueEmailSignature(storage) };
   };
 
@@ -116,6 +126,8 @@ export async function refreshPursueEmailSignature({ storage, config, now = new D
   } catch {
     return fail(STORE_FAILED);
   }
-  if (code) logger?.warn?.('[pursue-signature] Gmail signature stored empty', { code, source });
+  if (code && previous?.lastErrorCode !== code) {
+    logger?.warn?.('[pursue-signature] Gmail signature stored empty', { code, source });
+  }
   return { ok: true, code, changed: previous?.digest !== digest, signature: stored };
 }

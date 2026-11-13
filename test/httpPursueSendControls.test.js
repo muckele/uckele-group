@@ -156,7 +156,7 @@ test('viewer gets status without preview and cannot change controls', async () =
     assert.equal(emailSending.gmail.connected, false);
     assert.equal(emailSending.wording.currentDigest, pursueCimWordingDigest(getConfig().dealHunter.sender, null));
     assert.equal(emailSending.wording.signatureComplete, false);
-    assert.deepEqual(emailSending.signature, { loaded: false, empty: false, fetchedAt: null, sendAsEmail: null,
+    assert.deepEqual(emailSending.signature, { loaded: false, empty: false, imageOnly: false, fetchedAt: null, sendAsEmail: null,
       lastAttemptAt: null, lastErrorCode: null, senderNameSet: true });
     assert.equal(emailSending.wording.approvedDigest, null);
     assert.equal(Object.hasOwn(emailSending.wording, 'preview'), false);

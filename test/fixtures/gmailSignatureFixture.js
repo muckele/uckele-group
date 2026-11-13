@@ -18,7 +18,9 @@ export const GMAIL_SIGNATURE_FIXTURE_HTML = [
   '</tr></tbody></table></div>',
 ].join('');
 
+// The logo's alt text stands in for it; the phone icon has no alt text.
 export const GMAIL_SIGNATURE_FIXTURE_TEXT = [
+  'Example Co. logo',
   'Pat Example',
   'President',
   'Example Holdings LLC',

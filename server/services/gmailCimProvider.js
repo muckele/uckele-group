@@ -240,7 +240,10 @@ export function createGmailCimProvider({ storage, config, fetcher = defaultFetch
       if (status === 403) {
         const reasons = errorReasons(body);
         const quota = reasons.find((reason) => QUOTA_REASONS.has(reason));
-        if (quota) return { ok: false, code: `gmail_403_${quota}` };
+        // Snake case, so the code survives the code pattern storage and logs accept.
+        if (quota) {
+          return { ok: false, code: `gmail_403_${quota.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}` };
+        }
         return { ok: false, code: reasons.some((reason) => ACCESS_DENIED_REASONS.has(reason))
           ? 'gmail_access_denied' : 'gmail_403' };
       }

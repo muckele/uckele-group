@@ -68,9 +68,8 @@ test('a failed refresh keeps the stored signature, records the code and logs one
 
   const failures = [
     [() => mailProvider.failSignatureNext('gmail_503'), 'gmail_503'],
+    [() => mailProvider.failSignatureNext('gmail_403_user_rate_limit_exceeded'), 'gmail_403_user_rate_limit_exceeded'],
     [() => mailProvider.failSignatureNext('Not A Code'), 'gmail_signature_read_failed'],
-    [() => { mailProvider.readSignature = async () => { throw new Error('refresh-token-SECRET'); }; },
-      'gmail_signature_read_failed'],
   ];
   for (const [arrange, code] of failures) {
     arrange();
@@ -87,6 +86,18 @@ test('a failed refresh keeps the stored signature, records the code and logs one
     assert.match(logger.lines[0], new RegExp(code));
     assert.doesNotMatch(logger.lines[0], /SECRET/);
   }
+
+  // The same code again is recorded but not logged again; a thrown error never leaks.
+  mailProvider.readSignature = async () => { throw new Error('refresh-token-SECRET'); };
+  const quiet = capturingLogger();
+  const repeated = await refreshPursueEmailSignature({ storage, config, now: later, mailProvider, logger: quiet });
+  assert.equal(repeated.code, 'gmail_signature_read_failed');
+  assert.equal(quiet.lines.length, 0);
+  assert.equal((await storage.getGmailSignature()).lastErrorCode, 'gmail_signature_read_failed');
+  // A different code is logged again.
+  mailProvider.readSignature = async () => ({ ok: false, code: 'gmail_timeout' });
+  await refreshPursueEmailSignature({ storage, config, now: later, mailProvider, logger: quiet });
+  assert.equal(quiet.lines.length, 1);
 });
 
 test('a refresh never throws, even when storage fails', async (t) => {
@@ -117,8 +128,8 @@ test('an oversized signature is stored empty with a clear code, which blocks sen
   assert.equal(stored.html, '');
   assert.equal(stored.lastErrorCode, 'gmail_signature_too_large');
   assert.equal(usablePursueSignature(stored, config), null);
-  assert.deepEqual(pursueSignatureView(stored, config), { loaded: true, empty: true, fetchedAt: at,
-    sendAsEmail: SENDER, lastAttemptAt: at, lastErrorCode: 'gmail_signature_too_large' });
+  assert.deepEqual(pursueSignatureView(stored, config), { loaded: true, empty: true, imageOnly: false,
+    fetchedAt: at, sendAsEmail: SENDER, lastAttemptAt: at, lastErrorCode: 'gmail_signature_too_large' });
   assert.equal(logger.lines.length, 1);
 });
 
@@ -128,9 +139,41 @@ test('the view and the usable signature only count a snapshot read for the confi
   assert.ok(usablePursueSignature(snapshot, config));
   const other = { dealHunter: { gmail: { senderAddress: 'someone@example.com' } } };
   assert.equal(usablePursueSignature(snapshot, other), null);
-  assert.deepEqual(pursueSignatureView(snapshot, other), { loaded: false, empty: false, fetchedAt: null,
-    sendAsEmail: null, lastAttemptAt: at, lastErrorCode: null });
-  assert.deepEqual(pursueSignatureView(null, config), { loaded: false, empty: false, fetchedAt: null,
-    sendAsEmail: null, lastAttemptAt: null, lastErrorCode: null });
+  assert.deepEqual(pursueSignatureView(snapshot, other), { loaded: false, empty: false, imageOnly: false,
+    fetchedAt: null, sendAsEmail: null, lastAttemptAt: at, lastErrorCode: null });
+  assert.deepEqual(pursueSignatureView(null, config), { loaded: false, empty: false, imageOnly: false,
+    fetchedAt: null, sendAsEmail: null, lastAttemptAt: null, lastErrorCode: null });
+  // An image-only signature without alt text is not usable, and the view says why.
+  const imageOnly = { ...snapshot, html: '<img src="https://x.example/logo.png">', text: '' };
+  assert.equal(usablePursueSignature(imageOnly, config), null);
+  assert.deepEqual(pursueSignatureView(imageOnly, config), { loaded: true, empty: true, imageOnly: true,
+    fetchedAt: at, sendAsEmail: 'pat@example.com', lastAttemptAt: at, lastErrorCode: null });
   assert.equal(usablePursueSignature({ ...snapshot, loaded: false }, config), null);
+});
+
+test('a signature whose sanitized HTML grows past the cap is stored empty with the same code', async (t) => {
+  const storage = sqliteStorage(t);
+  const mailProvider = createFakeCimProvider({ senderAddress: SENDER });
+  mailProvider.setSignature('&'.repeat(EMAIL_SIGNATURE_MAX_INPUT_CHARS - 1));
+  const result = await refreshPursueEmailSignature({ storage, config, now: at, mailProvider,
+    logger: capturingLogger() });
+  assert.deepEqual([result.ok, result.code], [true, 'gmail_signature_too_large']);
+  const stored = await storage.getGmailSignature();
+  assert.deepEqual([stored.html, stored.lastErrorCode], ['', 'gmail_signature_too_large']);
+  assert.equal(usablePursueSignature(stored, config), null);
+});
+
+test('the owner-facing sentence names what is missing, image-only included', async () => {
+  const { signatureIncompleteSentence } = await import('../server/services/pursueEmailSending.js');
+  const named = { dealHunter: { sender: { name: 'Pat Example' } } };
+  const unnamed = { dealHunter: { sender: { name: '' } } };
+  assert.equal(signatureIncompleteSentence({ loaded: false }, named),
+    "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.");
+  assert.equal(signatureIncompleteSentence({ loaded: true, empty: true, imageOnly: true }, named),
+    'Your Gmail signature is only images, with no text. Add your name as text in Gmail, then refresh it from Gmail.');
+  assert.equal(signatureIncompleteSentence({ loaded: true, empty: true, imageOnly: false }, named),
+    'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.');
+  assert.equal(signatureIncompleteSentence({ loaded: true, empty: false }, unnamed),
+    'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings.');
+  assert.match(signatureIncompleteSentence({ loaded: false }, unnamed), /also missing from settings\.$/);
 });

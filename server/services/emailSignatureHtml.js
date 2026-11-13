@@ -5,16 +5,25 @@
 // and attributes listed here survive; every attribute value is checked, decoded and re-escaped;
 // text is re-escaped; and every allowed tag that is opened is closed. Anything else (comments,
 // scripts, styles, embedded content and its contents, event handlers, unknown tags) is dropped,
-// keeping only the text of unknown tags. No dependency: the output never contains markup this
-// module did not write itself.
+// keeping only the text of unknown tags (other block-level tags become line breaks). No
+// dependency: the output never contains markup this module did not write itself.
 
-export const EMAIL_SIGNATURE_MAX_INPUT_CHARS = 64 * 1024;
+// Bump when the sanitizing or text rules change: it is part of the Pursue wording digest, so a
+// rendering change pauses sending until the owner approves the wording again.
+export const EMAIL_SIGNATURE_RENDER_VERSION = 'email-signature-html-v2';
+// The cap applies to the input and to the sanitized output (escaping can grow it), in characters.
+export const EMAIL_SIGNATURE_MAX_CHARS = 64_000;
+export const EMAIL_SIGNATURE_MAX_INPUT_CHARS = EMAIL_SIGNATURE_MAX_CHARS;
 export const EMAIL_SIGNATURE_TOO_LARGE = 'gmail_signature_too_large';
 
 const ALLOWED_TAGS = new Set(['div', 'span', 'p', 'br', 'b', 'strong', 'i', 'em', 'u', 'a', 'img',
-  'table', 'tbody', 'thead', 'tr', 'td', 'th', 'font', 'small', 'hr']);
+  'table', 'tbody', 'thead', 'tr', 'td', 'th', 'font', 'small', 'hr', 'ul', 'ol', 'li', 'blockquote']);
 const VOID_TAGS = new Set(['br', 'img', 'hr']);
 const TABLE_TAGS = new Set(['table', 'tbody', 'thead', 'tr', 'td', 'th']);
+// Block-level tags that are not kept: a line break stands in for each end, so their words never
+// run into the next line ("Licensed in CA" / "Licensed in NV").
+const BREAK_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'center', 'pre', 'address', 'dl', 'dt',
+  'dd', 'section', 'article', 'header', 'footer', 'aside', 'nav', 'main', 'figure', 'figcaption']);
 // Dropped together with everything inside them. Raw-text elements end at their first close tag.
 const RAW_TEXT_TAGS = new Set(['script', 'style', 'textarea', 'title', 'xmp', 'iframe', 'noembed',
   'noframes', 'noscript', 'plaintext']);
@@ -27,13 +36,46 @@ const FACE_VALUE = /^[A-Za-z0-9 ,'"_-]{1,200}$/;
 const ALIGN_VALUE = /^(?:left|right|center|justify)$/i;
 const VALIGN_VALUE = /^(?:top|middle|bottom|baseline)$/i;
 const DIR_VALUE = /^(?:ltr|rtl|auto)$/i;
-const UNSAFE_STYLE = /url\s*\(|expression|javascript:|@import|behavior|[<>\\]|\/\*/i;
+// Style is an allow-list of CSS properties. A value with markup, escapes or comments drops the
+// whole attribute; a declaration whose property is not listed, or whose value uses any function
+// other than rgb()/rgba()/hsl()/hsla() (url, image-set, cross-fade, expression, var, ...), or a
+// negative length, is dropped on its own.
+const STYLE_TRICKS = /[<>\\]|\/\*|@import|javascript:|expression|behavior/i;
+const STYLE_PROPERTIES = new Set(['color', 'background-color', 'font', 'font-family', 'font-size',
+  'font-weight', 'font-style', 'font-variant', 'text-align', 'text-decoration', 'text-transform',
+  'text-indent', 'letter-spacing', 'word-spacing', 'white-space', 'line-height', 'vertical-align',
+  'margin', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'padding', 'padding-top',
+  'padding-right', 'padding-bottom', 'padding-left', 'border', 'border-top', 'border-right',
+  'border-bottom', 'border-left', 'border-width', 'border-style', 'border-color', 'border-collapse',
+  'border-spacing', 'border-radius', 'width', 'height', 'max-width', 'min-width', 'max-height',
+  'min-height', 'display']);
+const STYLE_VALUE = /^[A-Za-z0-9#%.,()'" +!-]{1,300}$/;
+const STYLE_FUNCTIONS = new Set(['rgb', 'rgba', 'hsl', 'hsla']);
+const DISPLAY_VALUES = new Set(['block', 'inline', 'inline-block', 'none']);
+
+function sanitizeStyle(value) {
+  if (value.length > 2000 || STYLE_TRICKS.test(value)) return null;
+  const kept = [];
+  for (const declaration of value.split(';')) {
+    const colon = declaration.indexOf(':');
+    if (colon < 0) continue;
+    const property = declaration.slice(0, colon).trim().toLowerCase();
+    const propertyValue = declaration.slice(colon + 1).trim();
+    if (!STYLE_PROPERTIES.has(property) || !STYLE_VALUE.test(propertyValue)) continue;
+    const functions = [...propertyValue.matchAll(/([A-Za-z-]+)\s*\(/g)].map((match) => match[1].toLowerCase());
+    if (functions.some((name) => !STYLE_FUNCTIONS.has(name)) || /\(\s*\(/.test(propertyValue)) continue;
+    if (/^(?:margin|padding)/.test(property) && /(?:^|[\s(,])-\s*\.?\d/.test(propertyValue)) continue;
+    if (property === 'display' && !DISPLAY_VALUES.has(propertyValue.toLowerCase())) continue;
+    kept.push(`${property}:${propertyValue}`);
+  }
+  return kept.length ? kept.join(';') : null;
+}
 const HREF_SCHEMES = new Set(['http', 'https', 'mailto', 'tel']);
 const SRC_SCHEMES = new Set(['https']);
 
 // One attribute rule per name: which tags may carry it and how its value is checked.
 const ATTRIBUTE_RULES = {
-  style: { tags: null, check: (value) => value.length <= 2000 && !UNSAFE_STYLE.test(value) },
+  style: { tags: null, normalize: sanitizeStyle },
   dir: { tags: null, check: (value) => DIR_VALUE.test(value) },
   href: { tags: new Set(['a']), url: HREF_SCHEMES },
   src: { tags: new Set(['img']), url: SRC_SCHEMES },
@@ -96,7 +138,7 @@ function escapeHtml(value) {
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 // eslint-disable-next-line no-control-regex
-const CONTROL_AND_SPACE = /[\u0000- \u007f]/g;
+const CONTROL_AND_SPACE = /[\u0000-\u0020\u007f]/g;
 
 /** A URL value with an allowed scheme, or null. Relative URLs are refused. */
 function safeUrl(value, schemes) {
@@ -116,9 +158,12 @@ function sanitizeAttributes(tag, source) {
     if (!rule || seen.has(name) || (rule.tags && !rule.tags.has(tag))) continue;
     const raw = match[2] ?? match[3] ?? match[4];
     if (raw === undefined) continue;
-    let value = decodeHtmlEntities(raw).replace(CONTROL, '').trim();
+    let value = decodeHtmlEntities(raw).toWellFormed().replace(CONTROL, '').trim();
     if (rule.url) {
       value = safeUrl(value, rule.url);
+      if (value === null) continue;
+    } else if (rule.normalize) {
+      value = rule.normalize(value);
       if (value === null) continue;
     } else if (!rule.check(value)) {
       continue;
@@ -177,18 +222,27 @@ function walk(input, { onText, onOpen, onClose }) {
 
 /**
  * Returns `{ html, code }`: the sanitized HTML, and `gmail_signature_too_large` (with empty html)
- * when the input is over the size cap. Empty or non-string input sanitizes to ''.
+ * when the input or the sanitized output is over the size cap (EMAIL_SIGNATURE_MAX_CHARS
+ * characters). Empty or non-string input sanitizes to ''.
  */
 export function sanitizeEmailSignatureHtml(input) {
   if (typeof input !== 'string' || input === '') return { html: '', code: null };
-  if (input.length > EMAIL_SIGNATURE_MAX_INPUT_CHARS) return { html: '', code: EMAIL_SIGNATURE_TOO_LARGE };
+  if (input.length > EMAIL_SIGNATURE_MAX_CHARS) return { html: '', code: EMAIL_SIGNATURE_TOO_LARGE };
   const output = [];
   const open = [];
+  const lineBreak = () => {
+    const last = output.at(-1);
+    if (last !== undefined && last !== '<br>') output.push('<br>');
+  };
   walk(input, {
     onText(text) {
-      output.push(escapeHtml(text.replace(CONTROL, '')));
+      output.push(escapeHtml(text.toWellFormed().replace(CONTROL, '')));
     },
     onOpen(tag, attributes, selfClosing) {
+      if (BREAK_TAGS.has(tag)) {
+        lineBreak();
+        return;
+      }
       if (!ALLOWED_TAGS.has(tag)) return;
       output.push(`<${tag}${sanitizeAttributes(tag, attributes)}>`);
       if (VOID_TAGS.has(tag)) return;
@@ -196,16 +250,25 @@ export function sanitizeEmailSignatureHtml(input) {
       else open.push(tag);
     },
     onClose(tag) {
+      if (BREAK_TAGS.has(tag)) {
+        lineBreak();
+        return;
+      }
       const position = open.lastIndexOf(tag);
       if (position < 0) return;
       while (open.length > position) output.push(`</${open.pop()}>`);
     },
   });
   while (open.length) output.push(`</${open.pop()}>`);
-  return { html: output.join(''), code: null };
+  const html = output.join('');
+  if (html.length > EMAIL_SIGNATURE_MAX_CHARS) return { html: '', code: EMAIL_SIGNATURE_TOO_LARGE };
+  return { html, code: null };
 }
 
-const LINE_BLOCK_TAGS = new Set(['div', 'p', 'table', 'tbody', 'thead', 'tr', 'hr']);
+const LINE_BLOCK_TAGS = new Set(['div', 'p', 'table', 'tbody', 'thead', 'tr', 'hr', 'ul', 'ol', 'li',
+  'blockquote']);
+// An image's alt text stands in for it, unless it is only a file name ("image001.png").
+const FILE_NAME_ALT = /^[\w .-]*\.(?:png|jpe?g|gif|webp|bmp|svg|ico)$/i;
 const CELL_TAGS = new Set(['td', 'th']);
 
 function comparableUrl(value) {
@@ -213,10 +276,11 @@ function comparableUrl(value) {
 }
 
 /**
- * Readable plain text for a signature: block elements and <br> become line breaks, table cells
- * are separated by a space, a link becomes its text (plus ` <href>` when the text is not the
- * URL itself and the link is not mailto:/tel:), images are dropped, entities are decoded,
- * whitespace is collapsed, and runs of blank lines become one.
+ * Readable plain text for a signature: block elements and <br> become line breaks (a list item
+ * starts with "- "), table cells are separated by a space, a link becomes its text (plus
+ * ` <href>` when the text is not the URL itself and the link is not mailto:/tel:), an image
+ * becomes its alt text (unless that is only a file name), entities are decoded, whitespace is
+ * collapsed, and runs of blank lines become one.
  */
 export function signatureHtmlToText(html) {
   const { html: safe } = sanitizeEmailSignatureHtml(html);
@@ -238,7 +302,14 @@ export function signatureHtmlToText(html) {
     },
     onOpen(tag, attributes) {
       if (tag === 'br') append('\n');
-      else if (LINE_BLOCK_TAGS.has(tag)) lineBreak();
+      else if (tag === 'li') {
+        lineBreak();
+        append('- ');
+      } else if (LINE_BLOCK_TAGS.has(tag)) lineBreak();
+      else if (tag === 'img') {
+        const alt = decodeHtmlEntities(/\salt="([^"]*)"/.exec(attributes)?.[1] ?? '').trim();
+        if (alt && !FILE_NAME_ALT.test(alt)) append(` ${alt.replace(/[\s\u00a0]+/g, ' ')} `);
+      }
       else if (CELL_TAGS.has(tag)) append(' ');
       else if (tag === 'a') {
         const href = /\shref="([^"]*)"/.exec(attributes)?.[1];
@@ -267,8 +338,17 @@ export function signatureHtmlToText(html) {
     .replace(/^\n+|\n+$/g, '');
 }
 
-/** True when the sanitized signature shows something: visible text or an image. */
+/**
+ * True when the signature has text (image alt text counts), so the plain-text part of an email
+ * is signed too. An image-only signature without alt text does not count.
+ */
 export function signatureHasContent(html) {
   if (typeof html !== 'string' || html === '') return false;
-  return signatureHtmlToText(html) !== '' || /<img\b/i.test(sanitizeEmailSignatureHtml(html).html);
+  return signatureHtmlToText(html) !== '';
+}
+
+/** True when the sanitized signature has images but no text: the card says so plainly. */
+export function signatureIsImageOnly(html) {
+  if (typeof html !== 'string' || html === '') return false;
+  return signatureHtmlToText(html) === '' && /<img\b/i.test(sanitizeEmailSignatureHtml(html).html);
 }

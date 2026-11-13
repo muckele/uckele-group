@@ -134,9 +134,12 @@ export function signatureIncompleteSentence(view, config) {
   if (view?.loaded && !view.empty) {
     return 'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings.';
   }
-  const signature = view?.loaded
-    ? 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.'
-    : "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.";
+  let signature = "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.";
+  if (view?.loaded) {
+    signature = view.imageOnly
+      ? 'Your Gmail signature is only images, with no text. Add your name as text in Gmail, then refresh it from Gmail.'
+      : 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.';
+  }
   return nameMissing
     ? `${signature} Your name for the From line (DEAL_HUNTER_SENDER_NAME) is also missing from settings.`
     : signature;

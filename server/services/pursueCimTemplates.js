@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import { signatureHasContent } from './emailSignatureHtml.js';
+import { EMAIL_SIGNATURE_RENDER_VERSION, signatureHasContent } from './emailSignatureHtml.js';
 
 // Pursue CIM email copy: the owner-approved wording from
 // docs/superpowers/specs/2026-11-03-gmail-send-runners-design.md section 8.2.
@@ -118,7 +118,8 @@ function signatureBlock(signature) {
 
 /**
  * True when a Pursue email can be signed: the sender name (the From display name) is set and
- * the Gmail signature snapshot has content. Title, phone and postal address are not used.
+ * the Gmail signature snapshot has text (an image's alt text counts), so the plain-text part is
+ * signed too. Title, phone and postal address are not used.
  */
 export function pursueSignatureComplete(sender, signature) {
   return oneLine(sender?.name) !== '' && signatureBlock(signature) !== null;
@@ -180,8 +181,8 @@ export function renderPursueCimEmail({
 }
 
 /**
- * The digest the owner approves: every template string and version, the sender name, and the
- * stored signature's digest. `signature` is the usable snapshot (`{ digest }`) or null.
+ * The digest the owner approves: every template string and version, the sender name, the
+ * signature render version, and the stored signature's digest. `signature` is the usable snapshot (`{ digest }`) or null.
  */
 export function pursueCimWordingDigest(sender, signature = null) {
   const canonical = JSON.stringify({
@@ -199,6 +200,8 @@ export function pursueCimWordingDigest(sender, signature = null) {
       signOff: SIGN_OFF,
     },
     sender: { name: oneLine(sender?.name) },
+    // A change to the signature sanitizer or its text rules changes what brokers receive.
+    signatureRenderVersion: EMAIL_SIGNATURE_RENDER_VERSION,
     signatureDigest: typeof signature?.digest === 'string' && signature.digest ? signature.digest : null,
   });
   return createHash('sha256').update(canonical).digest('hex');

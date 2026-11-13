@@ -16,7 +16,7 @@ function control(overrides = {}) {
 }
 
 function signatureStatus(overrides = {}) {
-  return { loaded: false, empty: false, fetchedAt: null, sendAsEmail: null, lastAttemptAt: null,
+  return { loaded: false, empty: false, imageOnly: false, fetchedAt: null, sendAsEmail: null, lastAttemptAt: null,
     lastErrorCode: null, senderNameSet: true, ...overrides };
 }
 
@@ -329,6 +329,7 @@ describe('Email sending card', () => {
   test.each([
     [signatureStatus(), "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail."],
     [loadedSignature({ empty: true }), 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.'],
+    [loadedSignature({ empty: true, imageOnly: true }), 'Your Gmail signature is only images, with no text. Add your name as text in Gmail, then refresh it from Gmail.'],
     [loadedSignature({ senderNameSet: false }), 'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings.'],
     [signatureStatus({ senderNameSet: false }), "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail. Your name for the From line (DEAL_HUNTER_SENDER_NAME) is also missing from settings."],
     [undefined, "Your Gmail signature hasn't been loaded yet, or it's empty. Refresh it from Gmail."],
@@ -372,11 +373,18 @@ describe('Email sending card', () => {
     expect(screen.queryByText(/gmail_timeout/)).not.toBeInTheDocument();
   });
 
+  test('says plainly when the Gmail signature is only images', async () => {
+    stubFetch(status({ signature: loadedSignature({ empty: true, imageOnly: true }) }));
+    render(<EmailSendingCard />);
+    expect(await screen.findByText(/only images, with no text, so the plain-text part of each email would be unsigned/))
+      .toBeVisible();
+  });
+
   test('says when the Gmail signature is empty or too large, and Refresh waits for Gmail to be connected', async () => {
     stubFetch(status({ signature: loadedSignature({ empty: true, lastErrorCode: 'gmail_signature_too_large' }) }));
     render(<EmailSendingCard />);
     expect(await screen.findByText('Your Gmail signature is empty. Add one in Gmail, then refresh it here.')).toBeVisible();
-    expect(screen.getByText(/too large to use \(over 64 KB\)/)).toBeVisible();
+    expect(screen.getByText(/too large to use \(over 64,000 characters\)/)).toBeVisible();
     expect(screen.getByRole('button', { name: 'Refresh from Gmail' })).toBeDisabled();
   });
 

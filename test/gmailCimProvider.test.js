@@ -621,7 +621,7 @@ test('readSignature maps failures to codes without throwing or leaking secrets',
   const cases = [
     [() => json(401, { error: { code: 401, message: `bad ${ACCESS_TOKEN}` } }), 'gmail_token_invalid'],
     [() => json(403, { error: { errors: [{ reason: 'insufficientPermissions' }] } }), 'gmail_access_denied'],
-    [() => json(403, { error: { errors: [{ reason: 'userRateLimitExceeded' }] } }), 'gmail_403_userRateLimitExceeded'],
+    [() => json(403, { error: { errors: [{ reason: 'userRateLimitExceeded' }] } }), 'gmail_403_user_rate_limit_exceeded'],
     [() => json(403, { error: { errors: [{ reason: 'forbidden' }] } }), 'gmail_403'],
     [() => json(404, { error: { code: 404 } }), 'gmail_send_as_not_found'],
     [() => json(500, { error: { code: 500 } }), 'gmail_500'],

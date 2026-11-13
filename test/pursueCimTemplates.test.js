@@ -7,6 +7,7 @@ import {
   pursueCimFollowUpVariant,
   pursueCimWordingDigest,
   renderPursueCimEmail,
+  pursueCimWordingTagValue,
   pursueSignatureComplete,
   renderPursueCimWordingPreview,
 } from '../server/services/pursueCimTemplates.js';
@@ -19,7 +20,7 @@ const signatureHtml = sanitizeEmailSignatureHtml(GMAIL_SIGNATURE_FIXTURE_HTML).h
 // The stored snapshot shape: sanitized HTML, its text, and its digest.
 const signature = { html: signatureHtml, text: signatureHtmlToText(signatureHtml), digest: sha256(signatureHtml) };
 const sampleDeal = { name: 'Sample Plumbing Co.', brokerName: 'Jordan Lee' };
-const PINNED_DIGEST = '179e40f2b1e9fe37929e5e4f406086b083719a798e0fe106353a2e5e250bd06f';
+const PINNED_DIGEST = '23d8cdd48595400677b8d3cb7a5ee1b2882a7cbb11af3bc8bbb3ad3316451b66';
 
 // Copied from docs/superpowers/specs/2026-11-03-gmail-send-runners-design.md section 8.2,
 // with the sample deal and the test Gmail signature filled in. A business name that already
@@ -189,7 +190,10 @@ test('pursueSignatureComplete needs the sender name and a non-empty Gmail signat
   for (const missing of [null, undefined, {}, { html: '' }, { html: '<div><br></div>&nbsp;' }]) {
     assert.equal(pursueSignatureComplete(sender, missing), false, JSON.stringify(missing));
   }
-  assert.equal(pursueSignatureComplete(sender, { html: '<img src="https://x.example/logo.png">', text: '' }), true);
+  // The plain-text part must be signed too: an image needs alt text to count.
+  assert.equal(pursueSignatureComplete(sender, { html: '<img src="https://x.example/logo.png">', text: '' }), false);
+  assert.equal(pursueSignatureComplete(sender,
+    { html: '<img src="https://x.example/logo.png" alt="Pat Example">', text: 'Pat Example' }), true);
   // Title, phone and postal address are not needed.
   assert.equal(pursueSignatureComplete({ name: 'Pat Example', title: '', phone: '', postalAddress: '' }, signature),
     true);
@@ -256,4 +260,19 @@ test('without a signature the email ends with Best, alone (previews only; sendin
 
 test('unknown kinds are rejected', () => {
   assert.throws(() => renderPursueCimEmail({ kind: 'nope', deal: sampleDeal, signature }), /kind/);
+});
+
+test('the wording tag value is read only from exactly one well-formed cim_wording tag', () => {
+  const value = 'a'.repeat(64);
+  assert.equal(pursueCimWordingTagValue(['cim_touch_id=t', `cim_wording=${value}`]), value);
+  for (const tags of [
+    [], undefined, null, 'cim_wording=' + value, ['cim_touch_id=t'],
+    [`cim_wording=${value}`, `cim_wording=${value}`],
+    [`cim_wording=${value}`, `cim_wording=${'b'.repeat(64)}`],
+    [`cim_wording=${'g'.repeat(64)}`], [`cim_wording=${'A'.repeat(64)}`],
+    [`cim_wording=${'a'.repeat(63)}`], [`cim_wording=${'a'.repeat(65)}`], ['cim_wording='],
+    [`cim_wording_x=${value}`], [{ name: 'cim_wording', value }],
+  ]) {
+    assert.equal(pursueCimWordingTagValue(tags), null, JSON.stringify(tags));
+  }
 });

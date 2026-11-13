@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  EMAIL_SIGNATURE_MAX_CHARS,
   EMAIL_SIGNATURE_MAX_INPUT_CHARS,
   sanitizeEmailSignatureHtml,
   signatureHasContent,
   signatureHtmlToText,
+  signatureIsImageOnly,
 } from '../server/services/emailSignatureHtml.js';
 import { GMAIL_SIGNATURE_FIXTURE_HTML, GMAIL_SIGNATURE_FIXTURE_TEXT } from './fixtures/gmailSignatureFixture.js';
 
@@ -68,10 +70,44 @@ test('drops dangerous style values and keeps safe ones', () => {
     '<span style="color:#222;font-weight:bold">a</span>');
 });
 
-test('unknown tags keep their text but lose the tag', () => {
+test('unknown tags keep their text but lose the tag; unknown block tags become line breaks', () => {
   assert.equal(clean('<section><h1>Title</h1><form action="x"><input value="v">Text</form></section>'),
-    'TitleText');
+    'Title<br>Text<br>');
   assert.equal(clean('<custom-tag foo="bar">kept</custom-tag>'), 'kept');
+  assert.equal(clean('<h3>Pat Example</h3><h4>President</h4><center>Example LLC</center><pre>x</pre><address>1 Way</address>'),
+    'Pat Example<br>President<br>Example LLC<br>x<br>1 Way<br>');
+  // Idempotent.
+  assert.equal(clean(clean('<h3>A</h3><h3>B</h3>')), 'A<br>B<br>');
+});
+
+test('lists and indents (Gmail editor markup) are kept, with style and dir only', () => {
+  assert.equal(clean('<ul class="x" style="margin:0"><li dir="ltr" onclick="x()">Licensed in CA</li><li>Licensed in NV</li></ul>'),
+    '<ul style="margin:0"><li dir="ltr">Licensed in CA</li><li>Licensed in NV</li></ul>');
+  assert.equal(clean('<ol><li>One</li></ol><blockquote style="margin:0 0 0 40px" cite="x">Quoted</blockquote>'),
+    '<ol><li>One</li></ol><blockquote style="margin:0 0 0 40px">Quoted</blockquote>');
+  assert.equal(signatureHtmlToText('<div>Pat</div><ul><li>Licensed in CA</li><li>Licensed in NV</li></ul><blockquote>Quoted</blockquote>'),
+    'Pat\n- Licensed in CA\n- Licensed in NV\nQuoted');
+  assert.equal(signatureHtmlToText('<h3>Pat Example</h3><h4>President</h4>'), 'Pat Example\nPresident');
+});
+
+test('style keeps only listed CSS properties and safe values', () => {
+  assert.equal(clean('<span style="position:fixed;top:0;z-index:99;color:red">a</span>'),
+    '<span style="color:red">a</span>');
+  for (const style of ['background-image:image-set("https://x.example/a.png" 1x)',
+    'background:cross-fade(url(x), url(y))', 'width:-webkit-image-set("https://x" 1x)',
+    'width:calc(100% - 1px)', 'color:var(--x)', 'margin-top:-200px', 'margin:0 -1em',
+    'display:flex', 'position:absolute', 'float:left', 'background:red']) {
+    assert.equal(clean(`<span style='${style}'>a</span>`), '<span>a</span>', style);
+  }
+  assert.equal(clean('<td style="padding-right:12px;BORDER-TOP: 1px solid rgb(0, 0, 0);display:block;font-family:\'Helvetica Neue\',Arial">a</td>'),
+    '<td style="padding-right:12px;border-top:1px solid rgb(0, 0, 0);display:block;font-family:&#39;Helvetica Neue&#39;,Arial">a</td>');
+});
+
+test('lone surrogates become U+FFFD in text and attribute values', () => {
+  assert.equal(clean('<b>a\ud83db</b>'), '<b>a\ufffdb</b>');
+  assert.equal(clean('<img src="https://x.example/a.png" alt="x\udc00">'),
+    '<img src="https://x.example/a.png" alt="x\ufffd">');
+  assert.equal(clean('a&#xd83d;b'), 'a\ufffdb');
 });
 
 test('escapes attribute values and text, and closes open tags', () => {
@@ -96,8 +132,15 @@ test('only allows each attribute on its own elements, with constrained values', 
 });
 
 test('caps the input size', () => {
+  assert.equal(EMAIL_SIGNATURE_MAX_CHARS, 64_000);
   const big = `<div>${'a'.repeat(EMAIL_SIGNATURE_MAX_INPUT_CHARS)}</div>`;
   assert.deepEqual(sanitizeEmailSignatureHtml(big), { html: '', code: 'gmail_signature_too_large' });
+  // The sanitized output is capped too: escaping can grow an input under the cap past it.
+  const growing = '&'.repeat(EMAIL_SIGNATURE_MAX_CHARS - 10);
+  assert.ok(growing.length <= EMAIL_SIGNATURE_MAX_CHARS);
+  assert.deepEqual(sanitizeEmailSignatureHtml(growing), { html: '', code: 'gmail_signature_too_large' });
+  const fits = '&'.repeat(1000);
+  assert.equal(sanitizeEmailSignatureHtml(fits).html.length, 5000);
   assert.deepEqual(sanitizeEmailSignatureHtml(null), { html: '', code: null });
   assert.deepEqual(sanitizeEmailSignatureHtml(''), { html: '', code: null });
 });
@@ -118,14 +161,21 @@ test('plain text: links, line breaks, entities and whitespace', () => {
     'Pat Example\nTom & Co \u2014 \u2022 <x>');
   assert.equal(signatureHtmlToText('<div>  a \n  b  </div><div><br></div><div><br></div><div><br></div><p>c</p>'),
     'a b\n\nc');
-  assert.equal(signatureHtmlToText('<div><img src="https://x.example/a.png" alt="logo"></div>'), '');
+  // An image becomes its alt text, unless that is only a file name.
+  assert.equal(signatureHtmlToText('<div><img src="https://x.example/a.png" alt="Example Co."></div>'), 'Example Co.');
+  assert.equal(signatureHtmlToText('<div><img src="https://x.example/a.png" alt="image001.png"></div>'), '');
+  assert.equal(signatureHtmlToText('<div><img src="https://x.example/a.png"></div>'), '');
   assert.equal(signatureHtmlToText('<script>alert(1)</script>ok'), 'ok');
   assert.equal(signatureHtmlToText(''), '');
 });
 
-test('signatureHasContent: visible text or an image', () => {
+test('signatureHasContent needs text (alt text counts); an image-only signature is flagged', () => {
   assert.equal(signatureHasContent(clean(GMAIL_SIGNATURE_FIXTURE_HTML)), true);
-  assert.equal(signatureHasContent('<div><img src="https://x.example/a.png"></div>'), true);
+  assert.equal(signatureHasContent('<div><img src="https://x.example/a.png" alt="Pat Example"></div>'), true);
+  assert.equal(signatureHasContent('<div><img src="https://x.example/a.png"></div>'), false);
+  assert.equal(signatureIsImageOnly('<div><img src="https://x.example/a.png"></div>'), true);
+  assert.equal(signatureIsImageOnly(clean(GMAIL_SIGNATURE_FIXTURE_HTML)), false);
+  assert.equal(signatureIsImageOnly(''), false);
   assert.equal(signatureHasContent('<div><br></div>&nbsp;'), false);
   assert.equal(signatureHasContent(''), false);
   assert.equal(signatureHasContent(null), false);
