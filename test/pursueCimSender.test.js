@@ -823,3 +823,86 @@ test('Gmail sends carry the owner name from DEAL_HUNTER_SENDER_NAME as the From 
     threadIds: [initial.threadId] });
   assert.equal(messages[0].headers.from, '"Mathew Uckele" <owner@uckele.example.test>');
 });
+
+test('every sender slot reads the Gmail signature once before anything is prepared, and goes on when the read fails', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805,
+    campaigns: [due('a'), due('b', '2030-10-28T17:00:00.000Z', '2030-10-28T10:00:00')] });
+  fixture.clock.set(MONDAY_0805);
+  const first = await fixture.run();
+  assert.equal(first.sentInitial, 1, JSON.stringify(first));
+  assert.equal(fixture.mailProvider.signatureReads.length, 1);
+  const stored = await fixture.storage.getGmailSignature();
+  assert.equal(stored.lastErrorCode, null);
+  // Read at the start of the slot, before the initial was prepared.
+  assert.equal(stored.fetchedAt, MONDAY_0805);
+  const preparedAt = fixture.database.prepare('SELECT created_at FROM deal_hunter_cim_transmissions').get();
+  assert.ok(Date.parse(stored.fetchedAt) < Date.parse(preparedAt.created_at));
+  const [sent] = fixture.mailProvider.sent;
+  assert.match(sent.text, /\n\nBest,\nPat Example\nExample Holdings LLC\npat@example\.com$/);
+  assert.match(sent.html, /<p>Best,<\/p>\n<div><div dir="ltr"><b>Pat Example<\/b>/);
+  assert.doesNotMatch(sent.text, /reply "stop"/);
+
+  // Gmail does not answer: the stored signature is kept, its code recorded, and the run sends.
+  fixture.mailProvider.failSignatureNext('gmail_timeout');
+  fixture.clock.set('2030-10-28T17:05:00.000Z');
+  const second = await fixture.run();
+  assert.equal(fixture.mailProvider.signatureReads.length, 2);
+  assert.equal(second.skipped.signature_refresh_failed, 1, JSON.stringify(second));
+  assert.equal(second.sentInitial, 1, JSON.stringify(second));
+  const kept = await fixture.storage.getGmailSignature();
+  assert.equal(kept.digest, stored.digest);
+  assert.equal(kept.fetchedAt, stored.fetchedAt);
+  assert.equal(kept.lastErrorCode, 'gmail_timeout');
+  assert.equal(fixture.mailProvider.sent[1].text.endsWith(sent.text.slice(sent.text.indexOf('Best,'))), true);
+});
+
+test('initial preparation refuses to prepare an unsigned email and leaves the touch scheduled', async (t) => {
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, campaigns: [due('a')] });
+  await fixture.storage.recordGmailSignatureRefresh({ ok: true, sendAsEmail: 'owner@uckele.example.test',
+    html: '', text: '', digest: fill('0'), now: MONDAY_0805 });
+  const [outcome] = await runDueCimInitialPreparations({ storage: fixture.storage, clock: fixture.clock,
+    loadAuthority: fixture.loadInitialAuthority, configOverride: fixture.config });
+  assert.deepEqual(outcome, { touchId: fixture.campaigns.a.touchId, claimed: false, prepared: false,
+    signatureIncomplete: true });
+  assert.equal(fixture.count('deal_hunter_cim_transmissions'), 0);
+  assert.equal(fixture.row('deal_hunter_cim_campaign_touches', fixture.campaigns.a.touchId).state, 'scheduled');
+});
+
+test('a Gmail signature change pauses sending until approved, and an email prepared with the old signature is prepared again, never sent', async (t) => {
+  const fixture = await createSenderFixture(t, { start: '2030-10-28T15:01:00.000Z', campaigns: [due('a')] });
+  const [prepared] = await runDueCimInitialPreparations({ storage: fixture.storage,
+    clock: fixture.clock, loadAuthority: fixture.loadInitialAuthority, configOverride: fixture.config });
+  assert.equal(prepared.prepared, true, JSON.stringify(prepared));
+  const oldBody = fixture.database.prepare(`SELECT c.body_text FROM deal_hunter_cim_transmissions tr
+    JOIN crm_communications c ON c.id = tr.communication_id WHERE tr.id = ?`).get(prepared.transmissionId);
+  assert.match(oldBody.body_text, /Example Holdings LLC/);
+
+  // The owner changes their Gmail signature; the next slot reads it and pauses.
+  fixture.mailProvider.setSignature('<div><b>Pat Example</b><br>Managing Partner</div>');
+  fixture.clock.set('2030-10-28T15:08:00.000Z');
+  const paused = await fixture.run();
+  assert.equal(paused.stoppedFor, 'not_ready', JSON.stringify(paused));
+  assert.deepEqual(paused.notReadyReasons, ['wording_not_approved']);
+  assert.equal(fixture.mailProvider.attempts.length, 0);
+
+  // The owner approves the new wording. The email prepared with the old signature is released
+  // and prepared again with the new one, in the same run, and only that one is sent.
+  const { changeEmailSendingControl } = await import('../server/services/pursueEmailSending.js');
+  const { wordingApproval } = await fixture.storage.getPursueSendControls();
+  const approval = await changeEmailSendingControl({ storage: fixture.storage, config: fixture.config,
+    actor: 'fixture-owner', now: fixture.clock.peek(), command: { controlKey: 'wording_approval',
+      enabled: true, expectedRevision: wordingApproval.revision, reason: '' } });
+  assert.equal(approval.ok, true, JSON.stringify(approval));
+  fixture.clock.set('2030-10-28T15:10:00.000Z');
+  const resumed = await fixture.run();
+  assert.equal(resumed.skipped.wording_changed, 1, JSON.stringify(resumed));
+  assert.equal(resumed.sentInitial, 1, JSON.stringify(resumed));
+  assert.equal(fixture.row('deal_hunter_cim_transmissions', prepared.transmissionId).state,
+    'cancelled-before-provider');
+  assert.equal(fixture.count('deal_hunter_cim_audit_events',
+    "event_type = 'transmission-released' AND reason_code = 'pursue_wording_changed'"), 1);
+  assert.equal(fixture.mailProvider.sent.length, 1);
+  assert.notEqual(fixture.mailProvider.sent[0].transmissionId, prepared.transmissionId);
+  assert.match(fixture.mailProvider.sent[0].text, /\n\nBest,\nPat Example\nManaging Partner$/);
+  assert.doesNotMatch(fixture.mailProvider.sent[0].text, /Example Holdings LLC/);
+});

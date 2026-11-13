@@ -130,3 +130,16 @@ test('the precedence order is ours, owner, bounce, auto-reply, stop, reply', () 
   assert.equal(classify(message({ bodyPrefix: 'stop' })), 'stop');
   assert.equal(classify(message()), 'reply');
 });
+
+test('replies to a footer-less email that ends with the Gmail signature are still classified', () => {
+  // Pursue emails now end with "Best," and the owner's Gmail signature: no stop line, no address.
+  const ours = 'Hi Jordan,\n\nBumping this up. Still interested in Acme Plumbing, and happy to sign the NDA today.'
+    + '\n\nBest,\nPat Example\nPresident\nExample Holdings LLC\n(555) 010-0000\npat@example.com';
+  const quoted = `\n\nOn Wed, Oct 30, 2030 at 8:00 AM Pat Example <owner@uckele.example.test> wrote:\n${
+    ours.split('\n').map((line) => `> ${line}`).join('\n')}\n`;
+  assert.equal(classify(message({ bodyPrefix: `Please stop.${quoted}` })), 'stop');
+  assert.equal(classify(message({ bodyPrefix: `Remove me from your list, thanks${quoted}` })), 'stop');
+  assert.equal(classify(message({ bodyPrefix: `STOP${quoted}` })), 'stop');
+  assert.equal(classify(message({ bodyPrefix: `Sure, NDA attached.${quoted}` })), 'reply');
+  assert.equal(classify(message({ bodyPrefix: 'Sure, NDA attached.' })), 'reply');
+});

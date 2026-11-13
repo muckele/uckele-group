@@ -17,6 +17,7 @@ import {
   SENDER_SETTINGS,
   enableSendControls,
   gmailConfig,
+  seedSignature,
   setSendControl,
 } from './fixtures/pursueCimGmailGateFixture.js';
 
@@ -79,10 +80,27 @@ for (const reason of ['gmail_not_connected', 'gmail_token_invalid', 'gmail_token
 
 test('readiness reports wording_not_approved when the approved digest is stale or missing', async (t) => {
   const storage = await readyStorage(t);
-  const changed = gmailConfig({ sender: { ...SENDER_SETTINGS, phone: '555-0199' } });
-  assert.deepEqual((await read(storage, { config: changed })).reasons, ['wording_not_approved']);
+  const renamed = gmailConfig({ sender: { ...SENDER_SETTINGS, name: 'Mathew J. Uckele' } });
+  assert.deepEqual((await read(storage, { config: renamed })).reasons, ['wording_not_approved']);
   await setSendControl(storage, 'wording_approval', false);
   assert.deepEqual((await read(storage)).reasons, ['wording_not_approved']);
+});
+
+test('a changed Gmail signature makes the approved wording stale until it changes back', async (t) => {
+  const storage = await readyStorage(t);
+  assert.deepEqual((await read(storage)).reasons, []);
+  await seedSignature(storage, { html: '<div><b>Mathew Uckele</b><br>New title</div>', now });
+  assert.deepEqual((await read(storage)).reasons, ['wording_not_approved']);
+  await seedSignature(storage, { now });
+  assert.deepEqual((await read(storage)).reasons, []);
+});
+
+test('title, phone and postal address no longer matter to readiness', async (t) => {
+  const storage = await readyStorage(t);
+  const config = gmailConfig({ sender: { ...SENDER_SETTINGS, title: '', phone: '', postalAddress: '' } });
+  const readiness = await read(storage, { config });
+  assert.deepEqual(readiness.reasons, []);
+  assert.equal(readiness.signatureComplete, true);
 });
 
 test('readiness reports contact_rule_off when the rule is off or under another policy version', async (t) => {
@@ -99,8 +117,36 @@ test('readiness reports live_sending_off', async (t) => {
   assert.deepEqual((await read(storage)).reasons, ['live_sending_off']);
 });
 
-test('readiness reports signature_incomplete when any signature field is blank', async (t) => {
-  const sender = { ...SENDER_SETTINGS, title: '' };
+test('readiness reports signature_incomplete without a signature snapshot', async (t) => {
+  const storage = sqliteStorage(t);
+  // A failed refresh records only its code: still no snapshot.
+  await storage.recordGmailSignatureRefresh({ ok: false, errorCode: 'gmail_timeout', now });
+  await enableSendControls(storage);
+  const readiness = await read(storage);
+  assert.deepEqual(readiness.reasons, ['signature_incomplete']);
+  assert.equal(readiness.signatureComplete, false);
+});
+
+test('readiness reports signature_incomplete when the signature is empty after sanitizing', async (t) => {
+  for (const html of ['', '<script>alert(1)</script>', '<div><br></div>&nbsp;']) {
+    const storage = sqliteStorage(t);
+    await seedSignature(storage, { html });
+    await enableSendControls(storage);
+    const readiness = await read(storage);
+    assert.deepEqual(readiness.reasons, ['signature_incomplete'], html);
+    assert.equal(readiness.signatureComplete, false);
+  }
+});
+
+test('readiness reports signature_incomplete for a snapshot read for another address', async (t) => {
+  const storage = sqliteStorage(t);
+  await seedSignature(storage, { sendAsEmail: 'someone-else@uckele.example.test' });
+  await enableSendControls(storage);
+  assert.deepEqual((await read(storage)).reasons, ['signature_incomplete']);
+});
+
+test('readiness reports signature_incomplete when the sender name is blank', async (t) => {
+  const sender = { ...SENDER_SETTINGS, name: '  ' };
   const storage = sqliteStorage(t);
   await enableSendControls(storage, { sender });
   const readiness = await read(storage, { config: gmailConfig({ sender }) });

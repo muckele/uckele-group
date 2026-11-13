@@ -18,7 +18,8 @@ import { normalizeResendTags } from './delivery.js';
 import { nextCimTouchKind } from './pursueCimCadence.js';
 import { PURSUE_FOLLOW_UP_PAYLOAD_VERSION } from './pursueCimFinalGate.js';
 import { PURSUE_CIM_IN_REPLY_TO_TAG } from './pursueCimProvider.js';
-import { renderPursueCimEmail } from './pursueCimTemplates.js';
+import { readUsablePursueSignature } from './pursueEmailSignature.js';
+import { PURSUE_CIM_WORDING_TAG, pursueCimWordingDigest, renderPursueCimEmail } from './pursueCimTemplates.js';
 import { RFC_MESSAGE_ID } from './rfc5322.js';
 
 const MAX_TAG_LENGTH = 120;
@@ -102,8 +103,9 @@ function followUpCadence({ touch, campaign, timezone }) {
  * come from the broker-materials authority (`loadMemberAuthority`, the same reader the final
  * gate uses). Returns null (the runner stops with authority_unavailable, before claiming) when
  * the touch does not exist, that authority is unavailable, or anything `buildPayload` would
- * reject is already known: no Gmail sender, no accepted initial or no safe Message-ID to reply
- * to, or a campaign cadence that cannot say whether this follow-up is the Final one.
+ * reject is already known: no Gmail sender, no usable Gmail signature snapshot, no accepted
+ * initial or no safe Message-ID to reply to, or a campaign cadence that cannot say whether this
+ * follow-up is the Final one.
  */
 export async function loadPursueFollowUpAuthority({ candidate, storage, now,
   loadMemberAuthority = loadBrokerMaterialsAuthority, config: configOverride } = {}) {
@@ -113,6 +115,7 @@ export async function loadPursueFollowUpAuthority({ candidate, storage, now,
   const at = isoInstant(now);
   const config = configOverride || getConfig();
   if (!gmailSenderAddress(config)) return null;
+  if (!(await readUsablePursueSignature({ storage, config }))) return null;
   const durable = await storage.readCimFollowUpAuthority({ touchId: candidate?.touch_id, now: at });
   if (!durable?.touch || !initialMessageId(durable.initial)) return null;
   const ordinal = Number(durable.touch.ordinal);
@@ -190,7 +193,8 @@ export function isFinalPursueFollowUp({ authority, now }) {
  * to the conversation's recipient, with the initial's RFC Message-ID as the In-Reply-To tag
  * that the Gmail dispatch reads. Throws a coded error when there is nothing to reply to.
  */
-export async function buildPursueFollowUpPayload({ authority, now, config: configOverride } = {}) {
+export async function buildPursueFollowUpPayload({ authority, now, storage,
+  config: configOverride } = {}) {
   // Defensive: loadPursueFollowUpAuthority already returns null for each of these, so the
   // runner stops before claiming the touch.
   const config = configOverride || getConfig();
@@ -204,16 +208,20 @@ export async function buildPursueFollowUpPayload({ authority, now, config: confi
   if (!fromAddress || !toAddress || !Number.isSafeInteger(followUpNumber) || followUpNumber < 1) {
     throw new Error('CIM sender or recipient unavailable');
   }
+  // Never prepared unsigned: the stored Gmail signature ends the email.
+  const signature = await readUsablePursueSignature({ storage, config });
+  if (!signature) throw new Error('signature_incomplete');
   const isFinal = isFinalPursueFollowUp({ authority, now });
   const rendered = renderPursueCimEmail({ kind: 'follow-up', followUpNumber, isFinal,
     deal: { name: opportunity?.canonical_name || '',
       brokerName: recipient?.firstName || recipient?.displayName || '' },
-    sender: config.dealHunter?.sender, initialSubject: initial.subject });
+    signature, initialSubject: initial.subject });
   // The Message-ID keeps its `<`, `@` and `>`, so it is added after the Resend-safe tags.
   const tags = [...normalizeResendTags([
     { name: 'cim_conversation_id', value: conversation.id },
     { name: 'cim_touch_id', value: touch.id },
     { name: 'cim_template', value: rendered.templateVersion },
+    { name: PURSUE_CIM_WORDING_TAG, value: pursueCimWordingDigest(config.dealHunter?.sender, signature) },
   ]).map(({ name, value }) => `${name}=${value}`), `${PURSUE_CIM_IN_REPLY_TO_TAG}=${inReplyTo}`];
   if (tags.some((tag) => tag.length > MAX_TAG_LENGTH)) {
     throw new Error('CIM tag exceeds storage bound');

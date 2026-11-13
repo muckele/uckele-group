@@ -5,7 +5,8 @@ import { getConfig } from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { createGmailCimProvider } from './gmailCimProvider.js';
 import { CONTACT_POLICY_VERSION } from './pursueCimContactPolicy.js';
-import { pursueCimWordingDigest, senderSignatureComplete } from './pursueCimTemplates.js';
+import { readUsablePursueSignature } from './pursueEmailSignature.js';
+import { pursueCimWordingDigest, pursueSignatureComplete } from './pursueCimTemplates.js';
 
 export const PURSUE_CIM_READINESS_EVIDENCE_TTL_MS = 60 * 1000;
 
@@ -63,7 +64,10 @@ async function readControls(storage) {
  * Reads Pursue CIM Gmail readiness. Returns the input shape normalizeCimProviderReadiness
  * expects, plus `ready` and the ordered `reasons`. `ready` is true only when the mailbox is
  * connected under the configured address with a working token, the current wording digest is
- * owner-approved, the contact rule and Live sending are on, and the signature is complete.
+ * owner-approved, the contact rule and Live sending are on, and the signature is complete: the
+ * sender name is set and the stored Gmail signature snapshot (for the configured address) is
+ * not empty. The wording digest includes that snapshot's digest, so a changed Gmail signature
+ * reports wording_not_approved until the owner approves again.
  * Never returns secrets: only codes, digests and timestamps.
  */
 export async function readPursueCimProviderReadiness({
@@ -76,7 +80,8 @@ export async function readPursueCimProviderReadiness({
   const reasons = await mailboxReasons(provider);
   const controls = await readControls(storage);
   const sender = resolvedConfig?.dealHunter?.sender ?? {};
-  const wordingDigest = pursueCimWordingDigest(sender);
+  const signature = await readUsablePursueSignature({ storage, config: resolvedConfig });
+  const wordingDigest = pursueCimWordingDigest(sender, signature);
   const wording = controls?.wordingApproval;
   if (wording?.enabled !== true || wording.valueDigest !== wordingDigest) {
     reasons.push('wording_not_approved');
@@ -86,7 +91,7 @@ export async function readPursueCimProviderReadiness({
     reasons.push('contact_rule_off');
   }
   if (controls?.liveSending?.enabled !== true) reasons.push('live_sending_off');
-  const signatureComplete = senderSignatureComplete(sender);
+  const signatureComplete = pursueSignatureComplete(sender, signature);
   if (!signatureComplete) reasons.push('signature_incomplete');
   const ordered = orderedReasons(reasons);
   const evidenceRevision = sha256(stableCanonicalJson({

@@ -11,8 +11,10 @@ import { calculateCampaignExpiry } from '../../server/services/cimCampaignPolicy
 import { authorizePreparedCimTransmission } from '../../server/services/pursueCimFinalGate.js';
 import { CONTACT_POLICY_VERSION, contactPolicyDigest } from '../../server/services/pursueCimContactPolicy.js';
 import { cimRfcMessageId } from '../../server/services/cimMailProvider.js';
-import { createFakeCimProvider } from '../../server/services/fakeCimProvider.js';
+import { sanitizeEmailSignatureHtml, signatureHtmlToText } from '../../server/services/emailSignatureHtml.js';
+import { FAKE_CIM_SIGNATURE_HTML, createFakeCimProvider } from '../../server/services/fakeCimProvider.js';
 import { readPursueCimProviderReadiness } from '../../server/services/pursueCimReadiness.js';
+import { readUsablePursueSignature } from '../../server/services/pursueEmailSignature.js';
 import { pursueCimWordingDigest, renderPursueCimEmail } from '../../server/services/pursueCimTemplates.js';
 import { createSqliteStorage } from '../../server/storage/sqlite.js';
 import { sha256, stableCanonicalJson } from '../../server/utils/security.js';
@@ -20,8 +22,7 @@ import { sha256, stableCanonicalJson } from '../../server/utils/security.js';
 export const GMAIL_PROFILE = 'production-gmail-v1';
 export const SENDER = 'owner@uckele.example.test';
 export const BROKER = 'broker@example.test';
-export const SENDER_SETTINGS = Object.freeze({ name: 'Mathew Uckele', title: 'Founder',
-  phone: '555-0100', postalAddress: '1 Main St, Springfield' });
+export const SENDER_SETTINGS = Object.freeze({ name: 'Mathew Uckele' });
 // Tuesday 2026-09-29 09:00 in Los Angeles: inside the send window.
 export const GATE_NOW = '2026-09-29T16:00:00.000Z';
 const seededAt = '2026-09-25T19:00:00.000Z';
@@ -91,13 +92,32 @@ export async function seedActivationChain(storage, providerProfile = GMAIL_PROFI
   }
 }
 
-/** Turns every send control on, with the current wording approved. */
-export async function enableSendControls(storage, { sender = SENDER_SETTINGS, now = seededAt } = {}) {
+/** The stored Gmail signature snapshot for `html` (the fake mailbox's signature by default). */
+export function fixtureSignature(html = FAKE_CIM_SIGNATURE_HTML) {
+  const sanitized = sanitizeEmailSignatureHtml(html).html;
+  return { html: sanitized, text: signatureHtmlToText(sanitized), digest: sha256(sanitized) };
+}
+
+/** Stores the owner's Gmail signature snapshot, as a refresh from Gmail would. */
+export async function seedSignature(storage, { html = FAKE_CIM_SIGNATURE_HTML, now = seededAt,
+  sendAsEmail = SENDER } = {}) {
+  const { html: sanitized, text, digest } = fixtureSignature(html);
+  return storage.recordGmailSignatureRefresh({ ok: true, sendAsEmail, html: sanitized, text, digest, now });
+}
+
+/**
+ * Turns every send control on, with the current wording approved. Seeds the fake mailbox's
+ * signature first when no signature snapshot is stored.
+ */
+export async function enableSendControls(storage, { sender = SENDER_SETTINGS, now = seededAt,
+  config = gmailConfig({ sender }) } = {}) {
+  if (!(await storage.getGmailSignature())) await seedSignature(storage, { now });
+  const signature = await readUsablePursueSignature({ storage, config });
   const controls = await storage.getPursueSendControls();
   for (const [controlKey, name, extra] of [
     ['live_sending', 'liveSending', {}],
     ['contact_rule', 'contactRule', { policyVersion: CONTACT_POLICY_VERSION }],
-    ['wording_approval', 'wordingApproval', { valueDigest: pursueCimWordingDigest(sender) }],
+    ['wording_approval', 'wordingApproval', { valueDigest: pursueCimWordingDigest(sender, signature) }],
   ]) {
     await storage.setPursueSendControl({ controlKey, enabled: true, ...extra,
       expectedRevision: controls[name].revision, actor: 'fixture-owner', now });
@@ -238,7 +258,7 @@ export async function createGmailGateFixture(t, suffix, { kind = 'initial', basi
   const initialSubject = 'CIM / NDA request for Acme Plumbing';
   const rendered = renderPursueCimEmail({ kind: followUp ? 'follow-up' : 'initial',
     followUpNumber: 1, deal: { name: 'Acme Plumbing', brokerName: 'Jordan Lee' },
-    sender: SENDER_SETTINGS, initialSubject });
+    signature: fixtureSignature(), initialSubject });
   const message = {
     payloadVersion: followUp ? 'deal-hunter-cim-pursue-follow-up-v1'
       : 'deal-hunter-cim-pursue-initial-v2',

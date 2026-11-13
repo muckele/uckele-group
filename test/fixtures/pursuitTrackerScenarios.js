@@ -429,8 +429,10 @@ const EXPECTED_BUNDLES = [{
   campaign: { id: '<id>', state: 'responded', reasonCode: 'reply_received', crmSubmissionId: '<id>',
     conversationId: '<id>', gmailThreadId: '<id>' },
   replies: [
+    // The sender's controlled clock ticks once per read; the slot's Gmail signature refresh
+    // reads it once before the send.
     { gmailMessageId: '<id>', classification: 'ours', processedAt: '2030-01-07T22:05:00.000Z',
-      messageAt: '2030-01-07T16:05:16.000Z' },
+      messageAt: '2030-01-07T16:05:17.000Z' },
     { gmailMessageId: '<id>', classification: 'reply', processedAt: '2030-01-07T22:05:01.000Z',
       messageAt: '2030-01-07T22:00:00.000Z' },
   ],

@@ -19,8 +19,9 @@ const AUTO_PRECEDENCE = new Set(['auto_reply', 'bulk', 'junk']);
 const STOP_WORDS = /(?<![\p{L}\p{N}_-])(?:stop|unsubscribe|remove\s+me|do\s+not\s+contact)(?![\p{L}\p{N}_-])/iu;
 // Where quoted history starts: Gmail/Apple "On ... wrote:", Outlook's original-message markers.
 const QUOTE_START = /^\s*(?:On\s[^\n]{0,300}wrote:|-{2,}\s*Original Message\s*-{2,}|_{10,}|From:\s.*|Sent from my\s.*)\s*$/im;
-// The footer every Pursue email ends with (spec §8.2); a reply that carries it unquoted
-// (some clients inline the original) is not asking us to stop.
+// The footer Pursue emails ended with before pursue-cim-initial-v4 / pursue-cim-follow-up-v3
+// (they now end with the owner's Gmail signature). Threads already sent still quote it, and a
+// reply that carries it unquoted (some clients inline the original) is not asking us to stop.
 const OUR_FOOTER = /If you would rather I not reach out about future listings,\s*just reply\s*["“”]?stop["“”]?\.?/giu;
 
 function headerText(value) {

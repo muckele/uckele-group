@@ -526,13 +526,12 @@ export function getConfig() {
         senderAddress: (process.env.DEAL_HUNTER_GMAIL_SENDER_ADDRESS || '').trim(),
         tokenKey: process.env.DEAL_HUNTER_GMAIL_TOKEN_KEY || '',
       },
-      // The signature and footer on Pursue CIM emails. Sending is refused by readiness
-      // (signature_incomplete) while any field is blank, so these are not startup requirements.
+      // The owner's name, the From display name on Pursue CIM emails. The emails end with the
+      // owner's Gmail signature, read from Gmail (pursueEmailSignature.js). Sending is refused by
+      // readiness (signature_incomplete) while the name is blank or no signature is loaded, so
+      // this is not a startup requirement.
       sender: {
         name: (process.env.DEAL_HUNTER_SENDER_NAME || '').trim(),
-        title: (process.env.DEAL_HUNTER_SENDER_TITLE || '').trim(),
-        phone: (process.env.DEAL_HUNTER_SENDER_PHONE || '').trim(),
-        postalAddress: (process.env.DEAL_HUNTER_CIM_AUTOMATION_PHYSICAL_POSTAL_ADDRESS || process.env.EMAIL_BRAND_MAILING_ADDRESS || '').trim(),
       },
       sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
       // Airtable is retired from Deal Hunter. Keep the public configuration
