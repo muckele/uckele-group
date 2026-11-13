@@ -327,7 +327,8 @@ function withQueryOnlyDatabaseFile(databasePath, inspect) {
 // creates or reads sidecars there. Copies are named <pid>.<instanceId>.<random> so a sweep can tell
 // which are left over from a killed process.
 async function withInspectionCopy(databasePath, copyRoot, inspect) {
-  const root = path.join(copyRoot, inspectionCopyDirectoryName);
+  // Resolved so the key matches the sweep's even when the backup directory is configured relative.
+  const root = path.resolve(copyRoot, inspectionCopyDirectoryName);
   // Not recursive: a backup directory removed in the meantime must not be recreated.
   await fs.mkdir(root, { mode: 0o700 }).catch((error) => {
     if (error.code !== 'EEXIST') throw error;
@@ -360,7 +361,7 @@ function inspectionCopyIsAbandoned(name, modifiedAtMs) {
 // Removes inspection copies left by a killed process (or a failed removal), keeping any still in
 // use by this process or possibly by another live one.
 async function sweepInspectionCopies(config) {
-  const root = path.join(config.backup.directory, inspectionCopyDirectoryName);
+  const root = path.resolve(config.backup.directory, inspectionCopyDirectoryName);
   let entries;
   try {
     entries = await fs.readdir(root, { withFileTypes: true });
