@@ -248,7 +248,8 @@ Follow-ups are sent in the same Gmail thread with the subject `Re: <initial subj
 - `server/services/emailSignatureHtml.js` sanitizes it with a strict allow-list and derives the plain text.
   - Kept: formatting, table layout, lists and indents, `http(s)`/`mailto`/`tel` links, `https` images, and an allow-list of CSS properties.
   - Removed: scripts, style elements, event handlers, comments, positioning and CSS functions other than `rgb`/`hsl`.
-  - Other block-level tags become line breaks.
+  - Other block-level tags become plain lines: headings (h1-h6), center, pre, address and the like keep their text, end with a line break, and lose their formatting.
+  - Nothing may hide content: `display:none` and negative indents or spacing are refused.
   - In the plain text, an image becomes its alt text.
   - Input or sanitized output over 64,000 characters is stored empty with `gmail_signature_too_large`.
   - `EMAIL_SIGNATURE_RENDER_VERSION` is part of the wording digest, so a change to these rules pauses sending until re-approval.

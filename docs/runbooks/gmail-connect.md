@@ -194,8 +194,9 @@ Follow Part A and Part B above. Restart or redeploy so the app picks up the new 
    - The signature needs some text, such as your name. A signature that is only an image
      leaves the plain-text part of each email unsigned, so the card refuses it. An image's alt
      text counts as text.
-   - Lists, indents and headings are kept. Positioning and background images are removed.
-     Signatures over 64,000 characters can't be used.
+   - Lists and indents are kept. Headings become plain lines: their text stays, without the
+     heading size. Positioning, background images and hidden text are removed. Signatures over
+     64,000 characters can't be used.
    - Back in the card, click **Refresh from Gmail** under **Gmail signature**.
 2. In the card, open **Preview the emails**. Read the first email and each follow-up. Each one
    shows the plain text and, below it, the email as brokers will see it, ending with "Best,"
