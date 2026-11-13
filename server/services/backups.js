@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import Database from 'better-sqlite3';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
@@ -28,6 +28,12 @@ const backupInstanceId = randomUUID();
 const maxBackupAttemptsPerDay = 3;
 const backupRetryDelayMs = 60 * 60 * 1000;
 const staleBackupClaimMs = 2 * 60 * 60 * 1000;
+// No backup runs this long: past it, a claim is reclaimed and its working directory is abandoned.
+const longestPossibleBackupMs = abandonedBundleGraceMs + staleBackupClaimMs;
+// Private copies made to inspect a snapshot SQLite must not open in place. They live on the backup
+// volume (never a possibly memory-backed /tmp) beside the bundles, and are swept when left behind.
+const inspectionCopyDirectoryName = '.inspection-copies';
+const activeInspectionCopies = new Set();
 // Recorded verification results live beside the bundles, outside any bundle directory, so recording
 // never changes a bundle's own files or its modification time.
 const verificationRecordDirectoryName = '.verification-cache';
@@ -188,15 +194,25 @@ async function backupPathActivity(bundlePath) {
     return 'active';
   }
   if (!Number.isInteger(marker?.pid) || marker.pid < 1) return 'dead';
-  // Same PID, different incarnation: a previous run of this container that was killed.
-  if (marker.pid === process.pid && typeof marker.instanceId === 'string' && marker.instanceId !== backupInstanceId) {
-    return 'dead';
-  }
-  try {
-    process.kill(marker.pid, 0);
+  const startedAtMs = Date.parse(marker.startedAt || '');
+  // Started longer ago than any backup can run: whatever process now holds that PID is not it.
+  if (Number.isFinite(startedAtMs) && Date.now() - startedAtMs > longestPossibleBackupMs) return 'dead';
+  if (marker.pid === process.pid) {
+    // Same PID, different incarnation: a previous run of this container that was killed.
+    if (typeof marker.instanceId === 'string') return marker.instanceId === backupInstanceId ? 'active' : 'dead';
+    // A marker written before instanceIds existed: ours only if it started after this process did.
+    if (!Number.isFinite(startedAtMs) || startedAtMs < performance.timeOrigin) return 'dead';
     return 'active';
+  }
+  return processIsAlive(marker.pid) ? 'active' : 'dead';
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
   } catch (error) {
-    return error.code === 'ESRCH' ? 'dead' : 'active';
+    return error.code !== 'ESRCH';
   }
 }
 
@@ -306,10 +322,20 @@ function withQueryOnlyDatabaseFile(databasePath, inspect) {
   }
 }
 
-// A legacy WAL-header snapshot is inspected through a private copy with rollback header bytes, so
-// the bundle's own file is never opened by SQLite and never gains sidecars.
-async function withLegacyInspectionCopy(databasePath, inspect) {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'ug-backup-inspect-'));
+// A snapshot with a WAL header (2/2), or one that has sidecars beside it, is inspected through a
+// private copy given rollback header bytes, so SQLite never opens the bundle's own file and never
+// creates or reads sidecars there. Copies are named <pid>.<instanceId>.<random> so a sweep can tell
+// which are left over from a killed process.
+async function withInspectionCopy(databasePath, copyRoot, inspect) {
+  const root = path.join(copyRoot, inspectionCopyDirectoryName);
+  // Not recursive: a backup directory removed in the meantime must not be recreated.
+  await fs.mkdir(root, { mode: 0o700 }).catch((error) => {
+    if (error.code !== 'EEXIST') throw error;
+  });
+  await fs.chmod(root, 0o700);
+  const directory = path.join(root, `${process.pid}.${backupInstanceId}.${randomUUID()}`);
+  await fs.mkdir(directory, { mode: 0o700 });
+  activeInspectionCopies.add(directory);
   try {
     const copyPath = path.join(directory, databaseFileName);
     await fs.copyFile(databasePath, copyPath);
@@ -318,18 +344,66 @@ async function withLegacyInspectionCopy(databasePath, inspect) {
     return withQueryOnlyDatabaseFile(copyPath, inspect);
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
+    activeInspectionCopies.delete(directory);
+  }
+}
+
+function inspectionCopyIsAbandoned(name, modifiedAtMs) {
+  if (Date.now() - modifiedAtMs > abandonedRecordTemporaryMs) return true;
+  const [pidText, instanceId] = name.split('.');
+  const pid = Number(pidText);
+  if (!Number.isInteger(pid) || pid < 1 || !instanceId) return false;
+  if (pid === process.pid) return true;
+  return !processIsAlive(pid);
+}
+
+// Removes inspection copies left by a killed process (or a failed removal), keeping any still in
+// use by this process or possibly by another live one.
+async function sweepInspectionCopies(config) {
+  const root = path.join(config.backup.directory, inspectionCopyDirectoryName);
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  const removed = [];
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (activeInspectionCopies.has(entryPath)) continue;
+    const stat = await fs.lstat(entryPath).catch(() => null);
+    if (!stat || !inspectionCopyIsAbandoned(entry.name, stat.mtimeMs)) continue;
+    await fs.rm(entryPath, { recursive: true, force: true });
+    removed.push(entryPath);
+  }
+  return removed;
+}
+
+async function sweepInspectionCopiesSafely(config) {
+  try {
+    const removed = await sweepInspectionCopies(config);
+    if (removed.length > 0) console.warn(`[backup] removed ${removed.length} leftover backup inspection ${removed.length === 1 ? 'copy' : 'copies'}`);
+  } catch (error) {
+    console.error(`[backup] could not remove leftover backup inspection copies: ${error.message}`);
   }
 }
 
 // Hashes the snapshot by streaming, reads only its header, and runs `inspect` against a read-only
-// query-only connection. Memory use does not grow with the database size. The file's identity
-// (device, inode, size, mtime, ctime) and its sidecar list must be the same before and after the
-// whole inspection, so the checksum and the inspected contents describe the same immutable bytes.
+// query-only connection. Memory use does not grow with the database size.
+//
+// The hash, the header read and the SQLite open are separate reads of the file by path. They are
+// tied together only by its lstat identity (device, inode, size, mtime, ctime) and sidecar list,
+// which must be the same before, immediately before the open, and after the whole inspection. That
+// catches a replaced file and any write that moves mtime or ctime. It assumes no other writer: a
+// same-size in-place write landing within the filesystem's timestamp granularity of the previous
+// one could go unseen, which needs a concurrent writer inside the backup directory.
 async function inspectStableSqliteSnapshot(databasePath, {
   expectedSizeBytes = null,
   expectedSha256 = '',
   allowLegacyWalHeader = false,
   allowLegacySidecars = false,
+  inspectionCopyRoot = path.dirname(path.dirname(databasePath)),
 } = {}, inspect = () => undefined) {
   const sidecarsBefore = await existingSqliteSidecars(databasePath);
   if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsBefore);
@@ -351,9 +425,10 @@ async function inspectStableSqliteSnapshot(databasePath, {
     throw new Error(`Current-format database snapshot must persist SQLite rollback header bytes 1/1; found ${header.writeVersion}/${header.readVersion}.`);
   }
 
-  const result = rollbackHeader
+  await assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars });
+  const result = rollbackHeader && sidecarsBefore.length === 0
     ? withQueryOnlyDatabaseFile(databasePath, inspect)
-    : await withLegacyInspectionCopy(databasePath, inspect);
+    : await withInspectionCopy(databasePath, inspectionCopyRoot, inspect);
   const sidecars = await assertSnapshotUnchanged(databasePath, before, sidecarsBefore, { allowLegacySidecars });
   return {
     sha256: snapshotSha256,
@@ -379,7 +454,12 @@ async function normalizeCreatedBackupDatabase(databasePath) {
   if (writeVersion !== 1 || readVersion !== 1) await writeRollbackHeaderBytes(databasePath);
   await fs.chmod(databasePath, 0o600);
 
-  const persisted = await inspectStableSqliteSnapshot(databasePath, {}, assertSnapshotQuickCheck);
+  // The secure-document rows are read in the same pass as quick_check, so they describe exactly
+  // the hashed bytes recorded in the manifest.
+  const persisted = await inspectStableSqliteSnapshot(databasePath, {}, (database) => {
+    assertSnapshotQuickCheck(database);
+    return readSecureDocumentRowsFromDatabase(database);
+  });
   if (persisted.writeVersion !== 1 || persisted.readVersion !== 1) {
     throw new Error('Normalized database snapshot did not persist SQLite rollback header bytes 1/1.');
   }
@@ -388,11 +468,8 @@ async function normalizeCreatedBackupDatabase(databasePath) {
     sizeBytes: persisted.sizeBytes,
     writeVersion: persisted.writeVersion,
     readVersion: persisted.readVersion,
+    secureDocumentRows: persisted.result,
   };
-}
-
-async function readSecureDocumentRows(databasePath) {
-  return (await inspectStableSqliteSnapshot(databasePath, {}, readSecureDocumentRowsFromDatabase)).result;
 }
 
 function readSecureDocumentRowsFromDatabase(database) {
@@ -460,8 +537,7 @@ async function placeSecureDocument(sourcePath, copiedPath, fileOps) {
   }
 }
 
-async function copySecureDocuments({ databasePath, documentsDirectory, destination, fileOps = defaultFileOps }) {
-  const rows = await readSecureDocumentRows(databasePath);
+async function copySecureDocuments({ rows, documentsDirectory, destination, fileOps = defaultFileOps }) {
   const manifestDocuments = [];
 
   for (const row of rows) {
@@ -814,9 +890,10 @@ async function inspectBackupDirectory(config, {
 
 // Verify and record every bundle that has no matching record yet, so the first Operations page
 // load after a deploy or restart does not have to wait for it. Callers run it in the background.
-export function warmBackupVerificationRecords(config = getConfig(), options = {}) {
-  return inspectBackupDirectory(config, { ...options, useRecordedVerification: true, verificationBudgetMs: Infinity })
-    .then(() => undefined);
+// It also sweeps inspection copies left by a process that was killed mid-verification.
+export async function warmBackupVerificationRecords(config = getConfig(), options = {}) {
+  await sweepInspectionCopiesSafely(config);
+  await inspectBackupDirectory(config, { ...options, useRecordedVerification: true, verificationBudgetMs: Infinity });
 }
 
 // Lists `.incomplete` working directories without verifying any finished bundle, so it is cheap
@@ -895,6 +972,7 @@ export async function createBackupBundle({
   } catch (error) {
     console.error(`[backup] could not remove abandoned backup work before backing up: ${error.message}`);
   }
+  await sweepInspectionCopiesSafely(config);
   const id = randomUUID();
   const finalPath = path.join(config.backup.directory, `backup-${backupStamp(now)}-${id.slice(0, 8)}`);
   const workingPath = `${finalPath}.incomplete`;
@@ -912,7 +990,7 @@ export async function createBackupBundle({
     await fs.chmod(databasePath, 0o600);
     const persistedDatabase = await normalizeCreatedBackupDatabase(databasePath);
     const documents = await copySecureDocuments({
-      databasePath,
+      rows: persistedDatabase.secureDocumentRows,
       documentsDirectory: config.secureDocuments.storageDir,
       destination: workingPath,
       fileOps,
@@ -949,7 +1027,12 @@ export async function createBackupBundle({
     }
     await fs.rm(path.join(workingPath, activeMarkerFileName), { force: true });
     await fs.rename(workingPath, finalPath);
-    await enforceBackupRetention(config, now);
+    // The bundle is complete and in place; a retention problem must not undo or fail the backup.
+    try {
+      await enforceBackupRetention(config, now);
+    } catch (error) {
+      console.error(`[backup] backup ${path.basename(finalPath)} succeeded, but backup retention failed: ${error.message}`);
+    }
     return { path: finalPath, manifest, documentsDegraded: verification.documentsDegraded };
   } catch (error) {
     await fs.rm(workingPath, { recursive: true, force: true });
@@ -1011,6 +1094,7 @@ export async function verifyBackupBundle(bundlePath) {
         expectedSha256: manifest.database.sha256,
         allowLegacyWalHeader: isLegacy,
         allowLegacySidecars: isLegacy,
+        inspectionCopyRoot: path.dirname(resolvedBundle),
       }, (database) => {
         assertSnapshotQuickCheck(database);
         return readSecureDocumentRowsFromDatabase(database);

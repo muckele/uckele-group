@@ -12,9 +12,10 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const fillerRowBytes = 4000;
 // better-sqlite3 builds SQLite with a 16 MB default page cache per connection, so the online-backup
 // copy (a source and a destination connection) adds a fixed ~45 MB of RSS whatever the database
-// size. The database must be large enough that this fixed cost stays under the 0.75x bound while
-// any per-byte copy of the database (the old in-memory inspection held 4-5) still exceeds it.
+// size. The bound allows that fixed cost plus half the database, while the old in-memory
+// inspection, which held 4-5 copies of the database, exceeds it several times over.
 const targetDatabaseBytes = 96 * 1024 * 1024;
+const fixedGrowthAllowanceBytes = 32 * 1024 * 1024;
 
 function testConfig(root) {
   return {
@@ -83,7 +84,7 @@ test('a backup of a large database does not hold the database in memory', async 
   t.diagnostic(`database ${dbBytes} bytes; RSS baseline ${baselineKb} KB, peak ${peakKb} KB, growth ${growthBytes} bytes (${(growthBytes / dbBytes).toFixed(2)}x)`);
 
   assert.ok(
-    growthBytes < dbBytes * 0.75,
+    growthBytes < dbBytes * 0.5 + fixedGrowthAllowanceBytes,
     `backup grew RSS by ${growthBytes} bytes for a ${dbBytes}-byte database (${(growthBytes / dbBytes).toFixed(2)}x)`,
   );
   assert.equal(fs.readdirSync(config.backup.directory).filter((name) => name.startsWith('backup-')).length, 1);
