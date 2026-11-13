@@ -25043,19 +25043,32 @@ set search_path = ''
 as $$
 declare
   v_now timestamptz := public.pursue_cim_required_instant_v1(p_command, 'now');
-  v_error_code text := p_command ->> 'errorCode';
+  v_ok boolean;
+  v_error_code text;
   v_row public.deal_hunter_gmail_signatures%rowtype;
 begin
-  if pg_catalog.jsonb_typeof(p_command -> 'ok') is distinct from 'boolean'
-    or pg_catalog.jsonb_typeof(p_command -> 'errorCode') not in ('string', 'null')
-    or (v_error_code is not null and v_error_code !~ '^[a-z0-9_]{1,80}$')
-    or (not (p_command ->> 'ok')::boolean and v_error_code is null) then
+  -- Each check runs on its own, so a malformed value is refused before it is ever cast.
+  if pg_catalog.jsonb_typeof(p_command -> 'ok') is distinct from 'boolean' then
     raise exception 'Invalid Gmail signature refresh';
   end if;
-  if (p_command ->> 'ok')::boolean then
+  v_ok := (p_command ->> 'ok')::boolean;
+  if coalesce(pg_catalog.jsonb_typeof(p_command -> 'errorCode'), 'null') not in ('string', 'null') then
+    raise exception 'Invalid Gmail signature refresh';
+  end if;
+  v_error_code := p_command ->> 'errorCode';
+  if v_error_code is not null and v_error_code !~ '^[a-z0-9_]{1,80}$' then
+    raise exception 'Invalid Gmail signature refresh';
+  end if;
+  if not v_ok and v_error_code is null then
+    raise exception 'Invalid Gmail signature refresh';
+  end if;
+  if v_ok then
     if pg_catalog.jsonb_typeof(p_command -> 'html') is distinct from 'string'
       or pg_catalog.jsonb_typeof(p_command -> 'text') is distinct from 'string'
       or pg_catalog.jsonb_typeof(p_command -> 'digest') is distinct from 'string' then
+      raise exception 'Invalid Gmail signature refresh';
+    end if;
+    if (p_command ->> 'digest') !~ '^[0-9a-f]{64}$' then
       raise exception 'Invalid Gmail signature refresh';
     end if;
     insert into public.deal_hunter_gmail_signatures (id, send_as_address, signature_html,

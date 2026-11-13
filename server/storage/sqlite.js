@@ -5931,6 +5931,8 @@ ${cimCapacityConsumeTriggerSql}
 
       -- The owner's Gmail signature snapshot for Pursue emails: one row, sanitized HTML, its
       -- plain text and digest. A failed refresh records only the attempt and its code.
+      -- A global setting with no opportunity identity: registered as excluded in the canonical
+      -- opportunity merge inventory (canonicalOpportunityMerge.js).
       CREATE TABLE IF NOT EXISTS deal_hunter_gmail_signatures (
         id TEXT NOT NULL PRIMARY KEY CHECK(id = 'current'),
         send_as_address TEXT CHECK(send_as_address IS NULL
