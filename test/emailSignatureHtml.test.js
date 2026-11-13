@@ -96,11 +96,19 @@ test('style keeps only listed CSS properties and safe values', () => {
   for (const style of ['background-image:image-set("https://x.example/a.png" 1x)',
     'background:cross-fade(url(x), url(y))', 'width:-webkit-image-set("https://x" 1x)',
     'width:calc(100% - 1px)', 'color:var(--x)', 'margin-top:-200px', 'margin:0 -1em',
-    'display:flex', 'position:absolute', 'float:left', 'background:red']) {
+    'display:flex', 'position:absolute', 'float:left', 'background:red',
+    // Nothing may hide content.
+    'display:none', 'DISPLAY: None', 'text-indent:-9999px', 'text-indent: -.5em', 'letter-spacing:-2px',
+    'word-spacing:-1em']) {
     assert.equal(clean(`<span style='${style}'>a</span>`), '<span>a</span>', style);
   }
   assert.equal(clean('<td style="padding-right:12px;BORDER-TOP: 1px solid rgb(0, 0, 0);display:block;font-family:\'Helvetica Neue\',Arial">a</td>'),
     '<td style="padding-right:12px;border-top:1px solid rgb(0, 0, 0);display:block;font-family:&#39;Helvetica Neue&#39;,Arial">a</td>');
+});
+
+test('non-negative indents and spacing are kept', () => {
+  assert.equal(clean('<span style="text-indent:2em;letter-spacing:0.5px;word-spacing:1px;display:inline-block">a</span>'),
+    '<span style="text-indent:2em;letter-spacing:0.5px;word-spacing:1px;display:inline-block">a</span>');
 });
 
 test('lone surrogates become U+FFFD in text and attribute values', () => {

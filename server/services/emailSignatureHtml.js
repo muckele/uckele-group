@@ -10,7 +10,7 @@
 
 // Bump when the sanitizing or text rules change: it is part of the Pursue wording digest, so a
 // rendering change pauses sending until the owner approves the wording again.
-export const EMAIL_SIGNATURE_RENDER_VERSION = 'email-signature-html-v2';
+export const EMAIL_SIGNATURE_RENDER_VERSION = 'email-signature-html-v3';
 // The cap applies to the input and to the sanitized output (escaping can grow it), in characters.
 export const EMAIL_SIGNATURE_MAX_CHARS = 64_000;
 export const EMAIL_SIGNATURE_MAX_INPUT_CHARS = EMAIL_SIGNATURE_MAX_CHARS;
@@ -39,7 +39,8 @@ const DIR_VALUE = /^(?:ltr|rtl|auto)$/i;
 // Style is an allow-list of CSS properties. A value with markup, escapes or comments drops the
 // whole attribute; a declaration whose property is not listed, or whose value uses any function
 // other than rgb()/rgba()/hsl()/hsla() (url, image-set, cross-fade, expression, var, ...), or a
-// negative length, is dropped on its own.
+// negative length on a spacing property, is dropped on its own. Nothing may hide content:
+// display:none and negative indents or spacing are refused.
 const STYLE_TRICKS = /[<>\\]|\/\*|@import|javascript:|expression|behavior/i;
 const STYLE_PROPERTIES = new Set(['color', 'background-color', 'font', 'font-family', 'font-size',
   'font-weight', 'font-style', 'font-variant', 'text-align', 'text-decoration', 'text-transform',
@@ -51,7 +52,8 @@ const STYLE_PROPERTIES = new Set(['color', 'background-color', 'font', 'font-fam
   'min-height', 'display']);
 const STYLE_VALUE = /^[A-Za-z0-9#%.,()'" +!-]{1,300}$/;
 const STYLE_FUNCTIONS = new Set(['rgb', 'rgba', 'hsl', 'hsla']);
-const DISPLAY_VALUES = new Set(['block', 'inline', 'inline-block', 'none']);
+const DISPLAY_VALUES = new Set(['block', 'inline', 'inline-block']);
+const NO_NEGATIVE = /^(?:margin|padding|text-indent|letter-spacing|word-spacing)/;
 
 function sanitizeStyle(value) {
   if (value.length > 2000 || STYLE_TRICKS.test(value)) return null;
@@ -64,7 +66,7 @@ function sanitizeStyle(value) {
     if (!STYLE_PROPERTIES.has(property) || !STYLE_VALUE.test(propertyValue)) continue;
     const functions = [...propertyValue.matchAll(/([A-Za-z-]+)\s*\(/g)].map((match) => match[1].toLowerCase());
     if (functions.some((name) => !STYLE_FUNCTIONS.has(name)) || /\(\s*\(/.test(propertyValue)) continue;
-    if (/^(?:margin|padding)/.test(property) && /(?:^|[\s(,])-\s*\.?\d/.test(propertyValue)) continue;
+    if (NO_NEGATIVE.test(property) && /(?:^|[\s(,])-\s*\.?\d/.test(propertyValue)) continue;
     if (property === 'display' && !DISPLAY_VALUES.has(propertyValue.toLowerCase())) continue;
     kept.push(`${property}:${propertyValue}`);
   }

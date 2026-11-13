@@ -20,7 +20,7 @@ const signatureHtml = sanitizeEmailSignatureHtml(GMAIL_SIGNATURE_FIXTURE_HTML).h
 // The stored snapshot shape: sanitized HTML, its text, and its digest.
 const signature = { html: signatureHtml, text: signatureHtmlToText(signatureHtml), digest: sha256(signatureHtml) };
 const sampleDeal = { name: 'Sample Plumbing Co.', brokerName: 'Jordan Lee' };
-const PINNED_DIGEST = '23d8cdd48595400677b8d3cb7a5ee1b2882a7cbb11af3bc8bbb3ad3316451b66';
+const PINNED_DIGEST = 'eb51f4a8269a6b363bc29f4011285b9397f72628138b5c463af300ae202a0804';
 
 // Copied from docs/superpowers/specs/2026-11-03-gmail-send-runners-design.md section 8.2,
 // with the sample deal and the test Gmail signature filled in. A business name that already
