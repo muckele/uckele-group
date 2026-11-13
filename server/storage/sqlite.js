@@ -148,8 +148,15 @@ function cimSafetyDigest(...parts) {
 
 // Called only inside an accepted source transaction. It is deliberately not a
 // storage method: callers cannot supply an arbitrary import-shaped event.
+// `safetyCounts`, when given, must be a Map scoped to one transaction. It holds
+// each safety run's stored event count, read once with COUNT(*) and then kept
+// current as this function inserts, so the cap does not recount the run per call.
+// The count stays exact only while this function is the sole writer of
+// deal_hunter_cim_safety_events inside that transaction.
+// `prepare`, when given, returns statements cached for that same transaction.
 function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
-  sourceRecordId, eventType: classification, evidenceDigest, acceptedAt }) {
+  sourceRecordId, eventType: classification, evidenceDigest, acceptedAt }, safetyCounts = null,
+  prepare = (sql) => database.prepare(sql)) {
   const safetyRunId = `cim-source:${cimSafetyDigest(sourceId, runId)}`;
   const recordKey = cimSafetyDigest('cim-source-record:v1', sourceId, sourceRecordId).slice(0, 32);
   const eventType = `${classification}#${recordKey}`;
@@ -157,7 +164,7 @@ function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
     sourceRecordId, type, evidenceDigest);
   const evidenceId = evidenceFor(eventType);
   const id = cimSafetyDigest('cim-safety:v1', safetyRunId, opportunityId, eventType, evidenceId);
-  const canonical = database.prepare(`SELECT material_revision, status FROM deal_hunter_opportunities
+  const canonical = prepare(`SELECT material_revision, status FROM deal_hunter_opportunities
     WHERE opportunity_id = ?`).get(opportunityId);
   const admittedHistoricalRemoval = classification === 'source-record-removed'
     && canonical?.status === 'superseded';
@@ -165,7 +172,7 @@ function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
     throw new Error('Admitted safety evidence lacks a current canonical opportunity.');
   }
   const sourceType = sourceId === 'deal-os-export' ? 'deal-os-import' : 'sheet-import';
-  const prior = database.prepare(`SELECT * FROM deal_hunter_cim_safety_events
+  const prior = prepare(`SELECT * FROM deal_hunter_cim_safety_events
     WHERE safety_run_id = ? AND opportunity_id = ? AND substr(event_type, -33) = ?`)
     .get(safetyRunId, opportunityId, `#${recordKey}`);
   if (prior) {
@@ -176,18 +183,21 @@ function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
     }
     return { id: prior.id, safetyRunId, emitted: false };
   }
-  if (database.prepare(`SELECT COUNT(*) AS n FROM deal_hunter_cim_safety_events
-    WHERE safety_run_id = ?`).get(safetyRunId).n >= 10000) {
+  const storedEvents = safetyCounts?.get(safetyRunId)
+    ?? prepare(`SELECT COUNT(*) AS n FROM deal_hunter_cim_safety_events
+      WHERE safety_run_id = ?`).get(safetyRunId).n;
+  if (storedEvents >= 10000) {
     throw new Error('Admitted safety run exceeds its bounded reader.');
   }
-  database.prepare(`INSERT INTO deal_hunter_cim_safety_events (
+  prepare(`INSERT INTO deal_hunter_cim_safety_events (
     id, safety_run_id, opportunity_id, source_type, source_run_id,
     canonical_revision, identity_exception_revision, event_type, evidence_id,
     status, created_at, updated_at
   ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'pending', ?, ?)`).run(id, safetyRunId,
     opportunityId, sourceType, runId, canonical.material_revision, eventType,
     evidenceId, acceptedAt, acceptedAt);
-  database.prepare(`INSERT INTO deal_hunter_cim_audit_events (
+  safetyCounts?.set(safetyRunId, storedEvents + 1);
+  prepare(`INSERT INTO deal_hunter_cim_audit_events (
     id, event_type, opportunity_id, next_state, actor, source, occurred_at, metadata
   ) VALUES (?, 'safety-emitted', ?, 'pending', ?, ?, ?, '{}')`).run(
     cimSafetyDigest('cim-audit:v1', 'safety-emitted', id), opportunityId,
@@ -195,12 +205,25 @@ function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
   return { id, safetyRunId, emitted: true };
 }
 
+// Building an Intl.DateTimeFormat is costly and the formatter is stateless, so
+// each one is built once per exact set of constructor arguments.
+const dateTimeFormats = new Map();
+function cachedDateTimeFormat(locale, options) {
+  const key = JSON.stringify([locale, options]);
+  let format = dateTimeFormats.get(key);
+  if (!format) {
+    format = new Intl.DateTimeFormat(locale, options);
+    dateTimeFormats.set(key, format);
+  }
+  return format;
+}
+
 function acceptedPublicationClaim(claim, acceptedAt) {
   if (!claim || claim.meaning !== 'listing_publication') {
     return { state: 'unknown', date: null, instant: null };
   }
   const raw = String(claim.rawValue || '').trim();
-  const acceptedDate = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+  const acceptedDate = Object.fromEntries(cachedDateTimeFormat('en-US', {
     timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
   }).formatToParts(new Date(acceptedAt)).map((part) => [part.type, part.value]));
   const today = `${acceptedDate.year}-${acceptedDate.month}-${acceptedDate.day}`;
@@ -14431,6 +14454,19 @@ ${cimCapacityConsumeTriggerSql}
         let acceptedAt = null;
         const evidenceByRecord = new Map();
         const currentByRecord = new Map();
+        // One cap counter per transaction, shared by every safety call site below.
+        const safetyCounts = new Map();
+        // Statements run per record or per observation are compiled once per
+        // transaction; the SQL text is unchanged at each call site.
+        const preparedStatements = new Map();
+        const prepare = (sql) => {
+          let statement = preparedStatements.get(sql);
+          if (!statement) {
+            statement = database.prepare(sql);
+            preparedStatements.set(sql, statement);
+          }
+          return statement;
+        };
         if (run) {
           const state = database.prepare('SELECT * FROM deal_hunter_source_freshness_state WHERE source_id = ?').get(value.source_id);
           if (!state || run.sourceId !== value.source_id || run.generation > state.next_generation) {
@@ -14453,7 +14489,7 @@ ${cimCapacityConsumeTriggerSql}
           }
           if (value.unresolved.length > 0) {
             for (const item of value.unresolved) {
-              const exception = database.prepare(`SELECT id FROM deal_hunter_identity_exceptions
+              const exception = prepare(`SELECT id FROM deal_hunter_identity_exceptions
                 WHERE id = ? AND status = 'open'`).get(item.identity_exception_id);
               if (!exception) throw new Error('Deferred Sheet evidence requires a current open identity exception.');
             }
@@ -14471,7 +14507,7 @@ ${cimCapacityConsumeTriggerSql}
                 current_canonical_id: item.opportunity_id || null,
                 identity_exception_id: item.identity_exception_id || null,
               };
-              const add = (eventType, fieldKey, claim = null) => database.prepare(`
+              const add = (eventType, fieldKey, claim = null) => prepare(`
                 INSERT INTO deal_hunter_freshness_evidence (
                   id, source_id, source_name, source_record_id, run_id, generation, record_digest,
                   event_type, field_key, accepted_at, original_canonical_id, current_canonical_id,
@@ -14510,25 +14546,25 @@ ${cimCapacityConsumeTriggerSql}
                 sourceId: value.source_id, runId: run.runId,
                 opportunityId: record.opportunity_id, sourceRecordId: record.source_record_id,
                 eventType: 'source-record-changed',
-                evidenceDigest: database.prepare(`SELECT id FROM deal_hunter_freshness_evidence
+                evidenceDigest: prepare(`SELECT id FROM deal_hunter_freshness_evidence
                   WHERE run_id = ? AND source_id = ? AND source_record_id = ?
                     AND event_type = 'accepted_source_record' AND field_key = '' LIMIT 1`)
                   .get(run.runId, value.source_id, record.source_record_id).id,
                 acceptedAt,
-              });
+              }, safetyCounts, prepare);
             }
             for (const item of value.unresolved) {
-              const exception = database.prepare(`SELECT candidate_opportunity_ids
+              const exception = prepare(`SELECT candidate_opportunity_ids
                 FROM deal_hunter_identity_exceptions WHERE id = ? AND status = 'open'`)
                 .get(item.identity_exception_id);
               for (const opportunityId of JSON.parse(exception.candidate_opportunity_ids || '[]')) {
-                if (!database.prepare(`SELECT 1 FROM deal_hunter_opportunities
+                if (!prepare(`SELECT 1 FROM deal_hunter_opportunities
                   WHERE opportunity_id = ? AND status = 'active'`).get(opportunityId)) continue;
                 appendAdmittedImportSafety(database, {
                   sourceId: value.source_id, runId: run.runId, opportunityId,
                   sourceRecordId: item.source_record_id, eventType: 'identity-exception',
                   evidenceDigest: item.identity_exception_id, acceptedAt,
-                });
+                }, safetyCounts, prepare);
               }
             }
             database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
@@ -14537,6 +14573,15 @@ ${cimCapacityConsumeTriggerSql}
             return database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
               WHERE source_id = ? ORDER BY observed_at DESC, id ASC`).all(value.source_id)
               .map(normalizeDealHunterOpportunitySourceObservationRow);
+          }
+          // Each record's first current row, in currentByRecord's own order: the
+          // first-inserted key's latest value. That is exactly the row
+          // `[...currentByRecord.values()].find(...)` returned per record.
+          const firstCurrentByRecordId = new Map();
+          for (const row of currentByRecord.values()) {
+            if (!firstCurrentByRecordId.has(row.source_record_id)) {
+              firstCurrentByRecordId.set(row.source_record_id, row);
+            }
           }
           const insertEvidence = database.prepare(`INSERT INTO deal_hunter_freshness_evidence (
             id, source_id, source_name, source_record_id, run_id, generation, record_digest,
@@ -14560,9 +14605,9 @@ ${cimCapacityConsumeTriggerSql}
                 .sort(([left], [right]) => left.localeCompare(right)),
               freshnessEvidence,
             })).digest('hex');
-            const current = [...currentByRecord.values()].find((row) => row.source_record_id === sourceRecordId);
+            const current = firstCurrentByRecordId.get(sourceRecordId);
             const priorEvidence = current?.accepted_evidence_id
-              ? database.prepare('SELECT * FROM deal_hunter_freshness_evidence WHERE id = ?').get(current.accepted_evidence_id)
+              ? prepare('SELECT * FROM deal_hunter_freshness_evidence WHERE id = ?').get(current.accepted_evidence_id)
               : null;
             if (priorEvidence?.record_digest === recordDigest && current.opportunity_id === record.opportunity_id) {
               evidenceByRecord.set(sourceRecordId, { coreId: current.accepted_evidence_id, changed: false });
@@ -14591,7 +14636,7 @@ ${cimCapacityConsumeTriggerSql}
               return id;
             };
             const coreId = writeEvent('accepted_source_record', '', null);
-            const earlierProven = database.prepare(`SELECT evidence.id, evidence.accepted_at,
+            const earlierProven = prepare(`SELECT evidence.id, evidence.accepted_at,
                 evidence.run_id, evidence.source_record_id, evidence.identity_exception_id
                 FROM deal_hunter_freshness_evidence AS evidence
               LEFT JOIN deal_hunter_identity_exceptions AS exception
@@ -14605,7 +14650,7 @@ ${cimCapacityConsumeTriggerSql}
               ORDER BY evidence.accepted_at, evidence.id LIMIT 1`
             ).get(value.source_id, run.runId, record.opportunity_id, record.opportunity_id);
             if (earlierProven?.identity_exception_id) {
-              database.prepare(`UPDATE deal_hunter_freshness_evidence
+              prepare(`UPDATE deal_hunter_freshness_evidence
                 SET current_canonical_id = ?, binding_audit_id = ?
                 WHERE source_id = ? AND source_record_id = ? AND run_id = ?
                   AND current_canonical_id IS NULL AND identity_exception_id = ?`
@@ -14623,13 +14668,13 @@ ${cimCapacityConsumeTriggerSql}
               const afterId = writeEvent('accepted_source_record', fieldKey, claim, afterValue);
               const beforeObservation = currentByRecord.get(`${sourceRecordId}\u0000${fieldKey}`);
               const beforeCore = beforeObservation?.accepted_evidence_id
-                ? database.prepare('SELECT run_id FROM deal_hunter_freshness_evidence WHERE id = ?').get(beforeObservation.accepted_evidence_id)
+                ? prepare('SELECT run_id FROM deal_hunter_freshness_evidence WHERE id = ?').get(beforeObservation.accepted_evidence_id)
                 : null;
-              const before = beforeCore ? database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+              const before = beforeCore ? prepare(`SELECT * FROM deal_hunter_freshness_evidence
                 WHERE run_id = ? AND source_id = ? AND source_record_id = ?
                   AND event_type = 'accepted_source_record' AND field_key = ? LIMIT 1`
               ).get(beforeCore.run_id, value.source_id, sourceRecordId, fieldKey)
-                : database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+                : prepare(`SELECT * FROM deal_hunter_freshness_evidence
                   WHERE source_id = ? AND source_record_id = ? AND field_key = ?
                     AND event_type = 'accepted_source_record' AND run_id <> ?
                     AND current_canonical_id = ?
@@ -14637,7 +14682,7 @@ ${cimCapacityConsumeTriggerSql}
                 ).get(value.source_id, sourceRecordId, fieldKey, run.runId, record.opportunity_id);
               if (beforeObservation?.opportunity_id !== record.opportunity_id
                 || before?.after_value === afterValue) continue;
-              const competing = database.prepare(`SELECT 1 FROM deal_hunter_opportunity_source_observations
+              const competing = prepare(`SELECT 1 FROM deal_hunter_opportunity_source_observations
                 WHERE opportunity_id = ? AND source_id <> ? AND field = ? AND value <> ? LIMIT 1`
               ).get(record.opportunity_id, value.source_id, fieldKey, String(afterValue));
               const comparable = before && !competing && before.after_value !== null && afterValue !== null
@@ -14647,10 +14692,10 @@ ${cimCapacityConsumeTriggerSql}
               const classification = comparable ? 'comparable_change' : competing ? 'conflict' : 'new_evidence';
               const transitionType = comparable ? 'material_change' : 'evidence_state_change';
               const revision = comparable
-                ? database.prepare('SELECT material_revision FROM deal_hunter_opportunities WHERE opportunity_id = ?')
+                ? prepare('SELECT material_revision FROM deal_hunter_opportunities WHERE opportunity_id = ?')
                   .get(record.opportunity_id).material_revision + 1
                 : null;
-              database.prepare(`INSERT INTO deal_hunter_freshness_evidence (
+              prepare(`INSERT INTO deal_hunter_freshness_evidence (
                 id, source_id, source_name, source_record_id, run_id, generation, record_digest,
                 event_type, field_key, accepted_at, original_canonical_id, current_canonical_id,
                 before_value, after_value, before_evidence_id, after_evidence_id,
@@ -14670,7 +14715,7 @@ ${cimCapacityConsumeTriggerSql}
                 after_evidence_id: afterId, metric: claim.metric, currency: claim.currency,
                 period: claim.period, classification, material_revision: revision,
               });
-              if (comparable) database.prepare(`UPDATE deal_hunter_opportunities
+              if (comparable) prepare(`UPDATE deal_hunter_opportunities
                 SET material_revision = ?, last_material_change_at = ? WHERE opportunity_id = ?`
               ).run(revision, acceptedAt, record.opportunity_id);
             }
@@ -14680,11 +14725,11 @@ ${cimCapacityConsumeTriggerSql}
             // durably unknown so a later complete refresh cannot invent a first date.
             const hasUnprovenEarlierObservation = current?.accepted_evidence_id === null
               && current?.opportunity_id === record.opportunity_id;
-            if (!earlierProven && hasUnprovenEarlierObservation) database.prepare(`UPDATE deal_hunter_opportunities
+            if (!earlierProven && hasUnprovenEarlierObservation) prepare(`UPDATE deal_hunter_opportunities
               SET discovery_state = 'untracked_legacy'
               WHERE opportunity_id = ? AND discovery_state = 'pending' AND first_accepted_at IS NULL`
             ).run(record.opportunity_id);
-            else database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
+            else prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
               first_discovery_evidence_id = ?, discovery_state = ?,
               discovery_revision = discovery_revision + 1
               WHERE opportunity_id = ? AND discovery_state = 'pending' AND first_accepted_at IS NULL`
@@ -14758,13 +14803,13 @@ ${cimCapacityConsumeTriggerSql}
           if (!desiredKeys.has(key)) {
             if (run && ['asking_price', 'annual_profit', 'annual_revenue'].includes(observation.field)) {
               const previousCore = observation.accepted_evidence_id
-                ? database.prepare('SELECT run_id FROM deal_hunter_freshness_evidence WHERE id = ?').get(observation.accepted_evidence_id)
+                ? prepare('SELECT run_id FROM deal_hunter_freshness_evidence WHERE id = ?').get(observation.accepted_evidence_id)
                 : null;
-              const previousField = previousCore ? database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+              const previousField = previousCore ? prepare(`SELECT * FROM deal_hunter_freshness_evidence
                 WHERE run_id = ? AND source_id = ? AND source_record_id = ?
                   AND event_type = 'accepted_source_record' AND field_key = ? LIMIT 1`
               ).get(previousCore.run_id, value.source_id, observation.source_record_id, observation.field) : null;
-              if (previousField) database.prepare(`INSERT INTO deal_hunter_freshness_evidence (
+              if (previousField) prepare(`INSERT INTO deal_hunter_freshness_evidence (
                 id, source_id, source_name, source_record_id, run_id, generation, event_type,
                 field_key, accepted_at, original_canonical_id, current_canonical_id,
                 before_value, before_evidence_id, metric, currency, period, classification
@@ -14790,7 +14835,7 @@ ${cimCapacityConsumeTriggerSql}
               eventType: evidenceByRecord.get(record.source_record_id)?.changed
                 ? 'source-record-changed' : 'source-record-unchanged',
               evidenceDigest: evidenceByRecord.get(record.source_record_id)?.coreId || '', acceptedAt,
-            });
+            }, safetyCounts, prepare);
           }
           const removedAssociations = new Set();
           for (const previous of currentByRecord.values()) {
@@ -14803,7 +14848,7 @@ ${cimCapacityConsumeTriggerSql}
               opportunityId: previous.opportunity_id, sourceRecordId: previous.source_record_id,
               eventType: 'source-record-removed',
               evidenceDigest: previous.accepted_evidence_id || '', acceptedAt,
-            });
+            }, safetyCounts, prepare);
           }
           database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
             accepted_run_id = ?, accepted_digest = ?, accepted_at = ?, projection_state = 'accepted'
