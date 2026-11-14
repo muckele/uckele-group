@@ -238,8 +238,10 @@ function opportunitySnapshot(opportunity = {}) {
 }
 
 export function compareCimOpportunityEvidence(leftDeal = {}, rightOpportunity = {}) {
-  const left = identitySnapshot(leftDeal);
-  const right = opportunitySnapshot(rightOpportunity);
+  return compareIdentitySnapshots(identitySnapshot(leftDeal), opportunitySnapshot(rightOpportunity));
+}
+
+function compareIdentitySnapshots(left, right) {
   const listingNamespace = (value) => normalizeText(value, 300).split(':')[0];
   const listingConflict = left.listingIds.some((leftId) => right.listingIds?.some(
     (rightId) => listingNamespace(leftId) === listingNamespace(rightId) && leftId !== rightId,
@@ -297,6 +299,24 @@ export function compareCimOpportunityEvidence(leftDeal = {}, rightOpportunity = 
       financialConflicts,
     },
   };
+}
+
+/**
+ * Compares a listing with the active opportunities that share its exact identity name, in
+ * their original order. The resolvers only act on `automatic` and `ambiguous` comparisons,
+ * and both require `nameMatch` (equal, non-empty snapshot names), so a comparison with any
+ * other opportunity could never be used.
+ */
+function sameNameComparisons(deal, activeOpportunities) {
+  const left = identitySnapshot(deal);
+  if (!left.name) return [];
+  const comparisons = [];
+  for (const opportunity of activeOpportunities) {
+    const right = opportunitySnapshot(opportunity);
+    if (right.name !== left.name) continue;
+    comparisons.push({ opportunity, ...compareIdentitySnapshots(left, right) });
+  }
+  return comparisons;
 }
 
 function opportunityRecord(deal, opportunityId, now, existing = null) {
@@ -502,7 +522,7 @@ export async function resolveDealHunterOpportunity({
     ? candidateOpportunities
     : await storage.listCurrentDealHunterOpportunities({ limit: 100000 }))
     .filter((opportunity) => opportunity?.status === 'active');
-  const comparisons = opportunities.map((opportunity) => ({ opportunity, ...compareCimOpportunityEvidence(deal, opportunity) }));
+  const comparisons = sameNameComparisons(deal, opportunities);
   const automatic = comparisons.filter((item) => item.automatic);
   const ambiguous = comparisons.filter((item) => item.ambiguous);
   if (automatic.length === 1) {
@@ -658,7 +678,7 @@ export async function resolveDealHunterOpportunityReadOnly({
     ? candidateOpportunities
     : await storage.listCurrentDealHunterOpportunities({ limit: 100000 }))
     .filter((opportunity) => opportunity?.status === 'active');
-  const comparisons = opportunities.map((opportunity) => ({ opportunity, ...compareCimOpportunityEvidence(deal, opportunity) }));
+  const comparisons = sameNameComparisons(deal, opportunities);
   const automatic = comparisons.filter((item) => item.automatic);
   const ambiguous = comparisons.filter((item) => item.ambiguous);
   if (automatic.length === 1) {
