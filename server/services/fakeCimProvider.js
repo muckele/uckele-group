@@ -10,6 +10,10 @@ import {
 } from './cimMailProvider.js';
 import { RFC_MESSAGE_ID, buildRfc5322Message, formatMailboxHeader } from './rfc5322.js';
 
+// The signature the fake mailbox reports until a test sets another (placeholder values only).
+export const FAKE_CIM_SIGNATURE_HTML = '<div dir="ltr"><b>Pat Example</b><br>Example Holdings LLC<br>'
+  + '<a href="mailto:pat@example.com">pat@example.com</a></div>';
+
 const DEFAULT_FAILURE_CODES = Object.freeze({
   'definitive-failure': 'gmail_400',
   ambiguous: 'gmail_timeout',
@@ -30,7 +34,7 @@ function invalidMessage() {
  * @param {string} [options.name]
  * @returns provider & { sent[], attempts[], injectReply(threadId, message), failNext(outcome, opts?),
  *   quotaNext(), expireCheckpointNext(), setReadinessReasons(reasons), rewriteMessageIds(),
- *   failReadMessageIdNext() }
+ *   failReadMessageIdNext(), setSignature(html), failSignatureNext(code), signatureReads }
  */
 export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com', name = 'fake' } = {}) {
   const clock = typeof now === 'function' ? now : () => (now === undefined ? new Date() : new Date(now));
@@ -46,6 +50,9 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
   // Gmail may replace a client Message-ID with its own; when on, every accepted send gets one.
   let rewriteDomain = null;
   let failReadNext = false;
+  let signatureHtml = FAKE_CIM_SIGNATURE_HTML;
+  const signatureFailures = [];
+  const signatureReads = [];
 
   function addToMailbox(message) {
     historyCounter += 1;
@@ -76,8 +83,17 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
     sent,
     attempts,
 
+    signatureReads,
+
     async readiness() {
       return { ready: readinessReasons.length === 0, reasons: [...readinessReasons] };
+    },
+
+    async readSignature() {
+      signatureReads.push(instant());
+      const code = signatureFailures.shift();
+      if (code) return { ok: false, code };
+      return { ok: true, sendAsEmail: senderAddress, html: signatureHtml };
     },
 
     async send(input = {}) {
@@ -200,6 +216,16 @@ export function createFakeCimProvider({ now, senderAddress = 'owner@domain.com',
     /** The next readMessageId fails. */
     failReadMessageIdNext() {
       failReadNext = true;
+    },
+
+    /** The signature HTML the mailbox reports from now on ('' for none). */
+    setSignature(html) {
+      signatureHtml = String(html ?? '');
+    },
+
+    /** The next readSignature fails with `code`. */
+    failSignatureNext(code = 'gmail_timeout') {
+      signatureFailures.push(code);
     },
 
     setReadinessReasons(reasons = []) {

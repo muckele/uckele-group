@@ -7,12 +7,18 @@ import { PRODUCTION_GMAIL_CIM_PROVIDER_PROFILE, cimProviderUsesGmail } from '../
 import { createGmailCimProvider } from './gmailCimProvider.js';
 import { CONTACT_POLICY_VERSION, contactPolicyDigest } from './pursueCimContactPolicy.js';
 import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
+import {
+  pursueSignatureView,
+  readPursueEmailSignature,
+  refreshPursueEmailSignature,
+  usablePursueSignature,
+} from './pursueEmailSignature.js';
 import { PURSUE_CIM_REPLY_POLLER_JOB_NAME, readPursueReplyPollerHold } from './pursueCimReplyPoller.js';
 import { PURSUE_CIM_SENDER_JOB_NAME } from './pursueCimSenderScheduler.js';
 import {
   pursueCimWordingDigest,
+  pursueSignatureComplete,
   renderPursueCimWordingPreview,
-  senderSignatureComplete,
 } from './pursueCimTemplates.js';
 import {
   PURSUE_GMAIL_CAPABILITY_POLICY,
@@ -115,12 +121,39 @@ async function latestRun(storage, jobName, countNames) {
   return projectRun(row && row.job_name === jobName ? row : null, countNames);
 }
 
+function senderNameSet(config) {
+  return String(config?.dealHunter?.sender?.name ?? '').trim() !== '';
+}
+
+/**
+ * The owner-facing sentence for signature_incomplete: what is missing, in plain words.
+ * `view` is the card's signature view.
+ */
+export function signatureIncompleteSentence(view, config) {
+  const nameMissing = !senderNameSet(config);
+  if (view?.loaded && !view.empty) {
+    return 'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings.';
+  }
+  let signature = "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail.";
+  if (view?.loaded) {
+    signature = view.imageOnly
+      ? 'Your Gmail signature is only images, with no text. Add your name as text in Gmail, then refresh it from Gmail.'
+      : 'Your Gmail signature is empty. Add one in Gmail, then refresh it from Gmail.';
+  }
+  return nameMissing
+    ? `${signature} Your name for the From line (DEAL_HUNTER_SENDER_NAME) is also missing from settings.`
+    : signature;
+}
+
 /**
  * Reads the card's status. `includePreview` adds the rendered wording (administrators only).
  * Readiness may refresh the Gmail token through `fetcher` when the last check is stale.
  */
 export async function getEmailSendingStatus({ storage, config, now = new Date(), fetcher, includePreview = false }) {
   const sender = config?.dealHunter?.sender ?? {};
+  const signatureSnapshot = await readPursueEmailSignature(storage);
+  const signature = usablePursueSignature(signatureSnapshot, config);
+  const signatureView = pursueSignatureView(signatureSnapshot, config);
   const [connection, controls] = await Promise.all([storage.getGmailConnection(), storage.getPursueSendControls()]);
   const providerProfile = activeGmailProviderProfile(config);
   const readiness = await readPursueCimProviderReadiness({
@@ -161,13 +194,14 @@ export async function getEmailSendingStatus({ storage, config, now = new Date(),
     },
     wording: {
       approvedDigest: approved ? wordingApproval.valueDigest ?? null : null,
-      currentDigest: pursueCimWordingDigest(sender),
+      currentDigest: pursueCimWordingDigest(sender, signature),
       approvedAt: approved ? wordingApproval.changedAt ?? null : null,
       approvedBy: approved ? wordingApproval.changedBy ?? null : null,
       revision: Number(wordingApproval.revision) || 0,
-      signatureComplete: senderSignatureComplete(sender),
-      ...(includePreview ? { preview: renderPursueCimWordingPreview(sender) } : {}),
+      signatureComplete: pursueSignatureComplete(sender, signature),
+      ...(includePreview ? { preview: renderPursueCimWordingPreview(signature) } : {}),
     },
+    signature: { ...signatureView, senderNameSet: senderNameSet(config) },
     contactRule: controlView(controls.contactRule),
     liveSending: { ...liveSending, providerProfile, capabilitiesInSync: inSync },
     readiness: { ready: readiness.ready === true && reasons.length === 0, reasons },
@@ -193,8 +227,15 @@ export function parseEmailSendingControlRequest(body) {
   if (typeof reason !== 'string' || reason.length > 500) {
     return refusal(400, 'invalid_control', 'reason must be text of at most 500 characters.');
   }
+  // Optional: the wording digest the card showed. Approving refuses when it is no longer the
+  // current one (the Gmail signature was refreshed since the card loaded).
+  const expectedWordingDigest = value.expectedWordingDigest ?? null;
+  if (expectedWordingDigest !== null
+    && (typeof expectedWordingDigest !== 'string' || !/^[0-9a-f]{64}$/.test(expectedWordingDigest))) {
+    return refusal(400, 'invalid_control', 'expectedWordingDigest must be the wording version you loaded.');
+  }
   return { ok: true, controlKey: value.controlKey, enabled: value.enabled,
-    expectedRevision: value.expectedRevision, reason: reason.trim() };
+    expectedRevision: value.expectedRevision, reason: reason.trim(), expectedWordingDigest };
 }
 
 /**
@@ -212,11 +253,18 @@ export async function changeEmailSendingControl({ storage, config, command, acto
     expectedRevision: command.expectedRevision, actor, reason: command.reason, now: at,
     valueDigest: null, policyVersion: null };
   if (command.controlKey === 'wording_approval' && command.enabled) {
-    if (!senderSignatureComplete(sender)) {
+    // The approved digest binds the signature stored now: the one the card's preview showed.
+    const snapshot = await readPursueEmailSignature(storage);
+    const signature = usablePursueSignature(snapshot, config);
+    if (!pursueSignatureComplete(sender, signature)) {
       return refusal(409, 'signature_incomplete',
-        'Your name, title, phone, or mailing address is missing from settings.');
+        signatureIncompleteSentence(pursueSignatureView(snapshot, config), config));
     }
-    write.valueDigest = pursueCimWordingDigest(sender);
+    write.valueDigest = pursueCimWordingDigest(sender, signature);
+    if (command.expectedWordingDigest && command.expectedWordingDigest !== write.valueDigest) {
+      return refusal(409, 'wording_changed',
+        'The wording or your Gmail signature changed since the card loaded. Review the preview and approve again.');
+    }
   }
   if (command.controlKey === 'contact_rule') {
     write.policyVersion = CONTACT_POLICY_VERSION;
@@ -256,4 +304,17 @@ export async function changeEmailSendingControl({ storage, config, command, acto
         providerProfile, now: at }) } };
   }
   return { ok: true, status: 200, control: controlView(control) };
+}
+
+/**
+ * The owner's "Refresh from Gmail": reads the signature from Gmail and stores the snapshot (a
+ * failure keeps the stored one and records its code), then returns the card's status.
+ */
+export async function refreshEmailSendingSignature({ storage, config, now = new Date(), fetcher,
+  includePreview = false, logger }) {
+  const refresh = await refreshPursueEmailSignature({ storage, config, now, source: 'owner',
+    ...(fetcher ? { fetcher } : {}), ...(logger ? { logger } : {}) });
+  const emailSending = await getEmailSendingStatus({ storage, config, now, includePreview,
+    ...(fetcher ? { fetcher } : {}) });
+  return { ok: refresh.ok, code: refresh.code ?? null, emailSending };
 }

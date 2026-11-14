@@ -12,12 +12,15 @@ import {
   P10B_CONTROLLED_MAILBOX_TEXT,
 } from '../server/services/pursueCimControlledMailboxTemplate.js';
 import { contactPolicyDigest } from '../server/services/pursueCimContactPolicy.js';
+import { pursueCimWordingDigest } from '../server/services/pursueCimTemplates.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import {
   GATE_NOW,
   GMAIL_PROFILE,
   createGmailGateFixture,
   setSendControl,
+  SENDER_SETTINGS,
+  fixtureSignature,
 } from './fixtures/pursueCimGmailGateFixture.js';
 
 const now = '2026-09-25T19:00:00.000Z';
@@ -753,7 +756,8 @@ test('SQLite rule-based campaign: the rule off pauses without terminal events an
   // Readiness is satisfied by injection so the storage contact-rule check decides alone.
   const readyGmail = async () => ({ provider: 'gmail', providerProfile: GMAIL_PROFILE, ready: true,
     reasons: [], signatureComplete: true, evidenceRevision: 'rule-test', generatedAt: GATE_NOW,
-    expiresAt: '2026-09-29T16:59:00.000Z' });
+    expiresAt: '2026-09-29T16:59:00.000Z',
+    wordingDigest: pursueCimWordingDigest(SENDER_SETTINGS, fixtureSignature()) });
   // Each attempt runs at its own instant, as separate sender runs would.
   const minute = (offset) => new Date(Date.parse(GATE_NOW) + offset * 60_000).toISOString();
   await setSendControl(storage, 'contact_rule', false);
@@ -769,6 +773,21 @@ test('SQLite rule-based campaign: the rule off pauses without terminal events an
   const resumed = await fixture.gate({ readProviderReadiness: readyGmail, now: minute(2) });
   assert.equal(resumed.authorized, true, JSON.stringify(resumed));
   assert.equal(terminalEvents(database), 0);
+});
+
+test('SQLite gate refuses a Pursue Gmail email rendered under other wording, without terminal events', async (t) => {
+  for (const [suffix, wordingTag] of [['wording-stale', 'f'.repeat(64)], ['wording-missing', 'not-a-digest']]) {
+    const fixture = await createGmailGateFixture(t, suffix, { wordingTag });
+    const outcome = await fixture.gate();
+    assert.equal(outcome.authorized, false);
+    assert.equal(outcome.blockedReason, 'wording_changed');
+    assert.equal(terminalEvents(fixture.database), 0);
+    assert.equal(fixture.database.prepare('SELECT state FROM deal_hunter_cim_transmissions WHERE id = ?')
+      .get(fixture.transmission.id).state, 'prepared');
+  }
+  // Rendered under the current, approved wording: authorized.
+  const current = await createGmailGateFixture(t, 'wording-current');
+  assert.equal((await current.gate()).authorized, true);
 });
 
 test('SQLite rule-based campaign ignores the activation permission fields', async (t) => {

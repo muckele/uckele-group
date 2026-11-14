@@ -217,6 +217,49 @@ export function createGmailCimProvider({ storage, config, fetcher = defaultFetch
       return { ready: reasons.length === 0, reasons };
     },
 
+    /**
+     * The owner's Gmail signature for the configured send-as address
+     * (users.settings.sendAs.get, which the gmail.readonly scope already allows). Never throws:
+     * `{ ok: true, sendAsEmail, html }` (html is '' when Gmail has no signature) or
+     * `{ ok: false, code }` with a code only, never a Google response body.
+     */
+    async readSignature() {
+      const sender = senderAddress();
+      if (!sender) return { ok: false, code: 'gmail_not_connected' };
+      let token;
+      try {
+        token = await accessToken();
+      } catch (error) {
+        return { ok: false, code: tokenFailureCode(error) };
+      }
+      const response = await gmailRequest(fetcher, token,
+        `${API}/settings/sendAs/${encodeURIComponent(sender)}`);
+      if (response.transport) return { ok: false, code: response.transport };
+      const { status, body } = response;
+      if (status === 401) return { ok: false, code: 'gmail_token_invalid' };
+      if (status === 403) {
+        const reasons = errorReasons(body);
+        const quota = reasons.find((reason) => QUOTA_REASONS.has(reason));
+        // Snake case, so the code survives the code pattern storage and logs accept.
+        if (quota) {
+          return { ok: false, code: `gmail_403_${quota.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)}` };
+        }
+        return { ok: false, code: reasons.some((reason) => ACCESS_DENIED_REASONS.has(reason))
+          ? 'gmail_access_denied' : 'gmail_403' };
+      }
+      if (status === 404) return { ok: false, code: 'gmail_send_as_not_found' };
+      if (status < 200 || status >= 300) return { ok: false, code: `gmail_${status}` };
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || (body.signature !== undefined && body.signature !== null && typeof body.signature !== 'string')) {
+        return { ok: false, code: 'gmail_response_invalid' };
+      }
+      const sendAsEmail = typeof body.sendAsEmail === 'string' ? body.sendAsEmail.trim() : sender;
+      if (sendAsEmail.toLowerCase() !== sender.toLowerCase()) {
+        return { ok: false, code: 'gmail_send_as_mismatch' };
+      }
+      return { ok: true, sendAsEmail, html: typeof body.signature === 'string' ? body.signature : '' };
+    },
+
     async send({ transmissionId, to, from, subject, text, html, threadId, inReplyTo, references } = {}) {
       const sender = senderAddress();
       if (!sender) return cimSendResult('not-attempted', { code: 'gmail_not_connected' });

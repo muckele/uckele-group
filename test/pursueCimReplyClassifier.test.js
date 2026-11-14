@@ -130,3 +130,45 @@ test('the precedence order is ours, owner, bounce, auto-reply, stop, reply', () 
   assert.equal(classify(message({ bodyPrefix: 'stop' })), 'stop');
   assert.equal(classify(message()), 'reply');
 });
+
+test('replies to a footer-less email that ends with the Gmail signature are still classified', () => {
+  // Pursue emails now end with "Best," and the owner's Gmail signature: no stop line, no address.
+  const ours = 'Hi Jordan,\n\nBumping this up. Still interested in Acme Plumbing, and happy to sign the NDA today.'
+    + '\n\nBest,\nPat Example\nPresident\nExample Holdings LLC\n(555) 010-0000\npat@example.com';
+  const quoted = `\n\nOn Wed, Oct 30, 2030 at 8:00 AM Pat Example <owner@uckele.example.test> wrote:\n${
+    ours.split('\n').map((line) => `> ${line}`).join('\n')}\n`;
+  assert.equal(classify(message({ bodyPrefix: `Please stop.${quoted}` })), 'stop');
+  assert.equal(classify(message({ bodyPrefix: `Remove me from your list, thanks${quoted}` })), 'stop');
+  assert.equal(classify(message({ bodyPrefix: `STOP${quoted}` })), 'stop');
+  assert.equal(classify(message({ bodyPrefix: `Sure, NDA attached.${quoted}` })), 'reply');
+  assert.equal(classify(message({ bodyPrefix: 'Sure, NDA attached.' })), 'reply');
+});
+
+test('our Gmail signature inlined in a reply is not a stop request; the broker\'s own stop still is', () => {
+  const signatureText = 'Pat Example\nPresident\nTo unsubscribe from my updates, reply UNSUBSCRIBE\nDo not contact after hours';
+  // An inlined original with no quote markers, no "On ... wrote:" and no From: line.
+  const inlined = 'Sounds good, NDA attached.\n\nHi Jordan,\nBumping this up.\n\nBest,\nPat Example\nPresident\n'
+    + 'To unsubscribe from my updates,   reply UNSUBSCRIBE\ndo not contact after hours';
+  assert.equal(classify(message({ bodyPrefix: inlined })), 'stop', 'without the signature text it looks like a stop');
+  assert.equal(classify(message({ bodyPrefix: inlined }), { signatureText }), 'reply');
+  assert.equal(classify(message({ bodyPrefix: `Please stop.\n${inlined}` }), { signatureText }), 'stop');
+  assert.equal(classify(message({ bodyPrefix: 'STOP' }), { signatureText }), 'stop');
+  // The old footer is still removed too.
+  assert.equal(classify(message({ bodyPrefix: 'Sure.\n\nIf you would rather I not reach out about future listings, just reply "stop".' }),
+    { signatureText }), 'reply');
+});
+
+test('our signature is removed only as a whole block, never a single line the broker wrote', () => {
+  const signatureText = 'Pat Example\nPresident, Example Holdings LLC\n\nReply STOP to opt out';
+  // The broker writes, as their own reply, a line identical to one signature line.
+  assert.equal(classify(message({ bodyPrefix: 'Reply STOP to opt out' }), { signatureText }), 'stop');
+  assert.equal(classify(message({ bodyPrefix: 'Thanks.\nreply   stop to OPT out\nPresident, Example Holdings LLC' }),
+    { signatureText }), 'stop');
+  // The full signature block, inlined (blank lines and spacing differ), is removed.
+  const inlined = 'Sounds good, NDA attached.\n\nBest,\nPat Example\n  President,  Example Holdings LLC\n\n\nreply stop to opt out\n';
+  assert.equal(classify(message({ bodyPrefix: inlined }), { signatureText }), 'reply');
+  // A stop line of the broker's own next to the full block still counts.
+  assert.equal(classify(message({ bodyPrefix: `Please stop.\n${inlined}` }), { signatureText }), 'stop');
+  // A one-line signature is never removed.
+  assert.equal(classify(message({ bodyPrefix: 'Unsubscribe' }), { signatureText: 'Unsubscribe' }), 'stop');
+});

@@ -167,7 +167,9 @@ import {
   changeEmailSendingControl,
   getEmailSendingStatus,
   parseEmailSendingControlRequest,
+  refreshEmailSendingSignature,
 } from './services/pursueEmailSending.js';
+import { refreshPursueEmailSignature } from './services/pursueEmailSignature.js';
 import {
   createCimRecipientOverride,
   resolveCimIdentityException,
@@ -2643,7 +2645,6 @@ export function createApp({
           now: new Date(),
           fetcher: gmailFetcher,
         });
-        response.redirect(302, gmailOperationsRedirect('connected'));
       } catch (error) {
         const code = gmailCallbackErrorCodes.has(error?.code) ? error.code : 'gmail_connect_failed';
         if (code === 'gmail_connect_failed') {
@@ -2651,7 +2652,14 @@ export function createApp({
             code, cause: String(error?.code || error?.name || 'Error').slice(0, 100) });
         }
         response.redirect(302, gmailOperationsRedirect(code));
+        return;
       }
+      // A fresh connection reads the owner's Gmail signature for Pursue emails. It never throws:
+      // a failure keeps any stored signature, records its code and logs one line, and the
+      // connection stands (the card offers "Refresh from Gmail").
+      await refreshPursueEmailSignature({ storage: getStorage(), config, now: new Date(),
+        fetcher: gmailFetcher, source: 'gmail-connect' });
+      response.redirect(302, gmailOperationsRedirect('connected'));
     }),
   );
 
@@ -2729,6 +2737,32 @@ export function createApp({
         return;
       }
       response.json({ success: true, control: result.control });
+    }),
+  );
+
+  // "Refresh from Gmail" on the Email sending card: re-reads the owner's Gmail signature for
+  // Pursue emails and returns the card's status. Admin role only, like the controls.
+  app.post(
+    '/api/admin/deal-hunter/email-sending/signature/refresh',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      if (session.role !== 'admin') {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await refreshEmailSendingSignature({
+        storage: getStorage(),
+        config,
+        now: new Date(),
+        fetcher: gmailFetcher,
+        includePreview: true,
+      });
+      response.json({ success: true, refreshed: result.ok, code: result.code,
+        emailSending: result.emailSending });
     }),
   );
 

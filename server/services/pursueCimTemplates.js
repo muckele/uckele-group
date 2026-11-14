@@ -1,12 +1,19 @@
 import { createHash } from 'node:crypto';
 
+import { EMAIL_SIGNATURE_RENDER_VERSION, signatureHasContent } from './emailSignatureHtml.js';
+
 // Pursue CIM email copy: the owner-approved wording from
 // docs/superpowers/specs/2026-11-03-gmail-send-runners-design.md section 8.2.
-// Changing any template string, version, or sender signature field changes the wording
-// digest, which pauses sending until the owner approves the wording again.
+// Every email ends with "Best," and the owner's Gmail signature (section 8.1); there is no
+// footer. Changing any template string or version, the sender name, or the stored signature
+// changes the wording digest, which pauses sending until the owner approves the wording again.
 
-export const PURSUE_CIM_INITIAL_TEMPLATE_VERSION = 'pursue-cim-initial-v3';
-export const PURSUE_CIM_FOLLOW_UP_TEMPLATE_VERSION = 'pursue-cim-follow-up-v2';
+export const PURSUE_CIM_INITIAL_TEMPLATE_VERSION = 'pursue-cim-initial-v4';
+export const PURSUE_CIM_FOLLOW_UP_TEMPLATE_VERSION = 'pursue-cim-follow-up-v3';
+// The tag a prepared Pursue email carries with the wording digest it was rendered under. The
+// sender sends a prepared email only while that digest is still the current one, so an email
+// prepared before a signature or wording change is never sent with the old wording.
+export const PURSUE_CIM_WORDING_TAG = 'cim_wording';
 
 const GREETING_TEMPLATE = 'Hi {firstName},';
 const GREETING_FALLBACK = 'Hi there,';
@@ -46,8 +53,7 @@ const FOLLOW_UP_PARAGRAPHS = {
 
 const ROTATING_VARIANTS = ['A', 'B', 'C', 'D'];
 
-const SIGNATURE_LINES = ['Best,', '{name}', '{title}, Uckele Group', '{phone}'];
-const FOOTER_LINES = ['If you would rather I not reach out about future listings, just reply "stop".', '{postal}'];
+const SIGN_OFF = 'Best,';
 
 const SAMPLE_DEAL = Object.freeze({ name: 'Sample Plumbing Co.', brokerName: 'Jordan Lee' });
 
@@ -103,33 +109,41 @@ export function pursueCimFollowUpVariant(followUpNumber, isFinal = false) {
   return ROTATING_VARIANTS[(followUpNumber - 1) % ROTATING_VARIANTS.length];
 }
 
-export function senderSignatureComplete(sender) {
-  return ['name', 'title', 'phone', 'postalAddress']
-    .every((field) => oneLine(sender?.[field]) !== '');
+/** The signature's sanitized HTML and plain text, or null when there is none to show. */
+function signatureBlock(signature) {
+  const html = typeof signature?.html === 'string' ? signature.html : '';
+  if (!signatureHasContent(html)) return null;
+  return { html, text: typeof signature.text === 'string' ? signature.text.trim() : '' };
 }
 
-function signatureValues(sender) {
-  return {
-    name: oneLine(sender?.name),
-    title: oneLine(sender?.title),
-    phone: oneLine(sender?.phone),
-    postal: oneLine(sender?.postalAddress),
-  };
+/**
+ * True when a Pursue email can be signed: the sender name (the From display name) is set and
+ * the Gmail signature snapshot has text (an image's alt text counts), so the plain-text part is
+ * signed too. Title, phone and postal address are not used.
+ */
+export function pursueSignatureComplete(sender, signature) {
+  return oneLine(sender?.name) !== '' && signatureBlock(signature) !== null;
 }
 
+/**
+ * Renders one Pursue email. `signature` is the stored Gmail signature snapshot
+ * (`{ html, text }`, html already sanitized by emailSignatureHtml.js). Without one the email
+ * ends with "Best," alone: rendering stays deterministic for previews, and readiness
+ * (signature_incomplete) and the preparation paths refuse to send such an email.
+ */
 export function renderPursueCimEmail({
   kind,
   followUpNumber,
   isFinal = false,
   deal = {},
-  sender = {},
+  signature = null,
   initialSubject,
 } = {}) {
   if (kind !== 'initial' && kind !== 'follow-up') {
     throw new TypeError('kind must be "initial" or "follow-up".');
   }
   const business = oneLine(deal?.name) || 'the listed business';
-  const values = { business, ...signatureValues(sender) };
+  const values = { business };
   const greeting = greetingFor(deal?.brokerName);
 
   let variant = 'initial';
@@ -144,23 +158,33 @@ export function renderPursueCimEmail({
     subject = base.startsWith(FOLLOW_UP_SUBJECT_PREFIX) ? base : `${FOLLOW_UP_SUBJECT_PREFIX}${base}`;
   }
 
-  // Each block is a paragraph; a block with several lines (signature, footer) breaks between lines.
+  // Each block is a paragraph; a labeled block breaks between its lines.
   const blocks = [
     [greeting.template],
     ...bodyParagraphs.map((paragraph) => (Array.isArray(paragraph) ? paragraph : [paragraph])),
-    SIGNATURE_LINES,
-    FOOTER_LINES,
+    [SIGN_OFF],
   ];
   const render = (escape, lineBreak) => blocks.map((lines) => lines
     .map((line) => fill(line, { ...values, ...greeting.values }, escape))
     .join(lineBreak));
 
-  const text = render((value) => value, '\n').join('\n\n');
-  const html = render(escapeHtml, '<br>').map((block) => `<p>${block}</p>`).join('\n');
+  const signed = signatureBlock(signature);
+  const textBlocks = render((value) => value, '\n');
+  if (signed?.text) textBlocks[textBlocks.length - 1] += `\n${signed.text}`;
+  const text = textBlocks.join('\n\n');
+  // The signature HTML was sanitized when it was stored, so it is inserted as is; everything
+  // else is escaped.
+  const htmlBlocks = render(escapeHtml, '<br>').map((block) => `<p>${block}</p>`);
+  if (signed) htmlBlocks.push(`<div>${signed.html}</div>`);
+  const html = htmlBlocks.join('\n');
   return { subject, text, html, templateVersion, variant };
 }
 
-export function pursueCimWordingDigest(sender) {
+/**
+ * The digest the owner approves: every template string and version, the sender name, the
+ * signature render version, and the stored signature's digest. `signature` is the usable snapshot (`{ digest }`) or null.
+ */
+export function pursueCimWordingDigest(sender, signature = null) {
   const canonical = JSON.stringify({
     versions: {
       initial: PURSUE_CIM_INITIAL_TEMPLATE_VERSION,
@@ -173,22 +197,20 @@ export function pursueCimWordingDigest(sender) {
       followUpSubjectPrefix: FOLLOW_UP_SUBJECT_PREFIX,
       initialParagraphs: INITIAL_PARAGRAPHS,
       followUpParagraphs: FOLLOW_UP_PARAGRAPHS,
-      signatureLines: SIGNATURE_LINES,
-      footerLines: FOOTER_LINES,
+      signOff: SIGN_OFF,
     },
-    sender: {
-      name: oneLine(sender?.name),
-      title: oneLine(sender?.title),
-      phone: oneLine(sender?.phone),
-      postalAddress: oneLine(sender?.postalAddress),
-    },
+    sender: { name: oneLine(sender?.name) },
+    // A change to the signature sanitizer or its text rules changes what brokers receive.
+    signatureRenderVersion: EMAIL_SIGNATURE_RENDER_VERSION,
+    signatureDigest: typeof signature?.digest === 'string' && signature.digest ? signature.digest : null,
   });
   return createHash('sha256').update(canonical).digest('hex');
 }
 
-// Every template rendered for the sample deal, for the owner's approval card.
-export function renderPursueCimWordingPreview(sender) {
-  const initial = renderPursueCimEmail({ kind: 'initial', deal: SAMPLE_DEAL, sender });
+// Every template rendered for the sample deal, for the owner's approval card: the plain text
+// and the HTML (which shows the Gmail signature as it will appear).
+export function renderPursueCimWordingPreview(signature = null) {
+  const initial = renderPursueCimEmail({ kind: 'initial', deal: SAMPLE_DEAL, signature });
   const followUps = [
     { followUpNumber: 1, isFinal: false },
     { followUpNumber: 2, isFinal: false },
@@ -196,7 +218,16 @@ export function renderPursueCimWordingPreview(sender) {
     { followUpNumber: 4, isFinal: false },
     { followUpNumber: 5, isFinal: true },
   ].map((options) => renderPursueCimEmail({
-    kind: 'follow-up', ...options, deal: SAMPLE_DEAL, sender, initialSubject: initial.subject,
+    kind: 'follow-up', ...options, deal: SAMPLE_DEAL, signature, initialSubject: initial.subject,
   }));
-  return [initial, ...followUps].map(({ variant, subject, text }) => ({ variant, subject, text }));
+  return [initial, ...followUps].map(({ variant, subject, text, html }) => ({ variant, subject, text, html }));
+}
+
+/** The wording digest a prepared email's tags carry, or null when it carries none. */
+export function pursueCimWordingTagValue(tags) {
+  const prefix = `${PURSUE_CIM_WORDING_TAG}=`;
+  const values = (Array.isArray(tags) ? tags : [])
+    .filter((tag) => typeof tag === 'string' && tag.startsWith(prefix))
+    .map((tag) => tag.slice(prefix.length));
+  return values.length === 1 && /^[0-9a-f]{64}$/.test(values[0]) ? values[0] : null;
 }

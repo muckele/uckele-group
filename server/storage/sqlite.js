@@ -46,6 +46,7 @@ import {
   validateSetPursueSendControl, normalizeGmailReplyMessageRow, normalizeGmailSentIdentityRow,
   validateGmailReplyMessage, validateGmailReplyMessageLookup, validateGmailSentIdentityLookup,
   validateGmailPendingReplyLookup,
+  normalizeGmailSignatureRow, validateGmailSignatureRefresh,
 } from './gmailSendStorageContract.js';
 import {
   normalizePursuitBundle, normalizePursuitDocumentRow, normalizePursuitStageEventRow, PURSUIT_CIM_DOCUMENT_TYPES,
@@ -5951,6 +5952,28 @@ ${cimCapacityConsumeTriggerSql}
       CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_gmail_connections_active
         ON deal_hunter_gmail_connections((1)) WHERE revoked_at IS NULL;
 
+      -- The owner's Gmail signature snapshot for Pursue emails: one row, sanitized HTML, its
+      -- plain text and digest. A failed refresh records only the attempt and its code.
+      -- A global setting with no opportunity identity: registered as excluded in the canonical
+      -- opportunity merge inventory (canonicalOpportunityMerge.js).
+      CREATE TABLE IF NOT EXISTS deal_hunter_gmail_signatures (
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = 'current'),
+        send_as_address TEXT CHECK(send_as_address IS NULL
+          OR (send_as_address = trim(send_as_address) AND length(send_as_address) BETWEEN 3 AND 320)),
+        signature_html TEXT CHECK(signature_html IS NULL OR length(signature_html) <= 262144),
+        signature_text TEXT CHECK(signature_text IS NULL OR length(signature_text) <= 131072),
+        signature_digest TEXT CHECK(signature_digest IS NULL OR (length(signature_digest) = 64
+          AND signature_digest NOT GLOB '*[^0-9a-f]*')),
+        fetched_at TEXT CHECK(fetched_at IS NULL OR julianday(fetched_at) IS NOT NULL),
+        last_attempt_at TEXT NOT NULL CHECK(julianday(last_attempt_at) IS NOT NULL),
+        last_error_code TEXT CHECK(last_error_code IS NULL OR (length(last_error_code) BETWEEN 1 AND 80
+          AND last_error_code NOT GLOB '*[^a-z0-9_]*')),
+        CHECK((signature_digest IS NULL) = (fetched_at IS NULL)
+          AND (signature_digest IS NULL) = (signature_html IS NULL)
+          AND (signature_digest IS NULL) = (signature_text IS NULL)
+          AND (signature_digest IS NULL) = (send_as_address IS NULL))
+      );
+
       -- Durable, revisioned Pursue send controls; every change appends a CIM audit event.
       CREATE TABLE IF NOT EXISTS deal_hunter_pursue_send_controls (
         control_key TEXT NOT NULL PRIMARY KEY
@@ -11564,6 +11587,41 @@ ${cimCapacityConsumeTriggerSql}
           UPDATE deal_hunter_gmail_connections SET history_checkpoint = ?
           WHERE revoked_at IS NULL AND history_checkpoint IS ?
         `).run(next, expected).changes === 1;
+      },
+
+      async getGmailSignature() {
+        return normalizeGmailSignatureRow(database.prepare(`
+          SELECT * FROM deal_hunter_gmail_signatures WHERE id = 'current'
+        `).get());
+      },
+
+      /** Stores a refreshed snapshot, or records a failed attempt and keeps the snapshot. */
+      async recordGmailSignatureRefresh(command = {}) {
+        const refresh = validateGmailSignatureRefresh(command);
+        return database.transaction(() => {
+          if (refresh.ok) {
+            database.prepare(`
+              INSERT INTO deal_hunter_gmail_signatures (id, send_as_address, signature_html,
+                signature_text, signature_digest, fetched_at, last_attempt_at, last_error_code)
+              VALUES ('current', ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET send_as_address = excluded.send_as_address,
+                signature_html = excluded.signature_html, signature_text = excluded.signature_text,
+                signature_digest = excluded.signature_digest, fetched_at = excluded.fetched_at,
+                last_attempt_at = excluded.last_attempt_at, last_error_code = excluded.last_error_code
+            `).run(refresh.sendAsEmail, refresh.html, refresh.text, refresh.digest, refresh.now,
+              refresh.now, refresh.errorCode);
+          } else {
+            database.prepare(`
+              INSERT INTO deal_hunter_gmail_signatures (id, last_attempt_at, last_error_code)
+              VALUES ('current', ?, ?)
+              ON CONFLICT(id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,
+                last_error_code = excluded.last_error_code
+            `).run(refresh.now, refresh.errorCode);
+          }
+          return normalizeGmailSignatureRow(database.prepare(`
+            SELECT * FROM deal_hunter_gmail_signatures WHERE id = 'current'
+          `).get());
+        }).immediate();
       },
 
       async getPursueSendControls() {

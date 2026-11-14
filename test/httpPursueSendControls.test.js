@@ -26,18 +26,22 @@ process.env.GOOGLE_OAUTH_CLIENT_SECRET = CLIENT_SECRET;
 process.env.DEAL_HUNTER_GMAIL_SENDER_ADDRESS = 'owner@uckele.test';
 process.env.DEAL_HUNTER_GMAIL_TOKEN_KEY = TOKEN_KEY;
 process.env.DEAL_HUNTER_SENDER_NAME = 'Mathew Uckele';
-process.env.DEAL_HUNTER_SENDER_TITLE = 'Owner';
-process.env.DEAL_HUNTER_SENDER_PHONE = '555-0100';
-process.env.DEAL_HUNTER_CIM_AUTOMATION_PHYSICAL_POSTAL_ADDRESS = '1 Main St, Springfield';
 
 const { createApp } = await import('../server/app.js');
 const { getConfig } = await import('../server/config.js');
 const { getStorage } = await import('../server/storage/index.js');
 const { pursueCimWordingDigest } = await import('../server/services/pursueCimTemplates.js');
 const { CONTACT_POLICY_VERSION } = await import('../server/services/pursueCimContactPolicy.js');
+const { usablePursueSignature } = await import('../server/services/pursueEmailSignature.js');
+const { sha256 } = await import('../server/utils/security.js');
 
 const statusPath = '/api/admin/deal-hunter/email-sending';
 const controlsPath = '/api/admin/deal-hunter/email-sending/controls';
+const signatureRefreshPath = '/api/admin/deal-hunter/email-sending/signature/refresh';
+const SEND_AS_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs/owner%40uckele.test';
+// What Gmail's sendAs settings return for the owner's address; tests change it.
+let sendAsResponse = () => json(200, { sendAsEmail: 'owner@uckele.test', isPrimary: true,
+  signature: '<div dir="ltr"><b>Mathew Uckele</b><br>Example Holdings LLC</div>' });
 const gmailBase = '/api/admin/deal-hunter/gmail';
 const secrets = [REFRESH_TOKEN, ACCESS_TOKEN, CLIENT_SECRET, TOKEN_KEY];
 
@@ -74,6 +78,7 @@ async function gmailFetcher(url) {
     return json(200, { emailAddress: 'owner@uckele.test', historyId: '7100' });
   }
   if (target === 'https://oauth2.googleapis.com/revoke') return json(200, {});
+  if (target === SEND_AS_URL) return sendAsResponse();
   throw new Error(`unexpected fetch ${target}`);
 }
 
@@ -119,6 +124,17 @@ async function connectGmail(origin, admin) {
 }
 
 const admin = (origin) => login(origin, 'admin', 'change-me-now');
+
+/** The usable signature snapshot stored now (null when none), as readiness reads it. */
+async function storedSignature() {
+  return usablePursueSignature(await getStorage().getGmailSignature(), getConfig());
+}
+
+/** Stores a signature snapshot directly, as a refresh from Gmail would. */
+async function seedStoredSignature(html = '<div><b>Mathew Uckele</b></div>') {
+  await getStorage().recordGmailSignatureRefresh({ ok: true, sendAsEmail: 'owner@uckele.test', html,
+    text: 'Mathew Uckele', digest: sha256(html), now: new Date().toISOString() });
+}
 const viewer = (origin) => login(origin, 'send-viewer', 'send-viewer-password');
 
 test.after(() => {
@@ -138,15 +154,18 @@ test('viewer gets status without preview and cannot change controls', async () =
     assert.equal(status.json.success, true);
     const { emailSending } = status.json;
     assert.equal(emailSending.gmail.connected, false);
-    assert.equal(emailSending.wording.currentDigest, pursueCimWordingDigest(getConfig().dealHunter.sender));
+    assert.equal(emailSending.wording.currentDigest, pursueCimWordingDigest(getConfig().dealHunter.sender, null));
+    assert.equal(emailSending.wording.signatureComplete, false);
+    assert.deepEqual(emailSending.signature, { loaded: false, empty: false, imageOnly: false, fetchedAt: null, sendAsEmail: null,
+      lastAttemptAt: null, lastErrorCode: null, senderNameSet: true });
     assert.equal(emailSending.wording.approvedDigest, null);
     assert.equal(Object.hasOwn(emailSending.wording, 'preview'), false);
     assert.equal(emailSending.readiness.ready, false);
     // This server has no Gmail CIM provider profile configured, so the card says so too, and
     // neither the sender nor reply checking is switched on, and outreach has never been unpaused.
     assert.deepEqual(emailSending.readiness.reasons,
-      ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off', 'provider_not_gmail',
-        'sender_off', 'reply_poller_off', 'central_pause']);
+      ['gmail_not_connected', 'wording_not_approved', 'contact_rule_off', 'live_sending_off', 'signature_incomplete',
+        'provider_not_gmail', 'sender_off', 'reply_poller_off', 'central_pause']);
     assert.equal(emailSending.liveSending.capabilitiesInSync, true);
     assert.equal(emailSending.liveSending.providerProfile, 'production-gmail-v1');
     assert.equal(emailSending.liveSending.enabled, false);
@@ -166,18 +185,22 @@ test('viewer gets status without preview and cannot change controls', async () =
     const adminStatus = await get(origin, statusPath, await admin(origin));
     const preview = adminStatus.json.emailSending.wording.preview;
     assert.equal(preview.length, 6);
-    assert.ok(preview.every((item) => item.subject && item.text.includes('Mathew Uckele')));
+    // No signature is loaded yet, so the preview ends with "Best," alone and nothing else.
+    assert.ok(preview.every((item) => item.subject && item.text.endsWith('Best,')
+      && item.html.endsWith('<p>Best,</p>')));
   });
 });
 
 test('approve wording stores the server-computed digest', async () => {
+  await seedStoredSignature();
   await withServer(async (origin) => {
     const cookie = await admin(origin);
     const forged = 'f'.repeat(64);
     const approved = await post(origin, controlsPath, cookie, { controlKey: 'wording_approval',
       enabled: true, expectedRevision: 0, valueDigest: forged, reason: 'Wording reviewed' });
     assert.equal(approved.status, 200);
-    const expected = pursueCimWordingDigest(getConfig().dealHunter.sender);
+    const expected = pursueCimWordingDigest(getConfig().dealHunter.sender, await storedSignature());
+    assert.notEqual(expected, pursueCimWordingDigest(getConfig().dealHunter.sender, null));
     const { wordingApproval } = await getStorage().getPursueSendControls();
     assert.equal(wordingApproval.enabled, true);
     assert.equal(wordingApproval.valueDigest, expected);
@@ -354,14 +377,31 @@ test('a failed Live sending sync keeps the control written and repeating the cha
 test('approving wording is refused while the signature is incomplete', async () => {
   const { changeEmailSendingControl } = await import('../server/services/pursueEmailSending.js');
   const config = getConfig();
-  const incomplete = { ...config, dealHunter: { ...config.dealHunter,
-    sender: { ...config.dealHunter.sender, phone: '' } } };
+  const noName = { ...config, dealHunter: { ...config.dealHunter,
+    sender: { ...config.dealHunter.sender, name: '' } } };
+  // A signature stored for another address is not loaded for this one.
+  const otherAddress = { ...config, dealHunter: { ...config.dealHunter,
+    gmail: { ...config.dealHunter.gmail, senderAddress: 'someone-else@uckele.test' } } };
   const before = (await getStorage().getPursueSendControls()).wordingApproval;
-  const result = await changeEmailSendingControl({ storage: getStorage(), config: incomplete, actor: 'admin',
-    command: { controlKey: 'wording_approval', enabled: true, expectedRevision: before.revision, reason: '' } });
-  assert.equal(result.status, 409);
-  assert.equal(result.code, 'signature_incomplete');
+  for (const [incomplete, sentence] of [
+    [noName, 'Your name for the From line (DEAL_HUNTER_SENDER_NAME) is missing from settings.'],
+    [otherAddress, "Your Gmail signature hasn't been loaded yet. Refresh it from Gmail."],
+  ]) {
+    const result = await changeEmailSendingControl({ storage: getStorage(), config: incomplete, actor: 'admin',
+      command: { controlKey: 'wording_approval', enabled: true, expectedRevision: before.revision, reason: '' } });
+    assert.equal(result.status, 409);
+    assert.equal(result.code, 'signature_incomplete');
+    assert.equal(result.error, sentence);
+  }
+  // Title, phone and postal address are not needed.
+  const noContactLines = { ...config, dealHunter: { ...config.dealHunter,
+    sender: { name: config.dealHunter.sender.name } } };
+  assert.equal(Object.hasOwn(config.dealHunter.sender, 'title'), false);
   assert.equal((await getStorage().getPursueSendControls()).wordingApproval.revision, before.revision);
+  const approved = await changeEmailSendingControl({ storage: getStorage(), config: noContactLines,
+    actor: 'admin', command: { controlKey: 'wording_approval', enabled: true,
+      expectedRevision: before.revision, reason: '' } });
+  assert.equal(approved.ok, true);
 });
 
 test('status reports a Live sending control out of sync with its capability chain, in both directions', async () => {
@@ -408,5 +448,100 @@ test('status reports a Live sending control out of sync with its capability chai
     assert.equal((await read()).liveSending.capabilitiesInSync, true);
     await post(origin, controlsPath, cookie, { controlKey: 'live_sending', enabled: false,
       expectedRevision: liveSending.revision + 3 });
+  });
+});
+
+test('signature refresh needs an administrator and returns the updated card status', async () => {
+  await withServer(async (origin) => {
+    assert.equal((await post(origin, signatureRefreshPath, null)).status, 401);
+    assert.equal((await post(origin, signatureRefreshPath, await viewer(origin))).status, 403);
+
+    const cookie = await admin(origin);
+    await connectGmail(origin, cookie);
+    const before = (await get(origin, statusPath, cookie)).json.emailSending;
+    const { wordingApproval } = await getStorage().getPursueSendControls();
+    await post(origin, controlsPath, cookie, { controlKey: 'wording_approval', enabled: true,
+      expectedRevision: wordingApproval.revision, reason: 'Wording reviewed' });
+    assert.ok(!(await get(origin, statusPath, cookie)).json.emailSending.readiness.reasons
+      .includes('wording_not_approved'));
+
+    // The owner changes the signature in Gmail and refreshes it here.
+    const changedHtml = '<div dir="ltr"><b>Mathew Uckele</b><br>President<script>alert(1)</script></div>';
+    sendAsResponse = () => json(200, { sendAsEmail: 'owner@uckele.test', signature: changedHtml });
+    const refreshed = await post(origin, signatureRefreshPath, cookie);
+    assert.equal(refreshed.status, 200);
+    assert.equal(refreshed.json.success, true);
+    assert.equal(refreshed.json.refreshed, true);
+    assert.equal(refreshed.json.code, null);
+    const status = refreshed.json.emailSending;
+    assert.equal(status.signature.loaded, true);
+    assert.equal(status.signature.empty, false);
+    assert.equal(status.signature.sendAsEmail, 'owner@uckele.test');
+    assert.equal(status.signature.lastErrorCode, null);
+    assert.match(status.signature.fetchedAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(status.wording.signatureComplete, true);
+    assert.notEqual(status.wording.currentDigest, before.wording.currentDigest);
+    // Approving what the card showed before the refresh is refused: the signature changed since.
+    const { wordingApproval: current } = await getStorage().getPursueSendControls();
+    const stale = await post(origin, controlsPath, cookie, { controlKey: 'wording_approval', enabled: true,
+      expectedRevision: current.revision, expectedWordingDigest: before.wording.currentDigest });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.json.code, 'wording_changed');
+    assert.equal((await getStorage().getPursueSendControls()).wordingApproval.revision, current.revision);
+    const malformed = await post(origin, controlsPath, cookie, { controlKey: 'wording_approval', enabled: true,
+      expectedRevision: current.revision, expectedWordingDigest: 'nope' });
+    assert.equal(malformed.status, 400);
+    // A changed signature makes the approved wording stale: sending pauses until it is approved again.
+    assert.ok(status.readiness.reasons.includes('wording_not_approved'));
+    assert.ok(status.wording.preview.every((item) => item.html.endsWith(
+      '<p>Best,</p>\n<div><div dir="ltr"><b>Mathew Uckele</b><br>President</div></div>')));
+    assert.ok(status.wording.preview.every((item) => item.text.endsWith('Best,\nMathew Uckele\nPresident')));
+    assert.equal(JSON.stringify(status).includes('<script>'), false);
+    // Approving the wording the card now shows works.
+    const approved = await post(origin, controlsPath, cookie, { controlKey: 'wording_approval', enabled: true,
+      expectedRevision: current.revision, expectedWordingDigest: status.wording.currentDigest });
+    assert.equal(approved.status, 200);
+  });
+});
+
+test('a failed signature refresh keeps the stored signature, records its code and logs one line', async () => {
+  await withServer(async (origin) => {
+    const cookie = await admin(origin);
+    const stored = await getStorage().getGmailSignature();
+    assert.equal(stored.loaded, true);
+    sendAsResponse = () => json(503, { error: { code: 503, message: 'backend unavailable' } });
+    const logsBefore = logLines.length;
+    const refreshed = await post(origin, signatureRefreshPath, cookie);
+    assert.equal(refreshed.status, 200);
+    assert.equal(refreshed.json.refreshed, false);
+    assert.equal(refreshed.json.code, 'gmail_503');
+    const { signature } = refreshed.json.emailSending;
+    assert.equal(signature.loaded, true);
+    assert.equal(signature.fetchedAt, stored.fetchedAt);
+    assert.equal(signature.lastErrorCode, 'gmail_503');
+    const after = await getStorage().getGmailSignature();
+    assert.equal(after.digest, stored.digest);
+    const lines = logLines.slice(logsBefore).filter((line) => line.includes('[pursue-signature]'));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /gmail_503/);
+    assert.doesNotMatch(lines[0], /backend unavailable/);
+  });
+});
+
+test('connecting Gmail reads the signature, and a failed read never breaks connecting', async () => {
+  await withServer(async (origin) => {
+    const cookie = await admin(origin);
+    sendAsResponse = () => { throw new TypeError('fetch failed'); };
+    await connectGmail(origin, cookie);
+    assert.equal((await getStorage().getGmailConnection()).email_address, 'owner@uckele.test');
+    assert.equal((await getStorage().getGmailSignature()).lastErrorCode, 'gmail_network_error');
+
+    const reconnectedHtml = '<div><b>Mathew Uckele</b><br>Reconnected</div>';
+    sendAsResponse = () => json(200, { sendAsEmail: 'owner@uckele.test', signature: reconnectedHtml });
+    await connectGmail(origin, cookie);
+    const signature = await getStorage().getGmailSignature();
+    assert.equal(signature.html, reconnectedHtml);
+    assert.equal(signature.text, 'Mathew Uckele\nReconnected');
+    assert.equal(signature.lastErrorCode, null);
   });
 });

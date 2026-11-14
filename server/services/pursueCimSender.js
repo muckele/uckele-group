@@ -1,4 +1,5 @@
 // The scheduled Pursue sender (spec 2026-11-03 §5). One run, in a fixed order:
+//   0. the owner's Gmail signature is refreshed from Gmail (a failure keeps the stored one);
 //   1. readiness: not ready sends nothing;
 //   2. the day-28 expiry sweep;
 //   3. sends whose provider seam was entered but never recorded an outcome are reconciled
@@ -8,8 +9,9 @@
 //   4. initial emails inside their campaign's weekday 08:00-17:00 local window;
 //   5. due follow-ups, only while reply checking is on and has completed a run in the last
 //      30 minutes (otherwise each is held with reply_poller_off or reply_poller_stale).
-// Sends go one at a time: prepare, issue the one-time authorization (only while Live sending
-// is on), the final gate, then Gmail, then finalize or reconcile. A touch whose claim lapsed is
+// Sends go one at a time: prepare, check the prepared email's wording is still the current
+// wording, issue the one-time authorization (only while Live sending is on), the final gate,
+// then Gmail, then finalize or reconcile. A touch whose claim lapsed is
 // picked up again (Ruling L); nothing that may have reached Gmail is ever prepared or sent again.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
@@ -30,6 +32,8 @@ import {
 } from './pursueCimProvider.js';
 import { readPursueCimProviderReadiness } from './pursueCimReadiness.js';
 import { applyPendingPursueCimReplies, readPursueReplyPollerHold } from './pursueCimReplyPoller.js';
+import { pursueCimWordingDigest, pursueCimWordingTagValue } from './pursueCimTemplates.js';
+import { refreshPursueEmailSignature, usablePursueSignature } from './pursueEmailSignature.js';
 
 export const PURSUE_CIM_SENDER_ACTOR = 'pursue-cim-sender';
 export const PURSUE_CIM_SENDER_QUOTA_JOB_NAME = 'pursue-cim-sender-quota';
@@ -46,6 +50,8 @@ const LATE_FOLLOW_UP_WINDOW_END_MINUTE = 9 * 60;
 const RUN_STOPPING_GATE_REFUSALS = new Set(['provider_readiness_unavailable', 'central_pause',
   'contact_rule_off', 'capability_inactive', 'profile_mismatch']);
 const CODE = /^[a-z][a-z0-9_]{0,79}$/;
+// The release reason when prepared emails are re-prepared because the wording changed.
+export const PURSUE_WORDING_CHANGED_RELEASE = 'pursue_wording_changed';
 
 const digest = (value) => sha256(stableCanonicalJson(value));
 
@@ -290,6 +296,9 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   const summary = { sentInitial: 0, sentFollowUps: 0, expired: 0, reconciled: 0, released: 0,
     skipped: {}, failed: 0, ambiguous: 0 };
   const skip = (reason) => { summary.skipped[reason] = (summary.skipped[reason] || 0) + 1; };
+  // Set once this run released prepared emails for a wording change: the lapsed rows listed
+  // before that release are skipped under their own code (they are prepared again below).
+  let wordingReleased = false;
   const stop = (stoppedFor, reason) => {
     if (reason) skip(reason);
     summary.stoppedFor = stoppedFor;
@@ -305,6 +314,16 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   const readProviderReadiness = ({ storage: gateStorage, now: gateNow }) =>
     readPursueCimProviderReadiness({ storage: gateStorage, providerProfile, now: gateNow,
       mailProvider: provider, config: resolvedConfig });
+
+  // 0. The owner's Gmail signature, once per slot, before anything is prepared or sent. A
+  // changed signature changes the wording digest, so readiness then reports
+  // wording_not_approved. A failure keeps the stored signature and the run goes on. Without a
+  // Gmail connection there is nothing to read (and readiness stops the run anyway).
+  if (await gmailConnected()) {
+    const signatureRefresh = await refreshPursueEmailSignature({ storage, config: resolvedConfig,
+      now: instant(), mailProvider: provider, source: PURSUE_CIM_SENDER_ACTOR });
+    if (!signatureRefresh.ok) skip('signature_refresh_failed');
+  }
 
   // 1. Readiness.
   const readiness = await readProviderReadiness({ storage, now: instant() });
@@ -394,6 +413,14 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   if (followUps) return followUps;
   return summary;
 
+  async function gmailConnected() {
+    try {
+      return Boolean(await storage.getGmailConnection());
+    } catch {
+      return false;
+    }
+  }
+
   async function currentChain() {
     const rows = typeof storage.listCurrentCimCapabilityActivations === 'function'
       ? await storage.listCurrentCimCapabilityActivations() : [];
@@ -461,12 +488,44 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
     return { reason: issued.blockedReason || 'authorization_unavailable' };
   }
 
+  /**
+   * Whether the prepared email was rendered under the current wording digest (templates,
+   * sender name and the stored Gmail signature): 'current', 'changed' or 'unavailable'.
+   * - 'changed' (the tag is missing, malformed or another digest): the email is never sent.
+   *   Every prepared, never-authorized email is released to be prepared again (the
+   *   Live-sending-off release, Ruling N), and this touch is skipped.
+   * - 'unavailable' (the stored signature cannot be read or is not usable right now): this
+   *   touch is skipped and nothing is released, so a passing storage error causes no churn.
+   * The final gate refuses a mismatch too (wording_changed); this is the recovery.
+   */
+  async function preparedWordingState(transmission) {
+    const communication = await storage.getCrmCommunication(transmission.communication_id);
+    const prepared = pursueCimWordingTagValue(communication?.metadata?.tags);
+    let signature;
+    try {
+      signature = usablePursueSignature(await storage.getGmailSignature(), resolvedConfig);
+    } catch {
+      return 'unavailable';
+    }
+    if (!signature) return 'unavailable';
+    if (prepared === pursueCimWordingDigest(resolvedConfig?.dealHunter?.sender, signature)) return 'current';
+    await storage.releasePreparedCimTransmissions({ reasonCode: PURSUE_WORDING_CHANGED_RELEASE,
+      actor, now: instant().toISOString() });
+    wordingReleased = true;
+    return 'changed';
+  }
+
   /** Authorizes, gates and sends one prepared transmission. Returns a stop summary or null. */
   async function sendPrepared({ transmission, kind, activation, recipientFingerprint }) {
     const followUp = kind !== 'initial';
     const capability = followUp ? 'fl04c-followup' : 'fl04b-initial';
     const writerPath = followUp ? 'pursue-cim-follow-up' : 'pursue-cim-initial';
     if (!(await liveSendingOn())) return stop('not_ready', 'live_sending_off');
+    const wording = await preparedWordingState(transmission);
+    if (wording !== 'current') {
+      skip(wording === 'changed' ? 'wording_changed' : 'signature_unavailable');
+      return null;
+    }
     const { authorization, reason } = await issueAuthorization({ transmission, capability,
       writerPath, activation, recipientFingerprint });
     if (!authorization) {
@@ -520,6 +579,10 @@ export async function runPursueCimSender({ storage, mailProvider, now, clock, co
   }
 
   async function recoverLapsedPreparation(row) {
+    if (wordingReleased) {
+      skip('wording_changed_released');
+      return null;
+    }
     const followUp = row.kind !== 'initial';
     if (followUp && followUpHold) {
       skip(followUpHold);
@@ -615,6 +678,7 @@ function randomClaimDigest() {
 }
 
 function preparationSkip(prepared) {
+  if (prepared.signatureIncomplete) return 'signature_incomplete';
   if (prepared.constructionFailed) return 'preparation_failed';
   if (prepared.staleAuthority) return 'authority_changed';
   if (prepared.terminal) return 'terminal_authority_changed';
