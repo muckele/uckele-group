@@ -16,9 +16,12 @@
 //   while a section is waiting to start still run, so a running call never waits on the
 //   section it is blocking.
 // - Sections run one at a time, in order.
+// - After a section, the queued calls run one per event-loop turn, oldest first, so each
+//   caller's own chain of storage calls runs unbroken, as it would have without the section.
 // - The read-only health checks bypass the queue: they read through an open section, which
 //   is harmless for `SELECT 1` and a schema check, and keeps `/api/ready` answering.
-// - `close()` during a section rolls the section back at its next yield, then closes.
+// - `close()` during a section rolls the section back at its next yield, then closes, and
+//   returns a promise that settles once the connection is closed.
 
 export const exclusiveGateBypassMethods = Object.freeze([
   'checkHealth',
@@ -50,6 +53,7 @@ export function installSqliteExclusiveGate(storageApi, database, {
   const exclusive = new Set(exclusiveMethods);
   const queue = [];
   let held = false;
+  let draining = false;
   let closeRequested = false;
   let closeOnRelease = null;
   let running = 0;
@@ -79,8 +83,15 @@ export function installSqliteExclusiveGate(storageApi, database, {
       storageApi.close = function closeStorage(...args) {
         if (!held) return raw.apply(this, args);
         closeRequested = true;
-        closeOnRelease = () => raw.apply(this, args);
-        return undefined;
+        return new Promise((resolve, reject) => {
+          closeOnRelease = () => {
+            try {
+              resolve(raw.apply(this, args));
+            } catch (error) {
+              reject(error);
+            }
+          };
+        });
       };
       continue;
     }
@@ -92,15 +103,27 @@ export function installSqliteExclusiveGate(storageApi, database, {
     };
   }
 
-  function drain() {
-    const pending = queue.splice(0);
-    for (const item of pending) {
-      try {
-        item.resolve(item.run());
-      } catch (error) {
-        item.reject(error);
-      }
+  // One queued call per turn: its caller's continuation, and any storage calls it makes
+  // straight away, run before the next queued caller starts. Starting them all at once would
+  // interleave the callers' read-then-write chains with each other.
+  function drainNext() {
+    if (held || queue.length === 0) {
+      draining = false;
+      return;
     }
+    const item = queue.shift();
+    try {
+      item.resolve(item.run());
+    } catch (error) {
+      item.reject(error);
+    }
+    setImmediate(drainNext);
+  }
+
+  function startDrain() {
+    if (draining || queue.length === 0) return;
+    draining = true;
+    setImmediate(drainNext);
   }
 
   /**
@@ -150,9 +173,10 @@ export function installSqliteExclusiveGate(storageApi, database, {
         if (closeOnRelease) {
           const close = closeOnRelease;
           closeOnRelease = null;
+          closeRequested = false;
           close();
         }
-        drain();
+        startDrain();
       }
       releaseSection();
     }

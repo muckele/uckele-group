@@ -1029,8 +1029,8 @@ const sourceObservationPageSize = 5000;
 
 // The rows `SELECT * ... WHERE source_id = ? ORDER BY observed_at DESC, id ASC` returns, read in
 // keyset pages. observed_at is NOT NULL and id is the primary key, so each row has exactly one
-// position in the order and the pages together are that query's result. Callers must hold the
-// connection exclusively, so no write lands between pages.
+// position in the order and the pages together are that query's result. Callers read inside
+// their own transaction and exclusive section, so no write lands between pages.
 async function readSourceObservationsNewestFirst(database, sourceId, slicer) {
   const firstPage = database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
     WHERE source_id = ? ORDER BY observed_at DESC, id ASC LIMIT ?`);
@@ -14916,17 +14916,16 @@ ${cimCapacityConsumeTriggerSql}
         database.exec('BEGIN IMMEDIATE');
         try {
           await runStepsInSlices(replaceSteps(normalizedSnapshot), checkedSlicer);
+          // Read back inside the transaction, as the single transaction did.
+          const rows = await readSourceObservationsNewestFirst(database, normalizedSnapshot.source_id, checkedSlicer);
           // COMMIT writes every page the transaction changed, so give it a slice of its own.
           await checkedSlicer.yield();
           database.exec('COMMIT');
+          return rows;
         } catch (error) {
           if (database.inTransaction) database.exec('ROLLBACK');
           throw error;
         }
-        // Committed: from here a close request waits for the section to end rather than fail a
-        // write that already landed. Still inside the section, so no write lands between pages.
-        await slicer.yield();
-        return readSourceObservationsNewestFirst(database, normalizedSnapshot.source_id, slicer);
       });
     },
 

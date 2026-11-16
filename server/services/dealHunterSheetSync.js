@@ -11,7 +11,7 @@ import { reevaluateWaitingPursuitEnrollments } from './pursueCimSender.js';
 import { createEventLoopSlicer, yieldToEventLoop } from '../utils/eventLoopSlices.js';
 
 const sheetErrorMaxLength = 300;
-const criteriaGroupReadChunkSize = 1000;
+const criteriaGroupReadChunkSize = 250;
 
 function boundedError(value) {
   const text = String(value?.message ?? value ?? '').replace(/\s+/g, ' ').trim();

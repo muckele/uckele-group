@@ -164,17 +164,41 @@ test('close() during a section rolls it back at the next yield, then closes the 
   const context = world(t);
   const { storageApi, database } = context;
   let queued;
+  let closed;
   const section = writeInSection(context, ['s1', 's2', 's3'], {
     async onYield(index) {
       if (index !== 0) return;
       queued = storageApi.countItems();
-      storageApi.close();
+      closed = storageApi.close();
       assert.equal(database.open, true, 'the connection stays open until the section ends');
     },
   });
   await assert.rejects(section, StorageClosingError);
+  await closed;
   assert.equal(database.open, false);
   await assert.rejects(queued, /not open/);
+});
+
+test('callers queued behind a section each run their read-then-write chain unbroken', async (t) => {
+  // Break caught: starting every queued call at once runs both callers' reads before either
+  // write, so both act on the same state, which a single macrotask per caller never allowed.
+  const context = world(t);
+  const { storageApi } = context;
+  const steps = [];
+  const caller = async (name) => {
+    const before = await storageApi.countItems();
+    steps.push(`${name} read ${before}`);
+    await storageApi.addItem(name);
+    steps.push(`${name} wrote`);
+  };
+  let callers;
+  await writeInSection(context, ['s1'], {
+    async onYield() {
+      callers = Promise.all([caller('a'), caller('b')]);
+    },
+  });
+  await callers;
+  assert.deepEqual(steps, ['a read 1', 'a wrote', 'b read 2', 'b wrote']);
 });
 
 test('sections run one at a time, in the order they were requested', async (t) => {
@@ -192,11 +216,13 @@ test('a section that made calls wait warns how long it held the connection; one 
   const { storageApi, logs } = context;
   await writeInSection(context, ['quiet']);
   assert.deepEqual(logs, []);
+  let queued;
   await writeInSection(context, ['s1', 's2'], {
     async onYield(index) {
-      if (index === 0) storageApi.countItems();
+      if (index === 0) queued = storageApi.countItems();
     },
   });
+  assert.equal(await queued, 3);
   assert.equal(logs.length, 1);
   assert.match(logs[0], /^\[storage:exclusive\] test-section heldMs=\d+ waitedMs=\d+ queuedCalls=1 longestQueuedMs=\d+$/);
 });

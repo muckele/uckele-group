@@ -134,14 +134,22 @@ function installSqliteCounters(t) {
   return counters;
 }
 
+const cpuMs = () => {
+  const { user, system } = process.cpuUsage();
+  return (user + system) / 1000;
+};
+
 // Runs `job` while a setImmediate ticker records the work done between consecutive turns.
 async function measureTurns(counters, job) {
   const turns = [];
   let running = true;
-  let last = { at: performance.now(), statements: counters.statements, commits: counters.commits };
+  const snapshot = () => ({ at: performance.now(), cpu: cpuMs(), statements: counters.statements, commits: counters.commits });
+  let last = snapshot();
+  const startedCpu = last.cpu;
   const record = () => {
-    const now = { at: performance.now(), statements: counters.statements, commits: counters.commits };
-    turns.push({ ms: now.at - last.at, statements: now.statements - last.statements, commits: now.commits - last.commits });
+    const now = snapshot();
+    turns.push({ ms: now.at - last.at, cpuMs: now.cpu - last.cpu, statements: now.statements - last.statements,
+      commits: now.commits - last.commits });
     last = now;
   };
   const tick = () => {
@@ -155,7 +163,7 @@ async function measureTurns(counters, job) {
     const result = await job();
     // The work since the last tick counts too: a job that never yields is a single turn.
     record();
-    return { result, turns, wallMs: performance.now() - startedAt };
+    return { result, turns, wallMs: performance.now() - startedAt, cpuMs: cpuMs() - startedCpu };
   } finally {
     running = false;
   }
@@ -176,18 +184,22 @@ test('the daily Sheet sync returns to the event loop between small pieces of wor
 
   for (const [label, options] of [['first run', {}], ['steady state', { changedProfitEvery: 50 }]]) {
     sheet = buildSheet(rows, options);
-    const { result, turns, wallMs } = await measureTurns(counters, () => runDealHunterSheetSync({ storage }));
+    const job = await measureTurns(counters, () => runDealHunterSheetSync({ storage }));
+    const { result, turns } = job;
     assert.equal(result.ok, true, `${label}: ${JSON.stringify(result.error)}`);
     assert.ok(result.scoredCount > rows * 0.95, `${label}: scored ${result.scoredCount}`);
-    const longest = max(turns, 'ms');
-    t.diagnostic(`${label}: ${rows} rows, ${Math.round(wallMs)} ms over ${turns.length} turns; largest turn `
-      + `${Math.round(longest)} ms (${(100 * longest / wallMs).toFixed(1)}% of the job), `
-      + `${max(turns, 'statements')} statements, ${max(turns, 'commits')} commits`);
-    // Statement and commit counts are exact under any load; the share of wall time holds on
-    // a slow or busy machine because the whole job slows with it.
+    const longestCpu = max(turns, 'cpuMs');
+    t.diagnostic(`${label}: ${rows} rows, ${Math.round(job.wallMs)} ms (${Math.round(job.cpuMs)} ms CPU) over `
+      + `${turns.length} turns; largest turn ${Math.round(max(turns, 'ms'))} ms wall, ${Math.round(longestCpu)} ms CPU `
+      + `(${(100 * longestCpu / job.cpuMs).toFixed(1)}% of the job's CPU), ${max(turns, 'statements')} statements, `
+      + `${max(turns, 'commits')} commits`);
+    // Statement and commit counts are exact under any load. CPU time, unlike wall time, does
+    // not grow when a busy machine takes the process off the CPU, and the whole job's CPU
+    // scales with the same machine speed. Every unsliced phase of the old sync was over 6%.
     assert.ok(max(turns, 'statements') <= 100, `${label}: one turn ran ${max(turns, 'statements')} statements`);
     assert.ok(max(turns, 'commits') <= 10, `${label}: one turn made ${max(turns, 'commits')} commits`);
-    assert.ok(longest < wallMs * 0.04, `${label}: one turn took ${Math.round(longest)} of ${Math.round(wallMs)} ms`);
+    assert.ok(longestCpu < job.cpuMs * 0.06,
+      `${label}: one turn used ${Math.round(longestCpu)} of ${Math.round(job.cpuMs)} ms CPU`);
   }
 });
 
@@ -261,4 +273,41 @@ test('two score refreshes started together run one after the other', async (t) =
     'allocateDealHunterSourceGeneration', 'reconcileDealHunterCurrentScoreEligibility',
     'allocateDealHunterSourceGeneration', 'reconcileDealHunterCurrentScoreEligibility',
   ]);
+});
+
+test('a storage call made while the snapshot transaction is open waits for COMMIT; a health check does not', async (t) => {
+  // Break caught: without the exclusive section, a request's storage call at one of the
+  // transaction's yields would run inside the open transaction on the shared connection.
+  const restoreSliceMs = setEventLoopSliceMs(0);
+  t.after(restoreSliceMs);
+  const storage = createWorld(t);
+  sheet = buildSheet(60);
+  const events = [];
+  const replace = storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot;
+  storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot = function observed(value) {
+    return replace.call(this, value).then((rows) => {
+      events.push('snapshot committed');
+      return rows;
+    });
+  };
+  // BEGIN IMMEDIATE runs only inside the section; the probe calls go out at its next yield.
+  const originalExec = Database.prototype.exec;
+  let probed = false;
+  Database.prototype.exec = function probedExec(source) {
+    if (!probed && source === 'BEGIN IMMEDIATE') {
+      probed = true;
+      setImmediate(() => {
+        storage.checkHealth().then(() => events.push('health check answered'));
+        storage.readCimOutreachCounters().then(() => events.push('other storage call answered'));
+      });
+    }
+    return originalExec.call(this, source);
+  };
+  t.after(() => {
+    Database.prototype.exec = originalExec;
+  });
+  const result = await runDealHunterSheetSync({ storage });
+  assert.equal(result.ok, true);
+  assert.equal(probed, true);
+  assert.deepEqual(events, ['health check answered', 'snapshot committed', 'other storage call answered']);
 });

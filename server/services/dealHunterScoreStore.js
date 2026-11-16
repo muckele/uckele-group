@@ -289,7 +289,7 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
   });
 }
 
-const fingerprintReadChunkSize = 1000;
+const fingerprintReadChunkSize = 250;
 
 // Stored fingerprints for `opportunityIds`, read a chunk at a time so a full refresh does not
 // hold the event loop for the whole read. Same rows as one call, in the same order.
@@ -437,8 +437,15 @@ async function refreshOpportunityScoresLocked({
   for (const { deal, result } of evaluated) {
     if (slicer.due()) await slicer.yield();
     try {
-      const stored = storedByOpportunity.get(deal.opportunityId);
       const storedContradictions = legacyContradictions.get(deal.opportunityId);
+      if (!force && storedScoreIsCurrent(storedByOpportunity.get(deal.opportunityId), result, storedContradictions)) {
+        counts.skipped += 1;
+        continue;
+      }
+      // The batched read is from before this loop started yielding: an operator may have
+      // reviewed this score since. Decide the write from the row as it is now.
+      const stored = (await storage.listDealHunterOpportunityScoreFingerprints([deal.opportunityId]))
+        .find((row) => row?.opportunity_id === deal.opportunityId);
       if (!force && storedScoreIsCurrent(stored, result, storedContradictions)) {
         counts.skipped += 1;
         continue;
