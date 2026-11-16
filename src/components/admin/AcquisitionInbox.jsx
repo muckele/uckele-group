@@ -736,8 +736,11 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         setQueue((current) => ({
           ...current,
           rows: current.rows.map((row) => row.opportunityId === opportunityId ? authoritativeOpportunity : row),
-          ...(Array.isArray(current.areas) ? { areas: current.areas.map((area) => ({ ...area,
-            rows: (area.rows || []).map((row) => row.opportunityId === opportunityId ? authoritativeOpportunity : row) })) } : {}),
+          // Inbox area rows carry fields a one-row response does not, so only the campaign is merged.
+          ...(Array.isArray(current.areas) && authoritativeOpportunity.campaign !== undefined
+            ? { areas: current.areas.map((area) => ({ ...area,
+              rows: (area.rows || []).map((row) => row.opportunityId === opportunityId
+                ? { ...row, campaign: authoritativeOpportunity.campaign } : row) })) } : {}),
         }));
         setDetail((current) => current.requestedId === opportunityId && current.data
           ? { ...current, data: { ...current.data, opportunity: authoritativeOpportunity }, error: '' }

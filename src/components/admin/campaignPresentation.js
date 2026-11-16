@@ -48,7 +48,11 @@ export function stoppedCampaignPresentation(cimRelease) {
     return { kind: 'Campaign stopped', title: 'The broker address is suppressed',
       detail: 'No more email goes to this address from here.' };
   }
-  if (reason === 'materials_received' || reason === 'advanced_beyond_broker_outreach') {
+  if (reason === 'advanced_beyond_broker_outreach') {
+    return { kind: 'Campaign stopped', title: 'The deal moved past broker outreach',
+      detail: 'The campaign stopped because the deal is already in later diligence. Continue from the linked CRM record.' };
+  }
+  if (reason === 'materials_received') {
     return { kind: 'Campaign stopped', title: 'Materials arrived before the first email',
       detail: 'The campaign stopped because materials are already on file. Review them in the linked CRM record.' };
   }

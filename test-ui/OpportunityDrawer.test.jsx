@@ -441,6 +441,7 @@ describe('Opportunity drawer', () => {
     ['when the address is suppressed', 'recipient_suppressed', 'accepted', 'The broker address is suppressed'],
     ['for unsafe delivery', 'unsafe_delivery', 'accepted', 'Delivery to this address was unsafe'],
     ['because materials arrived', 'materials_received', 'scheduled', 'Materials arrived before the first email'],
+    ['because the deal moved on', 'advanced_beyond_broker_outreach', 'scheduled', 'The deal moved past broker outreach'],
   ])('explains a campaign stopped %s', (_name, reasonCode, touchState, title) => {
     // Watch and Pass leave the release status at their own decision code, not campaign_stopped.
     const code = { 'watch-selected': 'watch_selected', 'pass-selected': 'pass_selected' }[reasonCode]
