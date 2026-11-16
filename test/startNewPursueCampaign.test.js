@@ -240,3 +240,34 @@ test('the new campaign goes only to the broker the stopped campaign was addresse
   assert.equal(enrolled.enrollment.reason_code, 'recipient_changed');
   assert.equal(campaigns(db).length, 1);
 });
+
+test('with several contact options the new campaign picks the stopped campaign\'s broker', async (t) => {
+  const { storage, db, opportunityId } = await campaignFixture(t);
+  const report = await stop(storage, opportunityId);
+  await storage.upsertDealHunterOpportunitySourceObservation({
+    id: 'p4b-other-broker', opportunity_id: opportunityId, source_id: 'sheet-1',
+    source_name: 'Second Synthetic Sheet', source_record_id: 'row-other', field: 'broker_email',
+    value: 'another-broker@example.test', observed_at: restartAt, created_at: restartAt, updated_at: restartAt });
+  const recorded = await storage.startNewPursueCampaign(restartCommand(opportunityId, report));
+  assert.equal(recorded.applied, true, recorded.reason);
+  const enrolled = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: recorded.enrollment, decision: recorded.decision, actor: 'fixture-owner',
+    now: restartAt, readSourceHealth: healthy });
+  assert.ok(enrolled.recipientOptions.length > 1, 'the listing now has more than one contact option');
+  assert.equal(enrolled.enrollment.state, 'campaign-created', enrolled.enrollment.reason_code);
+  const [first, second] = campaigns(db);
+  assert.equal(second.conversation_id, first.conversation_id, 'the same broker, the same conversation');
+});
+
+test('a refused restart allocation names the restart, not Request SIM', async (t) => {
+  const { storage, db, opportunityId } = await campaignFixture(t);
+  const report = await stop(storage, opportunityId);
+  const recorded = await storage.startNewPursueCampaign(restartCommand(opportunityId, report));
+  // Generation 1's email turns out to have reached Google before allocation runs.
+  db.prepare("UPDATE deal_hunter_cim_campaign_touches SET state = 'accepted'").run();
+  const enrolled = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: recorded.enrollment, decision: recorded.decision, actor: 'fixture-owner',
+    now: restartAt, readSourceHealth: healthy });
+  assert.equal(enrolled.enrollment.reason_code, 'campaign_restart_refused');
+  assert.equal(campaigns(db).length, 1);
+});

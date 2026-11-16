@@ -179,9 +179,17 @@ async function contactRuleBasis({ storage, authority, recipient, suppression }) 
 async function restartedCampaign({ storage, opportunityId, enrollment }) {
   if (!enrollment.restart_of_campaign_id) return null;
   const latest = (await storage.readPursueCimProjection({ opportunityId }))?.campaign;
-  return latest?.id === enrollment.restart_of_campaign_id
-    && Number.isSafeInteger(Number(latest.generation)) ? latest : null;
+  if (latest?.id !== enrollment.restart_of_campaign_id
+    || !Number.isSafeInteger(Number(latest.generation))) return null;
+  const conversation = await storage.getPursueCimBrokerConversation?.(latest.conversation_id);
+  return { ...latest, recipientAddress: String(conversation?.recipient_address || '').trim().toLowerCase() };
 }
+
+// The broker the stopped campaign was addressed to: the same address, whatever revision its
+// contact record has reached since. Without a readable address, the exact fingerprint.
+const sameRestartRecipient = (opportunityId, restart, option) => (restart.recipientAddress
+  ? String(option?.email || '').trim().toLowerCase() === restart.recipientAddress
+  : optionFingerprint(opportunityId, option) === restart.recipient_fingerprint);
 
 const optionFingerprint = (opportunityId, option) => digest({ opportunityId,
   emailHash: sha256(option.email), provenanceFingerprint: option.provenanceFingerprint,
@@ -210,7 +218,7 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
       restart = await restartedCampaign({ storage, opportunityId, enrollment });
       const restartOption = restart && !recipientContactRef
         ? authority.recipientOptions.find((option) =>
-          optionFingerprint(opportunityId, option) === restart.recipient_fingerprint) : null;
+          sameRestartRecipient(opportunityId, restart, option)) : null;
       const choice = restart && !recipientContactRef
         ? (restartOption ? { selected: restartOption } : { reason: 'recipient_changed' })
         : selectRecipient(authority, recipientContactRef, at);
@@ -296,7 +304,7 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                   const slot = calculateNextCimSlot({ policyVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     timezone: timezone.iana_timezone, kind: 'initial', readyAt: at.toISOString() });
                   const recipientFingerprint = optionFingerprint(opportunityId, freshRecipient);
-                  if (restart && recipientFingerprint !== restart.recipient_fingerprint) {
+                  if (restart && !sameRestartRecipient(opportunityId, restart, freshRecipient)) {
                     reason = 'recipient_changed';
                   } else {
                   const conversationId = framedDigest('cim-conversation:v1', recipientFingerprint,
