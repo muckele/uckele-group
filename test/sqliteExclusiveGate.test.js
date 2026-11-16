@@ -160,23 +160,38 @@ test('a section waits for a running storage call that awaits, and that call can 
   assert.deepEqual(names(), ['from-backup', 's1']);
 });
 
-test('close() during a section rolls it back at the next yield, then closes the connection', async (t) => {
+test('close() during a section rolls it back, runs the calls queued before it, then closes', async (t) => {
   const context = world(t);
   const { storageApi, database } = context;
   let queued;
-  let closed;
+  const closes = [];
   const section = writeInSection(context, ['s1', 's2', 's3'], {
     async onYield(index) {
       if (index !== 0) return;
       queued = storageApi.countItems();
-      closed = storageApi.close();
+      closes.push(storageApi.close(), storageApi.close());
       assert.equal(database.open, true, 'the connection stays open until the section ends');
     },
   });
   await assert.rejects(section, StorageClosingError);
-  await closed;
+  assert.equal(await queued, 0, 'the queued call ran before the close and saw the rolled-back table');
+  await Promise.all(closes);
   assert.equal(database.open, false);
-  await assert.rejects(queued, /not open/);
+});
+
+test('a section waits for the calls queued behind the previous one before it starts', async (t) => {
+  const context = world(t);
+  const { storageApi, names } = context;
+  let queued;
+  let second;
+  await writeInSection(context, ['s1'], {
+    async onYield() {
+      queued = [storageApi.addItem('q1'), storageApi.addItem('q2')];
+      second = writeInSection(context, ['s2']);
+    },
+  });
+  await Promise.all([...queued, second]);
+  assert.deepEqual(names(), ['s1', 'q1', 'q2', 's2']);
 });
 
 test('callers queued behind a section each run their read-then-write chain unbroken', async (t) => {

@@ -18,10 +18,12 @@
 // - Sections run one at a time, in order.
 // - After a section, the queued calls run one per event-loop turn, oldest first, so each
 //   caller's own chain of storage calls runs unbroken, as it would have without the section.
+//   The next section starts only once that backlog has run.
 // - The read-only health checks bypass the queue: they read through an open section, which
 //   is harmless for `SELECT 1` and a schema check, and keeps `/api/ready` answering.
-// - `close()` during a section rolls the section back at its next yield, then closes, and
-//   returns a promise that settles once the connection is closed.
+// - `close()` during a section rolls the section back at its next yield; the connection
+//   closes once the calls queued before it have run. Each such `close()` returns a promise
+//   that settles then.
 
 export const exclusiveGateBypassMethods = Object.freeze([
   'checkHealth',
@@ -55,18 +57,21 @@ export function installSqliteExclusiveGate(storageApi, database, {
   let held = false;
   let draining = false;
   let closeRequested = false;
-  let closeOnRelease = null;
+  let deferredClose = null;
+  let closeWaiters = [];
   let running = 0;
   let idleWaiters = [];
   let sectionChain = Promise.resolve();
 
+  // Wakes whoever waits for the gate to go idle; they check again what they wait for.
+  const notifyIdle = () => {
+    const waiters = idleWaiters;
+    idleWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
   const settle = () => {
     running -= 1;
-    if (running === 0) {
-      const waiters = idleWaiters;
-      idleWaiters = [];
-      for (const resolve of waiters) resolve();
-    }
+    if (running === 0) notifyIdle();
   };
   const invoke = (name, raw, self, args) => {
     const result = raw.apply(self, args);
@@ -81,16 +86,11 @@ export function installSqliteExclusiveGate(storageApi, database, {
     if (typeof raw !== 'function' || bypass.has(name)) continue;
     if (name === 'close') {
       storageApi.close = function closeStorage(...args) {
-        if (!held) return raw.apply(this, args);
+        if (!held && !draining) return raw.apply(this, args);
         closeRequested = true;
+        deferredClose = () => raw.apply(this, args);
         return new Promise((resolve, reject) => {
-          closeOnRelease = () => {
-            try {
-              resolve(raw.apply(this, args));
-            } catch (error) {
-              reject(error);
-            }
-          };
+          closeWaiters.push({ resolve, reject });
         });
       };
       continue;
@@ -109,6 +109,8 @@ export function installSqliteExclusiveGate(storageApi, database, {
   function drainNext() {
     if (held || queue.length === 0) {
       draining = false;
+      closeIfRequested();
+      notifyIdle();
       return;
     }
     const item = queue.shift();
@@ -124,6 +126,21 @@ export function installSqliteExclusiveGate(storageApi, database, {
     if (draining || queue.length === 0) return;
     draining = true;
     setImmediate(drainNext);
+  }
+
+  function closeIfRequested() {
+    if (!closeRequested || held || draining) return;
+    const close = deferredClose;
+    const waiters = closeWaiters;
+    closeRequested = false;
+    deferredClose = null;
+    closeWaiters = [];
+    try {
+      const result = close();
+      for (const waiter of waiters) waiter.resolve(result);
+    } catch (error) {
+      for (const waiter of waiters) waiter.reject(error);
+    }
   }
 
   /**
@@ -143,7 +160,10 @@ export function installSqliteExclusiveGate(storageApi, database, {
     let queuedCalls = 0;
     try {
       await previous;
-      while (running > 0) await new Promise((resolve) => idleWaiters.push(resolve));
+      // Calls queued behind the previous section run first; so does any running call.
+      while (running > 0 || draining || queue.length > 0) {
+        await new Promise((resolve) => idleWaiters.push(resolve));
+      }
       if (database.inTransaction) throw new Error('An exclusive storage section cannot start inside a transaction.');
       held = true;
       acquiredAt = now();
@@ -170,13 +190,8 @@ export function installSqliteExclusiveGate(storageApi, database, {
             // Diagnostics must never become the failure.
           }
         }
-        if (closeOnRelease) {
-          const close = closeOnRelease;
-          closeOnRelease = null;
-          closeRequested = false;
-          close();
-        }
         startDrain();
+        closeIfRequested();
       }
       releaseSection();
     }

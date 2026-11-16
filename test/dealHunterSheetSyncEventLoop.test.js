@@ -169,7 +169,7 @@ async function measureTurns(counters, job) {
   }
 }
 
-const max = (turns, key) => Math.max(...turns.map((turn) => turn[key]));
+const max = (turns, key) => turns.reduce((largest, turn) => Math.max(largest, turn[key]), -Infinity);
 
 test('the daily Sheet sync returns to the event loop between small pieces of work, first run and steady state', async (t) => {
   // Break caught: a phase that loops over listings, records or observations without a yield
