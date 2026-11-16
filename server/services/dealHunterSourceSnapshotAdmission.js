@@ -2,10 +2,11 @@ import { createHash } from 'node:crypto';
 import { importOutreachDelta, sourceSafetyRunId } from './cimSafetyIdentity.js';
 import {
   getOpportunitySourceObservationRecordId,
-  normalizeDealHunterSourceSnapshot,
+  normalizeDealHunterSourceSnapshotSteps,
   normalizeOpportunitySourceObservationSnapshot,
   normalizeSourceFreshnessEvidence,
 } from './dealHunterOpportunityFacts.js';
+import { createEventLoopSlicer, runSteps, runStepsInSlices } from '../utils/eventLoopSlices.js';
 
 // A source-wide replacement can delete every current observation for one
 // source. Issuance is intentionally private to this collector-owned module:
@@ -17,7 +18,15 @@ import {
 const completeGoogleSheetSourceSnapshotPolicy = 'complete-google-sheet-source-snapshot-v1';
 const completeGoogleSheetSourceSnapshotAdmissions = new WeakMap();
 
+// The functions below that end in `Steps` are step generators (see utils/eventLoopSlices.js):
+// a full Sheet is thousands of records, so the collector runs them in event-loop slices.
+// Each has a synchronous form with the same result for callers that need one.
+
 export function normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot = {}) {
+  return runSteps(normalizeCompleteGoogleSheetFreshnessSnapshotSteps(snapshot));
+}
+
+function* normalizeCompleteGoogleSheetFreshnessSnapshotSteps(snapshot = {}) {
   const unresolved = Array.isArray(snapshot.unresolved) ? snapshot.unresolved.map((item) => {
     const source_record_id = String(item?.source_record_id || '').trim();
     const identity_exception_id = String(item?.identity_exception_id || '').trim();
@@ -29,12 +38,15 @@ export function normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot = {}) {
       freshness_evidence: normalizeSourceFreshnessEvidence(item.freshness_evidence) };
   }) : [];
   if (unresolved.length === 0) {
-    return { ...normalizeDealHunterSourceSnapshot(snapshot), unresolved };
+    return { ...(yield* normalizeDealHunterSourceSnapshotSteps(snapshot)), unresolved };
   }
   const source_id = String(snapshot.source_id || '').trim();
   const source_name = String(snapshot.source_name || '').trim();
-  const records = Array.isArray(snapshot.records)
-    ? snapshot.records.map(normalizeOpportunitySourceObservationSnapshot) : [];
+  const records = [];
+  for (const record of Array.isArray(snapshot.records) ? snapshot.records : []) {
+    records.push(normalizeOpportunitySourceObservationSnapshot(record));
+    yield;
+  }
   if (!source_id || source_id.length > 160 || !source_name || source_name.length > 220
     || records.length + unresolved.length > 10_000
     || records.some((record) => record.source_id !== source_id || record.source_name !== source_name)) {
@@ -66,26 +78,36 @@ function sourceSnapshotAdmissionText(value) {
 // canonical token without relying on an optional extension. It is a
 // consistency checksum, not the authorization secret: the unforgeable,
 // one-shot in-process capability is the authorization layer.
-function completeGoogleSheetSourceSnapshotFingerprint(snapshot) {
+//
+// The token is `parts.join('|')`; at production scale it is tens of megabytes. It is hashed as it
+// is built, one record at a time, which feeds MD5 exactly the bytes of the joined string (every
+// part is ASCII), so the digest is unchanged.
+function* completeGoogleSheetSourceSnapshotDigestSteps(snapshot) {
   const sourceSlot = completeGoogleSheetSourceSlot(snapshot.source_id);
   const observationCount = snapshot.records.reduce((count, record) => count + record.observations.length, 0);
-  const parts = [
+  const hash = createHash('md5');
+  let started = false;
+  const append = (parts) => {
+    hash.update(`${started ? '|' : ''}${parts.join('|')}`);
+    started = true;
+  };
+  append([
     completeGoogleSheetSourceSnapshotPolicy,
     sourceSnapshotAdmissionText(snapshot.source_id),
     sourceSnapshotAdmissionText(snapshot.source_name),
     String(sourceSlot),
     String(snapshot.records.length),
     String(observationCount),
-  ];
+  ]);
   for (const record of snapshot.records) {
-    parts.push(
+    const parts = [
       'r',
       sourceSnapshotAdmissionText(record.opportunity_id),
       sourceSnapshotAdmissionText(record.source_id),
       sourceSnapshotAdmissionText(record.source_name),
       sourceSnapshotAdmissionText(record.source_record_id),
       String(record.observations.length),
-    );
+    ];
     for (const observation of record.observations) {
       parts.push(
         'o',
@@ -101,16 +123,36 @@ function completeGoogleSheetSourceSnapshotFingerprint(snapshot) {
         sourceSnapshotAdmissionText(observation.updated_at),
       );
     }
+    append(parts);
+    yield;
   }
   for (const item of snapshot.unresolved || []) {
-    parts.push('u', sourceSnapshotAdmissionText(item.source_record_id),
+    append(['u', sourceSnapshotAdmissionText(item.source_record_id),
       sourceSnapshotAdmissionText(item.identity_exception_id),
-      sourceSnapshotAdmissionText(JSON.stringify(item.freshness_evidence)));
+      sourceSnapshotAdmissionText(JSON.stringify(item.freshness_evidence))]);
   }
-  return parts.join('|');
+  return hash.digest('hex');
 }
 
-function completeGoogleSheetSourceSnapshotAdmissionMetadata(snapshot) {
+// MD5 of `JSON.stringify(value)` where value is an array or `{ records, unresolved }`, fed one
+// record at a time. JSON.stringify of an array is '[' + its elements' JSON joined by ',' + ']',
+// so the hashed bytes, and the digest, are exactly those of the single call.
+function* jsonMd5Steps(value) {
+  const hash = createHash('md5');
+  const records = Array.isArray(value) ? value : value.records;
+  if (!Array.isArray(value)) hash.update('{"records":');
+  hash.update('[');
+  for (const [index, record] of records.entries()) {
+    if (index > 0) hash.update(',');
+    hash.update(JSON.stringify(record) ?? 'null');
+    yield;
+  }
+  hash.update(']');
+  if (!Array.isArray(value)) hash.update(`,"unresolved":${JSON.stringify(value.unresolved)}}`);
+  return hash.digest('hex');
+}
+
+function* completeGoogleSheetSourceSnapshotAdmissionMetadataSteps(snapshot) {
   const source_record_ids = [
     ...snapshot.records.map((record) => record.source_record_id),
     ...(snapshot.unresolved || []).map((item) => item.source_record_id),
@@ -122,22 +164,28 @@ function completeGoogleSheetSourceSnapshotAdmissionMetadata(snapshot) {
     throw new Error('Complete Sheet freshness run is not an allocated bounded source run.');
   }
   const freshnessPayloadHash = run
-    ? createHash('md5').update(JSON.stringify(snapshot.unresolved?.length
-      ? { records: snapshot.records, unresolved: snapshot.unresolved } : snapshot.records)).digest('hex')
+    ? yield* jsonMd5Steps(snapshot.unresolved?.length
+      ? { records: snapshot.records, unresolved: snapshot.unresolved } : snapshot.records)
     : null;
+  // Evaluated in the order the single object literal evaluated them, so a bad slot still
+  // throws before the fingerprint is built.
+  const source_slot = completeGoogleSheetSourceSlot(snapshot.source_id);
+  const record_count = snapshot.records.length + (snapshot.unresolved?.length || 0);
+  const observation_count = snapshot.records.reduce((count, record) => count + record.observations.length, 0);
+  const snapshotDigest = yield* completeGoogleSheetSourceSnapshotDigestSteps(snapshot);
   return Object.freeze({
     policy: completeGoogleSheetSourceSnapshotPolicy,
     source_id: snapshot.source_id,
     source_name: snapshot.source_name,
-    source_slot: completeGoogleSheetSourceSlot(snapshot.source_id),
-    record_count: snapshot.records.length + (snapshot.unresolved?.length || 0),
+    source_slot,
+    record_count,
     ...(run ? {
       resolved_count: snapshot.records.length,
       deferred_count: snapshot.unresolved?.length || 0,
     } : {}),
-    observation_count: snapshot.records.reduce((count, record) => count + record.observations.length, 0),
+    observation_count,
     source_record_ids: Object.freeze(source_record_ids),
-    snapshot_digest: createHash('md5').update(completeGoogleSheetSourceSnapshotFingerprint(snapshot)).digest('hex'),
+    snapshot_digest: snapshotDigest,
     ...(run ? {
       run: Object.freeze({ sourceId: run.sourceId, runId: run.runId, generation: run.generation }),
       freshness_digest: freshnessPayloadHash + createHash('md5')
@@ -146,13 +194,13 @@ function completeGoogleSheetSourceSnapshotAdmissionMetadata(snapshot) {
   });
 }
 
-function mintCompleteGoogleSheetSourceSnapshotAdmission(snapshot) {
-  const admission = completeGoogleSheetSourceSnapshotAdmissionMetadata(snapshot);
+function* mintCompleteGoogleSheetSourceSnapshotAdmissionSteps(snapshot) {
+  const admission = yield* completeGoogleSheetSourceSnapshotAdmissionMetadataSteps(snapshot);
   completeGoogleSheetSourceSnapshotAdmissions.set(admission, admission);
   return admission;
 }
 
-function verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records, unresolved = [], run } = {}) {
+function* verifiedCompleteGoogleSheetSourceSnapshotSteps({ reviewMode, sourceResult, records, unresolved = [], run } = {}) {
   if (reviewMode !== 'full-backfill') return null;
   if (!run) return null;
   const source = sourceResult?.source || {};
@@ -197,12 +245,13 @@ function verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, r
     if (sourceName && sourceName !== dealSourceName) return null;
     sourceName = dealSourceName;
     expectedRecordIds.add(sourceRecordId);
+    yield;
   }
   if (expectedRecordIds.size !== sourceRowCount) return null;
 
   let snapshot;
   try {
-    snapshot = normalizeCompleteGoogleSheetFreshnessSnapshot({
+    snapshot = yield* normalizeCompleteGoogleSheetFreshnessSnapshotSteps({
       source_id: sourceId,
       source_name: sourceName,
       records,
@@ -248,13 +297,18 @@ export async function reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
   if (typeof storage?.replaceAdmittedCompleteGoogleSheetSourceSnapshot !== 'function') {
     return { reconciled: false };
   }
-  const snapshot = verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records, unresolved, run });
+  const slicer = createEventLoopSlicer();
+  const snapshot = await runStepsInSlices(
+    verifiedCompleteGoogleSheetSourceSnapshotSteps({ reviewMode, sourceResult, records, unresolved, run }),
+    slicer,
+  );
   if (!snapshot) return { reconciled: false };
 
   const before = typeof storage.readCimOutreachCounters === 'function'
     ? await storage.readCimOutreachCounters() : null;
-  const admission = mintCompleteGoogleSheetSourceSnapshotAdmission(snapshot);
+  const admission = await runStepsInSlices(mintCompleteGoogleSheetSourceSnapshotAdmissionSteps(snapshot), slicer);
   await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...snapshot, admission });
+  await slicer.maybeYield();
   const after = before ? await storage.readCimOutreachCounters() : null;
   const safetyRunId = run ? sourceSafetyRunId(run.sourceId, run.runId) : null;
   const events = safetyRunId && typeof storage.listCimSafetyEvents === 'function'
@@ -275,6 +329,20 @@ export async function reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
  * path above is the only supported way to create this opaque capability.
  */
 export function consumeCompleteGoogleSheetSourceSnapshotAdmission({ admission, snapshot } = {}) {
+  return runSteps(consumeCompleteGoogleSheetSourceSnapshotAdmissionSteps({ admission, snapshot })).admission;
+}
+
+/**
+ * The same consumption in event-loop slices. Resolves with the consumed admission and the
+ * normalized snapshot it was checked against, which is exactly
+ * `normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot)`, so the adapter can write the very
+ * copy that was verified. The admission is spent before the first slice ends.
+ */
+export function consumeCompleteGoogleSheetSourceSnapshotAdmissionInSlices({ admission, snapshot } = {}, slicer = undefined) {
+  return runStepsInSlices(consumeCompleteGoogleSheetSourceSnapshotAdmissionSteps({ admission, snapshot }), slicer);
+}
+
+function* consumeCompleteGoogleSheetSourceSnapshotAdmissionSteps({ admission, snapshot } = {}) {
   const issued = admission && typeof admission === 'object'
     ? completeGoogleSheetSourceSnapshotAdmissions.get(admission)
     : null;
@@ -285,8 +353,8 @@ export function consumeCompleteGoogleSheetSourceSnapshotAdmission({ admission, s
   // it reusable for a later source-wide mutation attempt.
   completeGoogleSheetSourceSnapshotAdmissions.delete(admission);
 
-  const normalizedSnapshot = normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot);
-  const actual = completeGoogleSheetSourceSnapshotAdmissionMetadata({ ...normalizedSnapshot, run: snapshot.run });
+  const normalizedSnapshot = yield* normalizeCompleteGoogleSheetFreshnessSnapshotSteps(snapshot);
+  const actual = yield* completeGoogleSheetSourceSnapshotAdmissionMetadataSteps({ ...normalizedSnapshot, run: snapshot.run });
   const matches = (
     actual.policy === issued.policy
     && actual.source_id === issued.source_id
@@ -304,15 +372,18 @@ export function consumeCompleteGoogleSheetSourceSnapshotAdmission({ admission, s
   if (!matches) throw new Error('Complete Google Sheet source snapshot admission does not match the normalized source payload.');
 
   return {
-    policy: issued.policy,
-    source_id: issued.source_id,
-    source_name: issued.source_name,
-    source_slot: issued.source_slot,
-    record_count: issued.record_count,
-    ...(issued.run ? { resolved_count: issued.resolved_count, deferred_count: issued.deferred_count } : {}),
-    observation_count: issued.observation_count,
-    source_record_ids: [...issued.source_record_ids],
-    snapshot_digest: issued.snapshot_digest,
-    ...(issued.run ? { run: issued.run, freshness_digest: issued.freshness_digest } : {}),
+    admission: {
+      policy: issued.policy,
+      source_id: issued.source_id,
+      source_name: issued.source_name,
+      source_slot: issued.source_slot,
+      record_count: issued.record_count,
+      ...(issued.run ? { resolved_count: issued.resolved_count, deferred_count: issued.deferred_count } : {}),
+      observation_count: issued.observation_count,
+      source_record_ids: [...issued.source_record_ids],
+      snapshot_digest: issued.snapshot_digest,
+      ...(issued.run ? { run: issued.run, freshness_digest: issued.freshness_digest } : {}),
+    },
+    normalizedSnapshot,
   };
 }

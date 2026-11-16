@@ -11,6 +11,8 @@ import { recordCrmActivity } from './activity.js';
 import { DEAL_CRITERIA_PROFILE_VERSION, evaluateDealCriteria } from './dealCriteriaProfile.js';
 import { collectScoredOpportunities, isBuilderProducedScoredSet } from './dealHunter.js';
 import { getStorage } from '../storage/index.js';
+import { createEventLoopSlicer } from '../utils/eventLoopSlices.js';
+import { withDealReviewLockHeld } from './dealReviewLock.js';
 import {
   DEAL_SCORING_ENGINE_VERSION,
   DEAL_SCORING_PROFILE_VERSION,
@@ -287,14 +289,36 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
   });
 }
 
+const fingerprintReadChunkSize = 1000;
+
+// Stored fingerprints for `opportunityIds`, read a chunk at a time so a full refresh does not
+// hold the event loop for the whole read. Same rows as one call, in the same order.
+async function listScoreFingerprintsInSlices(storage, opportunityIds, slicer) {
+  const rows = [];
+  for (let index = 0; index < opportunityIds.length; index += fingerprintReadChunkSize) {
+    if (slicer.due()) await slicer.yield();
+    rows.push(...await storage.listDealHunterOpportunityScoreFingerprints(
+      opportunityIds.slice(index, index + fingerprintReadChunkSize)));
+  }
+  return rows;
+}
+
 /**
  * Refresh persisted scores for the supplied canonical listings.
  *
  * Idempotent and resumable: an unchanged opportunity is skipped without any
  * write, and a failed opportunity is reported without stopping the batch, so a
  * retry only redoes the work that did not land.
+ *
+ * One refresh or review build runs at a time (see dealReviewLock.js); `reviewLock` is the
+ * caller's token when it already holds the lock. The work returns to the event loop between
+ * opportunities.
  */
-export async function refreshOpportunityScores({
+export function refreshOpportunityScores({ reviewLock = null, ...options } = {}) {
+  return withDealReviewLockHeld(reviewLock, (token) => refreshOpportunityScoresLocked(options, token));
+}
+
+async function refreshOpportunityScoresLocked({
   deals = null,
   authoritativeReview = null,
   opportunityIds = [],
@@ -303,7 +327,8 @@ export async function refreshOpportunityScores({
   actor = 'deal-hunter',
   recordActivity = true,
   storage = getStorage(),
-} = {}) {
+} = {}, reviewLock = null) {
+  const slicer = createEventLoopSlicer();
   const missingMethods = requiredStorageMethods(storage);
   if (missingMethods.length > 0) {
     return {
@@ -319,7 +344,7 @@ export async function refreshOpportunityScores({
   let candidates = callerSuppliedDeals ? deals : null;
   let authoritativeOpportunityIds = null;
   if (!candidates) {
-    const collected = await collectScoredOpportunities({ reviewMode, storage });
+    const collected = await collectScoredOpportunities({ reviewMode, storage, reviewLock });
     authoritativeReview = collected.review || null;
     if (collected.review?.scoringDeferred) {
       return {
@@ -389,6 +414,7 @@ export async function refreshOpportunityScores({
   // recomputed from stored rows, so automatic Pursue compares its stored fingerprint to this.
   const currentFingerprints = {};
   for (const deal of scoped) {
+    if (slicer.due()) await slicer.yield();
     try {
       const result = scoreOpportunity(deal);
       evaluated.push({ deal, result });
@@ -401,7 +427,7 @@ export async function refreshOpportunityScores({
 
   // One batched read instead of a lookup per opportunity.
   const storedByOpportunity = new Map(
-    (await storage.listDealHunterOpportunityScoreFingerprints(evaluated.map(({ deal }) => deal.opportunityId)))
+    (await listScoreFingerprintsInSlices(storage, evaluated.map(({ deal }) => deal.opportunityId), slicer))
       .map((row) => [row.opportunity_id, row]),
   );
   // Only deployed contradiction digests need the compatibility evidence, and
@@ -409,6 +435,7 @@ export async function refreshOpportunityScores({
   const legacyContradictions = await loadLegacyContradictions(storage, evaluated, storedByOpportunity);
 
   for (const { deal, result } of evaluated) {
+    if (slicer.due()) await slicer.yield();
     try {
       const stored = storedByOpportunity.get(deal.opportunityId);
       const storedContradictions = legacyContradictions.get(deal.opportunityId);
@@ -453,6 +480,7 @@ export async function refreshOpportunityScores({
     }
   }
 
+  await slicer.maybeYield();
   let eligibilityReconciliation = null;
   if (authoritativeOpportunityIds && counts.failed === 0) {
     try {
