@@ -6,6 +6,7 @@ import { earningsPresentation } from '../../utils/earningsPresentation.js';
 import BrokerRepliesBlock, { useBrokerReplies } from './BrokerReplies.jsx';
 import { AutoPursueModeBadge, CriteriaLine, NearMissConfirmDialog, NotAutomaticReason, isNearMiss } from './AcquisitionCriteria.jsx';
 import AutoPursueControl from './AutoPursueControl.jsx';
+import { campaignWorkflowLabel } from './campaignPresentation.js';
 
 const emptySummary = { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 };
 const summaryItems = [
@@ -45,6 +46,16 @@ function formatLabel(value) {
   return String(value || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[-_]/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function rowCimLabel(row) {
+  return row.campaign ? campaignWorkflowLabel(row.campaign) : formatLabel(row.workflow?.cimStatus || 'not-requested');
+}
+
+// A one-row response omits the campaign when the server could not read it; keep what was shown.
+function keepKnownCampaign(next, previous) {
+  return next.campaign === undefined && previous?.campaign !== undefined
+    ? { ...next, campaign: previous.campaign } : next;
+}
+
 function formatDate(value) {
   if (!value || !Number.isFinite(Date.parse(value))) return '';
   return new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' }).format(new Date(value));
@@ -54,11 +65,12 @@ function isAbortError(error) {
   return error?.name === 'AbortError';
 }
 
-function ActionButtons({ context = '', disabled, name, onAction }) {
+// A row whose listing has a campaign, running or finished, has nothing for Request SIM to start.
+function ActionButtons({ context = '', disabled, name, onAction, showRequestSim = true }) {
   const accessibleName = (action) => `${action}${context ? ` ${context}` : ''} ${name}`;
   return (
     <div className="flex flex-wrap justify-center gap-1.5 md:justify-start">
-      <button aria-label={accessibleName('Request SIM')} className={primaryButtonClass} disabled={disabled} onClick={(event) => onAction('pursue', event)} type="button">Request SIM</button>
+      {showRequestSim ? <button aria-label={accessibleName('Request SIM')} className={primaryButtonClass} disabled={disabled} onClick={(event) => onAction('pursue', event)} type="button">Request SIM</button> : null}
       <button aria-label={accessibleName('Watch')} className={buttonClass} disabled={disabled} onClick={(event) => onAction('watch', event)} type="button">Watch</button>
       <button aria-label={accessibleName('Pass')} className={`${buttonClass} text-red-700`} disabled={disabled} onClick={(event) => onAction('pass', event)} type="button">Pass</button>
     </div>
@@ -137,10 +149,10 @@ function MorningBriefing({ actionsAllowed = false, digest, error = '', loading =
               {row.missingEvidenceCount > 0 ? <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-900">{row.missingEvidenceCount} missing evidence {row.missingEvidenceCount === 1 ? 'item' : 'items'}</span> : null}
               {row.contradictionCount > 0 ? <span className="rounded-full bg-red-50 px-2 py-1 text-red-800">{row.contradictionCount} source {row.contradictionCount === 1 ? 'conflict' : 'conflicts'}</span> : null}
             </div>
-            <p className="mt-3 text-sm leading-6 text-ink/55">{row.changedSinceReview ? 'Changed since review' : row.reviewed ? 'Reviewed' : 'Needs review'} · CRM {formatLabel(row.workflow?.crmStatus)} · CIM {formatLabel(row.workflow?.cimStatus)}{formatDate(row.observationFreshness) ? ` · Observed ${formatDate(row.observationFreshness)}` : ''}</p>
+            <p className="mt-3 text-sm leading-6 text-ink/55">{row.changedSinceReview ? 'Changed since review' : row.reviewed ? 'Reviewed' : 'Needs review'} · CRM {formatLabel(row.workflow?.crmStatus)} · CIM {rowCimLabel(row)}{formatDate(row.observationFreshness) ? ` · Observed ${formatDate(row.observationFreshness)}` : ''}</p>
             <div className="mt-auto pt-4">
               <OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => onOpen?.(row, event)} />
-              {!readOnly ? <div className="mt-3 [&>div]:justify-start"><ActionButtons context="shortlist lead" disabled={pending || !actionsAllowed} name={row.name} onAction={(action, event) => onAction?.(row, action, event)} /><p className="mt-3 text-xs leading-5 text-ink/55">Opens current evidence for final review before recording the decision.</p></div> : null}
+              {!readOnly ? <div className="mt-3 [&>div]:justify-start"><ActionButtons context="shortlist lead" disabled={pending || !actionsAllowed} name={row.name} onAction={(action, event) => onAction?.(row, action, event)} showRequestSim={!row.campaign} /><p className="mt-3 text-xs leading-5 text-ink/55">Opens current evidence for final review before recording the decision.</p></div> : null}
             </div>
           </li>)}
         </ol>
@@ -180,7 +192,7 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
           <span className="rounded-full bg-moss/10 px-2 py-0.5 text-moss">Operator: {formatLabel(row.operatorPriority || 'normal')}</span>
           <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">Machine: {formatLabel(row.scoreStatus || 'provisional')}</span>
           <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CRM: {formatLabel(row.workflow?.crmStatus || 'not-started')}</span>
-          <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CIM: {formatLabel(row.workflow?.cimStatus || 'not-requested')}</span>
+          <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CIM: {rowCimLabel(row)}</span>
           {row.dismissed ? <span className="rounded-full bg-red-50 px-2 py-0.5 text-red-800">Passed: {formatLabel(row.dismissedReason || 'dismissed')}</span> : null}
         </div>
         {row.dismissedNote ? <p className="mt-1 text-sm leading-5 text-ink/68">Decision note: {row.dismissedNote}</p> : null}
@@ -194,7 +206,7 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
         {row.topStrength ? <p className="text-sm leading-5 text-moss">{row.topStrength}</p> : null}
         {row.topConcern ? <p className="mt-1 text-sm leading-5 text-amber-800">{row.topConcern}</p> : null}
         <div className="mt-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={onOpen} /></div>
-        {!readOnly && !row.dismissed ? <div className="mt-2"><ActionButtons disabled={pending || !actionsAllowed} name={row.name} onAction={onAction} /></div> : null}
+        {!readOnly && !row.dismissed ? <div className="mt-2"><ActionButtons disabled={pending || !actionsAllowed} name={row.name} onAction={onAction} showRequestSim={!row.campaign} /></div> : null}
       </div>
     </li>
   );
@@ -286,6 +298,8 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const [queueError, setQueueError] = useState('');
   const [newResultsAvailable, setNewResultsAvailable] = useState(false);
   const [mutationError, setMutationError] = useState('');
+  // Why a Request SIM click started nothing; informational, not a failure.
+  const [actionNotice, setActionNotice] = useState('');
   const [pendingId, setPendingId] = useState('');
   const [selectedId, setSelectedId] = useState('');
   const [detail, setDetail] = useState({ requestedId: '', data: null, loading: false, error: '' });
@@ -591,7 +605,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     setFollowUpState(emptyFollowUpState);
     setCimReleaseState(emptyCimReleaseState);
     setPursueChoice(null);
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     const trigger = detailTriggerRef.current;
     if (trigger?.isConnected) trigger.focus();
     else if (searchInputRef.current?.isConnected) searchInputRef.current.focus();
@@ -601,7 +615,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     if (!actionsAllowed) return;
     passTriggerRef.current = trigger || null;
     passFocusGuardRef.current = true;
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     setPassTarget(row);
   }
 
@@ -609,7 +623,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     if (mutationPendingRef.current && force !== true) return;
     passFocusGuardRef.current = false;
     setPassTarget(null);
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     const trigger = passTriggerRef.current;
     if (trigger?.isConnected && !trigger.disabled && trigger.getAttribute('aria-disabled') !== 'true') trigger.focus();
     else if (searchInputRef.current?.isConnected) searchInputRef.current.focus();
@@ -622,7 +636,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   function openNearMissConfirm(row, trigger) {
     if (!actionsAllowed) return;
     nearMissTriggerRef.current = trigger || null;
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     setNearMissTarget({ row });
   }
 
@@ -657,7 +671,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     const mutationGeneration = mutationGenerationRef.current + 1;
     mutationGenerationRef.current = mutationGeneration;
     setPendingId(opportunityId);
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     try {
       const body = action === 'pass'
         ? { action, reason: pass.reason.trim(), note: (pass.note || '').trim() }
@@ -702,6 +716,9 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       }
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record this decision.');
       pendingOwnerCommandRef.current = null;
+      if (mutationGenerationRef.current === mutationGeneration && typeof result.notice?.message === 'string') {
+        setActionNotice(result.notice.message);
+      }
       if (action === 'pursue') {
         if (result.enrollment?.state === 'action-required'
           && result.recipientOptions?.length > 1
@@ -710,7 +727,10 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
           && result.recipientOptions?.length > 1
           ? { opportunityId, options: result.recipientOptions } : null);
       }
-      const authoritativeOpportunity = result?.opportunity?.opportunityId === opportunityId ? result.opportunity : null;
+      const authoritativeOpportunity = result?.opportunity?.opportunityId === opportunityId
+        ? keepKnownCampaign(result.opportunity, queue.rows.find((row) => row.opportunityId === opportunityId)
+          || (detail.requestedId === opportunityId ? detail.data?.opportunity : null))
+        : null;
       if (authoritativeOpportunity) {
         setQueue((current) => ({
           ...current,
@@ -752,7 +772,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     if (!authority) return false;
     mutationPendingRef.current = true;
     setPendingId(opportunityId);
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     try {
       const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/restore`, {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
@@ -779,7 +799,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
       || !Number.isSafeInteger(authority.expectedTerminalRevision)) return false;
     mutationPendingRef.current = true;
     setPendingId(opportunityId);
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     const signature = JSON.stringify([opportunityId, authority]);
     if (cimReleaseStopKeyRef.current?.signature !== signature) {
       cimReleaseStopKeyRef.current = { signature, key: globalThis.crypto.randomUUID() };
@@ -862,7 +882,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     const mutationGeneration = mutationGenerationRef.current + 1;
     mutationGenerationRef.current = mutationGeneration;
     setPendingId(opportunityId);
-    setMutationError('');
+    setMutationError(''); setActionNotice('');
     try {
       const signature = JSON.stringify([
         opportunityId, field, String(value).trim(), String(note || '').trim(), verified,
@@ -1318,7 +1338,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         {preview ? <BrokerRepliesBlock readOnly={readOnly} replies={brokerReplies} /> : null}
         {item.rows.length === 0 ? (preview && brokerReplies.items.length > 0 ? null : <p className="p-4 text-sm text-ink/60">No opportunities in this area.</p>) : nearMissCollapsed
           ? <div className="p-4"><button aria-expanded="false" className={buttonClass} onClick={() => setShowNearMisses(true)} type="button">Show near misses ({item.total})</button></div> : preview
-          ? <ol aria-label="Action preview" className="divide-y divide-line/70">{item.rows.map((row) => <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-2" key={row.opportunityId}><div><button className="text-left text-sm font-semibold text-ink hover:text-moss" onClick={(event) => openDetail(row.opportunityId, event.currentTarget)} type="button">{row.name}</button><p className="text-xs text-ink/58">{row.freshness?.actionReason === 'broker_reply' ? 'Broker reply needs review' : row.freshness?.actionReason === 'materials_ready' ? 'Broker materials received' : row.freshness?.dueAction ? 'Due follow-up' : 'Owner priority'} · Fit {row.fitScore} · {formatLabel(row.operatorPriority)}</p></div><div className="flex flex-wrap items-center gap-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} />{!readOnly ? <ActionButtons disabled={Boolean(pendingId) || !actionsAllowed} name={row.name} onAction={(action, event) => handleRowAction(row, action, event)} /> : null}</div></li>)}</ol>
+          ? <ol aria-label="Action preview" className="divide-y divide-line/70">{item.rows.map((row) => <li className="flex flex-wrap items-center justify-between gap-3 px-4 py-2" key={row.opportunityId}><div><button className="text-left text-sm font-semibold text-ink hover:text-moss" onClick={(event) => openDetail(row.opportunityId, event.currentTarget)} type="button">{row.name}</button><p className="text-xs text-ink/58">{row.freshness?.actionReason === 'broker_reply' ? 'Broker reply needs review' : row.freshness?.actionReason === 'materials_ready' ? 'Broker materials received' : row.freshness?.dueAction ? 'Due follow-up' : 'Owner priority'} · Fit {row.fitScore} · {formatLabel(row.operatorPriority)}</p></div><div className="flex flex-wrap items-center gap-2"><OpportunityLinks listingUrl={row.listingUrl} name={row.name} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} />{!readOnly ? <ActionButtons disabled={Boolean(pendingId) || !actionsAllowed} name={row.name} onAction={(action, event) => handleRowAction(row, action, event)} showRequestSim={!row.campaign} /> : null}</div></li>)}</ol>
           : <ul aria-label={`${heading} opportunities`} className="divide-y divide-line/70">{item.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => handleRowAction(row, action, event)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} showNotAutomatic={item.id === 'your-review'} />)}</ul>}
         {item.id === 'near-miss' && area === 'inbox' && showNearMisses && item.rows.length > 0 ? <div className="border-t border-line/80 px-4 py-3"><button aria-expanded="true" className={buttonClass} onClick={() => setShowNearMisses(false)} type="button">Hide near misses</button></div> : null}
         {area !== 'inbox' ? <div className="flex items-center justify-between border-t border-line/80 px-4 py-3"><button className={buttonClass} disabled={cursorHistory.length === 0 || loading} onClick={() => { setAreaCursor(cursorHistory.at(-1) || ''); setCursorHistory((current) => current.slice(0, -1)); }} type="button">Previous page</button><span className="text-xs text-ink/58">{item.total} total</span><button className={buttonClass} disabled={!item.nextCursor || loading} onClick={() => { setCursorHistory((current) => [...current, areaCursor]); setAreaCursor(item.nextCursor); }} type="button">Next page</button></div> : null}
@@ -1357,6 +1377,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         <div className="p-4 sm:p-5">
           {queueError ? <div className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{queueError}<button className={`${buttonClass} ml-3`} onClick={() => { setAreaCursor(''); setCursorHistory([]); queueQueryRef.current.areaCursor = ''; loadQueue(); }} type="button">{view === 'inbox' ? 'Refresh this area' : 'Retry loading opportunities'}</button></div> : null}
           {mutationError && !selectedId && !passTarget ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{mutationError}</p> : null}
+          {actionNotice && !selectedId ? <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900" role="status">{actionNotice}</p> : null}
           {queueIsLastKnown ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50/70 p-3 text-sm font-semibold text-red-900">Last known queue — persisted rows are retained for reference, but current required-source authority is unavailable.</p> : null}
           {loading && queue.rows.length === 0 ? <p className="text-sm text-ink/62">Loading current opportunities…</p> : null}
           {view === 'inbox' ? inboxAreas.map(renderInboxArea) : <>{!loading && !queueError && queue.rows.length === 0 ? <p className="rounded-xl border border-line bg-fog/60 p-4 text-sm text-ink/68">No opportunities in this view.</p> : null}<ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => handleRowAction(row, action, event)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>{queue.totalPages > 1 ? <div className="mt-4 flex items-center justify-between"><button aria-label="Previous page" className={buttonClass} disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))} type="button"><ChevronLeft className="h-4 w-4" />Previous</button><p className="text-xs font-semibold text-ink/58">Page {queue.page || page} of {queue.totalPages}</p><button aria-label="Next page" className={buttonClass} disabled={page >= queue.totalPages || loading} onClick={() => setPage((current) => current + 1)} type="button">Next<ChevronRight className="h-4 w-4" /></button></div> : null}</>}
@@ -1365,7 +1386,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         <MorningBriefing actionsAllowed={actionsAllowed} digest={dailyDigest} error={queueError} loading={loading} onAction={(row, _action, event) => openDetail(row.opportunityId, event.currentTarget)} onOpen={(row, event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} />
       </div>
 
-      {selectedId ? <OpportunityDrawer actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly || detail.data?.archivedReadOnly === true} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onCimTimezoneSet={hasMatchingDetail ? () => loadCimRelease(loadedDetailId, { preserveData: true }) : undefined} onClose={closeDetail} onRestore={hasMatchingDetail ? () => restoreOpportunity(loadedDetailId) : undefined} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed || detail.data?.archivedReadOnly === true} /> : null}
+      {selectedId ? <OpportunityDrawer actionNotice={actionNotice} actionsBlocked={detail.loading || Boolean(detail.error)} brokerMaterialsState={brokerMaterialsState} cimRelease={hasMatchingCimRelease ? cimReleaseState.data : null} cimReleaseError={cimReleaseState.requestedId === selectedId ? cimReleaseState.error : ''} cimReleaseLoading={cimReleaseState.requestedId === selectedId && cimReleaseState.loading} cimReleaseReadOnly={readOnly || detail.data?.archivedReadOnly === true} cimReleaseStopping={cimReleaseState.requestedId === selectedId && cimReleaseState.stopping} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onCimReleaseStop={hasMatchingDetail ? (authority) => stopCimRelease(loadedDetailId, authority) : undefined} onCimTimezoneSet={hasMatchingDetail ? () => loadCimRelease(loadedDetailId, { preserveData: true }) : undefined} onClose={closeDetail} onRestore={hasMatchingDetail ? () => restoreOpportunity(loadedDetailId) : undefined} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId, { preserveData: true })} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} pursueChoice={pursueChoice?.opportunityId === loadedDetailId ? pursueChoice : null} readOnly={!actionsAllowed || detail.data?.archivedReadOnly === true} /> : null}
       {nearMissTarget ? <NearMissConfirmDialog name={nearMissTarget.row.name} onCancel={closeNearMissConfirm} onConfirm={confirmNearMiss} pending={pendingId === nearMissTarget.row.opportunityId} row={nearMissTarget.row} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>

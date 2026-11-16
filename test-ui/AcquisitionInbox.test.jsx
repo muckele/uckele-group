@@ -1099,6 +1099,36 @@ describe('Acquisition Inbox queue', () => {
     expect(writes.some(({ url }) => /send|cim|backfill|refresh|import/.test(url))).toBe(false);
   });
 
+  test('a row whose listing has a campaign shows it and offers no Request SIM', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ rows: [
+      queueRow({ campaign: { state: 'stopped', reasonCode: 'campaign_stopped' } }),
+      queueRow({ opportunityId: 'opp-2', name: 'Fresh Plumbing', campaign: null }),
+    ], total: 2 }))));
+
+    renderInbox();
+    await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ });
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.getByText(/CIM: Campaign Stopped/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Request SIM Fresh Plumbing' })).toBeVisible();
+  });
+
+  test('says why a Request SIM click started nothing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      if (String(input).endsWith('/action')) {
+        return jsonResponse({ success: true, action: 'pursue',
+          notice: { code: 'campaign_finished', message: "This listing's email campaign has already ended." },
+          opportunity: queueRow({ campaign: { state: 'stopped', reasonCode: 'campaign_stopped' } }) });
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ });
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
+    expect(await screen.findByText("This listing's email campaign has already ended.")).toBeVisible();
+  });
+
   test('loads the separate canary release report and stops only through its revision-bound route', async () => {
     const writes = [];
     const detail = { ...detailResponse(), pursueCimReleaseAvailable: true };

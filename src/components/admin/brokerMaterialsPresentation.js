@@ -1,3 +1,4 @@
+import { stoppedCampaignPresentation } from './campaignPresentation.js';
 function formatDateTime(value) {
   if (!value || !Number.isFinite(Date.parse(value))) return 'Not supplied';
   return new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
@@ -90,6 +91,7 @@ export function pursueNextActionPresentation({ brokerMaterials = {}, cimRelease 
       return { kind: 'Next action', title: 'Review received broker materials',
         detail: 'Materials were reported received; confirm retrieval, scanning, and owner review before relying on them.' };
     }
+    if (cimRelease.status?.code === 'campaign_stopped') return stoppedCampaignPresentation(cimRelease);
     if (cimRelease.status?.code === 'expired') {
       return { kind: 'Next action', title: 'Review the unanswered opportunity',
         detail: 'The bounded four-week email campaign expired without a reply or CIM. Decide whether a phone call is appropriate; no further email is scheduled.' };
