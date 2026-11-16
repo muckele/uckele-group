@@ -289,19 +289,8 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
   });
 }
 
-const fingerprintReadChunkSize = 250;
-
-// Stored fingerprints for `opportunityIds`, read a chunk at a time so a full refresh does not
-// hold the event loop for the whole read. Same rows as one call, in the same order.
-async function listScoreFingerprintsInSlices(storage, opportunityIds, slicer) {
-  const rows = [];
-  for (let index = 0; index < opportunityIds.length; index += fingerprintReadChunkSize) {
-    if (slicer.due()) await slicer.yield();
-    rows.push(...await storage.listDealHunterOpportunityScoreFingerprints(
-      opportunityIds.slice(index, index + fingerprintReadChunkSize)));
-  }
-  return rows;
-}
+// The most opportunities whose stored rows one read fetches before they are written.
+const scoreReadBatchSize = 250;
 
 /**
  * Refresh persisted scores for the supplied canonical listings.
@@ -425,66 +414,72 @@ async function refreshOpportunityScoresLocked({
     }
   }
 
-  // One batched read instead of a lookup per opportunity.
-  const storedByOpportunity = new Map(
-    (await listScoreFingerprintsInSlices(storage, evaluated.map(({ deal }) => deal.opportunityId), slicer))
-      .map((row) => [row.opportunity_id, row]),
-  );
-  // Only deployed contradiction digests need the compatibility evidence, and
-  // those rows are loaded together rather than through an N+1 query.
-  const legacyContradictions = await loadLegacyContradictions(storage, evaluated, storedByOpportunity);
-
-  for (const { deal, result } of evaluated) {
-    if (slicer.due()) await slicer.yield();
-    try {
-      const storedContradictions = legacyContradictions.get(deal.opportunityId);
-      if (!force && storedScoreIsCurrent(storedByOpportunity.get(deal.opportunityId), result, storedContradictions)) {
-        counts.skipped += 1;
-        continue;
+  // Stored rows are read in batches of up to `scoreReadBatchSize` opportunities. When the loop
+  // returns to the event loop, an operator may review a score before the next write, so the
+  // rest of the batch is dropped and read again from the next opportunity: every write is
+  // decided from a row read since the last yield, as in the single block this replaced.
+  let index = 0;
+  while (index < evaluated.length) {
+    const batch = evaluated.slice(index, index + scoreReadBatchSize);
+    // One batched read instead of a lookup per opportunity.
+    const storedByOpportunity = new Map(
+      (await storage.listDealHunterOpportunityScoreFingerprints(batch.map(({ deal }) => deal.opportunityId)))
+        .map((row) => [row.opportunity_id, row]),
+    );
+    // Only deployed contradiction digests need the compatibility evidence, and
+    // those rows are loaded together rather than through an N+1 query.
+    const legacyContradictions = await loadLegacyContradictions(storage, batch, storedByOpportunity);
+    let processed = 0;
+    for (const { deal, result } of batch) {
+      // Yield before the next opportunity once the slice is spent; the rest of the batch is
+      // read again afterwards. At least one opportunity is written per read.
+      if (processed > 0 && slicer.due()) break;
+      processed += 1;
+      index += 1;
+      try {
+        const stored = storedByOpportunity.get(deal.opportunityId);
+        const storedContradictions = legacyContradictions.get(deal.opportunityId);
+        if (!force && storedScoreIsCurrent(stored, result, storedContradictions)) {
+          counts.skipped += 1;
+          continue;
+        }
+        // An event describes a change in conclusions, not a change in version
+        // metadata, so it is gated on the semantic digest rather than the
+        // fingerprint. A rules bump that reproduces the same score is silent.
+        // The batched read already carries the stored digest, so deciding this
+        // costs no extra query.
+        const semanticallyChanged = !semanticDigestIsCurrent(stored, result, storedContradictions);
+        // A forced or version-only refresh over a reviewed, semantically
+        // equivalent v111 digest keeps the exact digest the operator
+        // acknowledged. Otherwise changing only the digest encoding would make
+        // the derived review state falsely stale.
+        const row = machineScoreRow(deal, result);
+        if (!semanticallyChanged
+          && stored?.reviewed_at
+          && stored.semantic_digest !== result.semanticDigest) {
+          row.semantic_digest = stored.semantic_digest;
+        }
+        // Keep the score/currentness data flow identical when activity recording
+        // is suppressed; only the operator-facing event emission is optional.
+        const previous = semanticallyChanged
+          ? await storage.getDealHunterOpportunityScore(deal.opportunityId)
+          : null;
+        await storage.writeDealHunterOpportunityScore(row, result.evidence);
+        if (semanticallyChanged && recordActivity) {
+          await emitRescoreEvent({ storage, deal, previous, row, actor });
+        }
+        if (semanticallyChanged) {
+          counts.changed += 1;
+        } else {
+          counts.versionOnly += 1;
+        }
+        counts.scored += 1;
+      } catch (error) {
+        counts.failed += 1;
+        errors.push({ opportunityId: deal.opportunityId, error: normalizeText(error.message, 500) });
       }
-      // The batched read is from before this loop started yielding: an operator may have
-      // reviewed this score since. Decide the write from the row as it is now.
-      const stored = (await storage.listDealHunterOpportunityScoreFingerprints([deal.opportunityId]))
-        .find((row) => row?.opportunity_id === deal.opportunityId);
-      if (!force && storedScoreIsCurrent(stored, result, storedContradictions)) {
-        counts.skipped += 1;
-        continue;
-      }
-      // An event describes a change in conclusions, not a change in version
-      // metadata, so it is gated on the semantic digest rather than the
-      // fingerprint. A rules bump that reproduces the same score is silent.
-      // The batched read already carries the stored digest, so deciding this
-      // costs no extra query.
-      const semanticallyChanged = !semanticDigestIsCurrent(stored, result, storedContradictions);
-      // A forced or version-only refresh over a reviewed, semantically
-      // equivalent v111 digest keeps the exact digest the operator
-      // acknowledged. Otherwise changing only the digest encoding would make
-      // the derived review state falsely stale.
-      const row = machineScoreRow(deal, result);
-      if (!semanticallyChanged
-        && stored?.reviewed_at
-        && stored.semantic_digest !== result.semanticDigest) {
-        row.semantic_digest = stored.semantic_digest;
-      }
-      // Keep the score/currentness data flow identical when activity recording
-      // is suppressed; only the operator-facing event emission is optional.
-      const previous = semanticallyChanged
-        ? await storage.getDealHunterOpportunityScore(deal.opportunityId)
-        : null;
-      await storage.writeDealHunterOpportunityScore(row, result.evidence);
-      if (semanticallyChanged && recordActivity) {
-        await emitRescoreEvent({ storage, deal, previous, row, actor });
-      }
-      if (semanticallyChanged) {
-        counts.changed += 1;
-      } else {
-        counts.versionOnly += 1;
-      }
-      counts.scored += 1;
-    } catch (error) {
-      counts.failed += 1;
-      errors.push({ opportunityId: deal.opportunityId, error: normalizeText(error.message, 500) });
     }
+    if (slicer.due()) await slicer.yield();
   }
 
   await slicer.maybeYield();
