@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { getTriageOpportunityDetail, publicTriageRow,
-  recordAcquisitionOwnerCommand } from '../server/services/dealHunterTriage.js';
+  recordAcquisitionOwnerCommand, requestSimNotice } from '../server/services/dealHunterTriage.js';
 import { orchestratePursuitEnrollment } from '../server/services/pursueCimEnrollment.js';
 import { publicCampaignSummary } from '../server/services/pursueCimCampaignSummary.js';
 import { stopPursueCimCampaign } from '../server/services/pursueCimRelease.js';
@@ -111,4 +111,17 @@ test('a campaign past its day-28 window reads as expired before the sweep record
   assert.deepEqual(publicCampaignSummary({ state: 'stopped', reasonCode: 'campaign_stopped',
     localExpiryAt: '2026-11-01T00:00:00.000Z' }, now),
   { state: 'stopped', reasonCode: 'campaign_stopped' });
+});
+
+test('a click that creates the campaign is not told one was already running', () => {
+  const created = { state: 'initial-pending', reasonCode: 'awaiting-window' };
+  // A waiting enrollment re-clicked: the writer changes nothing, enrollment then allocates.
+  assert.equal(requestSimNotice({ result: { applied: false, replay: false }, campaign: created,
+    priorCampaign: null }), null);
+  assert.equal(requestSimNotice({ result: { applied: false, replay: false }, campaign: created,
+    priorCampaign: created }).code, 'campaign_running');
+  assert.equal(requestSimNotice({ result: { applied: false, replay: true }, campaign: created,
+    priorCampaign: created }), null);
+  assert.equal(requestSimNotice({ result: { applied: true, replay: false },
+    campaign: { state: 'stopped', reasonCode: 'watch-selected' }, priorCampaign: null }).code, 'campaign_finished');
 });

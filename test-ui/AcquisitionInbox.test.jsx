@@ -1127,6 +1127,9 @@ describe('Acquisition Inbox queue', () => {
     await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ });
     fireEvent.click(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
     expect(await screen.findByText("This listing's email campaign has already ended.")).toBeVisible();
+    // The notice belongs to that click; opening a listing clears it.
+    fireEvent.click(screen.getByRole('button', { name: /Open Evergreen Fire Protection/ }));
+    await waitFor(() => expect(screen.queryByText("This listing's email campaign has already ended.")).toBeNull());
   });
 
   test('loads the separate canary release report and stops only through its revision-bound route', async () => {

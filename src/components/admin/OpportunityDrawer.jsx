@@ -303,7 +303,8 @@ function CimReleaseCard({ error = '', loading = false, onStop, onTimezoneSet, op
           <p className="mt-3 break-all text-[11px] text-ink/55">Transmission {transmission.id} · Payload {shortDigest(transmission.payloadDigest)} · Membership {shortDigest(transmission.memberDigest)}</p>
           {release.campaign?.localExpiryAt ? <p className="mt-1 text-[11px] text-ink/55">Campaign expiry {formatDate(release.campaign.localExpiryAt)}</p> : <p className="mt-1 text-[11px] text-ink/55">Campaign expiry is established after initial provider acceptance.</p>}
         </div> : null}
-        {!readOnly && opportunityId && (!release.timezoneAuthority
+        {/* Setting a timezone is recovery before a campaign exists; once one does, Request SIM is gone. */}
+        {!readOnly && opportunityId && !release.campaign && (!release.timezoneAuthority
           || ['missing', 'ambiguous'].includes(release.timezoneAuthority.state))
           ? <TimezonePicker expectedPriorRevision={release.timezoneAuthority?.revision ?? 0}
             key={opportunityId} onSet={() => { setTimezoneSavedFor(opportunityId); onTimezoneSet?.(); }}

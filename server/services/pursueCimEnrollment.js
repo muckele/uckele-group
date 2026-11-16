@@ -315,7 +315,10 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                       campaign: allocation.campaign, recipientOptions: options(freshAuthority) };
                   }
                   // A finished earlier campaign is never restarted by a Pursue click (spec 7.2.4).
-                  reason = TERMINAL_CAMPAIGN_STATES.has(allocation.campaign?.state)
+                  // Postgres returns no campaign when its gate refuses, so read the latest one.
+                  const latest = allocation.campaign
+                    ?? (await storage.readPursueCimProjection?.({ opportunityId }))?.campaign;
+                  reason = TERMINAL_CAMPAIGN_STATES.has(latest?.state)
                     ? 'prior_campaign_terminal' : 'current_authority_unavailable';
                   }
                 }

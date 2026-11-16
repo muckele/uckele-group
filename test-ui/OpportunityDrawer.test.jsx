@@ -439,9 +439,14 @@ describe('Opportunity drawer', () => {
     ['with the first email unconfirmed', 'pass-selected', 'provider-pending', 'Stopped before the first email was confirmed'],
     ['when the owner replied in Gmail', 'owner_replied', 'accepted', 'You replied in the Gmail thread'],
     ['when the address is suppressed', 'recipient_suppressed', 'accepted', 'The broker address is suppressed'],
+    ['for unsafe delivery', 'unsafe_delivery', 'accepted', 'Delivery to this address was unsafe'],
+    ['because materials arrived', 'materials_received', 'scheduled', 'Materials arrived before the first email'],
   ])('explains a campaign stopped %s', (_name, reasonCode, touchState, title) => {
+    // Watch and Pass leave the release status at their own decision code, not campaign_stopped.
+    const code = { 'watch-selected': 'watch_selected', 'pass-selected': 'pass_selected' }[reasonCode]
+      || 'campaign_stopped';
     render(<OpportunityDrawer cimRelease={cimReleaseFixture({
-      status: { code: 'campaign_stopped', reason: reasonCode, actionRequired: false },
+      status: { code, reason: reasonCode === 'watch-selected' ? 'watch' : reasonCode, actionRequired: false },
       campaign: { ...cimReleaseFixture().campaign, state: 'stopped', reasonCode },
       initialTouch: { ...cimReleaseFixture().initialTouch, state: touchState },
       actions: { canStop: false },
@@ -526,8 +531,17 @@ describe('Opportunity drawer', () => {
   describe('timezone picker', () => {
     const timezoneNames = ['America/New_York', 'America/Chicago', 'America/Denver',
       'America/Phoenix', 'America/Los_Angeles'];
-    const releaseWith = (timezoneAuthority) => cimReleaseFixture({ timezoneAuthority });
+    // A missing timezone holds enrollment before any campaign exists.
+    const releaseWith = (timezoneAuthority) => cimReleaseFixture({ timezoneAuthority, campaign: null,
+      transmission: null, actions: { canStop: false },
+      enrollment: { state: 'action-required', reasonCode: 'timezone_missing' } });
     const pickerGroup = () => screen.queryByRole('group', { name: 'Set timezone' });
+
+    test('timezone picker is not offered once a campaign exists, since Request SIM is gone', () => {
+      render(<OpportunityDrawer cimRelease={cimReleaseFixture({ timezoneAuthority: null })}
+        detail={detailFixture()} onClose={vi.fn()} />);
+      expect(pickerGroup()).toBeNull();
+    });
 
     test('timezone picker shows only when timezone authority is missing or ambiguous', () => {
       for (const [timezoneAuthority, visible] of [

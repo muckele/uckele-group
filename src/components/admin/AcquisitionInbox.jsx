@@ -550,6 +550,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   }, [loadCimRelease]);
 
   function openDetail(opportunityId, trigger) {
+    setActionNotice('');
     cimReleaseRequestRef.current.controller?.abort();
     cimReleaseRequestRef.current = { generation: cimReleaseRequestRef.current.generation + 1, controller: null };
     cimReleaseStopKeyRef.current = null;
@@ -735,6 +736,8 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         setQueue((current) => ({
           ...current,
           rows: current.rows.map((row) => row.opportunityId === opportunityId ? authoritativeOpportunity : row),
+          ...(Array.isArray(current.areas) ? { areas: current.areas.map((area) => ({ ...area,
+            rows: (area.rows || []).map((row) => row.opportunityId === opportunityId ? authoritativeOpportunity : row) })) } : {}),
         }));
         setDetail((current) => current.requestedId === opportunityId && current.data
           ? { ...current, data: { ...current.data, opportunity: authoritativeOpportunity }, error: '' }

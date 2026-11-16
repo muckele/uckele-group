@@ -1279,6 +1279,7 @@ export async function recordAcquisitionOwnerCommand({
     return { ok: false, status: 400, error: 'A disposition reason is required.' };
   }
   let result;
+  let priorCampaign = null;
   try {
     const decisionCommand = {
       opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
@@ -1289,6 +1290,8 @@ export async function recordAcquisitionOwnerCommand({
       ...(action === 'pass' ? { reason: normalizedReason, note: note?.trim() || '',
         submissionId: submissionId || '' } : {}),
     };
+    // What this click found, so a campaign it creates is not reported as already running.
+    priorCampaign = action === 'pursue' ? await latestCampaignSummary(storage, opportunityId) : null;
     // The automatic writer refuses, under the owner-decision lock, any opportunity that
     // already has an owner decision, a command outside the guarded business day, or a full cap.
     result = automatic
@@ -1343,7 +1346,7 @@ export async function recordAcquisitionOwnerCommand({
   const opportunity = score ? { ...publicTriageRow({ ...score,
     dismissed_at: disposition?.dismissed_at, dismissed_reason: disposition?.reason,
   }, { includeOperatorNote: true }), campaign } : null;
-  const notice = action === 'pursue' ? requestSimNotice({ result, campaign }) : null;
+  const notice = action === 'pursue' ? requestSimNotice({ result, campaign, priorCampaign }) : null;
   return { ok: true, status: 200, action, replay: Boolean(result.replay), opportunity,
     ...(notice ? { notice } : {}),
     ...(action === 'pass' ? { disposition: publicPassDisposition(disposition),
@@ -1372,12 +1375,13 @@ async function latestCampaignSummary(storage, opportunityId) {
  * Why a Request SIM click started nothing. A finished campaign is never restarted by a Pursue
  * click (spec 7.2.4), and a repeat Pursue while one runs returns the existing campaign (9.4).
  */
-function requestSimNotice({ result, campaign }) {
+export function requestSimNotice({ result, campaign, priorCampaign }) {
   if (campaignFinished(campaign)) {
     return { code: 'campaign_finished',
       message: 'This listing\'s email campaign has already ended, so Request SIM did not start another one. The listing shows what happens next.' };
   }
-  if (campaign && !result.applied && !result.replay) {
+  // Only a campaign that was there before the click; one this click created is not "already".
+  if (campaign && priorCampaign && !campaignFinished(priorCampaign) && !result.applied && !result.replay) {
     return { code: 'campaign_running',
       message: 'An email campaign is already running for this listing, so nothing new was started.' };
   }

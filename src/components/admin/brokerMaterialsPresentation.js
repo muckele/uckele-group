@@ -91,7 +91,9 @@ export function pursueNextActionPresentation({ brokerMaterials = {}, cimRelease 
       return { kind: 'Next action', title: 'Review received broker materials',
         detail: 'Materials were reported received; confirm retrieval, scanning, and owner review before relying on them.' };
     }
-    if (cimRelease.status?.code === 'campaign_stopped') return stoppedCampaignPresentation(cimRelease);
+    // Watch and Pass leave the release status at watch_selected or pass_selected, so route on the
+    // campaign itself.
+    if (cimRelease.campaign.state === 'stopped') return stoppedCampaignPresentation(cimRelease);
     if (cimRelease.status?.code === 'expired') {
       return { kind: 'Next action', title: 'Review the unanswered opportunity',
         detail: 'The bounded four-week email campaign expired without a reply or CIM. Decide whether a phone call is appropriate; no further email is scheduled.' };

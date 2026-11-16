@@ -48,6 +48,14 @@ export function stoppedCampaignPresentation(cimRelease) {
     return { kind: 'Campaign stopped', title: 'The broker address is suppressed',
       detail: 'No more email goes to this address from here.' };
   }
+  if (reason === 'materials_received' || reason === 'advanced_beyond_broker_outreach') {
+    return { kind: 'Campaign stopped', title: 'Materials arrived before the first email',
+      detail: 'The campaign stopped because materials are already on file. Review them in the linked CRM record.' };
+  }
+  if (reason === 'unsafe_delivery') {
+    return { kind: 'Campaign stopped', title: 'Delivery to this address was unsafe',
+      detail: 'A bounce or delivery problem stopped the campaign. Check the CRM record before contacting the broker another way.' };
+  }
   if (reason === 'crm_archived' || reason === 'crm_superseded') {
     return { kind: 'Campaign stopped', title: 'The CRM record was archived or replaced',
       detail: 'The campaign stopped with it. No more email goes out about this listing from here.' };
