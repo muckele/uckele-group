@@ -11,6 +11,8 @@ import { recordCrmActivity } from './activity.js';
 import { DEAL_CRITERIA_PROFILE_VERSION, evaluateDealCriteria } from './dealCriteriaProfile.js';
 import { collectScoredOpportunities, isBuilderProducedScoredSet } from './dealHunter.js';
 import { getStorage } from '../storage/index.js';
+import { createEventLoopSlicer } from '../utils/eventLoopSlices.js';
+import { withDealReviewLockHeld } from './dealReviewLock.js';
 import {
   DEAL_SCORING_ENGINE_VERSION,
   DEAL_SCORING_PROFILE_VERSION,
@@ -287,14 +289,25 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
   });
 }
 
+// The most opportunities whose stored rows one read fetches before they are written.
+const scoreReadBatchSize = 250;
+
 /**
  * Refresh persisted scores for the supplied canonical listings.
  *
  * Idempotent and resumable: an unchanged opportunity is skipped without any
  * write, and a failed opportunity is reported without stopping the batch, so a
  * retry only redoes the work that did not land.
+ *
+ * One refresh or review build runs at a time (see dealReviewLock.js); `reviewLock` is the
+ * caller's token when it already holds the lock. The work returns to the event loop between
+ * opportunities.
  */
-export async function refreshOpportunityScores({
+export function refreshOpportunityScores({ reviewLock = null, ...options } = {}) {
+  return withDealReviewLockHeld(reviewLock, (token) => refreshOpportunityScoresLocked(options, token));
+}
+
+async function refreshOpportunityScoresLocked({
   deals = null,
   authoritativeReview = null,
   opportunityIds = [],
@@ -303,7 +316,8 @@ export async function refreshOpportunityScores({
   actor = 'deal-hunter',
   recordActivity = true,
   storage = getStorage(),
-} = {}) {
+} = {}, reviewLock = null) {
+  const slicer = createEventLoopSlicer();
   const missingMethods = requiredStorageMethods(storage);
   if (missingMethods.length > 0) {
     return {
@@ -319,7 +333,7 @@ export async function refreshOpportunityScores({
   let candidates = callerSuppliedDeals ? deals : null;
   let authoritativeOpportunityIds = null;
   if (!candidates) {
-    const collected = await collectScoredOpportunities({ reviewMode, storage });
+    const collected = await collectScoredOpportunities({ reviewMode, storage, reviewLock });
     authoritativeReview = collected.review || null;
     if (collected.review?.scoringDeferred) {
       return {
@@ -389,6 +403,7 @@ export async function refreshOpportunityScores({
   // recomputed from stored rows, so automatic Pursue compares its stored fingerprint to this.
   const currentFingerprints = {};
   for (const deal of scoped) {
+    if (slicer.due()) await slicer.yield();
     try {
       const result = scoreOpportunity(deal);
       evaluated.push({ deal, result });
@@ -399,60 +414,75 @@ export async function refreshOpportunityScores({
     }
   }
 
-  // One batched read instead of a lookup per opportunity.
-  const storedByOpportunity = new Map(
-    (await storage.listDealHunterOpportunityScoreFingerprints(evaluated.map(({ deal }) => deal.opportunityId)))
-      .map((row) => [row.opportunity_id, row]),
-  );
-  // Only deployed contradiction digests need the compatibility evidence, and
-  // those rows are loaded together rather than through an N+1 query.
-  const legacyContradictions = await loadLegacyContradictions(storage, evaluated, storedByOpportunity);
-
-  for (const { deal, result } of evaluated) {
-    try {
-      const stored = storedByOpportunity.get(deal.opportunityId);
-      const storedContradictions = legacyContradictions.get(deal.opportunityId);
-      if (!force && storedScoreIsCurrent(stored, result, storedContradictions)) {
-        counts.skipped += 1;
-        continue;
+  // Stored rows are read in batches of up to `scoreReadBatchSize` opportunities. When the loop
+  // returns to the event loop, an operator may review a score before the next write, so the
+  // rest of the batch is dropped and read again from the next opportunity: every write is
+  // decided from a row read since the last yield, as in the single block this replaced.
+  let index = 0;
+  while (index < evaluated.length) {
+    const batch = evaluated.slice(index, index + scoreReadBatchSize);
+    // One batched read instead of a lookup per opportunity.
+    const storedByOpportunity = new Map(
+      (await storage.listDealHunterOpportunityScoreFingerprints(batch.map(({ deal }) => deal.opportunityId)))
+        .map((row) => [row.opportunity_id, row]),
+    );
+    // Only deployed contradiction digests need the compatibility evidence, and
+    // those rows are loaded together rather than through an N+1 query.
+    const legacyContradictions = await loadLegacyContradictions(storage, batch, storedByOpportunity);
+    let processed = 0;
+    for (const { deal, result } of batch) {
+      // Yield before the next opportunity once the slice is spent; the rest of the batch is
+      // read again afterwards. At least one opportunity is written per read.
+      if (processed > 0 && slicer.due()) break;
+      processed += 1;
+      index += 1;
+      try {
+        const stored = storedByOpportunity.get(deal.opportunityId);
+        const storedContradictions = legacyContradictions.get(deal.opportunityId);
+        if (!force && storedScoreIsCurrent(stored, result, storedContradictions)) {
+          counts.skipped += 1;
+          continue;
+        }
+        // An event describes a change in conclusions, not a change in version
+        // metadata, so it is gated on the semantic digest rather than the
+        // fingerprint. A rules bump that reproduces the same score is silent.
+        // The batched read already carries the stored digest, so deciding this
+        // costs no extra query.
+        const semanticallyChanged = !semanticDigestIsCurrent(stored, result, storedContradictions);
+        // A forced or version-only refresh over a reviewed, semantically
+        // equivalent v111 digest keeps the exact digest the operator
+        // acknowledged. Otherwise changing only the digest encoding would make
+        // the derived review state falsely stale.
+        const row = machineScoreRow(deal, result);
+        if (!semanticallyChanged
+          && stored?.reviewed_at
+          && stored.semantic_digest !== result.semanticDigest) {
+          row.semantic_digest = stored.semantic_digest;
+        }
+        // Keep the score/currentness data flow identical when activity recording
+        // is suppressed; only the operator-facing event emission is optional.
+        const previous = semanticallyChanged
+          ? await storage.getDealHunterOpportunityScore(deal.opportunityId)
+          : null;
+        await storage.writeDealHunterOpportunityScore(row, result.evidence);
+        if (semanticallyChanged && recordActivity) {
+          await emitRescoreEvent({ storage, deal, previous, row, actor });
+        }
+        if (semanticallyChanged) {
+          counts.changed += 1;
+        } else {
+          counts.versionOnly += 1;
+        }
+        counts.scored += 1;
+      } catch (error) {
+        counts.failed += 1;
+        errors.push({ opportunityId: deal.opportunityId, error: normalizeText(error.message, 500) });
       }
-      // An event describes a change in conclusions, not a change in version
-      // metadata, so it is gated on the semantic digest rather than the
-      // fingerprint. A rules bump that reproduces the same score is silent.
-      // The batched read already carries the stored digest, so deciding this
-      // costs no extra query.
-      const semanticallyChanged = !semanticDigestIsCurrent(stored, result, storedContradictions);
-      // A forced or version-only refresh over a reviewed, semantically
-      // equivalent v111 digest keeps the exact digest the operator
-      // acknowledged. Otherwise changing only the digest encoding would make
-      // the derived review state falsely stale.
-      const row = machineScoreRow(deal, result);
-      if (!semanticallyChanged
-        && stored?.reviewed_at
-        && stored.semantic_digest !== result.semanticDigest) {
-        row.semantic_digest = stored.semantic_digest;
-      }
-      // Keep the score/currentness data flow identical when activity recording
-      // is suppressed; only the operator-facing event emission is optional.
-      const previous = semanticallyChanged
-        ? await storage.getDealHunterOpportunityScore(deal.opportunityId)
-        : null;
-      await storage.writeDealHunterOpportunityScore(row, result.evidence);
-      if (semanticallyChanged && recordActivity) {
-        await emitRescoreEvent({ storage, deal, previous, row, actor });
-      }
-      if (semanticallyChanged) {
-        counts.changed += 1;
-      } else {
-        counts.versionOnly += 1;
-      }
-      counts.scored += 1;
-    } catch (error) {
-      counts.failed += 1;
-      errors.push({ opportunityId: deal.opportunityId, error: normalizeText(error.message, 500) });
     }
+    if (slicer.due()) await slicer.yield();
   }
 
+  await slicer.maybeYield();
   let eligibilityReconciliation = null;
   if (authoritativeOpportunityIds && counts.failed === 0) {
     try {

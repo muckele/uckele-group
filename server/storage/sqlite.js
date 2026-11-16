@@ -28,11 +28,13 @@ import {
   MANUAL_FOLLOW_UP_VERSION,
   nextManualFollowUpAt,
 } from '../services/dealHunterManualFollowUpPolicy.js';
-import { consumeCompleteGoogleSheetSourceSnapshotAdmission, normalizeCompleteGoogleSheetFreshnessSnapshot } from '../services/dealHunterSourceSnapshotAdmission.js';
+import { consumeCompleteGoogleSheetSourceSnapshotAdmissionInSlices } from '../services/dealHunterSourceSnapshotAdmission.js';
 import { normalizeDealHunterListingIdentity } from '../services/dealHunterListingIdentity.js';
 import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersession.js';
 import { buildFreshInboxAreas, classifyFreshInboxCandidate } from '../services/dealHunterFreshInboxPolicy.js';
 import { createPursueCimSqliteTransitions } from './pursueCimSqliteTransitions.js';
+import { installSqliteExclusiveGate } from './sqliteExclusiveGate.js';
+import { createEventLoopSlicer, runStepsInSlices } from '../utils/eventLoopSlices.js';
 import { restoreCrmLifecycleInTransaction } from './crmRestoreSqlite.js';
 import { upgradeOperatorFinancialFacts } from './operatorFinancialFactsSqlite.js';
 import { restoreCurrentUnlinkedInTransaction } from './currentUnlinkedRestoreSqlite.js';
@@ -1019,6 +1021,31 @@ function normalizeDealHunterOpportunityFactRow(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+}
+
+// Rows per page when a large source's observations are read in an exclusive section, so no
+// single statement holds the event loop for long.
+const sourceObservationPageSize = 5000;
+
+// The rows `SELECT * ... WHERE source_id = ? ORDER BY observed_at DESC, id ASC` returns, read in
+// keyset pages. observed_at is NOT NULL and id is the primary key, so each row has exactly one
+// position in the order and the pages together are that query's result. Callers read inside
+// their own transaction and exclusive section, so no write lands between pages.
+async function readSourceObservationsNewestFirst(database, sourceId, slicer) {
+  const firstPage = database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
+    WHERE source_id = ? ORDER BY observed_at DESC, id ASC LIMIT ?`);
+  const nextPage = database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
+    WHERE source_id = ? AND (observed_at < ? OR (observed_at = ? AND id > ?))
+    ORDER BY observed_at DESC, id ASC LIMIT ?`);
+  const rows = [];
+  let page = firstPage.all(sourceId, sourceObservationPageSize);
+  for (;;) {
+    for (const row of page) rows.push(normalizeDealHunterOpportunitySourceObservationRow(row));
+    if (page.length < sourceObservationPageSize) return rows;
+    const last = page[page.length - 1];
+    if (slicer.due()) await slicer.yield();
+    page = nextPage.all(sourceId, last.observed_at, last.observed_at, last.id, sourceObservationPageSize);
+  }
 }
 
 function normalizeDealHunterOpportunitySourceObservationRow(row) {
@@ -8338,6 +8365,7 @@ ${cimCapacityConsumeTriggerSql}
   }
 
   let storageApi;
+  let exclusiveGate;
   const cimTransitions = createPursueCimSqliteTransitions(database, {
     applyPass: (command) => storageApi._passDealHunterOpportunitySync(command),
     readCrmMatchAuthorityFingerprint: () => {
@@ -14444,12 +14472,17 @@ ${cimCapacityConsumeTriggerSql}
     },
 
     async replaceAdmittedCompleteGoogleSheetSourceSnapshot(snapshot = {}) {
-      const admission = consumeCompleteGoogleSheetSourceSnapshotAdmission({
+      // Spends the admission at once, then checks it against the payload in event-loop
+      // slices. The transaction writes the normalized copy that was checked.
+      const { admission, normalizedSnapshot } = await consumeCompleteGoogleSheetSourceSnapshotAdmissionInSlices({
         admission: snapshot.admission,
         snapshot,
       });
-      const normalizedSnapshot = normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot);
-      const replace = database.transaction((value) => {
+      // A step generator (see utils/eventLoopSlices.js) run inside an exclusive section:
+      // the same statements in the same order as the single transaction it replaces, with a
+      // `yield` wherever stopping between statements is safe. The caller reads the stored
+      // observations back after COMMIT.
+      const replaceSteps = function* replaceAdmittedCompleteGoogleSheetSourceSnapshotSteps(value) {
         const run = admission.run || null;
         let acceptedAt = null;
         const evidenceByRecord = new Map();
@@ -14477,21 +14510,30 @@ ${cimCapacityConsumeTriggerSql}
               || admission.freshness_digest !== state.accepted_digest) {
               throw new Error('Stale or conflicting complete Sheet freshness run.');
             }
-            return database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
-              WHERE source_id = ? ORDER BY observed_at DESC, id ASC`).all(value.source_id)
-              .map(normalizeDealHunterOpportunitySourceObservationRow);
+            return;
           }
           acceptedAt = database.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS at").get().at;
-          for (const row of database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
-            WHERE source_id = ?`).all(value.source_id)) {
-            const key = `${row.source_record_id}\u0000${row.field}`;
-            currentByRecord.set(key, row);
+          // The unpaged `SELECT * ... WHERE source_id = ?` is a full table scan in rowid order
+          // (no index leads with source_id), so rowid pages read the same rows in the same order.
+          const currentPage = database.prepare(`SELECT rowid AS source_observation_rowid, *
+            FROM deal_hunter_opportunity_source_observations
+            WHERE source_id = ? AND rowid > ? ORDER BY rowid LIMIT ?`);
+          for (let afterRowid = 0; ;) {
+            const page = currentPage.all(value.source_id, afterRowid, sourceObservationPageSize);
+            for (const { source_observation_rowid: rowid, ...row } of page) {
+              afterRowid = rowid;
+              const key = `${row.source_record_id}\u0000${row.field}`;
+              currentByRecord.set(key, row);
+            }
+            if (page.length < sourceObservationPageSize) break;
+            yield;
           }
           if (value.unresolved.length > 0) {
             for (const item of value.unresolved) {
               const exception = prepare(`SELECT id FROM deal_hunter_identity_exceptions
                 WHERE id = ? AND status = 'open'`).get(item.identity_exception_id);
               if (!exception) throw new Error('Deferred Sheet evidence requires a current open identity exception.');
+              yield;
             }
             for (const item of [
               ...value.records.map((record) => ({ ...record, identity_exception_id: null })),
@@ -14540,6 +14582,7 @@ ${cimCapacityConsumeTriggerSql}
                 ['annual_profit', evidence?.annualProfit], ['annual_revenue', evidence?.annualRevenue],
                 ['asking_price', evidence?.askingPrice],
               ]) if (claim) add('accepted_source_record', field, claim);
+              yield;
             }
             for (const record of value.records) {
               appendAdmittedImportSafety(database, {
@@ -14552,6 +14595,7 @@ ${cimCapacityConsumeTriggerSql}
                   .get(run.runId, value.source_id, record.source_record_id).id,
                 acceptedAt,
               }, safetyCounts, prepare);
+              yield;
             }
             for (const item of value.unresolved) {
               const exception = prepare(`SELECT candidate_opportunity_ids
@@ -14566,13 +14610,12 @@ ${cimCapacityConsumeTriggerSql}
                   evidenceDigest: item.identity_exception_id, acceptedAt,
                 }, safetyCounts, prepare);
               }
+              yield;
             }
             database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
               accepted_run_id = ?, accepted_digest = ?, accepted_at = ?, projection_state = 'deferred'
               WHERE source_id = ?`).run(run.generation, run.runId, admission.freshness_digest, acceptedAt, value.source_id);
-            return database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
-              WHERE source_id = ? ORDER BY observed_at DESC, id ASC`).all(value.source_id)
-              .map(normalizeDealHunterOpportunitySourceObservationRow);
+            return;
           }
           // Each record's first current row, in currentByRecord's own order: the
           // first-inserted key's latest value. That is exactly the row
@@ -14597,6 +14640,7 @@ ${cimCapacityConsumeTriggerSql}
             @after_value, @metric, @currency, @period
           )`);
           for (const record of value.records) {
+            yield;
             const sourceRecordId = record.source_record_id;
             const freshnessEvidence = normalizeSourceFreshnessEvidence(record.freshness_evidence);
             const recordDigest = createHash('sha256').update(JSON.stringify({
@@ -14771,6 +14815,7 @@ ${cimCapacityConsumeTriggerSql}
             publication_meaning = excluded.publication_meaning
         `);
         for (const record of value.records) {
+          yield;
           for (const observation of record.observations) {
             desiredKeys.add([observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000'));
             const evidence = evidenceByRecord.get(record.source_record_id);
@@ -14799,6 +14844,7 @@ ${cimCapacityConsumeTriggerSql}
           WHERE source_id = ? AND opportunity_id = ? AND source_record_id = ? AND field = ?
         `);
         for (const observation of current) {
+          yield;
           const key = [observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000');
           if (!desiredKeys.has(key)) {
             if (run && ['asking_price', 'annual_profit', 'annual_revenue'].includes(observation.field)) {
@@ -14829,6 +14875,7 @@ ${cimCapacityConsumeTriggerSql}
           const represented = new Map(value.records.map((record) => [record.source_record_id,
             record.opportunity_id]));
           for (const record of value.records) {
+            yield;
             appendAdmittedImportSafety(database, {
               sourceId: value.source_id, runId: run.runId,
               opportunityId: record.opportunity_id, sourceRecordId: record.source_record_id,
@@ -14839,6 +14886,7 @@ ${cimCapacityConsumeTriggerSql}
           }
           const removedAssociations = new Set();
           for (const previous of currentByRecord.values()) {
+            yield;
             if (represented.get(previous.source_record_id) === previous.opportunity_id) continue;
             const key = `${previous.opportunity_id}\u0000${previous.source_record_id}`;
             if (removedAssociations.has(key)) continue;
@@ -14855,14 +14903,30 @@ ${cimCapacityConsumeTriggerSql}
             WHERE source_id = ?`).run(run.generation, run.runId, admission.freshness_digest, acceptedAt, value.source_id);
         }
 
-        return database.prepare(`
-          SELECT * FROM deal_hunter_opportunity_source_observations
-          WHERE source_id = ?
-          ORDER BY observed_at DESC, id ASC
-        `).all(value.source_id)
-          .map(normalizeDealHunterOpportunitySourceObservationRow);
+      };
+      return exclusiveGate.runExclusive('complete-sheet-snapshot', async ({ checkpoint }) => {
+        const slicer = createEventLoopSlicer();
+        const checkedSlicer = {
+          due: () => slicer.due(),
+          async yield() {
+            await slicer.yield();
+            checkpoint();
+          },
+        };
+        database.exec('BEGIN IMMEDIATE');
+        try {
+          await runStepsInSlices(replaceSteps(normalizedSnapshot), checkedSlicer);
+          // Read back inside the transaction, as the single transaction did.
+          const rows = await readSourceObservationsNewestFirst(database, normalizedSnapshot.source_id, checkedSlicer);
+          // COMMIT writes every page the transaction changed, so give it a slice of its own.
+          await checkedSlicer.yield();
+          database.exec('COMMIT');
+          return rows;
+        } catch (error) {
+          if (database.inTransaction) database.exec('ROLLBACK');
+          throw error;
+        }
       });
-      return replace.immediate(normalizedSnapshot);
     },
 
     async linkDealHunterCrmSubmissionIfAuthorityCurrent({
@@ -16519,6 +16583,10 @@ ${cimCapacityConsumeTriggerSql}
         .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
         .map(normalizeSecureDocumentCleanupJobRow);
     },
-	  };
+  };
+  // Must run last: it wraps every method defined above.
+  exclusiveGate = installSqliteExclusiveGate(storageApi, database, {
+    exclusiveMethods: ['replaceAdmittedCompleteGoogleSheetSourceSnapshot'],
+  });
   return storageApi;
 }
