@@ -394,7 +394,6 @@ describe('Opportunity drawer', () => {
   test.each([
     ['no release has loaded', null],
     ['no campaign exists yet', { campaign: null, actions: { canStop: false } }],
-    ['the campaign has finished', { actions: { canStop: false } }],
     ['recovery needs another request', { campaign: null, actions: { canStop: false },
       enrollment: { state: 'action-required', reasonCode: 'timezone-missing' } }],
   ])('keeps Request SIM when %s', (_name, overrides) => {
@@ -402,6 +401,59 @@ describe('Opportunity drawer', () => {
       onAction={vi.fn()} onClose={vi.fn()} />);
 
     expect(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeVisible();
+  });
+
+  test.each([
+    ['stopped', 'campaign_stopped'], ['expired', 'campaign_window_elapsed'],
+    ['responded', 'reply_received'], ['materials-received', 'materials_received'],
+  ])('hides Request SIM once the campaign is %s, since a click would start nothing', (state, reasonCode) => {
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      campaign: { ...cimReleaseFixture().campaign, state, reasonCode }, actions: { canStop: false },
+    })} detail={detailFixture()} onAction={vi.fn()} onClose={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeVisible();
+  });
+
+  test('hides Request SIM from the detail summary while the release report is still loading', () => {
+    const base = detailFixture();
+    const detail = { ...base, opportunity: { ...base.opportunity,
+      campaign: { state: 'stopped', reasonCode: 'campaign_stopped' } } };
+    render(<OpportunityDrawer cimRelease={null} cimReleaseLoading detail={detail} onAction={vi.fn()} onClose={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull();
+    expect(screen.getByText(/CIM: Campaign Stopped/)).toBeVisible();
+  });
+
+  test('shows why a Request SIM click started nothing', () => {
+    render(<OpportunityDrawer actionNotice="This listing's email campaign has already ended." cimRelease={null}
+      detail={detailFixture()} onAction={vi.fn()} onClose={vi.fn()} />);
+
+    expect(screen.getAllByRole('status').some((node) =>
+      node.textContent === "This listing's email campaign has already ended.")).toBe(true);
+  });
+
+  test.each([
+    ['before any email went out', 'campaign_stopped', 'cancelled-before-provider', 'Stopped before any email went out'],
+    ['after the first email', 'watch-selected', 'accepted', 'Stopped after the first email'],
+    ['with the first email unconfirmed', 'pass-selected', 'provider-pending', 'Stopped before the first email was confirmed'],
+    ['when the owner replied in Gmail', 'owner_replied', 'accepted', 'You replied in the Gmail thread'],
+    ['when the address is suppressed', 'recipient_suppressed', 'accepted', 'The broker address is suppressed'],
+    ['for unsafe delivery', 'unsafe_delivery', 'accepted', 'Delivery to this address was unsafe'],
+    ['because materials arrived', 'materials_received', 'scheduled', 'Materials arrived before the first email'],
+    ['because the deal moved on', 'advanced_beyond_broker_outreach', 'scheduled', 'The deal moved past broker outreach'],
+  ])('explains a campaign stopped %s', (_name, reasonCode, touchState, title) => {
+    // Watch and Pass leave the release status at their own decision code, not campaign_stopped.
+    const code = { 'watch-selected': 'watch_selected', 'pass-selected': 'pass_selected' }[reasonCode]
+      || 'campaign_stopped';
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      status: { code, reason: reasonCode === 'watch-selected' ? 'watch' : reasonCode, actionRequired: false },
+      campaign: { ...cimReleaseFixture().campaign, state: 'stopped', reasonCode },
+      initialTouch: { ...cimReleaseFixture().initialTouch, state: touchState },
+      actions: { canStop: false },
+    })} detail={detailFixture()} onAction={vi.fn()} onClose={vi.fn()} />);
+
+    expect(within(screen.getByRole('region', { name: 'Pursue next action' })).getByText(title)).toBeVisible();
   });
 
   test('closes an open near-miss confirmation if a campaign turns out to own the listing', () => {
@@ -480,8 +532,17 @@ describe('Opportunity drawer', () => {
   describe('timezone picker', () => {
     const timezoneNames = ['America/New_York', 'America/Chicago', 'America/Denver',
       'America/Phoenix', 'America/Los_Angeles'];
-    const releaseWith = (timezoneAuthority) => cimReleaseFixture({ timezoneAuthority });
+    // A missing timezone holds enrollment before any campaign exists.
+    const releaseWith = (timezoneAuthority) => cimReleaseFixture({ timezoneAuthority, campaign: null,
+      transmission: null, actions: { canStop: false },
+      enrollment: { state: 'action-required', reasonCode: 'timezone_missing' } });
     const pickerGroup = () => screen.queryByRole('group', { name: 'Set timezone' });
+
+    test('timezone picker is not offered once a campaign exists, since Request SIM is gone', () => {
+      render(<OpportunityDrawer cimRelease={cimReleaseFixture({ timezoneAuthority: null })}
+        detail={detailFixture()} onClose={vi.fn()} />);
+      expect(pickerGroup()).toBeNull();
+    });
 
     test('timezone picker shows only when timezone authority is missing or ambiguous', () => {
       for (const [timezoneAuthority, visible] of [
