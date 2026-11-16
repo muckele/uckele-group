@@ -340,7 +340,8 @@ const relationshipInventoryEntries = [
   }),
   ...relationshipEntries({
     table: 'deal_hunter_pursuit_enrollments',
-    columns: ['decision_event_id', 'opportunity_id'],
+    // restart_of_campaign_id names a campaign of the same opportunity; any enrollment blocks.
+    columns: ['decision_event_id', 'opportunity_id', 'restart_of_campaign_id'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
     scannerPath: 'dependentState.records.pursueCimAuthorities',
     reason: inertPursueCimAuthorityBlockingReason,

@@ -120,6 +120,25 @@ function DetailActions({ name, onAction, onPass, onRequestSim, pending, showRequ
   return <div className="flex flex-wrap gap-2">{showRequestSim ? <button aria-label={`Request SIM ${name}`} className={primaryButton} disabled={pending} onClick={onRequestSim} type="button">Request SIM</button> : null}<button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
 }
 
+// The owner's Start a new campaign command, offered only for a campaign the owner stopped
+// before any email went out. It always asks first, naming the recipient.
+function NewCampaignControl({ cimRelease, name, onStart, pending }) {
+  const offer = cimRelease?.actions?.canStartNewCampaign ? cimRelease.actions.newCampaign : null;
+  const [confirmingFor, setConfirmingFor] = useState('');
+  if (!offer?.campaignId || !onStart) return null;
+  const address = cimRelease.recipientAuthority?.address;
+  if (confirmingFor !== offer.campaignId) {
+    return <button aria-label={`Start a new campaign ${name}`} className={primaryButton} disabled={pending} onClick={() => setConfirmingFor(offer.campaignId)} type="button">Start a new campaign</button>;
+  }
+  return (
+    <div aria-label="Confirm new campaign" className="rounded-xl border border-sky-200 bg-sky-50 p-4" role="group">
+      <p className="text-sm font-semibold text-sky-950">Start campaign {offer.nextGeneration} for {name}?</p>
+      <p className="mt-1 text-sm leading-6 text-sky-900">Campaign {offer.nextGeneration - 1} was stopped before any email went out. The new campaign sends the first email{address ? ` to ${address}` : ''} in the broker&apos;s next sending window, then follows up on its usual schedule.</p>
+      <div className="mt-3 flex flex-wrap gap-2"><button className={primaryButton} disabled={pending} onClick={() => { setConfirmingFor(''); onStart(offer); }} type="button">Confirm new campaign</button><button className={secondaryButton} disabled={pending} onClick={() => setConfirmingFor('')} type="button">Cancel</button></div>
+    </div>
+  );
+}
+
 function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
   const [draft, setDraft] = useState({ field: 'seller_name', value: detail.effectiveFacts?.seller_name?.value || '', note: '',
     currency: 'unknown', metric: 'unknown', period: 'unknown', evidenceSource: '', verified: false });
@@ -328,7 +347,7 @@ export default function OpportunityDrawer({
   actionNotice = '',
   actionsBlocked = false, brokerMaterialsState = {}, cimRelease = null, cimReleaseError = '', cimReleaseLoading = false, cimReleaseReadOnly = false, cimReleaseStopping = false, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
-  onCimReleaseStop, onCimTimezoneSet,
+  onCimReleaseStop, onCimTimezoneSet, onStartNewCampaign,
   onRestore, onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
   onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, pursueChoice = null, readOnly = false,
 }) {
@@ -452,6 +471,7 @@ export default function OpportunityDrawer({
               </div> : null}
               <div className="mt-4"><PursueNextAction brokerMaterials={detail.brokerMaterials} cimRelease={cimRelease} linkedCrmId={linkedCrmId} opportunity={opportunity} pursueCimReleaseAvailable={detail.pursueCimReleaseAvailable} /></div>
               <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} onRequestSim={() => (isNearMiss(opportunity) ? setSimConfirmOpen(true) : onAction('pursue'))} pending={pending || actionsBlocked} showRequestSim={!campaignOwnsListing} /></div>
+              {actionable && cimRelease?.actions?.canStartNewCampaign && onStartNewCampaign ? <div className="mt-4"><NewCampaignControl cimRelease={cimRelease} name={name} onStart={onStartNewCampaign} pending={pending || actionsBlocked} /></div> : null}
               {simConfirmOpen && actionable && !campaignOwnsListing && isNearMiss(opportunity) ? <NearMissConfirmPanel onCancel={() => setSimConfirmOpen(false)} onConfirm={() => { setSimConfirmOpen(false); onAction('pursue'); }} pending={pending || actionsBlocked} row={opportunity} /> : null}
               {pursueChoice?.options?.length > 1 && actionable ? <div aria-label="Choose Pursue recipient" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
                 <p className="text-sm font-semibold text-amber-950">Choose the authoritative broker recipient to continue Pursue</p>

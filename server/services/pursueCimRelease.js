@@ -1,5 +1,6 @@
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { isContactRuleCampaign } from './pursueCimContactPolicy.js';
+import { OWNER_STOP_REASONS } from './pursueCimCampaignSummary.js';
 
 const terminalCampaignStates = new Set([
   'responded', 'materials-received', 'stopped', 'expired',
@@ -192,6 +193,14 @@ export async function getPursueCimReleaseReport({ storage, opportunityId,
   const timezone = authority?.timezone || null;
   const canStop = Boolean(campaign && status.code !== 'expired'
     && !terminalCampaignStates.has(campaign.state));
+  // A campaign the owner stopped before any email reached Google may be followed by a new
+  // generation. Storage re-checks every generation before it records the command.
+  const canStartNewCampaign = Boolean(campaign && campaign.state === 'stopped'
+    && OWNER_STOP_REASONS.has(campaign.reason_code)
+    && (!initialTouch || ['scheduled', 'claimed', 'cancelled-before-provider'].includes(initialTouch.state))
+    && (!transmission || transmission.state === 'cancelled-before-provider')
+    && !(Number(projection?.legacySummary?.count) > 0)
+    && opportunity?.status === 'active');
   const releasedTransmission = publicTransmission({ transmission, communication, cadenceContext });
   const authorizationStatus = !liveAuthorization ? '' : liveAuthorization.withdrawn_at
     ? 'withdrawn' : liveAuthorization.consumed_at ? 'consumed'
@@ -288,6 +297,12 @@ export async function getPursueCimReleaseReport({ storage, opportunityId,
         expectedRowVersion: finiteRevision(campaign.row_version),
         expectedTerminalRevision: finiteRevision(campaign.terminal_revision),
       } : {}),
+      canStartNewCampaign,
+      ...(canStartNewCampaign ? { newCampaign: {
+        campaignId: boundedText(campaign.id, 240),
+        expectedRowVersion: finiteRevision(campaign.row_version),
+        nextGeneration: (finiteRevision(campaign.generation) ?? 0) + 1,
+      } } : {}),
     },
   };
 }
