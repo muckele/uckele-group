@@ -1357,6 +1357,69 @@ export async function recordAcquisitionOwnerCommand({
   };
 }
 
+const restartRefusals = {
+  stale_revision: [409, 'stale_freshness_review', 'Freshness changed since this opportunity was shown. Reload before acting.'],
+  'not-actionable': [409, 'not_actionable', 'This listing is not current, so a new campaign cannot start.'],
+  'already-passed': [409, 'already_passed', 'This listing has been passed. Restore it before starting a new campaign.'],
+  campaign_changed: [409, 'campaign_changed', 'The campaign changed since it was shown. Reload before acting.'],
+  campaign_not_restartable: [409, 'campaign_not_restartable', 'Only a campaign you stopped can be followed by a new one.'],
+  campaign_emailed: [409, 'campaign_emailed', 'An email from this listing\'s campaign already reached Google, so a new campaign would be a second inquiry.'],
+  prior_outreach: [409, 'prior_outreach', 'An earlier request already contacted this broker about this listing.'],
+  idempotency_conflict: [409, 'owner_command_conflict', 'This command conflicts with one already recorded. Reload before acting.'],
+};
+
+/**
+ * The owner's Start a new campaign command (autopilot spec 7.2.4, 17.1): only for a campaign
+ * the owner stopped before any of its email reached Google. It records a new Pursue decision
+ * bound to that campaign and runs enrollment, which allocates the next generation.
+ */
+export async function startNewPursueCampaign({
+  opportunityId, campaignId, expectedRowVersion, idempotencyKey, expectedDiscoveryRevision,
+  expectedMaterialRevision, actor, storage = getStorage(),
+  getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
+} = {}) {
+  if (typeof opportunityId !== 'string' || !opportunityId || opportunityId.length > 200
+    || opportunityId.trim() !== opportunityId
+    || typeof campaignId !== 'string' || !campaignId || campaignId.length > 240
+    || campaignId.trim() !== campaignId
+    || !Number.isSafeInteger(expectedRowVersion) || expectedRowVersion < 1
+    || ![expectedDiscoveryRevision, expectedMaterialRevision].every((value) =>
+      Number.isSafeInteger(value) && value >= 0)
+    || typeof idempotencyKey !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)
+    || typeof actor !== 'string' || !actor.trim() || actor.length > 160) {
+    return { ok: false, status: 400, error: 'A bounded, revision-bound new campaign command is required.' };
+  }
+  if (typeof storage.startNewPursueCampaign !== 'function') {
+    return { ok: false, status: 503, error: 'Owner command storage is unavailable.' };
+  }
+  const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
+  if (sourceGate) return sourceGate;
+  const result = await storage.startNewPursueCampaign({ opportunityId, campaignId,
+    expectedRowVersion, idempotencyKey, expectedDiscoveryRevision, expectedMaterialRevision,
+    actor: actor.trim(), policyVersion: OWNER_DECISION_POLICY_VERSION, now: new Date().toISOString() });
+  if (result.conflict) {
+    const [status, code, error] = restartRefusals[result.reason]
+      || [409, 'owner_command_conflict', 'A new campaign cannot start from the current state. Reload before acting.'];
+    return { ok: false, status, code, error };
+  }
+  let enrollment = result.enrollment;
+  if (['queued', 'waiting-on-eligibility'].includes(enrollment?.state)) {
+    enrollment = (await orchestratePursuitEnrollment({ storage, opportunityId, enrollment,
+      decision: result.decision, actor: actor.trim() })).enrollment;
+  }
+  const campaign = await latestCampaignSummary(storage, opportunityId);
+  const scheduled = enrollment?.state === 'campaign-created';
+  return { ok: true, status: 200, replay: Boolean(result.replay),
+    enrollment: enrollment ? { state: enrollment.state, reasonCode: enrollment.reason_code || '' } : null,
+    campaign,
+    notice: scheduled
+      ? { code: 'campaign_restarted',
+        message: 'A new campaign is scheduled. Its first email goes out in the broker\'s next sending window.' }
+      : { code: 'campaign_restart_waiting',
+        message: 'Your choice is saved, but the new campaign could not be scheduled yet. The listing shows what is blocking it.' } };
+}
+
 /**
  * The latest campaign for a one-row response, so the row the client swaps in keeps hiding
  * Request SIM. Undefined (omitted from JSON) when it cannot be read; the client then keeps

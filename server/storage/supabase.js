@@ -1810,6 +1810,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
     },
 
+    async startNewPursueCampaign(command) {
+      const { data, error } = await client.rpc('pursue_cim_start_new_campaign_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['decision', 'enrollment'],
+        { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason'] });
+    },
+
     async materializePursuitCampaign(command) {
       const { data, error } = await client.rpc('pursue_cim_materialize_campaign_v2', {
         p_command: command,

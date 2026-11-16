@@ -456,6 +456,42 @@ describe('Opportunity drawer', () => {
     expect(within(screen.getByRole('region', { name: 'Pursue next action' })).getByText(title)).toBeVisible();
   });
 
+  test('offers Start a new campaign for a campaign stopped before any email, and asks first', () => {
+    const onStartNewCampaign = vi.fn();
+    const newCampaign = { campaignId: 'campaign-p8a', expectedRowVersion: 5, nextGeneration: 2 };
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture({
+      status: { code: 'campaign_stopped', reason: 'campaign_stopped', actionRequired: false },
+      campaign: { ...cimReleaseFixture().campaign, state: 'stopped', reasonCode: 'campaign_stopped' },
+      initialTouch: { ...cimReleaseFixture().initialTouch, state: 'cancelled-before-provider' },
+      actions: { canStop: false, canStartNewCampaign: true, newCampaign },
+    })} detail={detailFixture()} onAction={vi.fn()} onClose={vi.fn()} onStartNewCampaign={onStartNewCampaign} />);
+
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull();
+    expect(within(screen.getByRole('region', { name: 'Pursue next action' }))
+      .getByText(/Use Start a new campaign/)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Start a new campaign Evergreen Fire Protection' }));
+    const confirm = screen.getByRole('group', { name: 'Confirm new campaign' });
+    expect(confirm).toHaveTextContent('Start campaign 2 for Evergreen Fire Protection?');
+    expect(confirm).toHaveTextContent('Campaign 1 was stopped before any email went out.');
+    expect(onStartNewCampaign).not.toHaveBeenCalled();
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Confirm new campaign' }));
+    expect(onStartNewCampaign).toHaveBeenCalledWith(newCampaign);
+  });
+
+  test('offers no new campaign when the report does not allow one or the drawer is read-only', () => {
+    const stopped = { status: { code: 'campaign_stopped', reason: 'campaign_stopped', actionRequired: false },
+      campaign: { ...cimReleaseFixture().campaign, state: 'stopped', reasonCode: 'campaign_stopped' } };
+    const { rerender } = render(<OpportunityDrawer cimRelease={cimReleaseFixture({ ...stopped,
+      actions: { canStop: false, canStartNewCampaign: false } })} detail={detailFixture()} onAction={vi.fn()}
+      onClose={vi.fn()} onStartNewCampaign={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /Start a new campaign/ })).toBeNull();
+
+    rerender(<OpportunityDrawer cimRelease={cimReleaseFixture({ ...stopped, actions: { canStop: false,
+      canStartNewCampaign: true, newCampaign: { campaignId: 'campaign-p8a', expectedRowVersion: 5, nextGeneration: 2 } } })}
+      detail={detailFixture()} onClose={vi.fn()} onStartNewCampaign={vi.fn()} readOnly />);
+    expect(screen.queryByRole('button', { name: /Start a new campaign/ })).toBeNull();
+  });
+
   test('closes an open near-miss confirmation if a campaign turns out to own the listing', () => {
     const base = detailFixture();
     const detail = { ...base, opportunity: { ...base.opportunity, criteriaGroup: 'near-miss' } };

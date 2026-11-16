@@ -31,7 +31,9 @@ export function stoppedCampaignPresentation(cimRelease) {
   if (ownerStopReasons.has(reason)) {
     if (!touchState || notYetSentTouchStates.has(touchState)) {
       return { kind: 'Campaign stopped', title: 'Stopped before any email went out',
-        detail: 'The broker was never emailed about this listing. Request SIM does not restart a stopped campaign.' };
+        detail: cimRelease?.actions?.canStartNewCampaign
+          ? 'The broker was never emailed about this listing. Use Start a new campaign if you want the first email to go out after all.'
+          : 'The broker was never emailed about this listing. Request SIM does not restart a stopped campaign.' };
     }
     if (touchState === 'accepted') {
       return { kind: 'Campaign stopped', title: 'Stopped after the first email',

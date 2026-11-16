@@ -6,6 +6,11 @@ export const TERMINAL_CAMPAIGN_STATES = Object.freeze(new Set([
   'responded', 'materials-received', 'stopped', 'expired',
 ]));
 
+// Owner choices that stop a campaign. Only a campaign stopped by one of these, before any of
+// its email reached Google, may be followed by a new generation (autopilot spec 7.2.4).
+export const OWNER_STOP_REASONS = Object.freeze(new Set(['campaign_stopped', 'watch-selected',
+  'pass-selected']));
+
 const knownStates = new Set([
   'queued', 'waiting-on-eligibility', 'initial-pending', 'active-follow-up',
   'action-required', 'provider-ambiguous', ...TERMINAL_CAMPAIGN_STATES,

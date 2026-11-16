@@ -171,6 +171,18 @@ async function contactRuleBasis({ storage, authority, recipient, suppression }) 
     permissionScope: pursuitPermissionCohortDigest(authority, recipient), policyHash: policyDigest } };
 }
 
+/**
+ * Generation 1, or the next one when the owner's Start a new campaign command bound this
+ * enrollment to the latest, stopped campaign. Storage re-checks the binding and refuses any
+ * other generation.
+ */
+async function allocationGeneration({ storage, opportunityId, enrollment }) {
+  if (!enrollment.restart_of_campaign_id) return 1;
+  const latest = (await storage.readPursueCimProjection({ opportunityId }))?.campaign;
+  return latest?.id === enrollment.restart_of_campaign_id && Number.isSafeInteger(Number(latest.generation))
+    ? Number(latest.generation) + 1 : 1;
+}
+
 export async function orchestratePursuitEnrollment({ storage, opportunityId, enrollment,
   decision, recipientContactRef, actor, now = new Date(), readSourceHealth } = {}) {
   if (!enrollment || !['queued', 'waiting-on-eligibility'].includes(enrollment.state)
@@ -275,10 +287,11 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                     contactAuthorityRevision: freshRecipient.contactAuthorityRevision });
                   const conversationId = framedDigest('cim-conversation:v1', recipientFingerprint,
                     CIM_CAMPAIGN_POLICY_VERSION);
+                  const generation = await allocationGeneration({ storage, opportunityId, enrollment });
                   phase = 'allocation';
                   const allocation = await storage.materializePursuitCampaign({
                     opportunityId, enrollmentId: enrollment.id,
-                    expectedEnrollmentRowVersion: enrollment.row_version, generation: 1,
+                    expectedEnrollmentRowVersion: enrollment.row_version, generation,
                     policyVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     templateVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     templateDigest: digest({ opportunityId, recipientFingerprint,
@@ -301,7 +314,10 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                     senderPolicyVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     replyPolicyVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     replyAliasTokenDigest: sha256(conversationId.slice(0, 32)),
-                    rfcThreadKey: digest({ opportunityId, type: 'rfc-thread-v1' }),
+                    // The key is unique per conversation. A later generation that needs a new
+                    // conversation (a changed recipient) must not collide with the first one's.
+                    rfcThreadKey: digest({ opportunityId, type: 'rfc-thread-v1',
+                      ...(generation > 1 ? { generation } : {}) }),
                     batchingPolicyVersion: 'batching-off-v1',
                     freshnessAuthorityDigest: freshnessDigest(fresh),
                     expectedDiscoveryRevision: Number(fresh.opportunity.discovery_revision),

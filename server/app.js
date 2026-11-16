@@ -50,6 +50,7 @@ import {
   getTriageOpportunityDetail,
   listTriageQueue,
   recordAcquisitionOwnerCommand,
+  startNewPursueCampaign,
   restoreDealHunterOpportunityWithInboxAuthority,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
@@ -1887,6 +1888,27 @@ export function createApp({
         expectedTerminalRevision: request.body?.expectedTerminalRevision,
         idempotencyKey: request.body?.idempotencyKey,
         reason: request.body?.reason,
+        actor: session.username || session.principal_id,
+      });
+      response.status(result.status).json({ success: result.ok, ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/cim-release/new-campaign',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await startNewPursueCampaign({ storage: getStorage(),
+        opportunityId: request.params.opportunityId,
+        campaignId: request.body?.campaignId,
+        expectedRowVersion: request.body?.expectedRowVersion,
+        idempotencyKey: request.body?.idempotencyKey,
+        expectedDiscoveryRevision: request.body?.expectedDiscoveryRevision,
+        expectedMaterialRevision: request.body?.expectedMaterialRevision,
         actor: session.username || session.principal_id,
       });
       response.status(result.status).json({ success: result.ok, ...result });

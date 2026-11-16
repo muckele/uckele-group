@@ -1156,6 +1156,39 @@ describe('Acquisition Inbox queue', () => {
     await waitFor(() => expect(screen.queryByText("This listing's email campaign has already ended.")).toBeNull());
   });
 
+  test('starts a new campaign only through its revision-bound route and says what happened', async () => {
+    const writes = [];
+    const stoppedRelease = cimReleaseResponse({
+      status: { code: 'campaign_stopped', reason: 'campaign_stopped', actionRequired: false },
+      campaign: { ...cimReleaseResponse().campaign, state: 'stopped', reasonCode: 'campaign_stopped' },
+      initialTouch: { ...cimReleaseResponse().initialTouch, state: 'cancelled-before-provider' },
+      actions: { canStop: false, canStartNewCampaign: true,
+        newCampaign: { campaignId: 'campaign-restart', expectedRowVersion: 7, nextGeneration: 2 } },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/cim-release/new-campaign')) {
+        writes.push({ url, method: options.method, body: JSON.parse(options.body) });
+        return jsonResponse({ success: true, enrollment: { state: 'campaign-created', reasonCode: '' },
+          notice: { code: 'campaign_restarted', message: 'A new campaign is scheduled.' } });
+      }
+      if (url.endsWith('/cim-release')) return jsonResponse(stoppedRelease);
+      if (url.endsWith('/triage/opp-1')) return jsonResponse({ ...detailResponse(), pursueCimReleaseAvailable: true });
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start a new campaign Evergreen Fire Protection' }));
+    fireEvent.click(within(screen.getByRole('group', { name: 'Confirm new campaign' }))
+      .getByRole('button', { name: 'Confirm new campaign' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toEqual({ url: '/api/admin/deal-hunter/triage/opp-1/cim-release/new-campaign', method: 'POST',
+      body: { campaignId: 'campaign-restart', expectedRowVersion: 7, expectedDiscoveryRevision: 0,
+        expectedMaterialRevision: 0, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/) } });
+    expect(await screen.findByText('A new campaign is scheduled.')).toBeVisible();
+  });
+
   test('loads the separate canary release report and stops only through its revision-bound route', async () => {
     const writes = [];
     const detail = { ...detailResponse(), pursueCimReleaseAvailable: true };
