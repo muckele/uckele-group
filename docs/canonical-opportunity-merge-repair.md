@@ -73,7 +73,7 @@ Stop if the approved evidence is incomplete or the intended decision differs in 
 
 ### Production-derived legacy relationship schema contract
 
-The v1 relationship inventory contains 328 entries. Its reviewed classification counts are 166 blocking entity dependencies, 68 relationships redundant through a scanned parent, 54 preserved global/recipient operational fields, and 40 explicit exclusions. Enforcement counts are 278 material scanner paths, 10 independent gates, 12 approval preconditions, and 28 explicit exclusions. The current inventory checksum is `024ae57efda4abe6f53c341601f76f13b6177cd4a485ed45fc5dcf87dcb0d4a8`.
+The v1 relationship inventory contains 329 entries. Its reviewed classification counts are 167 blocking entity dependencies, 68 relationships redundant through a scanned parent, 54 preserved global/recipient operational fields, and 40 explicit exclusions. Enforcement counts are 279 material scanner paths, 10 independent gates, 12 approval preconditions, and 28 explicit exclusions. The current inventory checksum is `fa88d71b041a3e1a611af343077c21137ea624d8856ac3ec3c76fd7fb071b660`.
 
 Historical SQLite installations can retain three relationship-bearing tables that a fresh current schema does not create. Their seven relationship-like columns use the same inventory and enforcement machinery as every current-schema entry:
 

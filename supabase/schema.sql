@@ -25037,7 +25037,7 @@ alter table public.deal_hunter_pursuit_enrollments
 
 -- True when any email of this campaign got as far as Google: a touch past the pre-provider
 -- states, or a transmission past preparation or into the provider seam.
-create or replace function public.pursue_cim_campaign_reached_provider_v1(p_campaign_id text)
+create or replace function public.deal_hunter_pursue_campaign_reached_provider_v1(p_campaign_id text)
 returns boolean
 language sql
 stable
@@ -25056,7 +25056,7 @@ as $$
 $$;
 
 -- True when no campaign of this listing, of any generation, got email as far as Google.
-create or replace function public.pursue_cim_any_campaign_reached_provider_v1(p_opportunity_id text)
+create or replace function public.deal_hunter_pursue_any_campaign_reached_provider_v1(p_opportunity_id text)
 returns boolean
 language sql
 stable
@@ -25065,12 +25065,12 @@ set search_path = ''
 as $$
   select exists (select 1 from public.deal_hunter_cim_campaigns as listed
     where listed.opportunity_id = p_opportunity_id
-      and public.pursue_cim_campaign_reached_provider_v1(listed.id));
+      and public.deal_hunter_pursue_campaign_reached_provider_v1(listed.id));
 $$;
 
 -- True when this campaign's generation may carry email: generation 1, or a later one whose
 -- earlier generations of the same listing never got email as far as Google.
-create or replace function public.pursue_cim_campaign_generation_may_send_v1(p_campaign_id text)
+create or replace function public.deal_hunter_pursue_generation_may_send_v1(p_campaign_id text)
 returns boolean
 language sql
 stable
@@ -25081,16 +25081,16 @@ as $$
       select 1 from public.deal_hunter_cim_campaigns as prior
       where prior.opportunity_id = campaign.opportunity_id
         and prior.generation < campaign.generation
-        and public.pursue_cim_campaign_reached_provider_v1(prior.id))
+        and public.deal_hunter_pursue_campaign_reached_provider_v1(prior.id))
     from public.deal_hunter_cim_campaigns as campaign
     where campaign.id = p_campaign_id), false);
 $$;
 
-revoke all on function public.pursue_cim_campaign_reached_provider_v1(text)
+revoke all on function public.deal_hunter_pursue_campaign_reached_provider_v1(text)
   from public, anon, authenticated, service_role;
-revoke all on function public.pursue_cim_any_campaign_reached_provider_v1(text)
+revoke all on function public.deal_hunter_pursue_any_campaign_reached_provider_v1(text)
   from public, anon, authenticated, service_role;
-revoke all on function public.pursue_cim_campaign_generation_may_send_v1(text)
+revoke all on function public.deal_hunter_pursue_generation_may_send_v1(text)
   from public, anon, authenticated, service_role;
 
 create or replace function public.pursue_cim_materialize_campaign_v1(p_command jsonb)
@@ -25200,11 +25200,11 @@ begin
     -- command bound to this exact stopped campaign; a plain Pursue never restarts one.
     select * into v_enrollment from public.deal_hunter_pursuit_enrollments
       where id = v_enrollment_id and opportunity_id = v_opportunity_id;
-    v_restarting := v_enrollment.restart_of_campaign_id is not null
+    v_restarting := coalesce(v_enrollment.restart_of_campaign_id is not null
       and v_enrollment.restart_of_campaign_id = v_current.id
       and v_current.state = 'stopped'
       and v_current.reason_code in ('campaign_stopped', 'watch-selected', 'pass-selected')
-      and v_generation = v_current.generation + 1;
+      and v_generation = v_current.generation + 1, false);
   end if;
   if v_current.id is not null and not v_restarting then
     v_same := v_current.id = v_campaign_id and v_current.enrollment_id = v_enrollment_id
@@ -25219,7 +25219,7 @@ begin
       'initialTouch', case when found then pg_catalog.to_jsonb(v_touch) else null end);
   end if;
   if v_generation <> (case when v_restarting then v_current.generation + 1 else 1 end)
-    or (v_restarting and public.pursue_cim_any_campaign_reached_provider_v1(v_opportunity_id)) then
+    or (v_restarting and public.deal_hunter_pursue_any_campaign_reached_provider_v1(v_opportunity_id)) then
     return pg_catalog.jsonb_build_object('applied', false, 'existing', false,
       'actionRequired', true, 'campaign', null, 'initialTouch', null);
   end if;
@@ -25554,7 +25554,7 @@ begin
         or v_campaign.terminal_revision <> v_expected_campaign
         or v_campaign.state not in ('initial-pending','active-follow-up')
         or (v_touch.kind = 'initial' and (v_campaign.state <> 'initial-pending'
-          or not public.pursue_cim_campaign_generation_may_send_v1(v_campaign.id)
+          or not public.deal_hunter_pursue_generation_may_send_v1(v_campaign.id)
           or v_campaign.policy_version <> 'deal-hunter-cim-autopilot-v1'
           or v_touch.logical_slot <> 'initial' or v_touch.ordinal <> 0))
         or v_campaign.crm_submission_id is null
@@ -25608,7 +25608,7 @@ begin
       or v_campaign.terminal_revision <> v_expected_campaign
       or v_campaign.state not in ('initial-pending','active-follow-up')
       or (v_touch.kind = 'initial' and (v_campaign.state <> 'initial-pending'
-        or not public.pursue_cim_campaign_generation_may_send_v1(v_campaign.id)
+        or not public.deal_hunter_pursue_generation_may_send_v1(v_campaign.id)
         or v_campaign.policy_version <> 'deal-hunter-cim-autopilot-v1'
         or v_touch.logical_slot <> 'initial' or v_touch.ordinal <> 0))
       or v_campaign.crm_submission_id is null
@@ -25933,7 +25933,7 @@ begin
               or v_member.ordinal < 1
             else v_member.kind <> 'initial' or v_member.logical_slot <> 'initial'
               or v_member.ordinal <> 0 end)
-        or not public.pursue_cim_campaign_generation_may_send_v1(v_member.campaign_id)
+        or not public.deal_hunter_pursue_generation_may_send_v1(v_member.campaign_id)
         or v_member.policy_version <> 'deal-hunter-cim-autopilot-v1'
         or v_member.campaign_state
           <> (case when v_follow_up then 'active-follow-up' else 'initial-pending' end)
@@ -26243,7 +26243,7 @@ begin
   end if;
   if v_campaign.state not in ('initial-pending','active-follow-up')
     or (v_touch.kind = 'initial' and (v_campaign.state <> 'initial-pending'
-      or not public.pursue_cim_campaign_generation_may_send_v1(v_campaign.id)
+      or not public.deal_hunter_pursue_generation_may_send_v1(v_campaign.id)
       or v_campaign.policy_version <> 'deal-hunter-cim-autopilot-v1'
       or v_touch.logical_slot <> 'initial' or v_touch.ordinal <> 0))
     or v_conversation.state <> 'open'
@@ -26362,7 +26362,7 @@ begin
       join public.deal_hunter_cim_campaigns as c on c.id = t.campaign_id
       join public.deal_hunter_broker_conversations as v on v.id = c.conversation_id
       where t.kind = 'initial' and t.logical_slot = 'initial' and t.ordinal = 0
-        and public.pursue_cim_campaign_generation_may_send_v1(c.id) and c.policy_version = 'deal-hunter-cim-autopilot-v1'
+        and public.deal_hunter_pursue_generation_may_send_v1(c.id) and c.policy_version = 'deal-hunter-cim-autopilot-v1'
         and c.state = 'initial-pending' and v.state = 'open'
         and t.opportunity_id = c.opportunity_id
         and t.due_at <= p_now
@@ -26425,7 +26425,7 @@ begin
     and v_transmission.provider_seam_entered_at is null
     and v_transmission.boundary_nonce_digest is null
     and v_transmission.conversation_id = v_conversation.id
-    and v_campaign.state = 'initial-pending' and public.pursue_cim_campaign_generation_may_send_v1(v_campaign.id)
+    and v_campaign.state = 'initial-pending' and public.deal_hunter_pursue_generation_may_send_v1(v_campaign.id)
     and v_campaign.policy_version = 'deal-hunter-cim-autopilot-v1'
     and v_conversation.state = 'open'
     and (v_campaign.local_expiry_at is null or v_campaign.local_expiry_at > v_now)
@@ -26477,7 +26477,7 @@ $$;
 -- The owner's Start a new campaign command: a new Pursue decision and an enrollment bound to
 -- the exact stopped campaign it follows. Refused unless that campaign is the latest, the owner
 -- stopped it, and no email of any generation of this listing reached Google.
-create or replace function public.pursue_cim_start_new_campaign_v1(p_command jsonb)
+create or replace function public.deal_hunter_pursue_start_new_campaign_v1(p_command jsonb)
 returns jsonb
 language plpgsql
 security definer
@@ -26575,7 +26575,7 @@ begin
     return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
       'reason', 'campaign_not_restartable', 'decision', null, 'enrollment', null);
   end if;
-  if public.pursue_cim_any_campaign_reached_provider_v1(v_opportunity_id) then
+  if public.deal_hunter_pursue_any_campaign_reached_provider_v1(v_opportunity_id) then
     return pg_catalog.jsonb_build_object('applied', false, 'replay', false, 'conflict', true,
       'reason', 'campaign_emailed', 'decision', null, 'enrollment', null);
   end if;
@@ -26649,5 +26649,5 @@ begin
     'enrollment', pg_catalog.to_jsonb(v_enrollment));
 end;
 $$;
-revoke all on function public.pursue_cim_start_new_campaign_v1(jsonb) from public, anon, authenticated;
-grant execute on function public.pursue_cim_start_new_campaign_v1(jsonb) to service_role;
+revoke all on function public.deal_hunter_pursue_start_new_campaign_v1(jsonb) from public, anon, authenticated;
+grant execute on function public.deal_hunter_pursue_start_new_campaign_v1(jsonb) to service_role;

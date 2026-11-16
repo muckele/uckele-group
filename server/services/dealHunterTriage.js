@@ -1363,7 +1363,7 @@ const restartRefusals = {
   'already-passed': [409, 'already_passed', 'This listing has been passed. Restore it before starting a new campaign.'],
   campaign_changed: [409, 'campaign_changed', 'The campaign changed since it was shown. Reload before acting.'],
   campaign_not_restartable: [409, 'campaign_not_restartable', 'Only a campaign you stopped can be followed by a new one.'],
-  campaign_emailed: [409, 'campaign_emailed', 'An email from this listing\'s campaign already reached Google, so a new campaign would be a second inquiry.'],
+  campaign_emailed: [409, 'campaign_emailed', 'An email from this listing\'s campaign reached or may have reached Google, so a new campaign could be a second inquiry.'],
   prior_outreach: [409, 'prior_outreach', 'An earlier request already contacted this broker about this listing.'],
   idempotency_conflict: [409, 'owner_command_conflict', 'This command conflicts with one already recorded. Reload before acting.'],
 };

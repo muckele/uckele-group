@@ -193,3 +193,50 @@ test('the owner command records the choice even when enrollment has to wait', as
     actor: 'fixture-owner' });
   assert.equal(pursue.notice?.code, 'campaign_running');
 });
+
+test('a campaign stopped by Watch can be followed by a new campaign', async (t) => {
+  const { storage, db, opportunityId } = await campaignFixture(t);
+  const watch = await storage.recordOwnerDecision({ opportunityId, action: 'watch',
+    idempotencyKey: 'watch-stop', actor: 'fixture-owner', policyVersion: 'owner-decision-v1',
+    now: restartAt, expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 });
+  assert.equal(watch.applied, true);
+  const report = await getPursueCimReleaseReport({ storage, opportunityId, getPauseStatus: noPause });
+  assert.equal(report.campaign.reasonCode, 'watch-selected');
+  assert.equal(report.actions.canStartNewCampaign, true);
+  const recorded = await storage.startNewPursueCampaign(restartCommand(opportunityId, report));
+  assert.equal(recorded.applied, true, recorded.reason);
+  const enrolled = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: recorded.enrollment, decision: recorded.decision, actor: 'fixture-owner',
+    now: restartAt, readSourceHealth: healthy });
+  assert.equal(enrolled.enrollment.state, 'campaign-created', enrolled.enrollment.reason_code);
+  assert.equal(campaigns(db).at(-1).generation, 2);
+});
+
+test('an email still with Google blocks a new campaign until it is released before sending', async (t) => {
+  const { storage, db, opportunityId } = await campaignFixture(t);
+  const report = await stop(storage, opportunityId);
+  const touch = () => db.prepare('SELECT id FROM deal_hunter_cim_campaign_touches').get().id;
+  db.prepare("UPDATE deal_hunter_cim_campaign_touches SET state = 'provider-pending' WHERE id = ?").run(touch());
+  assert.equal((await storage.startNewPursueCampaign(restartCommand(opportunityId, report))).reason,
+    'campaign_emailed');
+  db.prepare("UPDATE deal_hunter_cim_campaign_touches SET state = 'cancelled-before-provider' WHERE id = ?")
+    .run(touch());
+  assert.equal((await storage.startNewPursueCampaign(restartCommand(opportunityId, report))).applied, true);
+});
+
+test('the new campaign goes only to the broker the stopped campaign was addressed to', async (t) => {
+  const { storage, db, opportunityId } = await campaignFixture(t);
+  const report = await stop(storage, opportunityId);
+  const recorded = await storage.startNewPursueCampaign(restartCommand(opportunityId, report));
+  assert.equal(recorded.applied, true, recorded.reason);
+  await storage.upsertDealHunterOpportunitySourceObservation({
+    id: 'p4b-broker_email', opportunity_id: opportunityId, source_id: 'sheet-0',
+    source_name: 'Synthetic Sheet', source_record_id: 'row-p4b', field: 'broker_email',
+    value: 'someone-else@example.test', observed_at: restartAt, created_at: restartAt, updated_at: restartAt });
+  const enrolled = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: recorded.enrollment, decision: recorded.decision, actor: 'fixture-owner',
+    now: restartAt, readSourceHealth: healthy });
+  assert.notEqual(enrolled.enrollment.state, 'campaign-created');
+  assert.equal(enrolled.enrollment.reason_code, 'recipient_changed');
+  assert.equal(campaigns(db).length, 1);
+});

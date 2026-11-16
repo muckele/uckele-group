@@ -1811,7 +1811,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async startNewPursueCampaign(command) {
-      const { data, error } = await client.rpc('pursue_cim_start_new_campaign_v1', {
+      const { data, error } = await client.rpc('deal_hunter_pursue_start_new_campaign_v1', {
         p_command: command,
       });
       if (error) throw error;

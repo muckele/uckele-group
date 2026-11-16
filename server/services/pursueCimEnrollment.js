@@ -172,16 +172,20 @@ async function contactRuleBasis({ storage, authority, recipient, suppression }) 
 }
 
 /**
- * Generation 1, or the next one when the owner's Start a new campaign command bound this
- * enrollment to the latest, stopped campaign. Storage re-checks the binding and refuses any
- * other generation.
+ * The stopped campaign an owner's Start a new campaign command bound this enrollment to, when
+ * it is still the latest; null for every other enrollment. Storage re-checks the binding and
+ * refuses any other generation.
  */
-async function allocationGeneration({ storage, opportunityId, enrollment }) {
-  if (!enrollment.restart_of_campaign_id) return 1;
+async function restartedCampaign({ storage, opportunityId, enrollment }) {
+  if (!enrollment.restart_of_campaign_id) return null;
   const latest = (await storage.readPursueCimProjection({ opportunityId }))?.campaign;
-  return latest?.id === enrollment.restart_of_campaign_id && Number.isSafeInteger(Number(latest.generation))
-    ? Number(latest.generation) + 1 : 1;
+  return latest?.id === enrollment.restart_of_campaign_id
+    && Number.isSafeInteger(Number(latest.generation)) ? latest : null;
 }
+
+const optionFingerprint = (opportunityId, option) => digest({ opportunityId,
+  emailHash: sha256(option.email), provenanceFingerprint: option.provenanceFingerprint,
+  contactAuthorityRevision: option.contactAuthorityRevision });
 
 export async function orchestratePursuitEnrollment({ storage, opportunityId, enrollment,
   decision, recipientContactRef, actor, now = new Date(), readSourceHealth } = {}) {
@@ -194,13 +198,22 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
   let reason = '';
   let nextState = 'action-required';
   let phase = 'authority';
+  let restart = null;
   try {
     authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now: at });
     if (authority.preparationBlockers.some((item) =>
       ['broker_materials_authority_unavailable', 'canonical_authority_unavailable'].includes(item.code))) {
       reason = 'current_authority_unavailable'; nextState = 'waiting-on-eligibility';
     } else {
-      const choice = selectRecipient(authority, recipientContactRef, at);
+      // A new campaign emails the broker the stopped one was addressed to, the address the owner
+      // confirmed; with several contact options it is picked by that campaign's fingerprint.
+      restart = await restartedCampaign({ storage, opportunityId, enrollment });
+      const restartOption = restart && !recipientContactRef
+        ? authority.recipientOptions.find((option) =>
+          optionFingerprint(opportunityId, option) === restart.recipient_fingerprint) : null;
+      const choice = restart && !recipientContactRef
+        ? (restartOption ? { selected: restartOption } : { reason: 'recipient_changed' })
+        : selectRecipient(authority, recipientContactRef, at);
       reason = choice.reason || '';
       if (!reason && decision?.selected_contact_reference_digest
         && sha256(recipientContactRef || '') !== decision.selected_contact_reference_digest) {
@@ -282,12 +295,13 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                   if (!reason) {
                   const slot = calculateNextCimSlot({ policyVersion: CIM_CAMPAIGN_POLICY_VERSION,
                     timezone: timezone.iana_timezone, kind: 'initial', readyAt: at.toISOString() });
-                  const recipientFingerprint = digest({ opportunityId, emailHash: sha256(freshRecipient.email),
-                    provenanceFingerprint: freshRecipient.provenanceFingerprint,
-                    contactAuthorityRevision: freshRecipient.contactAuthorityRevision });
+                  const recipientFingerprint = optionFingerprint(opportunityId, freshRecipient);
+                  if (restart && recipientFingerprint !== restart.recipient_fingerprint) {
+                    reason = 'recipient_changed';
+                  } else {
                   const conversationId = framedDigest('cim-conversation:v1', recipientFingerprint,
                     CIM_CAMPAIGN_POLICY_VERSION);
-                  const generation = await allocationGeneration({ storage, opportunityId, enrollment });
+                  const generation = restart ? Number(restart.generation) + 1 : 1;
                   phase = 'allocation';
                   const allocation = await storage.materializePursuitCampaign({
                     opportunityId, enrollmentId: enrollment.id,
@@ -334,8 +348,10 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                   // Postgres returns no campaign when its gate refuses, so read the latest one.
                   const latest = allocation.campaign
                     ?? (await storage.readPursueCimProjection?.({ opportunityId }))?.campaign;
-                  reason = TERMINAL_CAMPAIGN_STATES.has(latest?.state)
-                    ? 'prior_campaign_terminal' : 'current_authority_unavailable';
+                  reason = enrollment.restart_of_campaign_id ? 'campaign_restart_refused'
+                    : TERMINAL_CAMPAIGN_STATES.has(latest?.state)
+                      ? 'prior_campaign_terminal' : 'current_authority_unavailable';
+                  }
                   }
                 }
               }

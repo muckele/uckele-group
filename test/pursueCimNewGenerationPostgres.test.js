@@ -84,12 +84,12 @@ function seedTouch(container, database, id, generation, state) {
 }
 
 const start = (container, database, id, extra = {}) => JSON.parse(psql(container, database,
-  `select public.pursue_cim_start_new_campaign_v1('${JSON.stringify({ opportunityId: id,
+  `select public.deal_hunter_pursue_start_new_campaign_v1('${JSON.stringify({ opportunityId: id,
     campaignId: `campaign-${id}-1`, expectedRowVersion: 1, idempotencyKey: randomUUID(),
     actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now: '2026-11-04T15:00:00.000Z',
     expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, ...extra })}'::jsonb);`));
 const maySend = (container, database, campaignId) => psql(container, database,
-  `select public.pursue_cim_campaign_generation_may_send_v1('${campaignId}');`);
+  `select public.deal_hunter_pursue_generation_may_send_v1('${campaignId}');`);
 
 test('PostgreSQL Start a new campaign and the generation rule on fresh and upgraded schemas', {
   skip: integrationEnabled ? false : 'set DEAL_HUNTER_POSTGRES_INTEGRATION=1 for disposable PostgreSQL integration',
@@ -165,9 +165,9 @@ test('PostgreSQL Start a new campaign and the generation rule on fresh and upgra
 
     // Only the server role reaches the command; the rule helpers are internal.
     assert.equal(psql(container, database, `select
-      has_function_privilege('anon', 'public.pursue_cim_start_new_campaign_v1(jsonb)', 'EXECUTE'),
-      has_function_privilege('service_role', 'public.pursue_cim_start_new_campaign_v1(jsonb)', 'EXECUTE'),
-      has_function_privilege('service_role', 'public.pursue_cim_campaign_generation_may_send_v1(text)', 'EXECUTE');`),
+      has_function_privilege('anon', 'public.deal_hunter_pursue_start_new_campaign_v1(jsonb)', 'EXECUTE'),
+      has_function_privilege('service_role', 'public.deal_hunter_pursue_start_new_campaign_v1(jsonb)', 'EXECUTE'),
+      has_function_privilege('service_role', 'public.deal_hunter_pursue_generation_may_send_v1(text)', 'EXECUTE');`),
     'f|t|f');
   }
 });

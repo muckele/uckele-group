@@ -1242,9 +1242,9 @@ test('the new-generation migration is mirrored exactly at the end of the fresh s
     const definition = migration.slice(start, migration.indexOf('\n$$;', start));
     assert.doesNotMatch(definition, /generation\s*(<>|=)\s*1\b/, `${name} no longer pins generation 1`);
   }
-  assert.match(migration, /grant execute on function public\.pursue_cim_start_new_campaign_v1\(jsonb\) to service_role;/);
-  for (const helper of ['pursue_cim_campaign_reached_provider_v1', 'pursue_cim_any_campaign_reached_provider_v1',
-    'pursue_cim_campaign_generation_may_send_v1']) {
+  assert.match(migration, /grant execute on function public\.deal_hunter_pursue_start_new_campaign_v1\(jsonb\) to service_role;/);
+  for (const helper of ['deal_hunter_pursue_campaign_reached_provider_v1', 'deal_hunter_pursue_any_campaign_reached_provider_v1',
+    'deal_hunter_pursue_generation_may_send_v1']) {
     assert.match(migration, new RegExp(`revoke all on function public\\.${helper}\\(text\\)\\s+from public, anon, authenticated, service_role;`));
   }
 });

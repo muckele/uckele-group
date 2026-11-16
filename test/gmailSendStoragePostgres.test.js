@@ -177,7 +177,7 @@ test('the Gmail send runner migration is mirrored exactly at the end of the fres
     const at = sql.indexOf(`create or replace function public.${name}(`);
     return sql.slice(at, sql.indexOf('\n$$;', at) + 4);
   };
-  const generationCheck = /(?:or v_member\.generation <> 1|or v_campaign\.generation <> 1|and c\.generation = 1|and v_campaign\.generation = 1|or not public\.pursue_cim_campaign_generation_may_send_v1\([a-z_.]+\)|and public\.pursue_cim_campaign_generation_may_send_v1\([a-z_.]+\))/g;
+  const generationCheck = /(?:or v_member\.generation <> 1|or v_campaign\.generation <> 1|and c\.generation = 1|and v_campaign\.generation = 1|or not public\.deal_hunter_pursue_generation_may_send_v1\([a-z_.]+\)|and public\.deal_hunter_pursue_generation_may_send_v1\([a-z_.]+\))/g;
   const redefinedForNewGeneration = new Set(['deal_hunter_pursue_renew_initial_claim_v1',
     'pursue_cim_authorize_provider_pending_p7a', 'pursue_cim_claim_due_touch_v1',
     'pursue_cim_list_due_initial_touches_v1', 'pursue_cim_materialize_campaign_v1']);
