@@ -22,8 +22,8 @@
 // - The read-only health checks bypass the queue: they read through an open section, which
 //   is harmless for `SELECT 1` and a schema check, and keeps `/api/ready` answering.
 // - `close()` during a section rolls the section back at its next yield; the connection
-//   closes once the calls queued before it have run. Each such `close()` returns a promise
-//   that settles then.
+//   closes once the calls queued before it have run and finished. Each such `close()` returns
+//   a promise that settles then.
 
 export const exclusiveGateBypassMethods = Object.freeze([
   'checkHealth',
@@ -71,7 +71,10 @@ export function installSqliteExclusiveGate(storageApi, database, {
   };
   const settle = () => {
     running -= 1;
-    if (running === 0) notifyIdle();
+    if (running === 0) {
+      closeIfRequested();
+      notifyIdle();
+    }
   };
   const invoke = (name, raw, self, args) => {
     const result = raw.apply(self, args);
@@ -129,7 +132,7 @@ export function installSqliteExclusiveGate(storageApi, database, {
   }
 
   function closeIfRequested() {
-    if (!closeRequested || held || draining) return;
+    if (!closeRequested || held || draining || running > 0) return;
     const close = deferredClose;
     const waiters = closeWaiters;
     closeRequested = false;
@@ -156,8 +159,25 @@ export function installSqliteExclusiveGate(storageApi, database, {
     });
     const requestedAt = now();
     let acquiredAt = requestedAt;
-    let longestQueuedMs = 0;
-    let queuedCalls = 0;
+    const openGate = () => {
+      held = false;
+      const releasedAt = now();
+      const queuedCalls = queue.length;
+      const longestQueuedMs = queue.reduce((longest, item) => Math.max(longest, releasedAt - item.queuedAt), 0);
+      // Only a section that made other callers wait is worth a line. It goes to stderr: some
+      // scripts that reach this path print JSON on stdout.
+      if (queuedCalls > 0) {
+        try {
+          logger.warn?.(`[storage:exclusive] ${label} heldMs=${Math.round(releasedAt - acquiredAt)}`
+            + ` waitedMs=${Math.round(acquiredAt - requestedAt)} queuedCalls=${queuedCalls}`
+            + ` longestQueuedMs=${Math.round(longestQueuedMs)}`);
+        } catch {
+          // Diagnostics must never become the failure.
+        }
+      }
+      startDrain();
+      closeIfRequested();
+    };
     try {
       await previous;
       // Calls queued behind the previous section run first; so does any running call.
@@ -173,27 +193,14 @@ export function installSqliteExclusiveGate(storageApi, database, {
         },
       });
     } finally {
-      if (held) {
-        if (database.inTransaction) database.exec('ROLLBACK');
-        held = false;
-        const releasedAt = now();
-        queuedCalls = queue.length;
-        for (const item of queue) longestQueuedMs = Math.max(longestQueuedMs, releasedAt - item.queuedAt);
-        // Only a section that made other callers wait is worth a line. It goes to stderr: some
-        // scripts that reach this path print JSON on stdout.
-        if (queuedCalls > 0) {
-          try {
-            logger.warn?.(`[storage:exclusive] ${label} heldMs=${Math.round(releasedAt - acquiredAt)}`
-              + ` waitedMs=${Math.round(acquiredAt - requestedAt)} queuedCalls=${queuedCalls}`
-              + ` longestQueuedMs=${Math.round(longestQueuedMs)}`);
-          } catch {
-            // Diagnostics must never become the failure.
-          }
-        }
-        startDrain();
-        closeIfRequested();
+      try {
+        if (held && database.inTransaction) database.exec('ROLLBACK');
+      } finally {
+        // Even if ROLLBACK throws, the gate opens and the next section may start; otherwise
+        // every later storage call would queue forever.
+        if (held) openGate();
+        releaseSection();
       }
-      releaseSection();
     }
   }
 

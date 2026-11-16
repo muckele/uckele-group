@@ -179,6 +179,47 @@ test('close() during a section rolls it back, runs the calls queued before it, t
   assert.equal(database.open, false);
 });
 
+test('close() after a section but before its queued calls have run lets them run, then closes', async (t) => {
+  const context = world(t);
+  const { storageApi, database, names } = context;
+  let queued;
+  await writeInSection(context, ['s1'], {
+    async onYield() {
+      queued = [storageApi.addItem('q1'), storageApi.addItem('q2')];
+    },
+  });
+  const closed = storageApi.close();
+  assert.equal(database.open, true, 'the queued calls have not run yet');
+  assert.deepEqual(await Promise.all(queued), ['q1', 'q2']);
+  assert.deepEqual(names(), ['s1', 'q1', 'q2']);
+  await closed;
+  assert.equal(database.open, false);
+});
+
+test('a ROLLBACK that throws still opens the gate', async (t) => {
+  const context = world(t);
+  const { storageApi, database, gate } = context;
+  const exec = database.exec;
+  let failRollback = true;
+  database.exec = function execOnce(source) {
+    if (source === 'ROLLBACK' && failRollback) {
+      failRollback = false;
+      throw new Error('rollback failed');
+    }
+    return exec.call(this, source);
+  };
+  t.after(() => {
+    database.exec = exec;
+  });
+  await assert.rejects(gate.runExclusive('failing-rollback', async () => {
+    database.exec('BEGIN IMMEDIATE');
+    throw new Error('body failed');
+  }), /rollback failed/);
+  assert.equal(gate.isHeld(), false);
+  database.exec('ROLLBACK');
+  assert.equal(await storageApi.countItems(), 0);
+});
+
 test('a section waits for the calls queued behind the previous one before it starts', async (t) => {
   const context = world(t);
   const { storageApi, names } = context;

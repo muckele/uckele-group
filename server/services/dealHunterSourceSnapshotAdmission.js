@@ -305,10 +305,11 @@ export async function reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
   if (!snapshot) return { reconciled: false };
 
   const admission = await runStepsInSlices(mintCompleteGoogleSheetSourceSnapshotAdmissionSteps(snapshot), slicer);
-  // Outreach created between these two reads is reported as this import's. The replacement
-  // checks its admission in event-loop slices before it takes the connection, so outreach
-  // another flow creates in those few slices can be counted too; it is a diagnostic. Once the
-  // replacement resolves, `after` is read before any call queued behind it runs.
+  // Outreach created between these two reads is reported as this import's; it is a diagnostic.
+  // The replacement checks its admission in event-loop slices and may wait for running storage
+  // calls before it takes the connection, and `after` may wait behind another section, so
+  // outreach other flows create in those gaps can be counted too. Calls queued behind this
+  // replacement do not run before `after` is read.
   const before = typeof storage.readCimOutreachCounters === 'function'
     ? await storage.readCimOutreachCounters() : null;
   await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...snapshot, admission });
