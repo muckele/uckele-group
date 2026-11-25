@@ -148,6 +148,61 @@ export function validateCimCommunicationMessageId(command = {}) {
     now: instant(command.now) };
 }
 
+// The owner's Gmail signature snapshot (one row). The HTML is already sanitized by
+// emailSignatureHtml.js; the text is derived from it and the digest is its sha256.
+export const GMAIL_SIGNATURE_MAX_HTML_CHARS = 256 * 1024;
+export const GMAIL_SIGNATURE_MAX_TEXT_CHARS = 128 * 1024;
+
+function signatureBody(value, name, maximum) {
+  if (typeof value !== 'string' || value.length > maximum) throw invalid(name);
+  return value;
+}
+
+/**
+ * A refresh attempt. `ok: true` stores the snapshot (and may carry a code, e.g. the signature
+ * was too large and is stored empty); `ok: false` records only the attempt and its code, so
+ * the previous snapshot is kept.
+ */
+export function validateGmailSignatureRefresh(command = {}) {
+  if (typeof command.ok !== 'boolean') throw invalid('ok');
+  const errorCode = command.errorCode ?? null;
+  if (errorCode !== null && (typeof errorCode !== 'string' || !errorCodePattern.test(errorCode))) {
+    throw invalid('errorCode');
+  }
+  const now = instant(command.now);
+  if (!command.ok) {
+    if (errorCode === null) throw invalid('errorCode');
+    return { ok: false, errorCode, now };
+  }
+  const digest = command.digest;
+  if (typeof digest !== 'string' || !digestPattern.test(digest)) throw invalid('digest');
+  return {
+    ok: true,
+    sendAsEmail: text(command.sendAsEmail, 'sendAsEmail', 320, 3),
+    html: signatureBody(command.html, 'html', GMAIL_SIGNATURE_MAX_HTML_CHARS),
+    text: signatureBody(command.text, 'text', GMAIL_SIGNATURE_MAX_TEXT_CHARS),
+    digest,
+    errorCode,
+    now,
+  };
+}
+
+/** The signature row in the same shape from both adapters, or null when never refreshed. */
+export function normalizeGmailSignatureRow(row) {
+  if (!row) return null;
+  const loaded = typeof row.signature_digest === 'string' && row.signature_digest !== '';
+  return {
+    loaded,
+    sendAsEmail: loaded ? row.send_as_address : null,
+    html: loaded ? row.signature_html ?? '' : null,
+    text: loaded ? row.signature_text ?? '' : null,
+    digest: loaded ? row.signature_digest : null,
+    fetchedAt: loaded ? optionalInstant(row.fetched_at) : null,
+    lastAttemptAt: optionalInstant(row.last_attempt_at),
+    lastErrorCode: row.last_error_code ?? null,
+  };
+}
+
 /** One connection row in the same shape from both adapters; scopes are an array. */
 export function normalizeGmailConnectionRow(row) {
   if (!row) return null;

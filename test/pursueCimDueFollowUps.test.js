@@ -18,7 +18,7 @@ import {
 import { runCimFollowUpPreparation } from '../server/services/pursueCimFollowUpPreparation.js';
 import { finalizeAuthorizedCimTransmission } from '../server/services/pursueCimProvider.js';
 import { readPursueCimProviderReadiness } from '../server/services/pursueCimReadiness.js';
-import { renderPursueCimEmail } from '../server/services/pursueCimTemplates.js';
+import { pursueCimWordingDigest, renderPursueCimEmail } from '../server/services/pursueCimTemplates.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
   BROKER,
@@ -28,6 +28,7 @@ import {
   SENDER_SETTINGS,
   createGmailGateFixture,
   fixtureMemberAuthority,
+  fixtureSignature,
   gmailConfig,
   fixtureRecipientFingerprint,
   seedActivationChain,
@@ -258,7 +259,7 @@ test('payload marks the last follow-up before expiry as Final', async (t) => {
   // Weeks remain before expiry: follow-up 1 is variant A.
   const regular = await build();
   const variantA = renderPursueCimEmail({ kind: 'follow-up', followUpNumber: 1, deal,
-    sender: SENDER_SETTINGS, initialSubject: fixture.initialSubject });
+    signature: fixtureSignature(), initialSubject: fixture.initialSubject });
   assert.equal(regular.isFinal, false);
   assert.equal(regular.bodyText, variantA.text);
   assert.equal(regular.bodyHtmlSanitized, variantA.html);
@@ -267,7 +268,7 @@ test('payload marks the last follow-up before expiry as Final', async (t) => {
   setCampaignExpiry(database, ids.campaignId, new Date(Date.now() + DAY).toISOString());
   const final = await build();
   const finalCopy = renderPursueCimEmail({ kind: 'follow-up', followUpNumber: 1, isFinal: true,
-    deal, sender: SENDER_SETTINGS, initialSubject: fixture.initialSubject });
+    deal, signature: fixtureSignature(), initialSubject: fixture.initialSubject });
   assert.equal(final.isFinal, true);
   assert.equal(final.bodyText, finalCopy.text);
   assert.match(final.bodyText, /Last note from me on Acme Plumbing\./);
@@ -294,9 +295,19 @@ test('payload threads to the initial Message-ID', async (t) => {
   assert.deepEqual(payload.tags, [
     `cim_conversation_id=${ids.conversationId}`,
     `cim_touch_id=${candidate.touch_id}`,
-    'cim_template=pursue-cim-follow-up-v2',
+    'cim_template=pursue-cim-follow-up-v3',
+    `cim_wording=${pursueCimWordingDigest(SENDER_SETTINGS, fixtureSignature())}`,
     `cim_in_reply_to=${initialMessageId}`,
   ]);
+  assert.match(payload.bodyText, /\n\nBest,\nPat Example\nExample Holdings LLC\npat@example\.com$/);
+
+  // Without a usable Gmail signature the follow-up is never prepared: the authority is
+  // unavailable before any claim, and the builder refuses defensively.
+  await storage.recordGmailSignatureRefresh({ ok: true, sendAsEmail: SENDER, html: '', text: '',
+    digest: fill('0'), now });
+  assert.equal(await fixture.hooks.loadAuthority({ candidate, storage, now }), null);
+  await assert.rejects(buildPursueFollowUpPayload({ candidate, authority, storage, now,
+    config: fixture.config }), /signature_incomplete/);
 
   // Without an accepted initial there is nothing to reply to: the authority is unavailable,
   // and the builder still refuses defensively.

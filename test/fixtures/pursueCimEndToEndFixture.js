@@ -40,6 +40,7 @@ import { readPursueCimProviderReadiness } from '../../server/services/pursueCimR
 import { runPursueCimSender } from '../../server/services/pursueCimSender.js';
 import { renderPursueCimEmail } from '../../server/services/pursueCimTemplates.js';
 import { changeEmailSendingControl } from '../../server/services/pursueEmailSending.js';
+import { readUsablePursueSignature, refreshPursueEmailSignature } from '../../server/services/pursueEmailSignature.js';
 import { CONTROLLED_CIM_MAILBOX_PROFILE } from '../../server/config.js';
 import { SENDER, SENDER_SETTINGS, gmailConfig } from './pursueCimGmailGateFixture.js';
 
@@ -172,6 +173,10 @@ export async function ownerTurnsSendingOn(world) {
   // Connect Gmail: the OAuth callback stores this row. The mailbox itself is the fake provider.
   await storage.saveGmailConnection({ emailAddress: SENDER, refreshTokenCiphertext: CIPHERTEXT,
     grantedScopes: SCOPES, historyCheckpoint: '0', connectedBy: OWNER, now: clock.peek().toISOString() });
+  // Connecting reads the owner's Gmail signature, as the OAuth callback does.
+  const signature = await refreshPursueEmailSignature({ storage, config: world.config, now: clock.peek(),
+    mailProvider: world.mailProvider, source: 'gmail-connect' });
+  assert.equal(signature.ok, true, JSON.stringify(signature));
   await world.control('wording_approval', true);
   await world.control('contact_rule', true);
   const live = await world.control('live_sending', true);
@@ -292,10 +297,12 @@ export async function brokerReplies(world, campaign, { body, from = `Jordan Lee 
     bodyPrefix: body });
 }
 
-/** The exact copy the owner approved, for one email of a campaign. */
-function expectedEmail(world, { kind, followUpNumber, isFinal = false, name }) {
+/** The exact copy the owner approved, for one email of a campaign: it ends with the Gmail signature. */
+async function expectedEmail(world, { kind, followUpNumber, isFinal = false, name }) {
+  const signature = await readUsablePursueSignature({ storage: world.storage, config: world.config });
+  assert.ok(signature, 'a Gmail signature is loaded');
   return renderPursueCimEmail({ kind, followUpNumber, isFinal, deal: { name, brokerName: 'Jordan Lee' },
-    sender: world.config.dealHunter.sender, initialSubject: `CIM / NDA request for ${name}` });
+    signature, initialSubject: `CIM / NDA request for ${name}` });
 }
 
 /** Sets up sending, automatic Pursue picks a 90+ deal, and its initial goes out Monday 08:05. */
@@ -341,7 +348,7 @@ async function autoPursueReplyStops(t, createBackend) {
   const first = await sendAt(world, pacific('2030-01-07', '08:05'));
   assert.equal(first.sentInitial, 1, JSON.stringify(first));
   const [initial] = world.mailProvider.sent;
-  const initialCopy = expectedEmail(world, { kind: 'initial', name: 'Acme Plumbing' });
+  const initialCopy = await expectedEmail(world, { kind: 'initial', name: 'Acme Plumbing' });
   assert.deepEqual([initial.from, initial.to, initial.subject, initial.text],
     [{ name: SENDER_SETTINGS.name, address: SENDER }, BROKER_EMAIL, initialCopy.subject, initialCopy.text]);
   campaign = await world.campaignFor(id);
@@ -373,7 +380,7 @@ async function autoPursueReplyStops(t, createBackend) {
   assert.equal(friday.sentFollowUps, 1, JSON.stringify(friday));
   const [, followUp1, followUp2] = world.mailProvider.sent;
   for (const [message, number] of [[followUp1, 1], [followUp2, 2]]) {
-    const copy = expectedEmail(world, { kind: 'follow-up', followUpNumber: number, name: 'Acme Plumbing' });
+    const copy = await expectedEmail(world, { kind: 'follow-up', followUpNumber: number, name: 'Acme Plumbing' });
     assert.deepEqual([message.to, message.subject, message.text, message.threadId, message.inReplyTo],
       [BROKER_EMAIL, copy.subject, copy.text, initial.threadId, initial.rfcMessageId]);
   }
@@ -453,13 +460,14 @@ async function requestSimToExpiry(t, createBackend) {
   assert.equal(iso(campaign.initial_accepted_at).slice(0, 16), pacific('2030-01-07', '12:00').slice(0, 16));
   assert.equal(iso(campaign.local_expiry_at),
     new RealDate(RealDate.parse(campaign.initial_accepted_at) + 28 * DAY).toISOString());
-  const variants = followUps.map((message, index) => {
+  const variants = [];
+  for (const [index, message] of followUps.entries()) {
     const isFinal = index === followUps.length - 1;
-    const copy = expectedEmail(world, { kind: 'follow-up', followUpNumber: index + 1, isFinal, name: 'Bayside HVAC' });
+    const copy = await expectedEmail(world, { kind: 'follow-up', followUpNumber: index + 1, isFinal, name: 'Bayside HVAC' });
     assert.deepEqual([message.subject, message.text, message.threadId, message.inReplyTo],
       [copy.subject, copy.text, initial.threadId, initial.rfcMessageId], `follow-up ${index + 1}`);
-    return copy.variant;
-  });
+    variants.push(copy.variant);
+  }
   assert.deepEqual(variants, ['A', 'B', 'C', 'D', 'A', 'B', 'C', 'D', 'A', 'Final']);
   assert.match(followUps.at(-1).text, /Last note from me on Bayside HVAC\./);
 
@@ -506,19 +514,26 @@ async function stopSuppressesBroker(t, createBackend) {
   assert.equal(world.mailProvider.attempts.length, 1);
 }
 
-/** Changing the wording after approval pauses sending until the owner approves it again. */
+/**
+ * Changing the Gmail signature after approval pauses sending until the owner approves it again:
+ * the sender reads the signature from Gmail at the start of every slot.
+ */
 async function wordingChangePauses(t, createBackend) {
   const world = await createWorld(t, createBackend, { start: START });
   const campaign = await autoPursuedAndSent(world);
+  const initialText = world.mailProvider.sent[0].text;
+  assert.match(initialText, /\n\nBest,\nPat Example\nExample Holdings LLC\npat@example\.com$/);
+  assert.doesNotMatch(initialText, /reply "stop"|Uckele Group/);
 
-  // The owner's title changes in settings after the wording was approved.
+  // The owner changes their title in their Gmail signature after the wording was approved.
   world.clock.set(pacific('2030-01-08', '12:00'));
-  const base = gmailConfig();
-  world.setConfig({ ...base, dealHunter: { ...base.dealHunter,
-    sender: { ...SENDER_SETTINGS, title: 'Managing Partner' } } });
-  assert.deepEqual((await world.readiness()).reasons, ['wording_not_approved']);
+  world.mailProvider.setSignature('<div dir="ltr"><b>Pat Example</b><br>Managing Partner<br>'
+    + '<a href="mailto:pat@example.com">pat@example.com</a></div>');
+  // Nothing has read it from Gmail yet.
+  assert.deepEqual((await world.readiness()).reasons, []);
 
-  // Follow-up 1 is due Wednesday 08:00: the sender stops before touching it.
+  // Follow-up 1 is due Wednesday 08:00: the sender reads the new signature first, then stops
+  // before touching the follow-up.
   for (const at of [pacific('2030-01-09', '08:00'), pacific('2030-01-09', '08:15')]) {
     const paused = await sendAt(world, at);
     assert.equal(paused.stoppedFor, 'not_ready', JSON.stringify(paused));
@@ -536,9 +551,10 @@ async function wordingChangePauses(t, createBackend) {
   const resumed = await sendAt(world, pacific('2030-01-09', '09:15'));
   assert.equal(resumed.sentFollowUps, 1, JSON.stringify(resumed));
   const [initial, followUp] = world.mailProvider.sent;
-  const copy = expectedEmail(world, { kind: 'follow-up', followUpNumber: 1, name: 'Acme Plumbing' });
+  const copy = await expectedEmail(world, { kind: 'follow-up', followUpNumber: 1, name: 'Acme Plumbing' });
   assert.deepEqual([followUp.text, followUp.threadId], [copy.text, initial.threadId]);
-  assert.match(followUp.text, /Managing Partner, Uckele Group/);
+  assert.match(followUp.text, /\n\nBest,\nPat Example\nManaging Partner\npat@example\.com$/);
+  assert.match(followUp.html, /<p>Best,<\/p>\n<div><div dir="ltr"><b>Pat Example<\/b><br>Managing Partner<br>/);
 }
 
 /** Live sending off mid-campaign holds the next follow-up; on again sends it. */
@@ -572,7 +588,7 @@ async function liveSendingOffAndOn(t, createBackend) {
   const resumed = await sendAt(world, pacific('2030-01-11', '09:15'));
   assert.equal(resumed.sentFollowUps, 1, JSON.stringify(resumed));
   const [initial, , followUp2] = world.mailProvider.sent;
-  const copy = expectedEmail(world, { kind: 'follow-up', followUpNumber: 2, name: 'Acme Plumbing' });
+  const copy = await expectedEmail(world, { kind: 'follow-up', followUpNumber: 2, name: 'Acme Plumbing' });
   assert.deepEqual([followUp2.text, followUp2.threadId, followUp2.inReplyTo],
     [copy.text, initial.threadId, initial.rfcMessageId]);
   assert.deepEqual(await world.scheduled(campaign), [['follow-up-3', pacific('2030-01-15', '08:00')]]);

@@ -131,6 +131,10 @@ const pursuingTrackerMigrationUrl = new URL(
   '../supabase/migrations/20261105120000_pursuing_tracker.sql',
   import.meta.url,
 );
+const pursueGmailSignatureMigrationUrl = new URL(
+  '../supabase/migrations/20261113120000_pursue_gmail_signature.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -496,7 +500,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const bestFirstDealListMigration = fs.readFileSync(bestFirstDealListMigrationUrl, 'utf8');
   const gmailSendRunnersMigration = fs.readFileSync(gmailSendRunnersMigrationUrl, 'utf8');
   const pursuingTrackerMigration = fs.readFileSync(pursuingTrackerMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${pursueCimFollowUpCapacityMigration}\n${bestFirstDealListMigration}\n${gmailSendRunnersMigration}\n${pursuingTrackerMigration}`;
+  const pursueGmailSignatureMigration = fs.readFileSync(pursueGmailSignatureMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}\n${pursueCimFollowUpCapacityMigration}\n${bestFirstDealListMigration}\n${gmailSendRunnersMigration}\n${pursuingTrackerMigration}\n${pursueGmailSignatureMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');

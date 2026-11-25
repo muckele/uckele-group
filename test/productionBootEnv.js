@@ -45,8 +45,6 @@ export function productionSecrets(dataDir) {
     DEAL_HUNTER_GMAIL_SENDER_ADDRESS: 'sender@example.com',
     DEAL_HUNTER_GMAIL_TOKEN_KEY: Buffer.alloc(32, 7).toString('base64'),
     DEAL_HUNTER_SENDER_NAME: 'Pat Example',
-    DEAL_HUNTER_SENDER_PHONE: '555-0100',
-    DEAL_HUNTER_SENDER_TITLE: 'Owner',
     GOOGLE_OAUTH_CLIENT_ID: 'client-id.apps.googleusercontent.com',
     GOOGLE_OAUTH_CLIENT_SECRET: 'client-secret',
     SQLITE_PATH: path.join(dataDir, 'app.sqlite'),

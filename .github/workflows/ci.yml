@@ -9,6 +9,29 @@ permissions:
   contents: read
 
 jobs:
+  # The Deal Hunter PostgreSQL integration suites (Supabase migrations and RPCs) run against a
+  # disposable postgres:16 container. They are skipped in `npm test`, so this job is the only
+  # place they run; it runs beside `validate` to keep that job within its timeout.
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Prepare disposable PostgreSQL test dependency
+        run: docker pull postgres:16
+      - name: Deal Hunter PostgreSQL integration suites
+        env:
+          DEAL_HUNTER_POSTGRES_INTEGRATION: '1'
+          DEAL_HUNTER_PASSED_ARCHIVE_POSTGRES_INTEGRATION: '1'
+        run: node --test --test-concurrency=2 $(git grep -lE 'DEAL_HUNTER_(PASSED_ARCHIVE_)?POSTGRES_INTEGRATION' -- 'test/*Postgres.test.js')
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 25

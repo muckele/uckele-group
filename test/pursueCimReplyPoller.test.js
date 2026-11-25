@@ -32,7 +32,7 @@ const SCOPES = ['https://www.googleapis.com/auth/gmail.send',
 const COLLEAGUE = 'assistant@brokerage.test';
 
 async function sentWorld(t, { connect = true } = {}) {
-  const fixture = await createSenderFixture(t, { start: MONDAY_0805,
+  const fixture = await createSenderFixture(t, { start: MONDAY_0805, gmailConnected: connect,
     campaigns: [{ suffix: 'a', dueAt: MONDAY_0800, dueLocal: '2030-10-28T08:00:00' }] });
   const sent = await fixture.run();
   assert.equal(sent.sentInitial, 1, JSON.stringify(sent));
@@ -718,4 +718,17 @@ test('a failed read of the sent Message-ID keeps ours and changes nothing', asyn
   assert.equal(world.row('deal_hunter_cim_campaigns', world.campaigns.a.campaignId).state, 'active-follow-up');
   const followUp = await world.sendFollowUp();
   assert.equal(followUp.inReplyTo, world.ours);
+});
+
+test('the poller ignores our own Gmail signature lines when it looks for stop words', async (t) => {
+  const world = await sentWorld(t);
+  const html = '<div><b>Pat Example</b><br>Do not contact me on weekends</div>';
+  await world.storage.recordGmailSignatureRefresh({ ok: true, sendAsEmail: SENDER, html,
+    text: 'Pat Example\nDo not contact me on weekends', digest: 'e'.repeat(64), now: MONDAY_1000 });
+  // The broker's client inlined our email without quote markers.
+  world.inject({}, 'Happy to share the CIM, NDA attached.\n\nBest,\nPat Example\nDo not contact me on weekends');
+  const summary = await world.poll();
+  assert.equal(summary.responded, 1, JSON.stringify(summary));
+  assert.equal(summary.stopped, 0, JSON.stringify(summary));
+  assert.equal(world.conversation().state, 'responded');
 });

@@ -372,6 +372,16 @@ const relationshipInventoryEntries = [
     scannerPath: 'excluded.pursueSendControlKey',
     reason: excludedRelationshipReason,
   }),
+  // The owner's Gmail signature snapshot is one global row (id 'current') for the sending
+  // address; it carries no canonical opportunity identity. Registered so a later column on it
+  // is classified rather than missed.
+  ...relationshipEntries({
+    table: 'deal_hunter_gmail_signatures',
+    columns: ['send_as_address'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
+    scannerPath: 'excluded.gmailSignatureSnapshot',
+    reason: excludedRelationshipReason,
+  }),
   ...relationshipEntries({
     table: 'deal_hunter_opportunity_timezone_revisions',
     columns: ['evidence_id', 'opportunity_id'],

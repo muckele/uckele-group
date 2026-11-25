@@ -32,6 +32,8 @@ const seededAt = '2026-09-25T19:00:00.000Z';
 // Tuesday 2026-09-29 09:00 in Los Angeles: inside the send window.
 const GATE_NOW = '2026-09-29T16:00:00.000Z';
 const fill = (character) => character.repeat(64);
+// The wording digest the synthetic emails were rendered under, and the readiness reports.
+const GATE_WORDING = fill('d');
 
 function uuidFor(value) {
   const hex = createHash('sha256').update(value).digest('hex');
@@ -251,7 +253,7 @@ async function prepareGate({ container, database, storage, suffix, followUp = fa
     fromAddress: SENDER, toAddresses: [BROKER], ccAddresses: [], bccAddresses: [],
     replyToAddress: SENDER, subject: 'CIM / NDA request for Acme Plumbing',
     bodyText: `Synthetic body ${suffix}`, bodyHtmlSanitized: `<p>Synthetic body ${suffix}</p>`,
-    tags: [`cim_touch_id=${ids.touchId}`],
+    tags: [`cim_touch_id=${ids.touchId}`, `cim_wording=${GATE_WORDING}`],
   };
   const prepared = followUp
     ? await storage.prepareReservedCimFollowUp({ activationId: 'gmail-fl04c-followup',
@@ -292,7 +294,8 @@ async function prepareGate({ container, database, storage, suffix, followUp = fa
       sourceHealth: { healthy: true, issues: [], requiredSources: ['sheet-0'] },
       identityExceptions: [] }),
     readProviderReadiness: async ({ now }) => ({ provider: 'gmail', providerProfile: GMAIL_PROFILE,
-      ready: true, reasons: [], signatureComplete: true, evidenceRevision: `readiness-${suffix}`,
+      ready: true, reasons: [], signatureComplete: true, wordingDigest: GATE_WORDING,
+      evidenceRevision: `readiness-${suffix}`,
       generatedAt: now, expiresAt: new Date(Date.parse(now) + 60_000).toISOString() }),
     ...overrides });
   return { ids, transmission: prepared.transmission, capability, writerPath, gate,

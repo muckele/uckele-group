@@ -19,8 +19,9 @@ const AUTO_PRECEDENCE = new Set(['auto_reply', 'bulk', 'junk']);
 const STOP_WORDS = /(?<![\p{L}\p{N}_-])(?:stop|unsubscribe|remove\s+me|do\s+not\s+contact)(?![\p{L}\p{N}_-])/iu;
 // Where quoted history starts: Gmail/Apple "On ... wrote:", Outlook's original-message markers.
 const QUOTE_START = /^\s*(?:On\s[^\n]{0,300}wrote:|-{2,}\s*Original Message\s*-{2,}|_{10,}|From:\s.*|Sent from my\s.*)\s*$/im;
-// The footer every Pursue email ends with (spec §8.2); a reply that carries it unquoted
-// (some clients inline the original) is not asking us to stop.
+// The footer Pursue emails ended with before pursue-cim-initial-v4 / pursue-cim-follow-up-v3
+// (they now end with the owner's Gmail signature). Threads already sent still quote it, and a
+// reply that carries it unquoted (some clients inline the original) is not asking us to stop.
 const OUR_FOOTER = /If you would rather I not reach out about future listings,\s*just reply\s*["“”]?stop["“”]?\.?/giu;
 
 function headerText(value) {
@@ -59,14 +60,47 @@ function isAutoReply(headers) {
   return AUTO_PRECEDENCE.has(headerText(headers.precedence).toLowerCase());
 }
 
-/** The reply's own words: the first 4096 chars, cut at quoted history, quote lines dropped. */
-function ownWords(bodyPrefix) {
+function comparableLine(line) {
+  return String(line).replace(/[\s\u00a0]+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * The reply without our Gmail signature, removed only as a whole block: every line of the
+ * signature text (whitespace-collapsed, case-insensitive, blank lines ignored) in order, as one
+ * run of the reply's lines. A single line is never removed on its own, so a broker who writes a
+ * line that happens to equal one signature line ("Reply STOP to opt out") still counts; a
+ * signature of fewer than two lines is never removed.
+ */
+function withoutSignatureBlock(lines, signatureText) {
+  const signature = (typeof signatureText === 'string' ? signatureText : '')
+    .split(/\r?\n/).map(comparableLine).filter(Boolean);
+  if (signature.length < 2) return lines;
+  const nonBlank = lines.map((line, index) => ({ line: comparableLine(line), index }))
+    .filter(({ line }) => line !== '');
+  const removed = new Set();
+  for (let start = 0; start + signature.length <= nonBlank.length; start += 1) {
+    if (!signature.every((line, offset) => nonBlank[start + offset].line === line)) continue;
+    const first = nonBlank[start].index;
+    const last = nonBlank[start + signature.length - 1].index;
+    for (let index = first; index <= last; index += 1) removed.add(index);
+    start += signature.length - 1;
+  }
+  return lines.filter((_, index) => !removed.has(index));
+}
+
+/**
+ * The reply's own words: the first 4096 chars, cut at quoted history, quote lines dropped, our
+ * old footer removed, and our Gmail signature removed when it appears whole. Our emails end
+ * with that signature, so a reply that inlines the original without quote markers is not asking
+ * us to stop because the signature happens to say "unsubscribe" or "do not contact".
+ */
+function ownWords(bodyPrefix, signatureText) {
   if (typeof bodyPrefix !== 'string' || !bodyPrefix) return '';
   let text = bodyPrefix.slice(0, CIM_BODY_PREFIX_CHARS);
   const quote = QUOTE_START.exec(text);
   if (quote) text = text.slice(0, quote.index);
-  return text.split(/\r?\n/).filter((line) => !/^\s*>/.test(line)).join('\n')
-    .replace(OUR_FOOTER, ' ');
+  const lines = text.split(/\r?\n/).filter((line) => !/^\s*>/.test(line));
+  return withoutSignatureBlock(lines, signatureText).join('\n').replace(OUR_FOOTER, ' ');
 }
 
 /**
@@ -75,10 +109,11 @@ function ownWords(bodyPrefix) {
  * @param {string} input.connectedAddress the connected Gmail mailbox
  * @param {Iterable<string>} [input.knownMessageIds] RFC Message-IDs of our transmissions
  * @param {Iterable<string>} [input.knownProviderMessageIds] Gmail ids of our accepted sends
+ * @param {string} [input.signatureText] the plain text of our stored Gmail signature
  * @returns {'ours'|'owner'|'bounce'|'auto-reply'|'stop'|'reply'}
  */
 export function classifyPursueCimReply({ message, connectedAddress, knownMessageIds = [],
-  knownProviderMessageIds = [] } = {}) {
+  knownProviderMessageIds = [], signatureText = '' } = {}) {
   const headers = message?.headers && typeof message.headers === 'object' ? message.headers : {};
   const known = new Set(Array.from(knownMessageIds, normalizeRfcMessageId).filter(Boolean));
   const messageId = normalizeRfcMessageId(headers.messageId);
@@ -90,6 +125,6 @@ export function classifyPursueCimReply({ message, connectedAddress, knownMessage
   if (from && connected && from === connected) return 'owner';
   if (isBounce(from, headers.contentType)) return 'bounce';
   if (isAutoReply(headers)) return 'auto-reply';
-  if (STOP_WORDS.test(ownWords(message?.bodyPrefix))) return 'stop';
+  if (STOP_WORDS.test(ownWords(message?.bodyPrefix, signatureText))) return 'stop';
   return 'reply';
 }

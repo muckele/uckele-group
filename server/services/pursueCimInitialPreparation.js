@@ -18,7 +18,8 @@ import {
   requiresP10bControlledMailboxTemplate,
 } from './pursueCimControlledMailboxTemplate.js';
 import { PURSUE_INITIAL_PAYLOAD_VERSION } from './pursueCimFinalGate.js';
-import { renderPursueCimEmail } from './pursueCimTemplates.js';
+import { readUsablePursueSignature } from './pursueEmailSignature.js';
+import { PURSUE_CIM_WORDING_TAG, pursueCimWordingDigest, renderPursueCimEmail } from './pursueCimTemplates.js';
 
 const leaseMilliseconds = 5 * 60 * 1000;
 
@@ -44,24 +45,28 @@ function validatedPayload(payload, config) {
   return payload;
 }
 
-// The owner's Gmail mailbox sends the Pursue initial template (spec §8.2). Replies come back to
-// the same mailbox, so Reply-To is the sender itself.
-function gmailProposal(candidate, authority, recipient, config) {
+// The owner's Gmail mailbox sends the Pursue initial template (spec §8.2), ending with the
+// stored Gmail signature. Replies come back to the same mailbox, so Reply-To is the sender
+// itself. The wording tag binds the prepared email to the wording digest it was rendered under.
+function gmailProposal(candidate, authority, recipient, config, signature) {
   const fromAddress = String(getCimProviderDeliveryConfig(config).delivery?.gmailSenderAddress
     || '').trim();
   if (!fromAddress || !recipient.email) throw new Error('CIM sender or recipient unavailable');
+  if (!signature) throw new Error('signature_incomplete');
   const rendered = renderPursueCimEmail({
     kind: 'initial',
     deal: {
       name: authority.opportunity?.canonical_name || authority.score?.name || '',
       brokerName: recipient.firstName || recipient.displayName || '',
     },
-    sender: config.dealHunter?.sender,
+    signature,
   });
   const tags = normalizeResendTags([
     { name: 'cim_conversation_id', value: candidate.conversation_id },
     { name: 'cim_touch_id', value: candidate.touch_id },
     { name: 'cim_template', value: rendered.templateVersion },
+    { name: PURSUE_CIM_WORDING_TAG,
+      value: pursueCimWordingDigest(config.dealHunter?.sender, signature) },
   ]).map(({ name, value }) => `${name}=${value}`);
   if (tags.some((tag) => tag.length > 120)) throw new Error('CIM tag exceeds storage bound');
   return validatedPayload({
@@ -76,8 +81,10 @@ function gmailProposal(candidate, authority, recipient, config) {
   }, config);
 }
 
-function proposal(candidate, authority, recipient, config) {
-  if (cimProviderUsesGmail(config)) return gmailProposal(candidate, authority, recipient, config);
+function proposal(candidate, authority, recipient, config, signature) {
+  if (cimProviderUsesGmail(config)) {
+    return gmailProposal(candidate, authority, recipient, config, signature);
+  }
   const deliveryConfig = getCimProviderDeliveryConfig(config);
   const fromAddress = deliveryConfig.delivery.resendFromEmail
     || deliveryConfig.delivery.fallbackRecipient;
@@ -154,6 +161,16 @@ export async function prepareDueCimInitialTouch({ storage, candidate, now, clock
   };
   if (candidate?.kind !== 'initial') throw new Error('Non-initial CIM touch reached Package 5');
   const config = configOverride || getConfig();
+  // A Gmail email is never prepared unsigned: without a usable Gmail signature snapshot the
+  // touch is left unclaimed (readiness reports signature_incomplete and stops the sender).
+  let signature = null;
+  if (cimProviderUsesGmail(config)) {
+    signature = await readUsablePursueSignature({ storage, config });
+    if (!signature) {
+      return { touchId: candidate.touch_id, claimed: false, prepared: false,
+        signatureIncomplete: true, transmission: null };
+    }
+  }
   const rawClaimToken = randomBytes(32).toString('hex');
   const claimTokenDigest = createHash('sha256').update(rawClaimToken).digest('hex');
   const claimAt = instant();
@@ -185,7 +202,7 @@ export async function prepareDueCimInitialTouch({ storage, candidate, now, clock
       return { touchId: candidate.touch_id, claimed: true,
         prepared: false, staleAuthority: true, transmission: null };
     }
-    const payload = proposal(candidate, authority, recipient, config);
+    const payload = proposal(candidate, authority, recipient, config, signature);
     const result = await storage.prepareCimTransmission({
       touchIds: [candidate.touch_id], claimTokenDigest,
       expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),

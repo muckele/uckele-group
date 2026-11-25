@@ -31,6 +31,7 @@ import { cimRfcMessageId } from './cimMailProvider.js';
 import { createGmailCimProvider } from './gmailCimProvider.js';
 import { applyVerifiedPursueCimInbound } from './pursueCimInbound.js';
 import { classifyPursueCimReply, replyFromAddress } from './pursueCimReplyClassifier.js';
+import { readPursueEmailSignature } from './pursueEmailSignature.js';
 
 export const PURSUE_CIM_REPLY_POLLER_ACTOR = 'pursue-cim-reply-poller';
 export const PURSUE_CIM_REPLY_POLLER_JOB_NAME = 'pursue-cim-reply-poller';
@@ -269,11 +270,14 @@ export async function runPursueCimReplyPoll({ storage, mailProvider, now, config
       connection.email_address)
     : { messageIds: new Set(), providerMessageIds: new Set() };
 
+  // Lines of our own Gmail signature in a reply are not the broker's words.
+  const signatureText = messages.some(({ id }) => !recorded.has(id))
+    ? (await readPursueEmailSignature(storage))?.text ?? '' : '';
   for (const message of messages) {
     if (recorded.has(message.id)) continue;
     const classification = classifyPursueCimReply({ message,
       connectedAddress: connection.email_address, knownMessageIds: known.messageIds,
-      knownProviderMessageIds: known.providerMessageIds });
+      knownProviderMessageIds: known.providerMessageIds, signatureText });
     const from = replyFromAddress(message.headers?.from);
     const record = { gmailMessageId: message.id, gmailThreadId: message.threadId,
       conversationId: byThread.get(message.threadId).conversationId, classification,

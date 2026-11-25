@@ -422,3 +422,33 @@ test('pending reply conversations are listed distinct and uncapped, beyond any p
   assert.deepEqual(await storage.listGmailPendingReplyConversationIds(),
     ['conversation-a', 'conversation-b']);
 });
+
+test('gmail signature snapshot: stored on success, kept with the code on a failed refresh', async (t) => {
+  const { storage, database } = openStorage(t);
+  assert.equal(await storage.getGmailSignature(), null);
+
+  const failedFirst = await storage.recordGmailSignatureRefresh({ ok: false, errorCode: 'gmail_timeout', now: at });
+  assert.deepEqual(failedFirst, { loaded: false, sendAsEmail: null, html: null, text: null, digest: null,
+    fetchedAt: null, lastAttemptAt: at, lastErrorCode: 'gmail_timeout' });
+
+  const snapshot = { sendAsEmail: 'owner@uckele.test', html: '<b>Pat Example</b>', text: 'Pat Example',
+    digest: hex('<b>Pat Example</b>') };
+  const stored = await storage.recordGmailSignatureRefresh({ ok: true, ...snapshot, now: at });
+  assert.deepEqual(stored, { loaded: true, ...snapshot, fetchedAt: at, lastAttemptAt: at, lastErrorCode: null });
+
+  const kept = await storage.recordGmailSignatureRefresh({ ok: false, errorCode: 'gmail_503', now: later });
+  assert.deepEqual(kept, { ...stored, lastAttemptAt: later, lastErrorCode: 'gmail_503' });
+  assert.deepEqual(await storage.getGmailSignature(), kept);
+
+  const empty = await storage.recordGmailSignatureRefresh({ ok: true, sendAsEmail: 'owner@uckele.test',
+    html: '', text: '', digest: hex(''), errorCode: 'gmail_signature_too_large', now: later });
+  assert.equal(empty.html, '');
+  assert.equal(empty.lastErrorCode, 'gmail_signature_too_large');
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_gmail_signatures').get().n, 1);
+
+  for (const bad of [{ ok: false, now: at }, { ok: false, errorCode: 'Bad Code', now: at },
+    { ok: true, ...snapshot, digest: 'nope', now: at }, { ok: true, ...snapshot, html: 1, now: at },
+    { ok: true, ...snapshot, sendAsEmail: ' x@y.z', now: at }, { ok: 'yes', now: at }]) {
+    await assert.rejects(storage.recordGmailSignatureRefresh(bad), /Invalid/);
+  }
+});

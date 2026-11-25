@@ -224,7 +224,11 @@ test('the tracker migration is mirrored exactly at the end of the fresh schema',
   const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
   const start = schema.indexOf(migration);
   assert.ok(start >= 0, 'the fresh schema must contain the exact tracker block');
-  assert.equal(schema.slice(start + migration.length).trim(), '', 'the tracker block is the end of the schema');
+  // Only later migrations' blocks follow it.
+  const later = fs.readFileSync(path.join(root, 'supabase/migrations/20261113120000_pursue_gmail_signature.sql'),
+    'utf8').trim();
+  assert.equal(schema.slice(start + migration.length).trim(), later,
+    'the tracker block is followed only by the Gmail signature block');
   assert.deepEqual(migrationFunctionNames(migration), ['pursuit_tracker_append_event_v1',
     'pursuit_tracker_event_command_valid_v1', 'pursuit_tracker_event_preflight_v1', 'pursuit_tracker_list_v1',
     'pursuit_tracker_record_event_v1', 'pursuit_tracker_record_sim_intake_v1',
