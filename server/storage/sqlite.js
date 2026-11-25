@@ -977,6 +977,15 @@ export const dealHunterEligibilityOwnedScoreFields = Object.freeze([
   'current_triage_eligible',
 ]);
 
+// The latest Pursue campaign generation for a queue row: one probe of the
+// (opportunity_id, generation) unique index per displayed row.
+const LATEST_CAMPAIGN_JOIN = `LEFT JOIN deal_hunter_cim_campaigns AS latest_campaign
+  ON latest_campaign.id = (SELECT c.id FROM deal_hunter_cim_campaigns AS c
+    WHERE c.opportunity_id = scores.opportunity_id ORDER BY c.generation DESC LIMIT 1)`;
+const LATEST_CAMPAIGN_COLUMNS = `latest_campaign.state AS campaign_state,
+  latest_campaign.reason_code AS campaign_reason_code,
+  latest_campaign.local_expiry_at AS campaign_local_expiry_at`;
+
 function normalizeDealHunterOpportunityScoreRow(row) {
   return row
     ? {
@@ -12271,8 +12280,10 @@ ${cimCapacityConsumeTriggerSql}
               WHERE submission.id = opportunity.primary_submission_id LIMIT 1), 'not-started') AS crm_status,
             COALESCE((SELECT cim.status FROM deal_hunter_cim_requests AS cim
               WHERE cim.opportunity_id = scores.opportunity_id
-              ORDER BY cim.updated_at DESC, cim.id DESC LIMIT 1), 'not-requested') AS cim_status
+              ORDER BY cim.updated_at DESC, cim.id DESC LIMIT 1), 'not-requested') AS cim_status,
+            ${LATEST_CAMPAIGN_COLUMNS}
           FROM deal_hunter_opportunity_scores AS scores
+          ${LATEST_CAMPAIGN_JOIN}
           ${dismissedJoin}
           ${where}
           ${orderBy}
@@ -12542,10 +12553,15 @@ ${cimCapacityConsumeTriggerSql}
             COALESCE((SELECT submission.status FROM contact_submissions AS submission
               JOIN deal_hunter_opportunities AS opportunity
                 ON opportunity.primary_submission_id = submission.id
-              WHERE opportunity.opportunity_id = scores.opportunity_id), 'not-started') AS crm_status
+              WHERE opportunity.opportunity_id = scores.opportunity_id), 'not-started') AS crm_status,
+            COALESCE((SELECT cim.status FROM deal_hunter_cim_requests AS cim
+              WHERE cim.opportunity_id = scores.opportunity_id
+              ORDER BY cim.updated_at DESC, cim.id DESC LIMIT 1), 'not-requested') AS cim_status,
+            ${LATEST_CAMPAIGN_COLUMNS}
             FROM deal_hunter_opportunity_scores AS scores
             JOIN deal_hunter_opportunities AS opportunity
               ON opportunity.opportunity_id = scores.opportunity_id
+            ${LATEST_CAMPAIGN_JOIN}
             WHERE scores.opportunity_id = ?`);
           const hydrated = new Map();
           for (const row of result.areas.flatMap((item) => item.rows)) {

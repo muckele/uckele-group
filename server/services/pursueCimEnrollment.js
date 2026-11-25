@@ -10,6 +10,7 @@ import { ensureDealHunterSubmissionForCim } from './dealHunter.js';
 import { validateIanaTimezone } from './opportunityTimezone.js';
 import { appendDerivedOpportunityTimezoneRevision } from './opportunityTimezoneRevision.js';
 import { CONTACT_POLICY_VERSION, contactPolicyDigest } from './pursueCimContactPolicy.js';
+import { TERMINAL_CAMPAIGN_STATES } from './pursueCimCampaignSummary.js';
 
 export { CONTACT_POLICY_VERSION, contactPolicyDigest };
 
@@ -313,7 +314,12 @@ export async function orchestratePursuitEnrollment({ storage, opportunityId, enr
                     return { enrollment: { ...enrollment, state: 'campaign-created' },
                       campaign: allocation.campaign, recipientOptions: options(freshAuthority) };
                   }
-                  reason = 'current_authority_unavailable';
+                  // A finished earlier campaign is never restarted by a Pursue click (spec 7.2.4).
+                  // Postgres returns no campaign when its gate refuses, so read the latest one.
+                  const latest = allocation.campaign
+                    ?? (await storage.readPursueCimProjection?.({ opportunityId }))?.campaign;
+                  reason = TERMINAL_CAMPAIGN_STATES.has(latest?.state)
+                    ? 'prior_campaign_terminal' : 'current_authority_unavailable';
                   }
                 }
               }

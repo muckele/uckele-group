@@ -6735,6 +6735,26 @@ begin
 end;
 $$;
 
+-- The latest Pursue campaign generation for one queue row. One probe of the
+-- (opportunity_id, generation) unique index; called only for rows being displayed.
+create or replace function public.deal_hunter_latest_campaign_fields_v1(p_opportunity_id text)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select coalesce((select pg_catalog.jsonb_build_object(
+      'campaign_state', campaign.state,
+      'campaign_reason_code', campaign.reason_code,
+      'campaign_local_expiry_at', campaign.local_expiry_at)
+    from public.deal_hunter_cim_campaigns as campaign
+    where campaign.opportunity_id = p_opportunity_id
+    order by campaign.generation desc limit 1), '{}'::jsonb);
+$$;
+revoke all on function public.deal_hunter_latest_campaign_fields_v1(text) from public, anon, authenticated;
+grant execute on function public.deal_hunter_latest_campaign_fields_v1(text) to service_role;
+
 create or replace function public.list_deal_hunter_opportunity_scores(
   p_view text, p_page integer, p_page_size integer, p_search text, p_sort text, p_direction text,
   p_min_score integer, p_confidence text, p_priority text, p_state text
@@ -6893,7 +6913,8 @@ as $$
       'currentOpportunities', count(*) filter (where current_triage_eligible = true and dismissed_deal_key is null)
     ) from candidates),
     'rows', coalesce((select jsonb_agg(
-      (to_jsonb(ordered) - 'ordinal' - 'score_name' - 'score_listing_url') order by ordinal
+      (to_jsonb(ordered) - 'ordinal' - 'score_name' - 'score_listing_url')
+        || public.deal_hunter_latest_campaign_fields_v1(ordered.opportunity_id) order by ordinal
     ) from ordered), '[]'::jsonb)
   );
 $$;
@@ -9570,7 +9591,7 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
           where source.opportunity_id = numbered.opportunity_id
             and source.field in ('annual_profit', 'annual_revenue', 'asking_price')
           group by source.field having count(distinct source.value) > 1) as conflict_fields)
-      )
+      ) || public.deal_hunter_latest_campaign_fields_v1(numbered.opportunity_id)
       order by ordinal) as rows,
       max(ordinal)::integer as last_ordinal,
       (array_agg(numbered.opportunity_id order by ordinal desc))[1] as last_id

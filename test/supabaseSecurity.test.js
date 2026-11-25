@@ -79,6 +79,7 @@ const passedArchiveMigrationUrl = new URL(
   '../supabase/migrations/20261012120000_deal_hunter_passed_archive.sql',
   import.meta.url,
 );
+const queueCampaignStateMigrationUrl = new URL('../supabase/migrations/20261115120000_queue_campaign_state.sql', import.meta.url);
 const cimDetailAuthorityMigrationUrl = new URL(
   '../supabase/migrations/20260831210000_deal_hunter_cim_detail_authority.sql',
   import.meta.url,
@@ -278,7 +279,8 @@ test('Acquisition Inbox queue SQL keeps filtering, ordering, summary, and lightw
 });
 
 test('Acquisition Inbox queue migration and fresh schema keep the same function contract', () => {
-  const migration = fs.readFileSync(passedArchiveMigrationUrl, 'utf8');
+  // The queue-campaign-state migration is the latest definition of the queue readers.
+  const migration = fs.readFileSync(queueCampaignStateMigrationUrl, 'utf8');
   const schema = fs.readFileSync(schemaUrl, 'utf8');
   const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
   const definition = (sql) => {
@@ -287,6 +289,20 @@ test('Acquisition Inbox queue migration and fresh schema keep the same function 
     return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
   };
   assert.equal(normalize(definition(migration)), normalize(definition(schema)));
+  for (const name of ['list_deal_hunter_fresh_inbox_v1', 'deal_hunter_latest_campaign_fields_v1']) {
+    const named = (sql) => {
+      const start = sql.indexOf(`create or replace function public.${name}(`);
+      const end = sql.indexOf('\n$$;', start);
+      return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
+    };
+    assert.notEqual(named(migration), '', `${name} is in the migration`);
+    assert.equal(normalize(named(migration)), normalize(named(schema)), name);
+  }
+  // The campaign helper is server-role only, like the readers that call it.
+  for (const sql of [migration, schema]) {
+    assert.match(sql, /revoke all on function public\.deal_hunter_latest_campaign_fields_v1\(text\) from public, anon, authenticated;/);
+    assert.match(sql, /grant execute on function public\.deal_hunter_latest_campaign_fields_v1\(text\) to service_role;/);
+  }
 });
 
 test('CIM detail authority migration and fresh schema enforce one bounded service-role ID window', () => {

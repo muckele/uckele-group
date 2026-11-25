@@ -1099,6 +1099,63 @@ describe('Acquisition Inbox queue', () => {
     expect(writes.some(({ url }) => /send|cim|backfill|refresh|import/.test(url))).toBe(false);
   });
 
+  test('a row whose listing has a campaign shows it and offers no Request SIM', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ rows: [
+      queueRow({ campaign: { state: 'stopped', reasonCode: 'campaign_stopped' } }),
+      queueRow({ opportunityId: 'opp-2', name: 'Fresh Plumbing', campaign: null }),
+    ], total: 2 }))));
+
+    renderInbox();
+    await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ });
+    expect(screen.queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.getByText(/CIM: Campaign Stopped/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Request SIM Fresh Plumbing' })).toBeVisible();
+  });
+
+  test('an action response updates an inbox row\'s campaign without dropping its other fields', async () => {
+    const row = queueRow({ industry: 'Fire protection' });
+    let queueGets = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      if (String(input).endsWith('/action')) {
+        return jsonResponse({ success: true, action: 'pursue',
+          opportunity: queueRow({ industry: '', campaign: { state: 'stopped', reasonCode: 'campaign_stopped' } }) });
+      }
+      queueGets += 1;
+      // The reload after the action fails, so the swapped row is what stays on screen.
+      if (queueGets > 1) return jsonResponse({ success: false, error: 'stale' }, { ok: false, status: 409 });
+      return jsonResponse(queueResponse({ view: 'inbox', rows: [row],
+        areas: [{ id: 'action-preview', rows: [], total: 0, counts: {} },
+          { id: 'new-important', rows: [row], total: 1, counts: {} }] }));
+    }));
+
+    renderInbox({ initialView: 'inbox' });
+    const region = await screen.findByRole('region', { name: 'New & Important' });
+    expect(within(region).getByText(/Fire protection/)).toBeVisible();
+    fireEvent.click(within(region).getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
+    await waitFor(() => expect(within(region).queryByRole('button', { name: 'Request SIM Evergreen Fire Protection' })).toBeNull());
+    expect(within(region).getByText(/Fire protection/)).toBeVisible();
+  });
+
+  test('says why a Request SIM click started nothing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      if (String(input).endsWith('/action')) {
+        return jsonResponse({ success: true, action: 'pursue',
+          notice: { code: 'campaign_finished', message: "This listing's email campaign has already ended." },
+          opportunity: queueRow({ campaign: { state: 'stopped', reasonCode: 'campaign_stopped' } }) });
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    await screen.findByRole('button', { name: /Open Evergreen Fire Protection/ });
+    fireEvent.click(screen.getByRole('button', { name: 'Request SIM Evergreen Fire Protection' }));
+    expect(await screen.findByText("This listing's email campaign has already ended.")).toBeVisible();
+    // The notice belongs to that click; opening a listing clears it.
+    fireEvent.click(screen.getByRole('button', { name: /Open Evergreen Fire Protection/ }));
+    await waitFor(() => expect(screen.queryByText("This listing's email campaign has already ended.")).toBeNull());
+  });
+
   test('loads the separate canary release report and stops only through its revision-bound route', async () => {
     const writes = [];
     const detail = { ...detailResponse(), pursueCimReleaseAvailable: true };

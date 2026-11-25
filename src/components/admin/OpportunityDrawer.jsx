@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
 import BrokerMaterialsCard, { BrokerMaterialsAttachmentStatus } from './BrokerMaterialsCard.jsx';
 import PursueNextAction from './PursueNextAction.jsx';
+import { campaignWorkflowLabel, listingCampaign } from './campaignPresentation.js';
 import { NearMissConfirmPanel, isNearMiss } from './AcquisitionCriteria.jsx';
 import { earningsPresentation } from '../../utils/earningsPresentation.js';
 import { financialFactFields, financialFactCurrencies, financialFactPeriods, financialFactMetrics,
@@ -302,7 +303,8 @@ function CimReleaseCard({ error = '', loading = false, onStop, onTimezoneSet, op
           <p className="mt-3 break-all text-[11px] text-ink/55">Transmission {transmission.id} · Payload {shortDigest(transmission.payloadDigest)} · Membership {shortDigest(transmission.memberDigest)}</p>
           {release.campaign?.localExpiryAt ? <p className="mt-1 text-[11px] text-ink/55">Campaign expiry {formatDate(release.campaign.localExpiryAt)}</p> : <p className="mt-1 text-[11px] text-ink/55">Campaign expiry is established after initial provider acceptance.</p>}
         </div> : null}
-        {!readOnly && opportunityId && (!release.timezoneAuthority
+        {/* Setting a timezone is recovery before a campaign exists; once one does, Request SIM is gone. */}
+        {!readOnly && opportunityId && !release.campaign && (!release.timezoneAuthority
           || ['missing', 'ambiguous'].includes(release.timezoneAuthority.state))
           ? <TimezonePicker expectedPriorRevision={release.timezoneAuthority?.revision ?? 0}
             key={opportunityId} onSet={() => { setTimezoneSavedFor(opportunityId); onTimezoneSet?.(); }}
@@ -323,6 +325,7 @@ function conflictKey(observation) {
 }
 
 export default function OpportunityDrawer({
+  actionNotice = '',
   actionsBlocked = false, brokerMaterialsState = {}, cimRelease = null, cimReleaseError = '', cimReleaseLoading = false, cimReleaseReadOnly = false, cimReleaseStopping = false, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
   onCimReleaseStop, onCimTimezoneSet,
@@ -341,16 +344,19 @@ export default function OpportunityDrawer({
   const linkedCrmId = detail?.crmSummary?.submission?.id;
   const safeUrls = [...new Set((detail?.listingUrls || []).map(safeListingUrl).filter(Boolean))];
   const actionable = Boolean(onAction && opportunity && !opportunity.dismissed && !readOnly);
-  // A running campaign already owns this listing, so another request would do nothing. Recovery that
-  // needs Request SIM, such as setting a timezone, happens before a campaign exists.
-  const campaignOwnsListing = Boolean(cimRelease?.campaign && cimRelease.actions?.canStop);
+  // Any campaign, running or finished, leaves Request SIM nothing to start: a finished one is
+  // never restarted by a Pursue click. Recovery that needs Request SIM, such as setting a
+  // timezone, happens before a campaign exists. The detail's summary covers the moment before
+  // the release report loads.
+  const campaign = listingCampaign({ cimRelease, opportunity });
+  const campaignOwnsListing = Boolean(campaign);
   useEffect(() => {
     if (campaignOwnsListing) setSimConfirmOpen(false);
   }, [campaignOwnsListing]);
   // The workflow's CIM status tracks the older manual request path and stays "not requested" for a
-  // campaign. Expiry is only projected into the status until the sender next updates the campaign.
-  const cimWorkflowLabel = cimRelease?.campaign
-    ? `Campaign ${formatLabel(cimRelease.status?.code === 'expired' ? 'expired' : cimRelease.campaign.state)}`
+  // campaign.
+  const cimWorkflowLabel = campaign
+    ? campaignWorkflowLabel(campaign)
     : formatLabel(opportunity?.workflow?.cimStatus || 'not-requested');
   const strengths = (detail?.score?.summary?.strengths || []).filter(hasValue);
   const concerns = (detail?.score?.summary?.concerns || []).filter(hasValue);
@@ -426,6 +432,7 @@ export default function OpportunityDrawer({
           {error ? <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{error}</p> : null}
           {error && onRetry ? <button className={secondaryButton} onClick={onRetry} type="button">Retry opportunity detail</button> : null}
           {mutationError ? <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{mutationError}</p> : null}
+          {actionNotice ? <p className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900" role="status">{actionNotice}</p> : null}
           {detail ? <>
             <Section title="Overview">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[

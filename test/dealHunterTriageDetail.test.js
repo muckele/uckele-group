@@ -1770,7 +1770,7 @@ test('detail closes every nested projection and strips injected storage metadata
     changedSinceReview: boolean, disposition: { type: 'object' }, dismissed: boolean, dismissedReason: text(160), scoredAt: text(80),
     scoreFingerprint: text(200), rulesVersion: text(160), freshness: { type: 'object' },
     criteriaGroup: text(80), criteriaResult: { type: 'object', nullable: true }, criteriaCurrent: boolean,
-    autoPursueBlocker: text(80),
+    autoPursueBlocker: text(80), campaign: { type: 'object', nullable: true },
   };
   const operatorFactContract = { id: text(200), field: text(80), value: text(4000), verified: boolean, actor: text(160), note: text(500), createdAt: text(80), updatedAt: text(80) };
   const evidenceContract = {
@@ -1788,6 +1788,9 @@ test('detail closes every nested projection and strips injected storage metadata
   assertRecordContract(detail.opportunity.geography, { city: text(160), state: text(40), label: text(240) }, 'opportunity.geography');
   assertRecordContract(detail.opportunity.financials, { annualProfit: nullableNumber, annualRevenue: nullableNumber, askingPrice: nullableNumber, profitMultiple: nullableNumber }, 'opportunity.financials');
   assertRecordContract(detail.opportunity.workflow, { crmStatus: text(80), cimStatus: text(80) }, 'opportunity.workflow');
+  if (detail.opportunity.campaign) {
+    assertRecordContract(detail.opportunity.campaign, { state: text(80), reasonCode: text(160) }, 'opportunity.campaign');
+  }
   assertRecordContract(detail.opportunity.freshness, {
     discoveryState: text(40), firstAcceptedAt: text(80), discoveryRevision: number,
     materialRevision: number, reviewedDiscoveryRevision: number,
