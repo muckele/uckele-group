@@ -1424,7 +1424,8 @@ test('a retention failure after the bundle is in place neither fails the backup 
   fs.writeFileSync(path.join(stuck, 'manifest.json'), '{invalid');
   fs.writeFileSync(path.join(locked, 'file'), 'x');
   fs.chmodSync(locked, 0o500);
-  const stale = new Date(Date.now() - 48 * 3600_000);
+  // Aged against the backup's own clock, not the wall clock, or the bundle stops looking stale once real time passes it.
+  const stale = new Date(backupAt(0).getTime() - 48 * 3600_000);
   fs.utimesSync(stuck, stale, stale);
 
   let result;
