@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { financialFactFields, normalizeFinancialFact, parseFinancialFact } from '../../shared/opportunityFinancialFacts.js';
 import { normalizeDealHunterListingIdentity } from './dealHunterListingIdentity.js';
+import { runSteps } from '../utils/eventLoopSlices.js';
 
 export const opportunityFactCrmSnapshotFields = Object.freeze([
   'seller_name',
@@ -331,6 +332,11 @@ export function normalizeOpportunitySourceObservationSnapshot(snapshot = {}) {
  * authorized by a deduped or partial candidate subset.
  */
 export function normalizeDealHunterSourceSnapshot(snapshot = {}) {
+  return runSteps(normalizeDealHunterSourceSnapshotSteps(snapshot));
+}
+
+// A step generator (see utils/eventLoopSlices.js) yielding after each record.
+export function* normalizeDealHunterSourceSnapshotSteps(snapshot = {}) {
   if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) || Buffer.isBuffer(snapshot)) {
     throw new Error('Complete source-observation snapshot must be an object.');
   }
@@ -343,11 +349,14 @@ export function normalizeDealHunterSourceSnapshot(snapshot = {}) {
   if (snapshot.records.length > 10_000) {
     throw new Error('Complete source-observation snapshot has too many records.');
   }
-  const normalized = {
-    source_id: normalizeText(snapshot.source_id, 'Opportunity source id', { maxLength: 160 }),
-    source_name: normalizeText(snapshot.source_name, 'Opportunity source name', { maxLength: 220 }),
-    records: snapshot.records.map(normalizeOpportunitySourceObservationSnapshot),
-  };
+  const source_id = normalizeText(snapshot.source_id, 'Opportunity source id', { maxLength: 160 });
+  const source_name = normalizeText(snapshot.source_name, 'Opportunity source name', { maxLength: 220 });
+  const records = [];
+  for (const record of snapshot.records) {
+    records.push(normalizeOpportunitySourceObservationSnapshot(record));
+    yield;
+  }
+  const normalized = { source_id, source_name, records };
   const recordIds = new Set();
   for (const record of normalized.records) {
     if (record.source_id !== normalized.source_id || record.source_name !== normalized.source_name) {

@@ -45,6 +45,7 @@ import {
   refreshOpportunityScores,
   requestOpportunityScoreRefresh,
 } from './services/dealHunterScoreStore.js';
+import { withDealReviewLock } from './services/dealReviewLock.js';
 import {
   dismissDealHunterOpportunityWithInboxAuthority,
   getTriageOpportunityDetail,
@@ -2802,14 +2803,16 @@ export function createApp({
         response.status(401).json({ success: false, error: 'Administrator access is required.' });
         return;
       }
-      const result = await resolveCimIdentityException({
+      // A running sync builds its Sheet snapshot around the exceptions open when it started;
+      // resolving one mid-build would make the snapshot transaction refuse the whole Sheet.
+      const result = await withDealReviewLock(() => resolveCimIdentityException({
         exceptionId: request.params.id,
         opportunityId: request.body?.opportunityId || '',
         action: request.body?.action || 'link',
         confirmed: request.body?.confirmed === true,
         reason: request.body?.reason || '',
         actor: session.username || 'admin',
-      });
+      }));
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );

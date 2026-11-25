@@ -8,8 +8,10 @@ import { getStorage } from '../storage/index.js';
 import { runAutoPursue } from './autoPursue.js';
 import { refreshOpportunityScores } from './dealHunterScoreStore.js';
 import { reevaluateWaitingPursuitEnrollments } from './pursueCimSender.js';
+import { createEventLoopSlicer, yieldToEventLoop } from '../utils/eventLoopSlices.js';
 
 const sheetErrorMaxLength = 300;
+const criteriaGroupReadChunkSize = 250;
 
 function boundedError(value) {
   const text = String(value?.message ?? value ?? '').replace(/\s+/g, ' ').trim();
@@ -52,9 +54,15 @@ async function countCriteriaGroups(storage, currentFingerprints) {
   if (ids.length === 0 || typeof storage?.listDealHunterOpportunityScoreFingerprints !== 'function') return {};
   try {
     const counts = {};
-    for (const row of await storage.listDealHunterOpportunityScoreFingerprints(ids)) {
-      const group = row?.criteria_group ? String(row.criteria_group) : 'unknown';
-      counts[group] = (counts[group] || 0) + 1;
+    const slicer = createEventLoopSlicer();
+    // A chunk at a time, so thousands of rows do not hold the event loop in one read.
+    for (let index = 0; index < ids.length; index += criteriaGroupReadChunkSize) {
+      if (slicer.due()) await slicer.yield();
+      for (const row of await storage.listDealHunterOpportunityScoreFingerprints(
+        ids.slice(index, index + criteriaGroupReadChunkSize))) {
+        const group = row?.criteria_group ? String(row.criteria_group) : 'unknown';
+        counts[group] = (counts[group] || 0) + 1;
+      }
     }
     return counts;
   } catch {
@@ -114,6 +122,8 @@ export async function runDealHunterSheetSync({
     : {};
   const ok = requiredSourcesHealthy && !scoringDeferred && !refreshFailed;
 
+  // Each step below reads or writes thousands of rows; let requests in between them.
+  await yieldToEventLoop();
   const result = {
     ok,
     sheets,
@@ -138,6 +148,7 @@ export async function runDealHunterSheetSync({
   }
 
   try {
+    await yieldToEventLoop();
     const pursue = await autoPursue({ storage, now, triggeredBy: 'sheet-sync', currentFingerprints });
     result.autoPursue = {
       runKey: pursue?.runKey ?? null,
@@ -154,6 +165,7 @@ export async function runDealHunterSheetSync({
   // Fresh sheets can make a waiting enrollment eligible under the current contact rule and
   // contact options (spec 2026-11-03 §5.5). A failure here never fails the sync.
   try {
+    await yieldToEventLoop();
     const counts = await reevaluate({ storage, now });
     result.waitingEnrollments = {
       enrolled: Math.max(0, Math.trunc(Number(counts?.enrolled) || 0)),
