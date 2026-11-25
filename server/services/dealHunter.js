@@ -4,6 +4,8 @@ import { findCanonicalOpportunityMergeApprovalForException } from '../repairs/ca
 import { matchDealNarrative } from './dealHunterSemanticMatcher.js';
 import { getStorage } from '../storage/index.js';
 import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
+import { createEventLoopSlicer, mapInSlices, runSteps, runStepsInSlices } from '../utils/eventLoopSlices.js';
+import { withDealReviewLockHeld } from './dealReviewLock.js';
 import { strFromU8, unzipSync } from 'fflate';
 import {
   buildCimReplyToAddress,
@@ -1203,6 +1205,11 @@ export function scoreDeal(deal, ledger = null) {
 }
 
 function parseCsvRows(csvText = '') {
+  return runSteps(parseCsvRowsSteps(csvText));
+}
+
+// A step generator (see utils/eventLoopSlices.js) yielding after each row.
+function* parseCsvRowsSteps(csvText = '') {
   const rows = [];
   const rowLines = [];
   let row = [];
@@ -1253,6 +1260,7 @@ function parseCsvRows(csvText = '') {
       endRow();
       line += 1;
       rowLine = line;
+      yield;
     } else if (quoteClosed) {
       if (character !== ' ' && character !== '\t') {
         throw new Error(`CSV line ${line} has text after a closing quote. Check quoting and export again.`);
@@ -1294,15 +1302,18 @@ function parseCsvRows(csvText = '') {
     usedHeaders.add(candidate);
     return candidate;
   });
-  return rows.slice(1).map((values, recordIndex) => {
+  const records = [];
+  for (const [recordIndex, values] of rows.slice(1).entries()) {
     if (values.slice(headers.length).some((item) => item.trim() !== '')) {
       throw new Error(`CSV line ${rowLines[recordIndex + 1]} has more populated fields than the header. Check delimiters and export again.`);
     }
-    return headers.reduce((record, header, index) => {
+    records.push(headers.reduce((record, header, index) => {
       record[header] = normalizeText(values[index] || '', 5000);
       return record;
-    }, Object.create(null));
-  });
+    }, Object.create(null)));
+    yield;
+  }
+  return records;
 }
 
 function normalizeDailyDealUpdateRow(row = {}) {
@@ -1364,21 +1375,33 @@ function extractXmlTextRuns(xml = '') {
 }
 
 function parseWorksheetCells(worksheetXml = '', sharedStrings = []) {
-  return [...String(worksheetXml || '').matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)].map((match) => {
-    const attributes = match[1];
-    const body = match[2] || '';
-    const ref = getXmlAttribute(attributes, 'r').toUpperCase();
-    const type = getXmlAttribute(attributes, 't');
-    const rawValue = body.match(/<v>([\s\S]*?)<\/v>/)?.[1] || '';
-    const value = type === 's'
-      ? sharedStrings[Number(rawValue)] || ''
-      : type === 'inlineStr'
-        ? extractXmlTextRuns(body)
-        : decodeXmlEntities(rawValue);
-    const formula = decodeXmlEntities(body.match(/<f(?:\s[^>]*)?>([\s\S]*?)<\/f>/)?.[1] || '');
+  return runSteps(parseWorksheetCellsSteps(worksheetXml, sharedStrings));
+}
 
-    return { formula, ref, value };
-  });
+// A step generator (see utils/eventLoopSlices.js) yielding after each cell.
+function* parseWorksheetCellsSteps(worksheetXml = '', sharedStrings = []) {
+  const cells = [];
+  for (const match of String(worksheetXml || '').matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+    cells.push(worksheetCell(match, sharedStrings));
+    yield;
+  }
+  return cells;
+}
+
+function worksheetCell(match, sharedStrings) {
+  const attributes = match[1];
+  const body = match[2] || '';
+  const ref = getXmlAttribute(attributes, 'r').toUpperCase();
+  const type = getXmlAttribute(attributes, 't');
+  const rawValue = body.match(/<v>([\s\S]*?)<\/v>/)?.[1] || '';
+  const value = type === 's'
+    ? sharedStrings[Number(rawValue)] || ''
+    : type === 'inlineStr'
+      ? extractXmlTextRuns(body)
+      : decodeXmlEntities(rawValue);
+  const formula = decodeXmlEntities(body.match(/<f(?:\s[^>]*)?>([\s\S]*?)<\/f>/)?.[1] || '');
+
+  return { formula, ref, value };
 }
 
 function extractHyperlinkFormulaTarget(formula = '') {
@@ -1410,8 +1433,8 @@ function parseWorksheetRelationshipTargets(relationshipsXml = '') {
   return targets;
 }
 
-function extractWorksheetListingUrls(worksheetXml = '', relationshipsXml = '', sharedStrings = []) {
-  const cells = parseWorksheetCells(worksheetXml, sharedStrings);
+function* extractWorksheetListingUrlsSteps(worksheetXml = '', relationshipsXml = '', sharedStrings = []) {
+  const cells = yield* parseWorksheetCellsSteps(worksheetXml, sharedStrings);
   const header = cells
     .filter((cell) => !cell.formula && normalizeComparableText(cell.value) === 'view listing')
     .sort((left, right) => Number(left.ref.match(/\d+$/)?.[0] || Infinity) - Number(right.ref.match(/\d+$/)?.[0] || Infinity))[0];
@@ -1426,6 +1449,7 @@ function extractWorksheetListingUrls(worksheetXml = '', relationshipsXml = '', s
   const cellsByRow = new Map();
 
   for (const cell of cells) {
+    yield;
     const row = Number(cell.ref.match(/\d+$/)?.[0] || 0);
     if (row <= headerRow) continue;
     if (!cellsByRow.has(row)) cellsByRow.set(row, []);
@@ -1451,6 +1475,7 @@ function extractWorksheetListingUrls(worksheetXml = '', relationshipsXml = '', s
 
   for (const cell of cells) {
     setListingUrl(cell.ref, extractHyperlinkFormulaTarget(cell.formula));
+    yield;
   }
 
   const relationshipTargets = parseWorksheetRelationshipTargets(relationshipsXml);
@@ -1491,6 +1516,7 @@ function extractWorksheetListingUrls(worksheetXml = '', relationshipsXml = '', s
   const rowNamesByIndex = new Map();
 
   for (const [row, rowCells] of cellsByRow) {
+    yield;
     const dataIndex = compactIndexByRow.get(row);
     if (dataIndex === undefined) continue;
     const rawRow = rowCells.reduce((record, cell) => {
@@ -1650,13 +1676,21 @@ function matchSimilarSheetRows(workbookRows = [], expectedRows = [], onMatch) {
   }
 }
 
-function alignWorksheetListingUrls(candidate, expectedRows = []) {
+// A step generator (see eventLoopSlices.js): each row's match identity normalizes the row,
+// which is most of the cost of aligning a large Sheet.
+function* alignWorksheetListingUrlsSteps(candidate, expectedRows = []) {
   if (expectedRows.length === 0) return candidate.listingUrlsByRow;
 
-  const expected = expectedRows.map((rawRow, index) => ({ index, ...sheetRowMatchIdentity(rawRow) }));
-  const workbook = [...candidate.listingUrlsByPhysicalRow.entries()]
-    .sort(([left], [right]) => left - right)
-    .map(([row, listingUrl]) => ({ listingUrl, row, ...sheetRowMatchIdentity(candidate.rawRowsByPhysicalRow.get(row)) }));
+  const expected = [];
+  for (const [index, rawRow] of expectedRows.entries()) {
+    expected.push({ index, ...sheetRowMatchIdentity(rawRow) });
+    yield;
+  }
+  const workbook = [];
+  for (const [row, listingUrl] of [...candidate.listingUrlsByPhysicalRow.entries()].sort(([left], [right]) => left - right)) {
+    workbook.push({ listingUrl, row, ...sheetRowMatchIdentity(candidate.rawRowsByPhysicalRow.get(row)) });
+    yield;
+  }
   const matchedExpectedIndexes = new Set();
   const matchedWorkbookRows = new Set();
   const listingUrlsByRow = new Map();
@@ -1699,6 +1733,10 @@ function alignWorksheetListingUrls(candidate, expectedRows = []) {
 }
 
 export function extractGoogleSheetListingUrls(workbookBytes, expectedRows = []) {
+  return runSteps(extractGoogleSheetListingUrlsSteps(workbookBytes, expectedRows));
+}
+
+function* extractGoogleSheetListingUrlsSteps(workbookBytes, expectedRows = []) {
   let expandedBytes = 0;
   const entries = unzipSync(workbookBytes, {
     filter: (file) => {
@@ -1716,7 +1754,11 @@ export function extractGoogleSheetListingUrls(workbookBytes, expectedRows = []) 
     },
   });
   const sharedStringsXml = entries['xl/sharedStrings.xml'] ? strFromU8(entries['xl/sharedStrings.xml']) : '';
-  const sharedStrings = [...sharedStringsXml.matchAll(/<si>([\s\S]*?)<\/si>/g)].map((match) => extractXmlTextRuns(match[1]));
+  const sharedStrings = [];
+  for (const match of sharedStringsXml.matchAll(/<si>([\s\S]*?)<\/si>/g)) {
+    sharedStrings.push(extractXmlTextRuns(match[1]));
+    yield;
+  }
   const worksheetPaths = Object.keys(entries)
     .filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(name))
     .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
@@ -1728,9 +1770,10 @@ export function extractGoogleSheetListingUrls(workbookBytes, expectedRows = []) 
     const worksheetName = worksheetPath.split('/').pop();
     const relationshipsPath = `xl/worksheets/_rels/${worksheetName}.rels`;
     const relationshipsXml = entries[relationshipsPath] ? strFromU8(entries[relationshipsPath]) : '';
-    const result = extractWorksheetListingUrls(worksheetXml, relationshipsXml, sharedStrings);
+    const result = yield* extractWorksheetListingUrlsSteps(worksheetXml, relationshipsXml, sharedStrings);
 
     if (result) candidates.push(result);
+    yield;
   }
 
   const result = selectWorksheetListingUrls(candidates, expectedRows);
@@ -1744,7 +1787,7 @@ export function extractGoogleSheetListingUrls(workbookBytes, expectedRows = []) 
     };
   }
 
-  const listingUrlsByRow = alignWorksheetListingUrls(result, expectedRows);
+  const listingUrlsByRow = yield* alignWorksheetListingUrlsSteps(result, expectedRows);
   return {
     ...result,
     listingUrlsByRow,
@@ -2097,7 +2140,21 @@ function withSourceListingOccurrences(deals = []) {
 }
 
 function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = new Map()) {
+  return runSteps(normalizeSheetCsvRowsSteps(rows, sourceIndex, listingUrlsByRow));
+}
+
+function* normalizeSheetCsvRowsSteps(rows = [], sourceIndex = 0, listingUrlsByRow = new Map()) {
   const safeListingUrls = listingUrlsByRow instanceof Map ? listingUrlsByRow : new Map();
+  const deals = [];
+  for (const [index, row] of rows.entries()) {
+    deals.push(normalizeDealRecord(
+      safeListingUrls.get(index)
+        ? { ...normalizeDailyDealUpdateRow(row), 'Original Broker Listing URL': safeListingUrls.get(index) }
+        : normalizeDailyDealUpdateRow(row),
+      { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) },
+    ));
+    yield;
+  }
   return {
     source: {
       id: `sheet-${sourceIndex}`,
@@ -2106,12 +2163,7 @@ function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = ne
       fetched: true,
       rowCount: rows.length,
     },
-    deals: withSourceListingOccurrences(rows.map((row, index) => normalizeDealRecord(
-      safeListingUrls.get(index)
-        ? { ...normalizeDailyDealUpdateRow(row), 'Original Broker Listing URL': safeListingUrls.get(index) }
-        : normalizeDailyDealUpdateRow(row),
-      { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) },
-    ))),
+    deals: withSourceListingOccurrences(deals),
   };
 }
 
@@ -2136,13 +2188,18 @@ async function fetchSheetCsvDeals(url, sourceIndex, config) {
         .catch((error) => ({ workbookBytes: null, error: normalizeText(error.message, 500) }))
       : Promise.resolve({ workbookBytes: null, error: '' }),
   ]);
-  const allRows = parseCsvRows(csv);
+  // A large Sheet takes seconds to parse, align and normalize; do it in event-loop slices.
+  const slicer = createEventLoopSlicer();
+  const allRows = await runStepsInSlices(parseCsvRowsSteps(csv), slicer);
   const rows = allRows.slice(0, config.dealHunter.maxSourceRecords);
   let workbookResult = { listingUrlsByRow: new Map(), error: workbookDownload.error };
 
   if (workbookDownload.workbookBytes) {
     try {
-      const extracted = extractGoogleSheetListingUrls(workbookDownload.workbookBytes, allRows);
+      const extracted = await runStepsInSlices(
+        extractGoogleSheetListingUrlsSteps(workbookDownload.workbookBytes, allRows),
+        slicer,
+      );
       const listingUrlsByRow = new Map(
         [...extracted.listingUrlsByRow].filter(([index]) => index >= 0 && index < rows.length),
       );
@@ -2157,12 +2214,15 @@ async function fetchSheetCsvDeals(url, sourceIndex, config) {
     return normalizeText(listing) !== '' && !normalizeUrl(listing);
   });
 
-  const result = normalizeSheetCsvRows(rows, sourceIndex, workbookResult.listingUrlsByRow);
-  const listingUrlHealth = rows.map((row, index) => {
+  const result = await runStepsInSlices(
+    normalizeSheetCsvRowsSteps(rows, sourceIndex, workbookResult.listingUrlsByRow),
+    slicer,
+  );
+  const listingUrlHealth = await mapInSlices(rows, (row, index) => {
     const viewListing = getField(row, ['View Listing']);
     const expected = normalizeText(viewListing) !== '' || Boolean(normalizeDealRecord(row).listingUrl);
     return { expected, resolved: Boolean(result.deals[index]?.listingUrl) };
-  });
+  }, slicer);
   const listingUrlExpectedCount = listingUrlHealth.filter(({ expected }) => expected).length;
   const listingUrlCount = listingUrlHealth.filter(({ expected, resolved }) => expected && resolved).length;
   const listingUrlUnresolvedCount = listingUrlHealth.filter(({ expected, resolved }) => expected && !resolved).length;
@@ -3281,10 +3341,25 @@ function mergeSyndicatedDeals(canonical, duplicate, decision) {
 }
 
 export function dedupeDeals(deals) {
-  const ranked = deals
-    .map((deal, inputIndex) => ({ deal: initializeDealIdentity(deal), inputIndex }))
-    .filter(({ deal }) => buildDealKey(deal))
-    .sort((left, right) => canonicalDealQuality(right.deal) - canonicalDealQuality(left.deal) || left.inputIndex - right.inputIndex);
+  return runSteps(dedupeDealsSteps(deals));
+}
+
+// The same dedupe, returning to the event loop between listings (see eventLoopSlices.js).
+export function dedupeDealsInSlices(deals, slicer) {
+  return runStepsInSlices(dedupeDealsSteps(deals), slicer);
+}
+
+function* dedupeDealsSteps(deals) {
+  const initialized = [];
+  for (let inputIndex = 0; inputIndex < deals.length; inputIndex += 1) {
+    const deal = initializeDealIdentity(deals[inputIndex]);
+    // The quality is a pure function of the listing, so computing it once per listing
+    // orders the sort exactly as computing it in every comparison did.
+    if (buildDealKey(deal)) initialized.push({ deal, inputIndex, quality: canonicalDealQuality(deal) });
+    yield;
+  }
+  const ranked = initialized
+    .sort((left, right) => right.quality - left.quality || left.inputIndex - right.inputIndex);
   const deduped = [];
   const indicesByBlock = new Map();
   const maximumBlockSize = 200;
@@ -3320,6 +3395,7 @@ export function dedupeDeals(deals) {
   };
 
   for (const { deal } of ranked) {
+    yield;
     const candidateIndices = new Set();
     for (const key of candidateBlockKeys(deal)) {
       for (const index of indicesByBlock.get(key) || []) {
@@ -6028,7 +6104,7 @@ async function attachCanonicalOpportunityIdentities(
   storage,
   deals = [],
   completeSheetObservationScopes = new Map(),
-  { readOnly = false } = {},
+  { readOnly = false, slicer = createEventLoopSlicer() } = {},
 ) {
   if (!storage.listCurrentDealHunterOpportunities) {
     return deals.map((deal) => ({ ...deal, identityStatus: 'unavailable', opportunityId: '' }));
@@ -6040,6 +6116,9 @@ async function attachCanonicalOpportunityIdentities(
     : new Map();
   const perRecordSnapshots = new Map();
   for (const deal of deals) {
+    // Each listing resolves through a few storage calls that never return to the event loop
+    // on their own; thousands of listings would otherwise run as one block.
+    if (slicer.due()) await slicer.yield();
     const resolution = await (readOnly ? resolveDealHunterOpportunityReadOnly : resolveDealHunterOpportunity)({
       deal,
       storage,
@@ -6126,6 +6205,7 @@ async function attachCanonicalOpportunityIdentities(
 
   if (!readOnly && typeof storage.replaceDealHunterOpportunitySourceObservationSnapshot === 'function') {
     for (const snapshot of perRecordSnapshots.values()) {
+      if (slicer.due()) await slicer.yield();
       if (snapshot.source_id === dealOsSourceId && snapshot.freshness_run
         && typeof storage.bindAcceptedDealHunterFreshness === 'function') {
         await storage.bindAcceptedDealHunterFreshness({
@@ -6170,17 +6250,19 @@ async function attachCanonicalOpportunityIdentities(
     }
   }
 
+  await slicer.maybeYield();
   const opportunityIds = uniqueStrings(resolvedDeals.map((deal) => deal.opportunityId));
   const aliases = opportunityIds.length > 0 && storage.listDealHunterOpportunityAliases
     ? await storage.listDealHunterOpportunityAliases({ opportunityIds, limit: 100000 })
     : [];
+  await slicer.maybeYield();
   const aliasesByOpportunity = aliases.reduce((map, item) => {
     const current = map.get(item.opportunity_id) || [];
     current.push(item);
     map.set(item.opportunity_id, current);
     return map;
   }, new Map());
-  const enrichedDeals = resolvedDeals.map((deal) => {
+  const enrichedDeals = await mapInSlices(resolvedDeals, (deal) => {
     const durableAliases = aliasesByOpportunity.get(deal.opportunityId) || [];
     return {
       ...deal,
@@ -6199,7 +6281,7 @@ async function attachCanonicalOpportunityIdentities(
           .map((item) => item.alias_value),
       ]),
     };
-  });
+  }, slicer);
   const collapsed = [];
   const indexByOpportunity = new Map();
   for (const deal of enrichedDeals) {
@@ -7956,7 +8038,13 @@ export function isBuilderProducedScoredSet(review, deals) {
       && member.identityStatus === deals[index]?.identityStatus));
 }
 
-async function buildDailyDealReview({
+// One build at a time (see dealReviewLock.js). `reviewLock` is the caller's token when it
+// already holds the lock.
+function buildDailyDealReview({ reviewLock = null, ...options } = {}) {
+  return withDealReviewLockHeld(reviewLock, () => buildDailyDealReviewLocked(options));
+}
+
+async function buildDailyDealReviewLocked({
   reviewMode = 'daily',
   dealOsImportId = '',
   storage = getStorage(),
@@ -8036,7 +8124,10 @@ async function buildDailyDealReview({
     return { review: sourceOnlyReview, scoredDeals: [], storage };
   }
 
-  const allDeals = dedupeDeals(sourceResults.flatMap((result) => result.deals));
+  // Dedupe and per-listing scoring take seconds at production scale; run them in event-loop
+  // slices so the server keeps answering (see eventLoopSlices.js).
+  const slicer = createEventLoopSlicer();
+  const allDeals = await dedupeDealsInSlices(sourceResults.flatMap((result) => result.deals), slicer);
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
   const usedDailyFallback = normalizedReviewMode === 'daily' && recentDeals.length === 0 && allDeals.length > 0;
   const candidateDeals = normalizedReviewMode === 'full-backfill'
@@ -8050,9 +8141,9 @@ async function buildDailyDealReview({
   // array index.
   const scoredDealsWithIdentity = await attachCanonicalOpportunityIdentities(
     storage,
-    candidateDeals.map((candidateDeal) => scoreDeal(candidateDeal)),
+    await mapInSlices(candidateDeals, (candidateDeal) => scoreDeal(candidateDeal), slicer),
     completeSheetObservationScopes,
-    { readOnly },
+    { readOnly, slicer },
   );
   // A cap or an incremental review is intentionally merely ineligible for
   // source-wide replacement. Ambiguous raw source-record identities are more
@@ -8064,8 +8155,11 @@ async function buildDailyDealReview({
     .filter((scope) => scope.identityComplete === false && scope.identityDefect === true)
     .map((scope) => scope.sourceId)
     .sort();
+  await slicer.maybeYield();
   const seenDeals = await loadDealHunterHistory(storage);
+  await slicer.maybeYield();
   const scoredDealsWithHistory = attachHistory(scoredDealsWithIdentity, seenDeals, generatedAt);
+  await slicer.maybeYield();
   const dealKeys = uniqueStrings(scoredDealsWithHistory.flatMap((deal) => [
     deal.dealKey,
     ...(deal.dealKeyAliases || []),
@@ -8079,6 +8173,7 @@ async function buildDailyDealReview({
     storage.listDealHunterIdentityExceptions?.({ statuses: ['open'], limit: 100 }) || [],
   ]);
   const identityExceptionOwners = await identityExceptionAliasOwners(identityExceptions, storage);
+  await slicer.maybeYield();
   const baseScoredDeals = attachCimRequestStatus(
     attachDealHunterDispositions(scoredDealsWithHistory, dispositions),
     cimRequests,
@@ -8093,7 +8188,8 @@ async function buildDailyDealReview({
       }
     : deal);
   const generatedAtMs = Date.parse(generatedAt);
-  const scoredDeals = baseScoredDeals.map((deal) => {
+  await slicer.maybeYield();
+  const scoredDeals = await mapInSlices(baseScoredDeals, (deal) => {
     const touches = logicalCimTouchesForRecipient(allCimRequests, deal.brokerEmail);
     const touches24Hours = touches.filter((touch) => Date.parse(touch.occurredAt) >= generatedAtMs - 24 * 60 * 60 * 1000).length;
     const touches30Days = touches.filter((touch) => Date.parse(touch.occurredAt) >= generatedAtMs - 30 * 24 * 60 * 60 * 1000).length;
@@ -8117,19 +8213,23 @@ async function buildDailyDealReview({
         outreachPaused: !outreachGate.allowed,
       },
     };
-  });
+  }, slicer);
+  await slicer.maybeYield();
   const newlySeenMatches = scoredDeals
     .filter((deal) => !deal.dismissed && deal.isNew && !deal.shouldRemove && deal.score >= watchlistScoreThreshold)
     .sort(sortBestDeals)
     .map(publicDeal);
+  await slicer.maybeYield();
   const qualified = scoredDeals
     .filter((deal) => !deal.dismissed && !deal.shouldRemove && deal.score >= highFitScoreThreshold)
     .sort(sortNewThenBest)
     .map(publicDeal);
+  await slicer.maybeYield();
   const watchlist = scoredDeals
     .filter((deal) => !deal.dismissed && !deal.shouldRemove && deal.score >= watchlistScoreThreshold && deal.score < highFitScoreThreshold)
     .sort(sortNewThenBest)
     .map(publicDeal);
+  await slicer.maybeYield();
   const removalCandidates = scoredDeals
     .filter((deal) => !deal.dismissed && deal.shouldRemove)
     .sort((left, right) => {
@@ -8137,7 +8237,9 @@ async function buildDailyDealReview({
       return dateDifference || left.score - right.score;
     })
     .map(publicDeal);
+  await slicer.maybeYield();
   const crmEligibleDeals = dealHunterCrmCandidates(scoredDeals);
+  await slicer.maybeYield();
   const includedSourceRows = sourceResults
     .filter((result) => result.source.fetched && !result.source.error)
     .reduce((sum, result) => sum + (result.source.rowCount || 0), 0);
@@ -8333,8 +8435,13 @@ export async function reviewDailyDealsReadOnly({
  * needs the scored listings themselves. This is a thin accessor over the same
  * review build rather than a second scoring path.
  */
-export async function collectScoredOpportunities({ reviewMode = 'full-backfill', dealOsImportId = '', storage = getStorage() } = {}) {
-  const result = await buildDailyDealReview({ reviewMode, dealOsImportId, storage });
+export async function collectScoredOpportunities({
+  reviewMode = 'full-backfill',
+  dealOsImportId = '',
+  storage = getStorage(),
+  reviewLock = null,
+} = {}) {
+  const result = await buildDailyDealReview({ reviewMode, dealOsImportId, storage, reviewLock });
   return { scoredDeals: result.scoredDeals, review: result.review };
 }
 

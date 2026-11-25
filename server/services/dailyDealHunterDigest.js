@@ -4,6 +4,7 @@ import { getStorage } from '../storage/index.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 import { refreshOpportunityScores } from './dealHunterScoreStore.js';
 import { listTriageQueue } from './dealHunterTriage.js';
+import { yieldToEventLoop } from '../utils/eventLoopSlices.js';
 
 export const DAILY_DEAL_HUNTER_DIGEST_VERSION = 'daily-deal-hunter-digest-v1';
 export const DAILY_DEAL_HUNTER_TOP_LIMIT = 5;
@@ -726,6 +727,8 @@ export async function buildCurrentDailyDealHunterDigest({
     scoreRefresh = { ok: false, status: 503, error: 'Authoritative score refresh failed.' };
   }
 
+  // The refresh and each read below take a while at production scale; let requests in between.
+  await yieldToEventLoop();
   let sourceHealth;
   if (scoreRefresh?.review && typeof scoreRefresh.review === 'object') {
     try {
@@ -749,6 +752,7 @@ export async function buildCurrentDailyDealHunterDigest({
 
   let queue;
   try {
+    await yieldToEventLoop();
     queue = await readTriageQueue({
       storage,
       view: 'needs-review',
