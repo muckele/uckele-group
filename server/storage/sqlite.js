@@ -6260,6 +6260,10 @@ ${cimCapacityConsumeTriggerSql}
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'delivery_state_at', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'follow_up_state', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'first_requested_at', 'TEXT');
+  // The stopped campaign an owner's Start a new campaign command follows; null for every other
+  // enrollment. Enrollment allocates the next generation only when this names the latest one.
+  ensureColumn(database, 'deal_hunter_pursuit_enrollments', 'restart_of_campaign_id',
+    "TEXT CHECK(restart_of_campaign_id IS NULL OR length(restart_of_campaign_id) BETWEEN 1 AND 240)");
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'first_provider_accepted_at', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'delivered_at', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'last_attempt_at', 'TEXT');

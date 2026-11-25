@@ -1227,3 +1227,24 @@ test('scheduled job fencing migration adds no table or column', () => {
   const definitions = sqlFunctionDefinitions(migration).map(({ name }) => name).sort();
   assert.deepEqual(definitions, ['claim_scheduled_job', 'transition_scheduled_job']);
 });
+
+test('the new-generation migration is mirrored exactly at the end of the fresh schema', () => {
+  const migration = fs.readFileSync(new URL('../supabase/migrations/20261115130000_pursue_cim_new_generation.sql',
+    import.meta.url), 'utf8').trim();
+  const schema = fs.readFileSync(schemaUrl, 'utf8').trim();
+  assert.ok(schema.endsWith(migration), 'the fresh schema ends with the exact new-generation block');
+  // The send path no longer pins generation 1; it asks whether earlier generations reached Google.
+  for (const name of ['pursue_cim_materialize_campaign_v1', 'pursue_cim_prepare_transmission_p7a',
+    'pursue_cim_authorize_provider_pending_p7a', 'pursue_cim_claim_due_touch_v1',
+    'pursue_cim_list_due_initial_touches_v1', 'deal_hunter_pursue_renew_initial_claim_v1']) {
+    const start = migration.indexOf(`create or replace function public.${name}(`);
+    assert.ok(start >= 0, `${name} is re-created`);
+    const definition = migration.slice(start, migration.indexOf('\n$$;', start));
+    assert.doesNotMatch(definition, /generation\s*(<>|=)\s*1\b/, `${name} no longer pins generation 1`);
+  }
+  assert.match(migration, /grant execute on function public\.deal_hunter_pursue_start_new_campaign_v1\(jsonb\) to service_role;/);
+  for (const helper of ['deal_hunter_pursue_campaign_reached_provider_v1', 'deal_hunter_pursue_any_campaign_reached_provider_v1',
+    'deal_hunter_pursue_generation_may_send_v1']) {
+    assert.match(migration, new RegExp(`revoke all on function public\\.${helper}\\(text\\)\\s+from public, anon, authenticated, service_role;`));
+  }
+});

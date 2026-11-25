@@ -5,6 +5,7 @@ import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
 import { deriveAcceptedCimCadence } from '../services/pursueCimCadence.js';
 import { cimFollowUpCapacityWindow } from '../services/pursueCimFollowUpCapacity.js';
+import { OWNER_STOP_REASONS } from '../services/pursueCimCampaignSummary.js';
 import {
   CONTACT_POLICY_VERSION,
   contactPolicyDigest,
@@ -312,6 +313,50 @@ function nextPreparationGeneration(database, touchId) {
     JOIN deal_hunter_cim_transmissions AS tr ON tr.id = m.transmission_id
     WHERE m.touch_id = ?
   `).get(touchId).generation;
+}
+
+// SQL that is true when an earlier generation of the campaign aliased `alias` got any email as
+// far as Google. One inquiry per listing (contact rule section 7): a later generation may send
+// only while every earlier one never did. Generation 1 has no earlier generation.
+function priorGenerationReachedProviderSql(alias) {
+  return `EXISTS (SELECT 1 FROM deal_hunter_cim_campaigns AS prior_campaign
+    WHERE prior_campaign.opportunity_id = ${alias}.opportunity_id
+      AND prior_campaign.generation < ${alias}.generation
+      AND (EXISTS (SELECT 1 FROM deal_hunter_cim_campaign_touches AS prior_touch
+          WHERE prior_touch.campaign_id = prior_campaign.id
+            AND prior_touch.state NOT IN ('scheduled', 'claimed', 'cancelled-before-provider'))
+        OR EXISTS (SELECT 1 FROM deal_hunter_cim_transmission_touches AS prior_member
+          JOIN deal_hunter_cim_transmissions AS prior_transmission
+            ON prior_transmission.id = prior_member.transmission_id
+          WHERE prior_member.campaign_id = prior_campaign.id
+            AND (prior_transmission.state NOT IN ('prepared', 'final-gate-blocked',
+                'cancelled-before-provider')
+              OR prior_transmission.provider_seam_entered_at IS NOT NULL))))`;
+}
+
+// True when this campaign's generation may carry email: generation 1, or a later one whose
+// earlier generations never reached Google.
+function campaignGenerationMaySend(database, campaign) {
+  if (!campaign || !Number.isSafeInteger(campaign.generation) || campaign.generation < 1) return false;
+  if (campaign.generation === 1) return true;
+  return !database.prepare(`SELECT ${priorGenerationReachedProviderSql('current_campaign')} AS reached
+    FROM deal_hunter_cim_campaigns AS current_campaign WHERE current_campaign.id = ?`)
+    .get(campaign.id)?.reached;
+}
+
+// True when no campaign of this opportunity, of any generation, got email as far as Google.
+function noCampaignReachedProvider(database, opportunityId) {
+  return !database.prepare(`SELECT 1 FROM deal_hunter_cim_campaigns AS listed
+    WHERE listed.opportunity_id = ?
+      AND (EXISTS (SELECT 1 FROM deal_hunter_cim_campaign_touches AS touch
+          WHERE touch.campaign_id = listed.id
+            AND touch.state NOT IN ('scheduled', 'claimed', 'cancelled-before-provider'))
+        OR EXISTS (SELECT 1 FROM deal_hunter_cim_transmission_touches AS member
+          JOIN deal_hunter_cim_transmissions AS transmission ON transmission.id = member.transmission_id
+          WHERE member.campaign_id = listed.id
+            AND (transmission.state NOT IN ('prepared', 'final-gate-blocked', 'cancelled-before-provider')
+              OR transmission.provider_seam_entered_at IS NOT NULL)))
+    LIMIT 1`).get(opportunityId);
 }
 
 const campaignTransitions = Object.freeze({
@@ -1471,7 +1516,7 @@ export function createPursueCimSqliteTransitions(database, {
             || expectedMember?.campaign?.permission_version !== campaign?.permission_version) {
             return blocked('unknown_policy_version');
           }
-          if (!expectedMember || !campaign || campaign.generation !== 1
+          if (!expectedMember || !campaign || !campaignGenerationMaySend(database, campaign)
             || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'
             || campaign.state !== (followUp ? 'active-follow-up' : 'initial-pending')
             || campaign.terminal_reason
@@ -2253,7 +2298,7 @@ export function createPursueCimSqliteTransitions(database, {
               || campaign.terminal_revision !== expectedCampaignTerminalRevision
               || !['initial-pending', 'active-follow-up'].includes(campaign.state)
               || (touches[0].kind === 'initial' && (campaign.state !== 'initial-pending'
-                || campaign.generation !== 1
+                || !campaignGenerationMaySend(database, campaign)
                 || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'))
               || (campaign.local_expiry_at && Date.parse(campaign.local_expiry_at) <= Date.parse(now)))
             || touches.some((touch) => (touch.kind === 'initial'
@@ -2279,7 +2324,7 @@ export function createPursueCimSqliteTransitions(database, {
             || campaign.terminal_revision !== expectedCampaignTerminalRevision
             || !['initial-pending', 'active-follow-up'].includes(campaign.state)
             || (touches[0].kind === 'initial' && (campaign.state !== 'initial-pending'
-              || campaign.generation !== 1
+              || !campaignGenerationMaySend(database, campaign)
               || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'))
             || !campaign.crm_submission_id
             || (campaign.local_expiry_at && Date.parse(campaign.local_expiry_at) <= Date.parse(now)))
@@ -3176,7 +3221,7 @@ export function createPursueCimSqliteTransitions(database, {
         }
         if (!['initial-pending', 'active-follow-up'].includes(campaign.state)
           || (touch.kind === 'initial' && (campaign.state !== 'initial-pending'
-            || campaign.generation !== 1
+            || !campaignGenerationMaySend(database, campaign)
             || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'
             || touch.logical_slot !== 'initial' || touch.ordinal !== 0))
           || conversation.state !== 'open'
@@ -3249,7 +3294,8 @@ export function createPursueCimSqliteTransitions(database, {
         JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
         JOIN deal_hunter_broker_conversations AS v ON v.id = c.conversation_id
         WHERE t.kind = 'initial' AND t.logical_slot = 'initial' AND t.ordinal = 0
-          AND c.generation = 1 AND c.policy_version = 'deal-hunter-cim-autopilot-v1'
+          AND NOT ${priorGenerationReachedProviderSql('c')}
+          AND c.policy_version = 'deal-hunter-cim-autopilot-v1'
           AND c.state = 'initial-pending' AND v.state = 'open'
           AND t.opportunity_id = c.opportunity_id
           AND t.due_at <= ? AND (c.local_expiry_at IS NULL OR c.local_expiry_at > ?)
@@ -3569,7 +3615,7 @@ export function createPursueCimSqliteTransitions(database, {
           && transmission.state === 'prepared' && transmission.invocation_authority_count === 0
           && !transmission.provider_seam_entered_at && !transmission.boundary_nonce_digest
           && transmission.conversation_id === conversation.id
-          && campaign.state === 'initial-pending' && campaign.generation === 1
+          && campaign.state === 'initial-pending' && campaignGenerationMaySend(database, campaign)
           && campaign.policy_version === 'deal-hunter-cim-autopilot-v1'
           && conversation.state === 'open'
           && (!campaign.local_expiry_at || campaign.local_expiry_at > now)
@@ -3737,7 +3783,16 @@ export function createPursueCimSqliteTransitions(database, {
           SELECT * FROM deal_hunter_cim_campaigns WHERE opportunity_id = ?
           ORDER BY generation DESC LIMIT 1
         `).get(opportunityId);
-        if (current) {
+        // A new generation is allocated only for an enrollment the owner's Start a new campaign
+        // command bound to this exact stopped campaign; a plain Pursue never restarts one.
+        const restartOf = database.prepare(`SELECT restart_of_campaign_id
+          FROM deal_hunter_pursuit_enrollments WHERE id = ? AND opportunity_id = ?`)
+          .get(enrollmentId, opportunityId)?.restart_of_campaign_id ?? null;
+        const restarting = Boolean(current && restartOf && restartOf === current.id
+          && current.state === 'stopped'
+          && OWNER_STOP_REASONS.has(current.reason_code)
+          && generation === current.generation + 1);
+        if (current && !restarting) {
           const same = current.id === campaignId && current.enrollment_id === enrollmentId
             && current.template_digest === command.templateDigest
             && current.permission_digest === command.permissionDigest
@@ -3818,8 +3873,11 @@ export function createPursueCimSqliteTransitions(database, {
               WHERE campaign_id = ? AND logical_slot = 'initial'
             `).get(current.id) ?? null };
         }
-        if (generation !== 1) return { applied: false, existing: false, actionRequired: true,
-          campaign: null, initialTouch: null };
+        if (generation !== (restarting ? current.generation + 1 : 1)
+          || (restarting && !noCampaignReachedProvider(database, opportunityId))) {
+          return { applied: false, existing: false, actionRequired: true,
+            campaign: null, initialTouch: null };
+        }
         const enrollment = database.prepare('SELECT * FROM deal_hunter_pursuit_enrollments WHERE id = ?')
           .get(enrollmentId);
         const decision = enrollment && database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE id = ?')
@@ -4315,6 +4373,105 @@ export function createPursueCimSqliteTransitions(database, {
           decision: database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE id = ?').get(decisionId),
           enrollment: database.prepare('SELECT * FROM deal_hunter_pursuit_enrollments WHERE id = ?').get(enrollmentId),
         };
+      }).immediate();
+    },
+    /**
+     * The owner's Start a new campaign command (autopilot spec 7.2.4 and 17.1): a new Pursue
+     * decision and an enrollment bound to the exact stopped campaign it follows, so enrollment
+     * may allocate the next generation. Refused unless that campaign is the latest, the owner
+     * stopped it, and no email of any generation of this listing reached Google.
+     */
+    async startNewPursueCampaign(command) {
+      const opportunityId = requiredText(command.opportunityId, 'opportunityId', 200);
+      const campaignId = requiredText(command.campaignId, 'campaignId', 240);
+      const expectedRowVersion = requiredRevision(command.expectedRowVersion, 'expectedRowVersion');
+      const idempotencyKey = requiredText(command.idempotencyKey, 'idempotencyKey');
+      const actor = requiredText(command.actor, 'actor', 200);
+      const policyVersion = requiredText(command.policyVersion, 'policyVersion', 120);
+      const now = requiredInstant(command.now);
+      const expectedDiscoveryRevision = requiredRevision(command.expectedDiscoveryRevision, 'expectedDiscoveryRevision');
+      const expectedMaterialRevision = requiredRevision(command.expectedMaterialRevision, 'expectedMaterialRevision');
+      const requestDigest = digest('campaign-restart-request:v1', opportunityId, campaignId,
+        expectedRowVersion, expectedDiscoveryRevision, expectedMaterialRevision, actor,
+        policyVersion, idempotencyKey);
+      const refused = (reason) => ({ applied: false, replay: false, conflict: true, reason,
+        decision: null, enrollment: null });
+      return database.transaction(() => {
+        const existing = database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE idempotency_key = ?')
+          .get(idempotencyKey);
+        if (existing) {
+          const replay = existing.request_digest === requestDigest;
+          return { applied: false, replay, conflict: !replay, reason: replay ? null : 'idempotency_conflict',
+            decision: existing,
+            enrollment: database.prepare('SELECT * FROM deal_hunter_pursuit_enrollments WHERE decision_event_id = ?')
+              .get(existing.id) ?? null };
+        }
+        const opportunity = database.prepare('SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?')
+          .get(opportunityId);
+        if (!opportunity || opportunity.status !== 'active'
+          || opportunity.discovery_revision !== expectedDiscoveryRevision
+          || opportunity.material_revision !== expectedMaterialRevision) return refused('stale_revision');
+        const score = database.prepare(`SELECT * FROM deal_hunter_opportunity_scores
+          WHERE opportunity_id = ? AND current_triage_eligible = 1 AND should_remove = 0`).get(opportunityId);
+        if (!score) return refused('not-actionable');
+        if (score.deal_key && database.prepare(`SELECT 1 FROM deal_hunter_dispositions
+          WHERE deal_key = ? AND disposition = 'dismissed'`).get(score.deal_key)) return refused('already-passed');
+        const latest = database.prepare(`SELECT * FROM deal_hunter_cim_campaigns WHERE opportunity_id = ?
+          ORDER BY generation DESC LIMIT 1`).get(opportunityId);
+        if (!latest || latest.id !== campaignId || latest.row_version !== expectedRowVersion) {
+          return refused('campaign_changed');
+        }
+        if (latest.state !== 'stopped' || !OWNER_STOP_REASONS.has(latest.reason_code)) {
+          return refused('campaign_not_restartable');
+        }
+        if (!noCampaignReachedProvider(database, opportunityId)) return refused('campaign_emailed');
+        if (database.prepare(`SELECT 1 FROM deal_hunter_cim_requests WHERE opportunity_id = ?
+            OR deal_key IN (SELECT deal_key FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?) LIMIT 1`)
+          .get(opportunityId, opportunityId)
+          || database.prepare('SELECT 1 FROM deal_hunter_cim_opportunity_claims WHERE opportunity_id = ? LIMIT 1')
+            .get(opportunityId)) return refused('prior_outreach');
+        const current = database.prepare(`SELECT * FROM deal_hunter_pursuit_enrollments
+          WHERE opportunity_id = ? AND state <> 'superseded'`).get(opportunityId);
+        if (current) {
+          database.prepare(`UPDATE deal_hunter_pursuit_enrollments SET state = 'superseded',
+            reason_code = 'campaign-restarted', row_version = row_version + 1, updated_at = ?
+            WHERE id = ? AND row_version = ?`).run(now, current.id, current.row_version);
+          appendAudit(database, { eventType: 'enrollment-transition',
+            authorityId: `${current.id}:${current.row_version + 1}`, opportunityId,
+            priorState: current.state, nextState: 'superseded', reasonCode: 'campaign-restarted',
+            actor, occurredAt: now });
+        }
+        const decisionId = digest('owner-decision:v1', idempotencyKey);
+        const enrollmentId = digest('pursuit-enrollment:v1', decisionId);
+        database.prepare(`
+          INSERT INTO deal_hunter_owner_decision_events (
+            id, idempotency_key, request_digest, opportunity_id, action, actor,
+            expected_discovery_revision, expected_material_revision,
+            observed_discovery_revision, observed_material_revision,
+            selected_contact_reference_digest, policy_version, created_at
+          ) VALUES (?, ?, ?, ?, 'pursue', ?, ?, ?, ?, ?, NULL, ?, ?)
+        `).run(decisionId, idempotencyKey, requestDigest, opportunityId, actor,
+          expectedDiscoveryRevision, expectedMaterialRevision,
+          opportunity.discovery_revision, opportunity.material_revision, policyVersion, now);
+        database.prepare(`
+          INSERT INTO deal_hunter_pursuit_enrollments (
+            id, decision_event_id, opportunity_id, state, reason_code, authority_digest,
+            restart_of_campaign_id, created_at, updated_at
+          ) VALUES (?, ?, ?, 'queued', 'awaiting-orchestration', ?, ?, ?, ?)
+        `).run(enrollmentId, decisionId, opportunityId,
+          digest('enrollment-authority:v1', decisionId, opportunity.discovery_revision,
+            opportunity.material_revision), campaignId, now, now);
+        appendAudit(database, { eventType: 'owner-decision', authorityId: decisionId,
+          opportunityId, campaignId, nextState: 'pursue', reasonCode: 'campaign-restart',
+          authorityDigest: requestDigest, actor, occurredAt: now });
+        database.prepare(`UPDATE deal_hunter_opportunity_scores SET operator_priority = 'high',
+          reviewed_at = ?, reviewed_by = ?, reviewed_fingerprint = score_fingerprint,
+          reviewed_semantic_digest = semantic_digest, reviewed_discovery_revision = ?,
+          reviewed_material_revision = ?, operator_updated_at = ? WHERE opportunity_id = ?`)
+          .run(now, actor, expectedDiscoveryRevision, expectedMaterialRevision, now, opportunityId);
+        return { applied: true, replay: false, conflict: false, reason: null,
+          decision: database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE id = ?').get(decisionId),
+          enrollment: database.prepare('SELECT * FROM deal_hunter_pursuit_enrollments WHERE id = ?').get(enrollmentId) };
       }).immediate();
     },
   };
